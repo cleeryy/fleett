@@ -1,0 +1,185 @@
+name: compose-integration
+
+# Exercises the real Compose driver: the mock driver covers the HTTP API, but
+# only this job proves that the rendered compose file still builds, starts,
+# logs, stops and deletes against a Docker daemon. See docs/CI.md.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose-driver:
+    name: Compose driver against real Docker
+    runs-on: ubuntu-24.04
+    # Issue #16 caps the end-to-end scenario at three minutes. The job allows
+    # more because a cold release build alone took ~2m16s on a fast runner.
+    timeout-minutes: 10
+    env:
+      FLEETT_BIND: "127.0.0.1:8090"
+      FLEETT_DRIVER: compose
+      FLEETT_IMAGE: fleett-test-agent
+      # Quoted: an unquoted `off` is a boolean in YAML 1.1 parsers.
+      FLEETT_EGRESS: "off"
+      FLEETT_TOKEN: ci-token
+      FLEETT_URL: "http://127.0.0.1:8090"
+      INSTANCE_ID: solo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend -> target
+
+      - name: Build the agent stand-in image
+        run: docker build --tag "$FLEETT_IMAGE" tests/compose
+
+      - name: Build the control plane
+        working-directory: backend
+        run: cargo build --release --locked
+
+      - name: Prepare the data root
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/fleett"
+          rm -rf "$root"
+          mkdir -p "$root"
+          echo "FLEETT_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Start the control plane
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/fleett-serve.log"
+          ./backend/target/release/fleett serve > "$log" 2>&1 &
+          pid=$!
+          echo "$pid" > "$RUNNER_TEMP/fleett-serve.pid"
+          for _ in $(seq 1 60); do
+            if curl -fsS "$FLEETT_URL/api/health" > /dev/null; then
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::the control plane exited during startup"
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::the control plane did not answer GET /api/health within 60s"
+          cat "$log"
+          exit 1
+
+      - name: Create the instance
+        run: |
+          set -euo pipefail
+          auth="Authorization: Bearer $FLEETT_TOKEN"
+
+          code=$(curl -sS -X POST "$FLEETT_URL/api/instances" \
+            -H "$auth" \
+            -H 'Content-Type: application/json' \
+            --data '{"id":"solo","name":"CI stand-in","template":"guest","model":"deepseek-v4.1-flash","base_url":"https://opencode.ai/inference/go/openai/v1"}' \
+            -o "$RUNNER_TEMP/create.json" \
+            -w '%{http_code}')
+          python3 -m json.tool "$RUNNER_TEMP/create.json" || true
+          if [ "$code" != 201 ]; then
+            echo "::error::POST /api/instances answered HTTP $code (expected 201)"
+            exit 1
+          fi
+
+          for _ in $(seq 1 30); do
+            status=$(curl -fsS "$FLEETT_URL/api/instances/$INSTANCE_ID" -H "$auth" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')
+            if [ "$status" = running ]; then
+              echo "instance $INSTANCE_ID is running"
+              exit 0
+            fi
+            echo "instance $INSTANCE_ID is $status"
+            sleep 2
+          done
+          echo "::error::instance $INSTANCE_ID never reached status=running within 60s"
+          exit 1
+
+      - name: Validate the rendered compose file
+        run: |
+          set -euo pipefail
+          compose="$FLEETT_ROOT/instances/$INSTANCE_ID/compose.yaml"
+          test -f "$compose"
+          docker compose -f "$compose" config
+
+      - name: Assert the stand-in logs reach the API
+        run: |
+          set -euo pipefail
+          auth="Authorization: Bearer $FLEETT_TOKEN"
+          logs="$RUNNER_TEMP/logs.txt"
+          for _ in $(seq 1 15); do
+            curl -fsS "$FLEETT_URL/api/instances/$INSTANCE_ID/logs?tail=10" \
+              -H "$auth" -o "$logs"
+            if grep -q 'fleett-test-agent: gateway starting (args: run)' "$logs"; then
+              cat "$logs"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::GET /instances/$INSTANCE_ID/logs did not return the stand-in output"
+          cat "$logs" || true
+          exit 1
+
+      - name: Stop and purge the instance
+        run: |
+          set -euo pipefail
+          auth="Authorization: Bearer $FLEETT_TOKEN"
+
+          curl -fsS -X POST "$FLEETT_URL/api/instances/$INSTANCE_ID/stop" -H "$auth" -o /dev/null
+          curl -fsS -X DELETE "$FLEETT_URL/api/instances/$INSTANCE_ID?purge=true" -H "$auth" -o /dev/null
+
+          if curl -fsS "$FLEETT_URL/api/instances/$INSTANCE_ID" -H "$auth" -o /dev/null; then
+            echo "::error::the instance still answers after DELETE"
+            exit 1
+          fi
+
+          if docker ps -a --format '{{.Names}}' | grep -qx "fleett-$INSTANCE_ID"; then
+            echo "::error::container fleett-$INSTANCE_ID survived DELETE"
+            docker ps -a --filter "name=fleett-$INSTANCE_ID"
+            exit 1
+          fi
+
+          if docker compose ls --all --format json | grep -q "\"fleett-$INSTANCE_ID\""; then
+            echo "::error::compose project fleett-$INSTANCE_ID survived DELETE"
+            docker compose ls --all
+            exit 1
+          fi
+
+          test ! -e "$FLEETT_ROOT/instances/$INSTANCE_ID"
+          echo "container, compose project and instance directory are gone"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set -x
+          docker ps -a || true
+          docker compose ls --all || true
+          docker image ls "$FLEETT_IMAGE" || true
+          tail -n 200 "$RUNNER_TEMP/fleett-serve.log" 2>/dev/null || true
+          find "$FLEETT_ROOT/instances" -maxdepth 2 -name 'compose.yaml' -print 2>/dev/null || true
+          docker ps -a --format '{{.Names}}' | grep -qx "fleett-$INSTANCE_ID" \
+            && docker logs "fleett-$INSTANCE_ID" || true
+          true
+
+      - name: Stop the control plane
+        if: always()
+        run: |
+          pid_file="$RUNNER_TEMP/fleett-serve.pid"
+          if [ -f "$pid_file" ]; then
+            kill "$(cat "$pid_file")" 2>/dev/null || true
+          fi
