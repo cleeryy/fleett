@@ -92,12 +92,28 @@ impl Config {
     /// default root); `fleet.env` is then read from that root and fills in any
     /// variable the process environment does not define.
     pub fn from_process_env(process: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let root_hint = process("FLEET_ROOT")
+        let explicit_root = process("FLEET_ROOT")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
-        let file_vars = load_env_file(&root_hint.join(ENV_FILE_NAME));
+            .map(PathBuf::from);
+
+        let env_file = match explicit_root {
+            Some(ref root) => root.join(ENV_FILE_NAME),
+            None => {
+                // The installer writes `$HOME/.hermes-fleet/fleet.env`, while the
+                // system default root is `/opt/hermes-fleet`. Prefer the home file
+                // when it exists so a bare `hermes-fleet` starts with no env at all.
+                match process("HOME").map(|home| {
+                    PathBuf::from(home)
+                        .join(".hermes-fleet")
+                        .join(ENV_FILE_NAME)
+                }) {
+                    Some(path) if path.is_file() => path,
+                    _ => PathBuf::from(DEFAULT_ROOT).join(ENV_FILE_NAME),
+                }
+            }
+        };
+        let file_vars = load_env_file(&env_file);
         Self::from_lookup(|key| process(key).or_else(|| file_vars.get(key).cloned()))
     }
 
@@ -365,6 +381,31 @@ FLEET_NETWORK='fleet-net'
         assert_eq!(cfg.bind.port(), 9999);
         assert_eq!(cfg.network, DEFAULT_NETWORK);
         assert_eq!(cfg.driver, DriverKind::Mock);
+    }
+
+    #[test]
+    fn home_fleet_env_is_used_without_fleet_root() {
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().join(".hermes-fleet");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join(ENV_FILE_NAME),
+            format!(
+                "FLEET_ROOT={}\nFLEET_TOKEN=home-token\n",
+                root.to_string_lossy()
+            ),
+        )
+        .expect("write home fleet.env");
+
+        let home_str = home.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "HOME" => Some(home_str.clone()),
+            _ => None,
+        })
+        .expect("config resolves from the home file");
+
+        assert_eq!(cfg.token.as_deref(), Some("home-token"));
+        assert_eq!(cfg.root, root);
     }
 
     #[test]
