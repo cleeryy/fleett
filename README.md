@@ -36,7 +36,9 @@ fleett                           # reads ~/.fleett/fleett.env
 ```
 
 Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). The installer also creates a
-`hermes-fleet` symlink for scripts written against the old name. Details: `docs/INSTALL.md`,
+`hermes-fleet` symlink for scripts written against the old name. A `.deb` (systemd unit,
+UID 10000, secrets key) and the OCI image `ghcr.io/cleeryy/fleett` are published with each
+release — see `docs/PACKAGING.md`. Details: `docs/INSTALL.md`,
 deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`,
 backups and instance archives: `docs/BACKUP.md`, rolling image upgrades: `docs/UPGRADE.md`,
 metrics: `docs/METRICS.md`, container hardening: `docs/HARDENING.md`.
