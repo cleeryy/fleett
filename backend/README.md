@@ -49,8 +49,9 @@ FLEET_DRIVER=compose
 FLEET_BIND=127.0.0.1:8090
 ```
 
-`FLEET_ROOT` is resolved from the process environment first (or the default
-`/opt/hermes-fleet`); that value decides where `fleet.env` is read from.
+`FLEET_ROOT` is resolved from the process environment first. When it is unset, the
+loader reads `$HOME/.hermes-fleet/fleet.env` if that file exists (the location used by
+`install.sh`), then falls back to `/opt/hermes-fleet/fleet.env`.
 
 ## Run
 
