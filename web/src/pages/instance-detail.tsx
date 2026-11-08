@@ -47,6 +47,7 @@ import { SharePicker } from "@/components/share-picker";
 import { StatusBadge } from "@/components/status-badge";
 import { formatClock, formatDateTime, formatRelative, formatUptime } from "@/lib/format";
 import { navigate } from "@/lib/router";
+import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 import { isHttpUrl } from "@/lib/validation";
 import { cn } from "@/lib/utils";
@@ -80,7 +81,15 @@ function tokenEnv(detail: InstanceDetail): string | null {
   return detail.env_keys.includes(env) ? env : null;
 }
 
-function OverviewTab({ detail, onConfigure }: { detail: InstanceDetail; onConfigure: () => void }) {
+function OverviewTab({
+  detail,
+  canEdit,
+  onConfigure,
+}: {
+  detail: InstanceDetail;
+  canEdit: boolean;
+  onConfigure: () => void;
+}) {
   const env = tokenEnv(detail);
   const providerKeySet = detail.env_keys.includes("HERMES_GATE_PROFILE_TOKEN");
 
@@ -121,15 +130,17 @@ function OverviewTab({ detail, onConfigure }: { detail: InstanceDetail; onConfig
                       >
                         missing
                       </Badge>
-                      <Button
-                        type="button"
-                        variant="link"
-                        size="sm"
-                        className="h-auto p-0"
-                        onClick={onConfigure}
-                      >
-                        Add the token
-                      </Button>
+                      {canEdit ? (
+                        <Button
+                          type="button"
+                          variant="link"
+                          size="sm"
+                          className="h-auto p-0"
+                          onClick={onConfigure}
+                        >
+                          Add the token
+                        </Button>
+                      ) : null}
                     </div>
                     <p className="text-xs text-muted-foreground">The agent cannot call the model.</p>
                   </div>
@@ -348,8 +359,10 @@ function ConfigurationTab({
   const showErrors = attempted;
   const providerKeySet = detail.env_keys.includes("HERMES_GATE_PROFILE_TOKEN");
   const dirty = JSON.stringify(draft) !== JSON.stringify(toConfigDraft(detail));
-  // The prerequisite sits on the network field, so the alert belongs there.
+  // Host prerequisites sit on the field that needs them, like egress on the
+  // network checkbox: the provider token needs the secrets key.
   const egressError = error?.code === "egress_not_enforced" ? error : null;
+  const secretsError = error?.code === "secrets_key_missing" ? error : null;
 
   function update<K extends keyof ConfigDraft>(key: K, value: ConfigDraft[K]) {
     onDraftChange({ ...draft, [key]: value } as ConfigDraft);
@@ -399,7 +412,7 @@ function ConfigurationTab({
 
   return (
     <form onSubmit={onSubmit} noValidate className="max-w-2xl space-y-6">
-      {error && !egressError ? <ErrorAlert error={error} /> : null}
+      {error && !egressError && !secretsError ? <ErrorAlert error={error} /> : null}
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-2">
@@ -520,6 +533,7 @@ function ConfigurationTab({
           Encrypted at rest and never returned by the API. The host needs its secrets key
           (<span className="font-mono">sudo fleett secrets init</span>).
         </p>
+        {secretsError ? <ErrorAlert error={secretsError} /> : null}
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2">
@@ -744,6 +758,7 @@ function DetailSkeleton() {
 }
 
 export function InstanceDetailPage({ id }: { id: string }) {
+  const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [tab, setTab] = useState("overview");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
@@ -847,40 +862,56 @@ export function InstanceDetailPage({ id }: { id: string }) {
             >
               <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
             </Button>
-            {running ? (
-              <Button size="sm" onClick={() => run("stop")} disabled={busy}>
-                {pendingAction === "stop" ? <Loader2 aria-hidden className="animate-spin" /> : <Square aria-hidden />}
-                Stop
-              </Button>
-            ) : (
-              <Button size="sm" onClick={() => run("start")} disabled={busy}>
-                {pendingAction === "start" ? <Loader2 aria-hidden className="animate-spin" /> : <Play aria-hidden />}
-                Start
-              </Button>
-            )}
-            <Button variant="outline" size="sm" onClick={() => run("restart")} disabled={busy}>
-              {pendingAction === "restart" ? <Loader2 aria-hidden className="animate-spin" /> : <RotateCw aria-hidden />}
-              Restart
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon-sm"
-                  aria-label="More actions"
-                  title="More actions"
-                  disabled={busy}
-                >
-                  <MoreHorizontal aria-hidden />
+            {canEdit ? (
+              <>
+                {running ? (
+                  <Button size="sm" onClick={() => run("stop")} disabled={busy}>
+                    {pendingAction === "stop" ? (
+                      <Loader2 aria-hidden className="animate-spin" />
+                    ) : (
+                      <Square aria-hidden />
+                    )}
+                    Stop
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={() => run("start")} disabled={busy}>
+                    {pendingAction === "start" ? (
+                      <Loader2 aria-hidden className="animate-spin" />
+                    ) : (
+                      <Play aria-hidden />
+                    )}
+                    Start
+                  </Button>
+                )}
+                <Button variant="outline" size="sm" onClick={() => run("restart")} disabled={busy}>
+                  {pendingAction === "restart" ? (
+                    <Loader2 aria-hidden className="animate-spin" />
+                  ) : (
+                    <RotateCw aria-hidden />
+                  )}
+                  Restart
                 </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
-                  <Trash2 aria-hidden />
-                  Delete instance…
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon-sm"
+                      aria-label="More actions"
+                      title="More actions"
+                      disabled={busy}
+                    >
+                      <MoreHorizontal aria-hidden />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
+                      <Trash2 aria-hidden />
+                      Delete instance…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : null}
           </>
         }
       />
@@ -891,28 +922,30 @@ export function InstanceDetailPage({ id }: { id: string }) {
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
             <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="configuration">Configuration</TabsTrigger>
+            {canEdit ? <TabsTrigger value="configuration">Configuration</TabsTrigger> : null}
             <TabsTrigger value="logs">Logs</TabsTrigger>
             <TabsTrigger value="compose">Compose</TabsTrigger>
           </TabsList>
         </div>
 
         <TabsContent value="overview" className="mt-4">
-          <OverviewTab detail={data} onConfigure={() => setTab("configuration")} />
+          <OverviewTab detail={data} canEdit={canEdit} onConfigure={() => setTab("configuration")} />
         </TabsContent>
 
-        <TabsContent value="configuration" className="mt-4">
-          {configDraft ? (
-            <ConfigurationTab
-              detail={data}
-              draft={configDraft}
-              onDraftChange={setConfigDraft}
-              onSaved={handleConfigSaved}
-            />
-          ) : (
-            <Skeleton className="h-64 w-full rounded-md" />
-          )}
-        </TabsContent>
+        {canEdit ? (
+          <TabsContent value="configuration" className="mt-4">
+            {configDraft ? (
+              <ConfigurationTab
+                detail={data}
+                draft={configDraft}
+                onDraftChange={setConfigDraft}
+                onSaved={handleConfigSaved}
+              />
+            ) : (
+              <Skeleton className="h-64 w-full rounded-md" />
+            )}
+          </TabsContent>
+        ) : null}
 
         <TabsContent value="logs" className="mt-4">
           <LogsTab id={data.id} />
@@ -927,15 +960,17 @@ export function InstanceDetailPage({ id }: { id: string }) {
         </TabsContent>
       </Tabs>
 
-      <DeleteInstanceDialog
-        instance={{ id: data.id, name: data.name }}
-        open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        onDeleted={() => {
-          toast.success(`Instance ${data.id} deleted.`);
-          navigate("/instances");
-        }}
-      />
+      {canEdit ? (
+        <DeleteInstanceDialog
+          instance={{ id: data.id, name: data.name }}
+          open={deleteOpen}
+          onOpenChange={setDeleteOpen}
+          onDeleted={() => {
+            toast.success(`Instance ${data.id} deleted.`);
+            navigate("/instances");
+          }}
+        />
+      ) : null}
     </>
   );
 }

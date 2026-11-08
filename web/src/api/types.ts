@@ -12,6 +12,68 @@ export interface Health {
   docker: { ok: boolean };
 }
 
+/** Credential types offered by the controller (`FLEETT_AUTH`). */
+export type AuthMode = "bearer" | "oidc" | "both";
+export type Role = "admin" | "viewer";
+export type AuthMethod = "session" | "bearer";
+
+export interface AuthConfig {
+  mode: AuthMode;
+  oidc: { enabled: boolean; login_url: string };
+  bearer: { enabled: boolean };
+}
+
+export interface SessionUser {
+  sub: string;
+  email: string;
+  name: string;
+}
+
+/** `GET /api/auth/me`: the identity behind the current request. */
+export interface Identity {
+  authenticated: boolean;
+  actor: string;
+  role: Role;
+  method: AuthMethod;
+  /** Present for cookie sessions only. */
+  user?: SessionUser;
+}
+
+export interface TokenInfo {
+  id: string;
+  name: string;
+  role: Role;
+  created_at: string;
+  /** Omitted while the token is active. */
+  revoked_at?: string | null;
+}
+
+/** `POST /api/tokens`: the secret is returned exactly once. */
+export interface CreatedToken {
+  id: string;
+  name: string;
+  role: Role;
+  created_at: string;
+  token: string;
+}
+
+export interface CreateTokenInput {
+  name: string;
+  role: Role;
+}
+
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actor: string;
+  role: Role;
+  method: AuthMethod;
+  action: string;
+  target: string;
+  ip?: string | null;
+  details?: unknown;
+}
+
 export interface Template {
   id: string;
   name: string;
@@ -123,7 +185,15 @@ export interface LifecycleResult {
 
 export interface FleetApi {
   health(): Promise<Health>;
+  /** Public: which login methods the controller advertises. */
+  authConfig(): Promise<AuthConfig>;
+  /** Identity behind the current credential; 401 when there is none. */
+  me(): Promise<Identity>;
   checkAuth(): Promise<void>;
+  /** Session login; a no-op navigation for the real API, a mock session in the adapter. */
+  signInWithOidc(loginUrl: string): Promise<void>;
+  /** Clears the session cookies. Harmless when there is no session. */
+  logout(): Promise<void>;
   listTemplates(): Promise<Template[]>;
   listInstances(): Promise<InstanceSummary[]>;
   getInstance(id: string): Promise<InstanceDetail>;
@@ -137,4 +207,8 @@ export interface FleetApi {
   deleteShare(name: string): Promise<void>;
   attachShare(name: string, instance: string, mode: ShareMode): Promise<void>;
   detachShare(name: string, instance: string): Promise<void>;
+  listTokens(): Promise<TokenInfo[]>;
+  createToken(input: CreateTokenInput): Promise<CreatedToken>;
+  revokeToken(id: string): Promise<void>;
+  listAudit(limit: number): Promise<AuditEntry[]>;
 }

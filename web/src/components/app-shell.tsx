@@ -1,6 +1,18 @@
 import { useState, type ReactNode } from "react";
-import { Boxes, FolderTree, LayoutTemplate, LogOut, Menu, Moon, Sun } from "lucide-react";
-import type { Health } from "@/api/types";
+import {
+  Boxes,
+  FolderTree,
+  KeyRound,
+  LayoutTemplate,
+  LogOut,
+  Menu,
+  Moon,
+  ScrollText,
+  Sun,
+  type LucideIcon,
+} from "lucide-react";
+import type { Health, Identity } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -10,6 +22,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
+import { identityLabel } from "@/lib/session";
 import { cn } from "@/lib/utils";
 
 export interface Crumb {
@@ -18,22 +31,34 @@ export interface Crumb {
   mono?: boolean;
 }
 
-const NAV = [
+interface NavItem {
+  key: string;
+  label: string;
+  href: string;
+  icon: LucideIcon;
+  /** Hidden from `viewer` accounts, and the route refuses them. */
+  adminOnly?: boolean;
+}
+
+const NAV: NavItem[] = [
   { key: "instances", label: "Instances", href: "#/instances", icon: Boxes },
   { key: "shares", label: "Shares", href: "#/shares", icon: FolderTree },
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
-] as const;
+  { key: "tokens", label: "Tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
+  { key: "audit", label: "Audit log", href: "#/audit", icon: ScrollText, adminOnly: true },
+];
 
-type NavKey = (typeof NAV)[number]["key"];
-
-function activeKey(path: string): NavKey {
+function activeKey(path: string): string {
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/templates")) return "templates";
+  if (path.startsWith("/tokens")) return "tokens";
+  if (path.startsWith("/audit")) return "audit";
   return "instances";
 }
 
 function SideNav({
   path,
+  identity,
   health,
   healthFailed,
   theme,
@@ -42,6 +67,7 @@ function SideNav({
   onNavigate,
 }: {
   path: string;
+  identity: Identity;
   health: Health | null;
   healthFailed: boolean;
   theme: "dark" | "light";
@@ -51,6 +77,9 @@ function SideNav({
 }) {
   const active = activeKey(path);
   const dockerOk = health?.docker.ok ?? true;
+  const admin = identity.role === "admin";
+  const viewer = !admin;
+  const items = NAV.filter((item) => !item.adminOnly || admin);
 
   return (
     <div className="flex h-full flex-col bg-background">
@@ -62,7 +91,7 @@ function SideNav({
       </div>
 
       <nav aria-label="Console sections" className="flex-1 space-y-1 p-2">
-        {NAV.map((item) => {
+        {items.map((item) => {
           const Icon = item.icon;
           const isActive = item.key === active;
           return (
@@ -86,7 +115,45 @@ function SideNav({
       </nav>
 
       <div className="space-y-3 border-t p-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
-        <div className="space-y-1 px-1" title={health ? `driver ${health.driver} · docker ${dockerOk ? "ok" : "unreachable"}` : undefined}>
+        <div className="space-y-1.5 rounded-md border bg-muted/30 p-2.5">
+          <p
+            className="truncate text-sm font-medium"
+            title={`${identity.actor} · ${identity.method}`}
+          >
+            {identityLabel(identity)}
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge
+              variant={admin ? "default" : "secondary"}
+              className="font-mono text-[11px] font-normal"
+            >
+              {identity.role}
+            </Badge>
+            {viewer ? (
+              <Badge variant="outline" className="font-mono text-[11px] font-normal">
+                read-only
+              </Badge>
+            ) : null}
+          </div>
+          {viewer ? (
+            <p className="text-xs text-muted-foreground">Changes are disabled for this role.</p>
+          ) : null}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mt-1 w-full justify-start"
+            onClick={onSignOut}
+          >
+            <LogOut aria-hidden />
+            Sign out
+          </Button>
+        </div>
+
+        <div
+          className="space-y-1 px-1"
+          title={health ? `driver ${health.driver} · docker ${dockerOk ? "ok" : "unreachable"}` : undefined}
+        >
           <p className="flex items-center gap-2 font-mono text-xs text-muted-foreground">
             <span
               aria-hidden
@@ -103,29 +170,18 @@ function SideNav({
             <p className="pl-3.5 text-xs text-destructive">Docker unreachable</p>
           ) : null}
         </div>
-        <div className="flex items-center gap-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="flex-1 justify-start"
-            onClick={onToggleTheme}
-            aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          >
-            {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
-            {theme === "dark" ? "Light theme" : "Dark theme"}
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            onClick={onSignOut}
-            aria-label="Sign out"
-            title="Sign out"
-          >
-            <LogOut aria-hidden />
-          </Button>
-        </div>
+
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="w-full justify-start"
+          onClick={onToggleTheme}
+          aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+        >
+          {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
+          {theme === "dark" ? "Light theme" : "Dark theme"}
+        </Button>
       </div>
     </div>
   );
@@ -134,6 +190,7 @@ function SideNav({
 export function AppShell({
   path,
   crumbs,
+  identity,
   health,
   healthFailed,
   theme,
@@ -143,6 +200,7 @@ export function AppShell({
 }: {
   path: string;
   crumbs: Crumb[];
+  identity: Identity;
   health: Health | null;
   healthFailed: boolean;
   theme: "dark" | "light";
@@ -169,6 +227,7 @@ export function AppShell({
         <div className="sticky top-0 h-dvh">
           <SideNav
             path={path}
+            identity={identity}
             health={health}
             healthFailed={healthFailed}
             theme={theme}
@@ -193,6 +252,7 @@ export function AppShell({
               </SheetHeader>
               <SideNav
                 path={path}
+                identity={identity}
                 health={health}
                 healthFailed={healthFailed}
                 theme={theme}

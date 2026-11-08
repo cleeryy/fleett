@@ -1,9 +1,15 @@
 import { ApiError } from "./errors";
+import { readCookie } from "@/lib/cookies";
 import { tokenStore } from "@/lib/token";
 import type {
+  AuditEntry,
+  AuthConfig,
   CreateInstanceInput,
+  CreateTokenInput,
+  CreatedToken,
   FleetApi,
   Health,
+  Identity,
   InstanceDetail,
   InstanceSummary,
   LifecycleResult,
@@ -11,22 +17,52 @@ import type {
   Share,
   ShareMode,
   Template,
+  TokenInfo,
 } from "./types";
 
-/** Empty base = same origin. Vite proxies /api to the controller in development. */
+/** Empty base = same origin. Vite proxies /api and /auth to the controller in development. */
 const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+const MUTATIONS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+interface RequestOptions {
+  /** Boot and credential checks must not fire the global "session expired" event. */
+  signalUnauthorized?: boolean;
+}
+
+function isAbsoluteUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+/** Keep `/auth/login` same-origin, or prefix it when VITE_API_BASE points elsewhere. */
+function authUrl(loginUrl: string): string {
+  if (isAbsoluteUrl(loginUrl)) return loginUrl;
+  return `${BASE}${loginUrl.startsWith("/") ? loginUrl : `/${loginUrl}`}`;
+}
+
+async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
   const token = tokenStore.get();
   const headers = new Headers(init.headers);
   if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const method = (init.method ?? "GET").toUpperCase();
+  if (MUTATIONS.has(method)) {
+    // Cookie sessions need a double-submit proof; bearer clients are exempt and
+    // the cookie is simply absent. Harmless in every mode.
+    const csrf = readCookie("fleett_csrf");
+    if (csrf) headers.set("X-Fleett-CSRF", csrf);
+  }
   if (init.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
   let response: Response;
   try {
-    response = await fetch(`${BASE}${path}`, { ...init, headers });
+    response = await fetch(`${BASE}${path}`, {
+      ...init,
+      headers,
+      credentials: "same-origin",
+    });
   } catch {
     throw new ApiError(0, "network_error", "Controller unreachable. Check that the backend is running.");
   }
@@ -42,7 +78,17 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       if (body?.error?.code) code = body.error.code;
       if (body?.error?.message) message = body.error.message;
     }
-    if (response.status === 401) {
+
+    // Turn the two role/CSRF refusals into something a person can act on. The
+    // server wording stays visible for every other error.
+    if (code === "csrf_required") {
+      message =
+        "The browser session is missing its security token (CSRF). Reload the page and sign in again.";
+    } else if (code === "forbidden") {
+      message = `${message.replace(/\.$/, "")}. This account cannot make that change.`;
+    }
+
+    if (response.status === 401 && options.signalUnauthorized !== false) {
       window.dispatchEvent(new CustomEvent("fleett:unauthorized"));
     }
     throw new ApiError(response.status, code, message);
@@ -57,7 +103,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export const httpApi: FleetApi = {
   health: () => request<Health>("/api/health"),
 
-  checkAuth: () => request<void>("/api/auth/check"),
+  authConfig: () => request<AuthConfig>("/api/auth/config", {}, { signalUnauthorized: false }),
+
+  me: () => request<Identity>("/api/auth/me", {}, { signalUnauthorized: false }),
+
+  checkAuth: () => request<void>("/api/auth/check", {}, { signalUnauthorized: false }),
+
+  async signInWithOidc(loginUrl: string): Promise<void> {
+    window.location.assign(authUrl(loginUrl));
+    // The browser is leaving this document; never resolve so the caller cannot
+    // race the navigation with an /api/auth/me call.
+    await new Promise<void>(() => undefined);
+  },
+
+  logout: () => request<void>("/auth/logout", { method: "POST" }, { signalUnauthorized: false }),
 
   listTemplates: () => request<Template[]>("/api/templates"),
 
@@ -103,4 +162,14 @@ export const httpApi: FleetApi = {
       method: "POST",
       body: JSON.stringify({ instance }),
     }),
+
+  listTokens: () => request<TokenInfo[]>("/api/tokens"),
+
+  createToken: (input: CreateTokenInput) =>
+    request<CreatedToken>("/api/tokens", { method: "POST", body: JSON.stringify(input) }),
+
+  revokeToken: (id) =>
+    request<void>(`/api/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  listAudit: (limit) => request<AuditEntry[]>(`/api/audit?limit=${limit}`),
 };

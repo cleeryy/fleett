@@ -15,9 +15,11 @@ import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { plural } from "@/lib/format";
 import { hrefFor } from "@/lib/router";
+import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 export function TemplatesPage() {
+  const canEdit = useCanEdit();
   const templates = useResource(() => api.listTemplates(), []);
   const rows = templates.data ?? [];
 
@@ -63,9 +65,11 @@ export function TemplatesPage() {
                     <TableHead>Description</TableHead>
                     <TableHead className="w-[240px]">Default model</TableHead>
                     <TableHead className="w-[110px]">Channel</TableHead>
-                    <TableHead className="w-[90px]">
-                      <span className="sr-only">Actions</span>
-                    </TableHead>
+                    {canEdit ? (
+                      <TableHead className="w-[90px]">
+                        <span className="sr-only">Actions</span>
+                      </TableHead>
+                    ) : null}
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -78,16 +82,18 @@ export function TemplatesPage() {
                       <TableCell className="text-sm text-muted-foreground">{template.description}</TableCell>
                       <TableCell className="font-mono text-xs">{template.default_model}</TableCell>
                       <TableCell className="font-mono text-xs">{template.channel}</TableCell>
-                      <TableCell className="text-right">
-                        <Button asChild variant="outline" size="sm">
-                          <a
-                            href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
-                            aria-label={`Use ${template.name}`}
-                          >
-                            Use
-                          </a>
-                        </Button>
-                      </TableCell>
+                      {canEdit ? (
+                        <TableCell className="text-right">
+                          <Button asChild variant="outline" size="sm">
+                            <a
+                              href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
+                              aria-label={`Use ${template.name}`}
+                            >
+                              Use
+                            </a>
+                          </Button>
+                        </TableCell>
+                      ) : null}
                     </TableRow>
                   ))}
                 </TableBody>
@@ -112,14 +118,16 @@ export function TemplatesPage() {
                       <dd className="font-mono">{template.channel}</dd>
                     </div>
                   </dl>
-                  <Button asChild variant="outline" size="sm">
-                    <a
-                      href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
-                      aria-label={`Use ${template.name}`}
-                    >
-                      Use template
-                    </a>
-                  </Button>
+                  {canEdit ? (
+                    <Button asChild variant="outline" size="sm">
+                      <a
+                        href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
+                        aria-label={`Use ${template.name}`}
+                      >
+                        Use template
+                      </a>
+                    </Button>
+                  ) : null}
                 </div>
               ))}
             </div>

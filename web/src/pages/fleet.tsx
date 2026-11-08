@@ -53,6 +53,7 @@ import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { formatClock, formatUptime, plural } from "@/lib/format";
 import { hrefFor, navigate } from "@/lib/router";
+import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 const FILTERS = ["all", "running", "stopped", "created", "error", "unknown"] as const;
@@ -135,6 +136,7 @@ function RowMenu({
 }
 
 export function FleetPage() {
+  const canEdit = useCanEdit();
   const [q, setQ] = useState(persisted.q);
   const [status, setStatus] = useState<Filter>(persisted.status);
   const [nonce, setNonce] = useState(0);
@@ -181,7 +183,7 @@ export function FleetPage() {
         searchRef.current?.focus();
         return;
       }
-      if (event.key === "c") {
+      if (event.key === "c" && canEdit) {
         event.preventDefault();
         navigate("/instances/new");
         return;
@@ -200,7 +202,7 @@ export function FleetPage() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [canEdit]);
 
   const counts = useMemo(() => {
     const result: Record<string, number> = { all: list.data?.length ?? 0 };
@@ -244,14 +246,20 @@ export function FleetPage() {
     <EmptyState
       icon={Boxes}
       title="No instances yet"
-      description="Create one to start a container. Each instance is its own compose project."
+      description={
+        canEdit
+          ? "Create one to start a container. Each instance is its own compose project."
+          : "No instance exists. Your role is read-only; ask an admin to create one."
+      }
       action={
-        <Button asChild>
-          <a href={hrefFor("/instances/new")}>
-            <Plus aria-hidden />
-            New instance
-          </a>
-        </Button>
+        canEdit ? (
+          <Button asChild>
+            <a href={hrefFor("/instances/new")}>
+              <Plus aria-hidden />
+              New instance
+            </a>
+          </Button>
+        ) : undefined
       }
     />
   ) : (
@@ -290,12 +298,14 @@ export function FleetPage() {
               <RefreshCw aria-hidden className={list.refreshing ? "animate-spin" : undefined} />
               Refresh
             </Button>
-            <Button asChild size="sm">
-              <a href={hrefFor("/instances/new")}>
-                <Plus aria-hidden />
-                New instance
-              </a>
-            </Button>
+            {canEdit ? (
+              <Button asChild size="sm">
+                <a href={hrefFor("/instances/new")}>
+                  <Plus aria-hidden />
+                  New instance
+                </a>
+              </Button>
+            ) : null}
           </>
         }
       />
@@ -481,12 +491,18 @@ export function FleetPage() {
                           )}
                         </TableCell>
                         <TableCell className="text-right">
-                          <RowMenu
-                            row={row}
-                            pending={pendingId === row.id}
-                            onAction={(action) => runAction(row.id, action)}
-                            onDelete={() => setDeleteTarget(row)}
-                          />
+                          {canEdit ? (
+                            <RowMenu
+                              row={row}
+                              pending={pendingId === row.id}
+                              onAction={(action) => runAction(row.id, action)}
+                              onDelete={() => setDeleteTarget(row)}
+                            />
+                          ) : (
+                            <Button asChild variant="outline" size="sm">
+                              <a href={hrefFor(`/instances/${row.id}`)}>Open</a>
+                            </Button>
+                          )}
                         </TableCell>
                       </TableRow>
                     );
@@ -551,12 +567,14 @@ export function FleetPage() {
                       <Button asChild variant="outline" size="sm">
                         <a href={hrefFor(`/instances/${row.id}`)}>Open</a>
                       </Button>
-                      <RowMenu
-                        row={row}
-                        pending={pendingId === row.id}
-                        onAction={(action) => runAction(row.id, action)}
-                        onDelete={() => setDeleteTarget(row)}
-                      />
+                      {canEdit ? (
+                        <RowMenu
+                          row={row}
+                          pending={pendingId === row.id}
+                          onAction={(action) => runAction(row.id, action)}
+                          onDelete={() => setDeleteTarget(row)}
+                        />
+                      ) : null}
                     </div>
                   </div>
                 );
@@ -568,7 +586,12 @@ export function FleetPage() {
 
       <p className="hidden text-xs text-muted-foreground md:block">
         <span className="font-mono">j</span> <span className="font-mono">k</span> move · Enter open ·{" "}
-        <span className="font-mono">/</span> search · <span className="font-mono">c</span> create
+        <span className="font-mono">/</span> search
+        {canEdit ? (
+          <>
+            {" "}· <span className="font-mono">c</span> create
+          </>
+        ) : null}
       </p>
 
       <DeleteInstanceDialog

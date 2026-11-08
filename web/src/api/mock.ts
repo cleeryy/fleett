@@ -1,17 +1,25 @@
 import { ApiError } from "./errors";
 import type {
+  AuditEntry,
+  AuthConfig,
+  AuthMode,
   ChannelType,
   CreateInstanceInput,
+  CreateTokenInput,
+  CreatedToken,
   FleetApi,
   Health,
+  Identity,
   InstanceDetail,
   InstanceStatus,
   InstanceSummary,
   LifecycleResult,
   PatchInstanceInput,
+  Role,
   Share,
   ShareMode,
   Template,
+  TokenInfo,
 } from "./types";
 import { tokenStore } from "@/lib/token";
 import { isValidSlug } from "@/lib/validation";
@@ -19,10 +27,11 @@ import { isValidSlug } from "@/lib/validation";
 /**
  * In-memory adapter used when VITE_MOCK is on (default in development).
  * It implements every endpoint in API.md, including the error statuses the UI
- * has to render: 401, 404, 409 and 502.
+ * has to render: 401, 403, 404, 409 and 502.
  */
 
 const DEMO_TOKEN = "demo";
+const DEMO_VIEWER_TOKEN = "demo-viewer";
 const IMAGE = "hermes-agent:0.22.2-local";
 const FLEETT_ROOT = "/opt/fleett";
 const DOCKER_ERROR =
@@ -33,20 +42,42 @@ const EGRESS_ERROR =
   "LAN access is disabled for this instance, but the host egress firewall is not installed. " +
   "The agent could reach private networks, so the change was refused.";
 
+const SECRETS_ERROR =
+  "no secrets key is configured; run `sudo fleett secrets init` (or set FLEETT_SECRETS_KEY) and retry";
+
+/**
+ * Auth advertised by the mock, from `VITE_MOCK_AUTH`:
+ * `bearer` (default), `oidc`, or `both`. In `oidc`/`both`, the Authentik
+ * button opens a demo admin session so the console is usable without a backend.
+ */
+export const mockAuthMode: AuthMode = (() => {
+  const raw = (import.meta.env.VITE_MOCK_AUTH as string | undefined)?.trim().toLowerCase();
+  return raw === "oidc" || raw === "both" ? raw : "bearer";
+})();
+
 /**
  * Switchable mock behaviour, so the UI can be exercised in both worlds.
  * `egressEnforced` mirrors `fleett egress install` on the host: when false,
  * creating a restricted instance (or turning LAN access off) fails with
  * 409 `egress_not_enforced`, exactly like the controller.
  * Set `VITE_MOCK_EGRESS_ENFORCED=0` (dev/build) or assign `mockConfig.egressEnforced = false`.
+ * `secretsKey` mirrors `fleett secrets init`: when false, storing a provider
+ * token fails with 409 `secrets_key_missing`.
  */
 export const mockConfig = {
   egressEnforced: (import.meta.env.VITE_MOCK_EGRESS_ENFORCED ?? "1") !== "0",
+  secretsKey: (import.meta.env.VITE_MOCK_SECRETS_KEY ?? "1") !== "0",
 };
 
 function assertEgress(allowLan: boolean): void {
   if (!allowLan && !mockConfig.egressEnforced) {
     fail(409, "egress_not_enforced", EGRESS_ERROR);
+  }
+}
+
+function assertSecretsKey(token: string | null | undefined): void {
+  if (token && !mockConfig.secretsKey) {
+    fail(409, "secrets_key_missing", SECRETS_ERROR);
   }
 }
 
@@ -80,9 +111,36 @@ const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const SEEDED_AT = Date.now();
 
+const ADMIN_SESSION: Identity = {
+  authenticated: true,
+  actor: "cleeryy@example.com",
+  role: "admin",
+  method: "session",
+  user: { sub: "mock-1", email: "cleeryy@example.com", name: "Cleeryy" },
+};
+
+const ADMIN_BEARER: Identity = {
+  authenticated: true,
+  actor: "demo",
+  role: "admin",
+  method: "bearer",
+};
+
+const VIEWER_BEARER: Identity = {
+  authenticated: true,
+  actor: "demo-viewer",
+  role: "viewer",
+  method: "bearer",
+};
+
+/** Set by the mock SSO button; survives reloads only in memory. */
+let mockSession: Identity | null = null;
+
 let rows: Stored[] = [];
 let shares: Share[] = [];
 let templates: Template[] = [];
+let tokens: TokenInfo[] = [];
+let audit: AuditEntry[] = [];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -95,10 +153,43 @@ function fail(status: number, code: string, message: string): never {
   throw new ApiError(status, code, message);
 }
 
-function requireAuth(): void {
-  if (tokenStore.get() !== DEMO_TOKEN) {
+function currentIdentity(): Identity | null {
+  if (mockSession) return mockSession;
+  const token = tokenStore.get();
+  if (token === DEMO_TOKEN) return ADMIN_BEARER;
+  if (token === DEMO_VIEWER_TOKEN) return VIEWER_BEARER;
+  return null;
+}
+
+function requireAuth(): Identity {
+  const identity = currentIdentity();
+  if (!identity) {
     fail(401, "unauthorized", "Missing or invalid bearer token.");
   }
+  return identity;
+}
+
+/** Every mutation: admin only, like the controller's role middleware. */
+function requireWrite(): Identity {
+  const identity = requireAuth();
+  if (identity.role !== "admin") {
+    fail(403, "forbidden", "the viewer role is read-only");
+  }
+  return identity;
+}
+
+function requireAdmin(): Identity {
+  const identity = requireAuth();
+  if (identity.role !== "admin") {
+    fail(403, "forbidden", "this endpoint requires the admin role");
+  }
+  return identity;
+}
+
+function randomHex(bytes: number): string {
+  const buffer = new Uint8Array(bytes);
+  crypto.getRandomValues(buffer);
+  return Array.from(buffer, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function iso(ms: number): string {
@@ -132,6 +223,25 @@ function composeYaml(row: Stored): string {
     row.channel === "none"
       ? "      HERMES_CHANNEL: none"
       : `      HERMES_CHANNEL: ${row.channel}`;
+
+  // Secrets are declared as Compose interpolations and read from the
+  // `docker compose` process environment; no plaintext file on disk.
+  const environment = [
+    `      HERMES_PROFILE: ${row.id}`,
+    `      HERMES_MODEL: ${row.model}`,
+    `      HERMES_BASE_URL: ${row.base_url}`,
+    channelLine,
+  ];
+  if (row.gate_token) {
+    environment.push("      HERMES_GATE_PROFILE_TOKEN: ${HERMES_GATE_PROFILE_TOKEN}");
+  }
+  if (row.channel === "telegram") {
+    environment.push("      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}");
+  }
+  if (row.channel === "discord") {
+    environment.push("      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}");
+  }
+
   const networkLines = ["    networks:", "      - fleett"];
   if (row.allow_lan) networkLines.push("      - fleett-lan");
   const networkDefs = ["networks:", "  fleett:", "    external: true"];
@@ -146,13 +256,8 @@ function composeYaml(row: Stored): string {
     `    image: ${IMAGE}`,
     "    restart: unless-stopped",
     '    user: "10000:10000"',
-    "    env_file:",
-    "      - secrets.env",
     "    environment:",
-    `      HERMES_PROFILE: ${row.id}`,
-    `      HERMES_MODEL: ${row.model}`,
-    `      HERMES_BASE_URL: ${row.base_url}`,
-    channelLine,
+    ...environment,
     "    volumes:",
     ...mounts,
     ...networkLines,
@@ -493,6 +598,80 @@ export function resetMock(): void {
       notes: "Template check. Kept for the error state.",
     }),
   ];
+
+  tokens = [
+    {
+      id: "tok_seed_ci",
+      name: "ci-nightly",
+      role: "viewer",
+      created_at: iso(SEEDED_AT - 9 * DAY),
+      revoked_at: null,
+    },
+  ];
+
+  audit = [
+    {
+      id: 6,
+      at: iso(SEEDED_AT - 35 * 60_000),
+      actor: "cleeryy@example.com",
+      role: "admin",
+      method: "session",
+      action: "instance.restart",
+      target: "alice",
+      ip: "10.1.20.5",
+    },
+    {
+      id: 5,
+      at: iso(SEEDED_AT - 2 * HOUR),
+      actor: "cleeryy@example.com",
+      role: "admin",
+      method: "session",
+      action: "share.attach",
+      target: "findings",
+      ip: "10.1.20.5",
+      details: { instance: "alice", mode: "rw" },
+    },
+    {
+      id: 4,
+      at: iso(SEEDED_AT - 5 * HOUR),
+      actor: "fleett-cli",
+      role: "admin",
+      method: "bearer",
+      action: "instance.patch",
+      target: "school",
+      ip: "203.0.113.24",
+    },
+    {
+      id: 3,
+      at: iso(SEEDED_AT - 9 * HOUR),
+      actor: "cleeryy@example.com",
+      role: "admin",
+      method: "session",
+      action: "share.create",
+      target: "runbooks",
+      ip: "10.1.20.5",
+    },
+    {
+      id: 2,
+      at: iso(SEEDED_AT - DAY),
+      actor: "cleeryy@example.com",
+      role: "admin",
+      method: "session",
+      action: "token.create",
+      target: "tok_seed_ci",
+      ip: "10.1.20.5",
+      details: { name: "ci-nightly", role: "viewer" },
+    },
+    {
+      id: 1,
+      at: iso(SEEDED_AT - 2 * DAY),
+      actor: "cleeryy@example.com",
+      role: "admin",
+      method: "session",
+      action: "instance.create",
+      target: "alice",
+    },
+  ];
 }
 
 resetMock();
@@ -511,6 +690,40 @@ export const mockApi: FleetApi = {
   async health(): Promise<Health> {
     await delay(60);
     return { ok: true, version: "0.2.0", driver: "mock", docker: { ok: true } };
+  },
+
+  async authConfig(): Promise<AuthConfig> {
+    await delay(40);
+    const oidc = mockAuthMode === "oidc" || mockAuthMode === "both";
+    const bearer = mockAuthMode === "bearer" || mockAuthMode === "both";
+    return {
+      mode: mockAuthMode,
+      oidc: { enabled: oidc, login_url: "/auth/login" },
+      bearer: { enabled: bearer },
+    };
+  },
+
+  async me(): Promise<Identity> {
+    await delay(120);
+    const identity = requireAuth();
+    return { ...identity, user: identity.user ? { ...identity.user } : undefined };
+  },
+
+  async signInWithOidc(_loginUrl: string): Promise<void> {
+    await delay(420);
+    if (mockAuthMode === "bearer") {
+      fail(404, "not_found", "OIDC is not enabled");
+    }
+    mockSession = {
+      ...ADMIN_SESSION,
+      user: ADMIN_SESSION.user ? { ...ADMIN_SESSION.user } : undefined,
+    };
+  },
+
+  async logout(): Promise<void> {
+    await delay(120);
+    mockSession = null;
+    tokenStore.clear();
   },
 
   async checkAuth(): Promise<void> {
@@ -537,7 +750,7 @@ export const mockApi: FleetApi = {
   },
 
   async createInstance(input: CreateInstanceInput): Promise<InstanceDetail> {
-    requireAuth();
+    requireWrite();
     await delay(320);
 
     const id = input.id.trim();
@@ -545,7 +758,7 @@ export const mockApi: FleetApi = {
       fail(400, "invalid_input", "Id must be 2-32 characters: lowercase letters, digits, hyphens.");
     }
     if (rows.some((row) => row.id === id)) {
-      fail(409, "conflict", `Instance "${id}" already exists.`);
+      fail(409, "instance_exists", `Instance "${id}" already exists.`);
     }
     if (!templates.some((template) => template.id === input.template)) {
       fail(400, "invalid_input", `Unknown template "${input.template}".`);
@@ -558,6 +771,7 @@ export const mockApi: FleetApi = {
     }
     validateChannel(input.channel, "none");
     assertSharesExist(input.shares);
+    assertSecretsKey(input.gate_token);
     assertEgress(input.allow_lan === true);
 
     const created = Date.now();
@@ -590,7 +804,7 @@ export const mockApi: FleetApi = {
   },
 
   async patchInstance(id: string, input: PatchInstanceInput): Promise<InstanceDetail> {
-    requireAuth();
+    requireWrite();
     await delay(300);
     const row = findRow(id);
 
@@ -605,6 +819,7 @@ export const mockApi: FleetApi = {
     }
     if (input.channel) validateChannel(input.channel, row.channel);
     if (input.shares) assertSharesExist(input.shares);
+    assertSecretsKey(input.gate_token);
     // Only a transition to restricted needs the host firewall; a stale
     // allow_lan=false in a full form save must not block unrelated edits.
     if (input.allow_lan === false && row.allow_lan) assertEgress(false);
@@ -636,7 +851,7 @@ export const mockApi: FleetApi = {
   },
 
   async action(id, action): Promise<LifecycleResult> {
-    requireAuth();
+    requireWrite();
     await delay(360);
     const row = findRow(id);
 
@@ -671,7 +886,7 @@ export const mockApi: FleetApi = {
   },
 
   async deleteInstance(id, _purge): Promise<void> {
-    requireAuth();
+    requireWrite();
     await delay(340);
     const row = findRow(id);
     for (const share of row.shares) detachFromShare(share.name, id);
@@ -696,7 +911,7 @@ export const mockApi: FleetApi = {
   },
 
   async createShare(name: string): Promise<void> {
-    requireAuth();
+    requireWrite();
     await delay(260);
     if (!isValidSlug(name)) {
       fail(400, "invalid_input", "Name must be 2-32 characters: lowercase letters, digits, hyphens.");
@@ -708,7 +923,7 @@ export const mockApi: FleetApi = {
   },
 
   async deleteShare(name: string): Promise<void> {
-    requireAuth();
+    requireWrite();
     await delay(260);
     const share = findShare(name);
     if (share.instances.length > 0) {
@@ -724,7 +939,7 @@ export const mockApi: FleetApi = {
   },
 
   async attachShare(name, instance, mode): Promise<void> {
-    requireAuth();
+    requireWrite();
     await delay(300);
     const share = findShare(name);
     const row = findRow(instance);
@@ -740,7 +955,7 @@ export const mockApi: FleetApi = {
   },
 
   async detachShare(name, instance): Promise<void> {
-    requireAuth();
+    requireWrite();
     await delay(280);
     const share = findShare(name);
     if (!share.instances.some((entry) => entry.id === instance)) {
@@ -752,5 +967,57 @@ export const mockApi: FleetApi = {
       row.shares = row.shares.filter((ref) => ref.name !== name);
       row.updated_at = nowIso();
     }
+  },
+
+  async listTokens(): Promise<TokenInfo[]> {
+    requireAdmin();
+    await delay();
+    return tokens.map((token) => ({ ...token }));
+  },
+
+  async createToken(input: CreateTokenInput): Promise<CreatedToken> {
+    requireAdmin();
+    await delay(280);
+    const name = input.name.trim();
+    if (!name) {
+      fail(400, "invalid_name", "name is required");
+    }
+    if (name.length > 64) {
+      fail(400, "invalid_name", "name must be at most 64 characters");
+    }
+    const role: Role = input.role === "admin" ? "admin" : "viewer";
+    const created_at = nowIso();
+    const record: TokenInfo = {
+      id: `tok_${randomHex(8)}`,
+      name,
+      role,
+      created_at,
+      revoked_at: null,
+    };
+    tokens = [record, ...tokens];
+    return {
+      id: record.id,
+      name,
+      role,
+      created_at,
+      token: `flt_${randomHex(16)}`,
+    };
+  },
+
+  async revokeToken(id: string): Promise<void> {
+    requireAdmin();
+    await delay(240);
+    const token = tokens.find((candidate) => candidate.id === id);
+    if (!token) {
+      fail(404, "not_found", `Token "${id}" does not exist.`);
+    }
+    if (!token.revoked_at) token.revoked_at = nowIso();
+  },
+
+  async listAudit(limit: number): Promise<AuditEntry[]> {
+    requireAdmin();
+    await delay(160);
+    const count = Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), 1000) : 200;
+    return audit.slice(0, count).map((entry) => ({ ...entry }));
   },
 };

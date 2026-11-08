@@ -37,6 +37,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { plural } from "@/lib/format";
+import { useCanEdit } from "@/lib/session";
 import { isValidSlug } from "@/lib/validation";
 import { useResource } from "@/lib/use-resource";
 
@@ -394,6 +395,7 @@ function DeleteShareDialog({
 }
 
 export function SharesPage() {
+  const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const shares = useResource(() => api.listShares(), [nonce]);
   const instances = useResource(() => api.listInstances(), [nonce]);
@@ -424,10 +426,12 @@ export function SharesPage() {
               <RefreshCw aria-hidden className={shares.refreshing ? "animate-spin" : undefined} />
               Refresh
             </Button>
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
-              <Plus aria-hidden />
-              New share
-            </Button>
+            {canEdit ? (
+              <Button size="sm" onClick={() => setCreateOpen(true)}>
+                <Plus aria-hidden />
+                New share
+              </Button>
+            ) : null}
           </>
         }
       />
@@ -445,12 +449,18 @@ export function SharesPage() {
           <EmptyState
             icon={FolderTree}
             title="No shares yet"
-            description="Create a share, then attach it to instances. Each instance mounts it at /opt/data/shared/<name>."
+            description={
+              canEdit
+                ? "Create a share, then attach it to instances. Each instance mounts it at /opt/data/shared/<name>."
+                : "No share exists. Your role is read-only; ask an admin to create one."
+            }
             action={
-              <Button onClick={() => setCreateOpen(true)}>
-                <Plus aria-hidden />
-                New share
-              </Button>
+              canEdit ? (
+                <Button onClick={() => setCreateOpen(true)}>
+                  <Plus aria-hidden />
+                  New share
+                </Button>
+              ) : undefined
             }
           />
         ) : (
@@ -462,9 +472,11 @@ export function SharesPage() {
                     <TableHead>Share</TableHead>
                     <TableHead>Path</TableHead>
                     <TableHead>Attached to</TableHead>
-                    <TableHead className="w-[180px]">
-                      <span className="sr-only">Actions</span>
-                    </TableHead>
+                    {canEdit ? (
+                      <TableHead className="w-[180px]">
+                        <span className="sr-only">Actions</span>
+                      </TableHead>
+                    ) : null}
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -475,22 +487,24 @@ export function SharesPage() {
                       <TableCell>
                         <Attachments share={share} />
                       </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          <Button variant="outline" size="sm" onClick={() => setManageName(share.name)}>
-                            Manage
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={`Delete share ${share.name}`}
-                            title={`Delete share ${share.name}`}
-                            onClick={() => setDeleteName(share.name)}
-                          >
-                            <Trash2 aria-hidden />
-                          </Button>
-                        </div>
-                      </TableCell>
+                      {canEdit ? (
+                        <TableCell className="text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <Button variant="outline" size="sm" onClick={() => setManageName(share.name)}>
+                              Manage
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`Delete share ${share.name}`}
+                              title={`Delete share ${share.name}`}
+                              onClick={() => setDeleteName(share.name)}
+                            >
+                              <Trash2 aria-hidden />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      ) : null}
                     </TableRow>
                   ))}
                 </TableBody>
@@ -505,20 +519,22 @@ export function SharesPage() {
                     <p className="font-mono text-xs break-all text-muted-foreground">{share.path}</p>
                   </div>
                   <Attachments share={share} />
-                  <div className="flex items-center justify-between gap-2">
-                    <Button variant="outline" size="sm" onClick={() => setManageName(share.name)}>
-                      Manage
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setDeleteName(share.name)}
-                      aria-label={`Delete share ${share.name}`}
-                    >
-                      <Trash2 aria-hidden />
-                      Delete
-                    </Button>
-                  </div>
+                  {canEdit ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <Button variant="outline" size="sm" onClick={() => setManageName(share.name)}>
+                        Manage
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setDeleteName(share.name)}
+                        aria-label={`Delete share ${share.name}`}
+                      >
+                        <Trash2 aria-hidden />
+                        Delete
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>

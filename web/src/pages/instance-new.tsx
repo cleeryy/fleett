@@ -293,20 +293,24 @@ export function NewInstancePage() {
       leaveWizard(`/instances/${detail.id}`);
     } catch (cause) {
       const error = toApiError(cause);
-      if (error.status === 409 && error.code !== "egress_not_enforced") {
+      if (error.status === 409 && error.code === "instance_exists") {
+        // The only id-specific refusal: the slug is taken.
         setServerIdError(error.message);
         setStep(0);
         setAttempted(0);
         window.requestAnimationFrame(() => document.getElementById("id")?.focus());
       } else {
         setSubmitError(error);
-        if (error.code === "egress_not_enforced") {
-          // The host prerequisite lives on the network field: put the user there.
+        if (error.code === "egress_not_enforced" || error.code === "secrets_key_missing") {
+          // Host prerequisites live on the "Model & network" step: put the
+          // user on the field that needs the command to be run.
           setStep(2);
           setAttempted(null);
+          const field = error.code === "egress_not_enforced" ? "wizard-allow-lan" : "provider-token";
+          const marker = error.code === "egress_not_enforced" ? "[data-egress-alert]" : "[data-secrets-alert]";
           window.requestAnimationFrame(() => {
-            document.getElementById("wizard-allow-lan")?.focus({ preventScroll: true });
-            document.querySelector("[data-egress-alert]")?.scrollIntoView({ block: "center" });
+            document.getElementById(field)?.focus({ preventScroll: true });
+            document.querySelector(marker)?.scrollIntoView({ block: "center" });
           });
         }
       }
@@ -329,6 +333,7 @@ export function NewInstancePage() {
   const templateList = templates.data ?? [];
   const shareList = shares.data ?? [];
   const egressError = submitError?.code === "egress_not_enforced" ? submitError : null;
+  const secretsError = submitError?.code === "secrets_key_missing" ? submitError : null;
 
   return (
     <>
@@ -375,7 +380,9 @@ export function NewInstancePage() {
         </nav>
 
         <div className="min-w-0 max-w-2xl space-y-6">
-          {submitError && !(egressError && step === 2) ? <ErrorAlert error={submitError} /> : null}
+          {submitError && !(egressError && step === 2) && !(secretsError && step === 2) ? (
+            <ErrorAlert error={submitError} />
+          ) : null}
 
           <form onSubmit={handleSubmit} noValidate className="space-y-6">
             {step === 0 ? (
@@ -574,13 +581,21 @@ export function NewInstancePage() {
                     className="font-mono"
                     value={draft.providerToken}
                     aria-describedby="provider-token-help"
-                    onChange={(event) => update("providerToken", event.target.value)}
+                    onChange={(event) => {
+                      update("providerToken", event.target.value);
+                      if (secretsError) setSubmitError(null);
+                    }}
                   />
                   <p id="provider-token-help" className="text-xs text-muted-foreground">
                     Encrypted at rest and never returned by the API. The host needs its secrets key
                     (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
                     cannot call the model.
                   </p>
+                  {secretsError ? (
+                    <div data-secrets-alert>
+                      <ErrorAlert error={secretsError} />
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="space-y-2">

@@ -10,9 +10,14 @@ export default defineConfig({
   },
   server: {
     port: 5180,
-    // Same-origin proxy so a real backend needs no CORS setup.
+    // Same-origin proxy so a real backend needs no CORS setup. OIDC lives
+    // outside /api: /auth/login, /auth/callback and /auth/logout.
     proxy: {
       "/api": {
+        target: "http://127.0.0.1:8090",
+        changeOrigin: false,
+      },
+      "/auth": {
         target: "http://127.0.0.1:8090",
         changeOrigin: false,
       },
