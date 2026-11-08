@@ -6,7 +6,7 @@
 
 use super::{Driver, DriverError, DriverFuture, PsResult};
 use crate::config::DEFAULT_IMAGE;
-use crate::models::{ContainerInfo, InstanceSpec, Status};
+use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -28,6 +28,7 @@ pub struct MockCall {
 #[derive(Debug)]
 struct MockInstance {
     status: Status,
+    health: Health,
     container_id: String,
     image: String,
     started_at: Option<SystemTime>,
@@ -86,6 +87,7 @@ impl MockDriver {
         let mut state = lock(&self.state);
         let entry = state.entry(id.to_string()).or_insert_with(|| MockInstance {
             status,
+            health: Health::Unknown,
             container_id: Uuid::new_v4().to_string(),
             image: self.image.clone(),
             started_at: Some(SystemTime::now()),
@@ -95,6 +97,20 @@ impl MockDriver {
         if status != Status::Running {
             entry.started_at = None;
         }
+    }
+
+    /// Force the container health without going through an operation.
+    pub fn force_health(&self, id: &str, health: Health) {
+        let mut state = lock(&self.state);
+        let entry = state.entry(id.to_string()).or_insert_with(|| MockInstance {
+            status: Status::Running,
+            health,
+            container_id: Uuid::new_v4().to_string(),
+            image: self.image.clone(),
+            started_at: Some(SystemTime::now()),
+            ups: 0,
+        });
+        entry.health = health;
     }
 
     fn record(&self, operation: &'static str, id: &str) {
@@ -116,6 +132,7 @@ impl MockDriver {
         let mut state = lock(&self.state);
         state.entry(id.to_string()).or_insert_with(|| MockInstance {
             status: Status::Created,
+            health: Health::Unknown,
             container_id: Uuid::new_v4().to_string(),
             image: self.image.clone(),
             started_at: None,
@@ -128,6 +145,7 @@ impl MockDriver {
         let mut state = self.ensure_instance(id);
         if let Some(entry) = state.get_mut(id) {
             entry.status = Status::Running;
+            entry.health = Health::Healthy;
             entry.started_at = Some(SystemTime::now());
         }
     }
@@ -168,6 +186,7 @@ impl Driver for MockDriver {
             let mut state = self.ensure_instance(&spec.id);
             if let Some(entry) = state.get_mut(&spec.id) {
                 entry.status = Status::Running;
+                entry.health = Health::Healthy;
                 entry.started_at = Some(SystemTime::now());
                 entry.ups += 1;
             }
@@ -182,6 +201,7 @@ impl Driver for MockDriver {
             let mut state = self.ensure_instance(&spec.id);
             if let Some(entry) = state.get_mut(&spec.id) {
                 entry.status = Status::Stopped;
+                entry.health = Health::Unknown;
                 entry.started_at = None;
             }
             Ok(())
@@ -223,6 +243,7 @@ impl Driver for MockDriver {
             let Some(entry) = state.get(&spec.id) else {
                 return Ok(PsResult {
                     status: Status::Unknown,
+                    health: Health::Unknown,
                     container: None,
                 });
             };
@@ -235,6 +256,7 @@ impl Driver for MockDriver {
             };
             Ok(PsResult {
                 status: entry.status,
+                health: entry.health,
                 container: Some(ContainerInfo {
                     id: Some(entry.container_id.clone()),
                     image: Some(entry.image.clone()),

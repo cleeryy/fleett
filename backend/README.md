@@ -28,6 +28,8 @@ process environment does not define):
 | `FLEET_DRIVER` | `mock` | `mock` (in-memory, no Docker) or `compose` |
 | `FLEET_IMAGE` | `hermes-agent:0.22.2-local` | Image used for every agent container |
 | `FLEET_NETWORK` | `hermes-fleet` | Existing external Docker network all agents join |
+| `FLEET_MAX_TOTAL_CPU` | `0` | Optional fleet-wide CPU cap (sum of `cpu_limit`); `0` disables it |
+| `FLEET_MAX_TOTAL_MEM_MB` | `0` | Optional fleet-wide memory cap in MB; `0` disables it |
 | `FLEET_WEB_DIST` | auto-detect | Optional path to a built frontend (see “Serving the console”) |
 
 `FLEET_TOKEN` is required unless `FLEET_ALLOW_NO_AUTH=1`. There is no default
@@ -102,23 +104,54 @@ $FLEET_ROOT/
 │   ├── compose.yaml          # generated, one compose project per agent
 │   ├── data/                 # mounted at /opt/data, still there after delete
 │   │   ├── config.yaml       # generated from the template
+│   │   ├── healthcheck.py    # generated probe used by the Docker health check
 │   │   └── SOUL.md           # generated from the template (create only)
 │   └── secrets.env           # mode 0600, bot token + gate token
 ├── shares/<name>/            # mounted at /opt/data/shared/<name>
 └── templates/<id>/           # optional overrides: config.yaml, SOUL.md, template.yaml
 ```
 
-The database is rebuilt from `instances/*/compose.yaml` and `shares/*` at every
-startup:
+The database is **not** the source of truth: it is an index reconciled with the
+filesystem at every startup.
 
-- a directory with a `compose.yaml` that is not indexed is adopted (model,
-  base URL, API-key variable, channel, memory limit and shares are recovered
-  from the compose file and from `data/config.yaml`; the template is reported
-  as `custom`, and a later `PATCH` reuses that config file as its template);
-- an index row whose `compose.yaml` disappeared is dropped (the data directory,
-  if any, is left untouched and is reused by a later create with the same id).
+Rebuildable from disk (`instances/*/compose.yaml` plus `instances/*/data/`):
 
-Deleting `fleet.db` therefore loses notes, names and timestamps, never an agent.
+- the instance id (directory name) and its presence in the fleet;
+- `mem_limit_mb` (from `mem_limit`) and `cpu_limit` (from `cpus`);
+- shares and their mode (from the `../../shares/<name>:…` volumes);
+- `model`, `base_url`, `api_key_env` and `channel` (from `data/config.yaml`);
+- the template is **not** recovered: a directory with a `compose.yaml` that is
+  not indexed is adopted with the template `custom`, and a later `PATCH` reuses
+  that `data/config.yaml` as its template.
+
+DB-only (lost if `fleet.db` is deleted, or if a migration fails and is rolled
+back):
+
+- `name`, `notes`, `created_at` and `updated_at`;
+- the cached `status` / `last_error`, which are recomputed from Docker on the
+  next read;
+- nothing that is needed to run an agent: containers keep running and are
+  re-adopted from their compose file.
+
+`shares/<name>` directories are re-indexed as share rows; a share row whose
+directory is gone and that is not attached anywhere is dropped. An index row
+whose `compose.yaml` disappeared is dropped (the data directory, if any, is left
+untouched and is reused by a later create with the same id).
+
+### Schema migrations
+
+The SQLite file carries a schema version in `PRAGMA user_version`. At startup
+`Db::open` applies every migration above that version, one transaction per
+migration (`MIGRATIONS` in `src/db.rs`):
+
+- a v0 file — anything written before schema versioning, including a database
+  created by v0.1.0 — is upgraded in place, rows preserved;
+- the version bump happens in the same transaction as the DDL, so a migration
+  that fails rolls back completely and leaves the database at the last good
+  version; the control plane refuses to start on a half-migrated file;
+- a file whose `user_version` is newer than the binary is refused instead of
+  being touched (downgrades are not supported);
+- migrations are append-only: a released entry is never edited or reordered.
 
 ## Security notes
 
@@ -136,17 +169,31 @@ Deleting `fleet.db` therefore loses notes, names and timestamps, never an agent.
   network (never `network_mode: host`), no Docker socket mount, single data
   bind mount plus explicit share mounts, `security_opt:
   no-new-privileges:true`, `cap_drop: NET_RAW`, `tmpfs: /tmp`,
-  `pids_limit: 256`, `mem_limit` between 256 and 8192 MB, `json-file` logs
-  capped at 10 MB × 3.
+  `pids_limit: 256`, `mem_limit` between 256 and 8192 MB, `memswap_limit` equal
+  to `mem_limit` (no swap spill-over), `cpus` from `cpu_limit` (0.1–8.0),
+  `json-file` logs capped at 10 MB × 3.
+- **Health check**: every container runs `python3 /opt/data/healthcheck.py`
+  every 30 s (timeout 5 s, 3 retries, 60 s start period). The probe speaks the
+  Hermes gateway control-socket protocol — one JSON line
+  `{"verb":"identify","id":1,"protocol":1}` on `/opt/data/gateway.sock` — and
+  exits 0 only when the gateway answers `ok: true`. `GET /api/instances`
+  reports `health` (`healthy|unhealthy|starting|none`); an unhealthy container
+  keeps its `running` status and gets a short `last_error`, so a crashlooping
+  or deadlocked gateway is visible without restarting it.
+- **Fleet caps**: optional `FLEET_MAX_TOTAL_CPU` / `FLEET_MAX_TOTAL_MEM_MB`
+  bound the sum of every instance's limits. A create or update that would
+  exceed one is refused with `409` and `error.details` `{used, requested,
+  cap}`; an instance being patched is never counted twice.
 - **UID/GID 10000 for every agent.** Data directories and share directories are
   chowned to `10000:10000` when the process runs as root (best effort
   otherwise). Shares are writable by every instance that mounts them, so
   isolation between guests relies on the container, not on the UID.
 - **Input validation**: `id` and share names are `[a-z0-9-]`, 2–32 characters,
   must start with a letter or digit (Docker Compose project names cannot start
-  with `-`); `mem_limit_mb` is 256..=8192; `model` and `base_url` must be
-  non-empty; `channel.type` is `telegram`, `discord` or `none`; a share must
-  exist before it can be attached; `logs?tail` is 1..=2000.
+  with `-`); `mem_limit_mb` is 256..=8192; `cpu_limit` is 0.1..=8.0; `model` and
+  `base_url` must be non-empty; `channel.type` is `telegram`, `discord` or
+  `none`; a share must exist before it can be attached; `logs?tail` is
+  1..=2000.
 - **Template rendering** parses the rendered YAML before writing it, so a broken
   template fails with `422` instead of writing an invalid config. For instances
   created from a template, `data/config.yaml` is generated and manual edits are
@@ -175,25 +222,40 @@ The test suite uses `MockDriver` exclusively and never needs a Docker daemon.
 
 ```bash
 cargo fmt --all --check
-cargo test                  # 23 unit + 24 integration tests
+cargo test                  # 36 unit + 30 integration tests
 cargo clippy --all-targets  # must stay warning-free
 ```
 
 Integration tests (`tests/api.rs`) build the real router with a temporary
 `FLEET_ROOT` and a `MockDriver`, then call it through
 `tower::ServiceExt::oneshot`. They cover auth (401/204), health, templates,
-create (files on disk, YAML validity, `0600` secrets), duplicate ids, invalid
-ids and payloads, get/list, patch (compose rewrite, data preserved, token
-rotation), start/stop/restart, logs, share create/attach/detach/delete with the
-409-while-attached rule, delete keep vs purge, the generated compose shape
-(restart policy, external network, no host networking, no Docker socket, share
-mounts) and driver failures (502 with truncated stderr).
+create (files on disk, YAML validity, `0600` secrets, generated
+`data/healthcheck.py`), duplicate ids, invalid ids and payloads (`mem_limit_mb`
+and `cpu_limit` bounds), get/list (including `health` and `last_error` for an
+unhealthy container), patch (compose rewrite, data preserved, token rotation,
+CPU accounting that excludes the patched instance), fleet-wide CPU/memory caps
+with `409` and `error.details`, start/stop/restart, logs, share
+create/attach/detach/delete with the 409-while-attached rule, delete keep vs
+purge, the generated compose shape (restart policy, external network, no host
+networking, no Docker socket, share mounts, `cpus`, `memswap_limit`,
+`healthcheck`) and driver failures (502 with truncated stderr). Unit tests also
+run the health probe against a fake Unix socket, parse both `docker compose ps`
+output shapes with `Health`, and migrate a v0 database (including a deliberately
+failing migration that must roll back).
 
 ## API notes
 
 `API.md` is implemented literally. Additions (all optional, none required by the
 contract):
 
+- `GET /api/instances` now also returns `health`
+  (`healthy|unhealthy|starting|none`), `cpu_limit` and `last_error`;
+  `GET /api/instances/{id}` returns the same `health`/`cpu_limit`.
+- `POST /api/instances` and `PATCH /api/instances/{id}` accept `cpu_limit`
+  (default `1.0`, accepted range `0.1..=8.0`).
+- Exceeding `FLEET_MAX_TOTAL_CPU` or `FLEET_MAX_TOTAL_MEM_MB` returns `409`
+  (`cpu_cap_exceeded` / `mem_cap_exceeded`) with
+  `error.details: {used, requested, cap}`.
 - `POST /api/instances` accepts `gate_token` (stored as
   `HERMES_GATE_PROFILE_TOKEN`, and also under `api_key_env` when the two
   differ) and `env` (extra `KEY=VALUE` pairs for `secrets.env`, value names

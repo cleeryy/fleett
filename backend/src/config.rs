@@ -60,6 +60,9 @@ pub struct Config {
     pub driver: DriverKind,
     pub image: String,
     pub network: String,
+    /// Optional fleet-wide caps. `0` (the default) disables the cap.
+    pub max_total_cpu: f64,
+    pub max_total_mem_mb: u64,
     /// Directory containing an on-disk frontend build, when one is present.
     pub web_dist: Option<PathBuf>,
 }
@@ -159,6 +162,34 @@ impl Config {
         let image = get("FLEET_IMAGE").unwrap_or_else(|| DEFAULT_IMAGE.to_string());
         let network = get("FLEET_NETWORK").unwrap_or_else(|| DEFAULT_NETWORK.to_string());
 
+        let max_total_cpu = match get("FLEET_MAX_TOTAL_CPU") {
+            None => 0.0,
+            Some(value) => {
+                let parsed = value.parse::<f64>().map_err(|err| ConfigError::Invalid {
+                    var: "FLEET_MAX_TOTAL_CPU",
+                    value: value.clone(),
+                    detail: err.to_string(),
+                })?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err(ConfigError::Invalid {
+                        var: "FLEET_MAX_TOTAL_CPU",
+                        value,
+                        detail: "expected a non-negative number of CPUs (0 disables the cap)"
+                            .to_string(),
+                    });
+                }
+                parsed
+            }
+        };
+        let max_total_mem_mb = match get("FLEET_MAX_TOTAL_MEM_MB") {
+            None => 0,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEET_MAX_TOTAL_MEM_MB",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
         let web_dist = get("FLEET_WEB_DIST").map(PathBuf::from).or_else(|| {
             ["web/dist", "../web/dist"]
                 .iter()
@@ -174,6 +205,8 @@ impl Config {
             driver,
             image,
             network,
+            max_total_cpu,
+            max_total_mem_mb,
             web_dist,
         })
     }
@@ -190,6 +223,8 @@ impl Config {
             driver: DriverKind::Mock,
             image: DEFAULT_IMAGE.to_string(),
             network: DEFAULT_NETWORK.to_string(),
+            max_total_cpu: 0.0,
+            max_total_mem_mb: 0,
             web_dist: None,
         }
     }
@@ -420,6 +455,42 @@ FLEET_NETWORK='fleet-net'
         .expect("no-auth mode resolves");
         assert!(cfg.token.is_none());
         assert!(cfg.allow_no_auth);
+    }
+
+    #[test]
+    fn total_caps_are_optional_and_validated() {
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEET_TOKEN" => Some("t".to_string()),
+            "FLEET_MAX_TOTAL_CPU" => Some("4.5".to_string()),
+            "FLEET_MAX_TOTAL_MEM_MB" => Some("6144".to_string()),
+            _ => None,
+        })
+        .expect("caps resolve");
+        assert_eq!(cfg.max_total_cpu, 4.5);
+        assert_eq!(cfg.max_total_mem_mb, 6144);
+
+        let default = Config::from_lookup(|key| (key == "FLEET_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert_eq!(default.max_total_cpu, 0.0);
+        assert_eq!(default.max_total_mem_mb, 0);
+
+        for (var, value) in [
+            ("FLEET_MAX_TOTAL_CPU", "-1"),
+            ("FLEET_MAX_TOTAL_CPU", "lots"),
+            ("FLEET_MAX_TOTAL_MEM_MB", "-5"),
+            ("FLEET_MAX_TOTAL_MEM_MB", "1.5"),
+        ] {
+            let err = Config::from_lookup(|key| match key {
+                "FLEET_TOKEN" => Some("t".to_string()),
+                other if other == var => Some(value.to_string()),
+                _ => None,
+            })
+            .expect_err("invalid cap");
+            assert!(
+                matches!(err, ConfigError::Invalid { var: reported, .. } if reported == var),
+                "unexpected error for {var}={value}: {err}"
+            );
+        }
     }
 
     #[test]

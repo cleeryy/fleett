@@ -8,6 +8,7 @@ use axum::Router;
 use hermes_fleet::api::{self, AppState};
 use hermes_fleet::config::Config;
 use hermes_fleet::driver::mock::MockDriver;
+use hermes_fleet::models::Health;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::os::unix::fs::MetadataExt;
@@ -875,6 +876,16 @@ async fn compose_file_is_restrictive() {
     assert_eq!(agent["tmpfs"], json!(["/tmp"]));
     assert_eq!(agent["pids_limit"], 256);
     assert_eq!(agent["mem_limit"], "1536m");
+    assert_eq!(agent["memswap_limit"], "1536m");
+    assert_eq!(agent["cpus"], "1");
+    assert_eq!(
+        agent["healthcheck"]["test"],
+        json!(["CMD", "python3", "/opt/data/healthcheck.py"])
+    );
+    assert_eq!(agent["healthcheck"]["interval"], "30s");
+    assert_eq!(agent["healthcheck"]["timeout"], "5s");
+    assert_eq!(agent["healthcheck"]["retries"], 3);
+    assert_eq!(agent["healthcheck"]["start_period"], "60s");
     assert_eq!(agent["logging"]["driver"], "json-file");
     assert_eq!(agent["logging"]["options"]["max-size"], "10m");
     assert_eq!(agent["logging"]["options"]["max-file"], "3");
@@ -897,6 +908,221 @@ async fn compose_file_is_restrictive() {
 
     assert_eq!(compose["networks"]["fleet"]["external"], true);
     assert_eq!(compose["networks"]["fleet"]["name"], "hermes-fleet");
+}
+
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_writes_the_healthcheck_and_exposes_health() {
+    let harness = Harness::new();
+    let detail = create_instance(&harness, "alice").await;
+    assert_eq!(detail["health"], "healthy");
+    assert_eq!(detail["cpu_limit"], 1.0);
+
+    let script_path = harness.instance_dir("alice").join("data/healthcheck.py");
+    let metadata = std::fs::metadata(&script_path).expect("healthcheck metadata");
+    assert_eq!(metadata.mode() & 0o777, 0o644);
+    let script = std::fs::read_to_string(&script_path).expect("healthcheck");
+    assert_eq!(script, hermes_fleet::render::HEALTHCHECK_SCRIPT);
+    assert!(script.contains("/opt/data/gateway.sock"));
+    assert!(script.contains("\"verb\": \"identify\""));
+    assert!(script.contains("TIMEOUT_S = 3.0"));
+
+    // A later PATCH regenerates the probe as well.
+    std::fs::write(&script_path, "tampered").expect("tamper");
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"notes": "rewrite"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(&script_path).expect("healthcheck"),
+        hermes_fleet::render::HEALTHCHECK_SCRIPT
+    );
+}
+
+#[tokio::test]
+async fn unhealthy_containers_are_reported_with_last_error() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    harness.mock.force_health("alice", Health::Unhealthy);
+    let (status, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = parse(&body);
+    assert_eq!(list[0]["health"], "unhealthy");
+    let last_error = list[0]["last_error"]
+        .as_str()
+        .expect("last_error is set for an unhealthy instance");
+    assert!(last_error.contains("health check"), "{last_error}");
+
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    let detail = parse(&body);
+    assert_eq!(detail["health"], "unhealthy");
+    // The process is up; only the probe fails.
+    assert_eq!(detail["status"], "running");
+
+    harness.mock.force_health("alice", Health::Healthy);
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    let detail = parse(&body);
+    assert_eq!(detail["health"], "healthy");
+    assert!(detail["last_error"].is_null(), "{detail}");
+}
+
+// ---------------------------------------------------------------------------
+// Resource limits
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cpu_limit_is_validated_accepted_and_rendered() {
+    let harness = Harness::new();
+    let mut body = instance_body("alice");
+    body["cpu_limit"] = json!(0.5);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(parse(&response)["cpu_limit"], 0.5);
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(compose["services"]["agent"]["cpus"], "0.5");
+    assert_eq!(
+        compose["services"]["agent"]["memswap_limit"],
+        json!(format!("{}m", 1024))
+    );
+
+    let (_, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(parse(&body)[0]["cpu_limit"], 0.5);
+
+    for bad in [json!(0.0), json!(0.05), json!(-1), json!(8.5), json!(100)] {
+        let mut body = instance_body("bob");
+        body["cpu_limit"] = bad.clone();
+        let (status, response) = harness
+            .request(Method::POST, "/api/instances", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "cpu_limit {bad}");
+        assert_eq!(parse(&response)["error"]["code"], "invalid_cpu_limit");
+    }
+
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"cpu_limit": 9.0})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&response)["error"]["code"], "invalid_cpu_limit");
+}
+
+#[tokio::test]
+async fn total_cpu_cap_returns_409_with_details() {
+    let harness = Harness::with_config(|cfg| cfg.max_total_cpu = 1.0);
+
+    for (id, cpu) in [("alice", 0.5), ("bob", 0.5)] {
+        let mut body = instance_body(id);
+        body["cpu_limit"] = json!(cpu);
+        let (status, response) = harness
+            .request(Method::POST, "/api/instances", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+    }
+
+    let mut carol = instance_body("carol");
+    carol["cpu_limit"] = json!(0.1);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(carol))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "cpu_cap_exceeded");
+    assert_eq!(error["details"]["used"], 1.0);
+    assert_eq!(error["details"]["requested"], 0.1);
+    assert_eq!(error["details"]["cap"], 1.0);
+    // Nothing is written for a rejected create.
+    assert!(!harness.instance_dir("carol").exists());
+}
+
+#[tokio::test]
+async fn total_memory_cap_returns_409_with_details() {
+    let harness = Harness::with_config(|cfg| cfg.max_total_mem_mb = 2048);
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(instance_body("carol")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "mem_cap_exceeded");
+    assert_eq!(error["details"]["used"], 2048);
+    assert_eq!(error["details"]["requested"], 1024);
+    assert_eq!(error["details"]["cap"], 2048);
+}
+
+#[tokio::test]
+async fn patch_accounting_does_not_count_the_instance_twice() {
+    let harness = Harness::with_config(|cfg| cfg.max_total_cpu = 1.0);
+    for (id, cpu) in [("alice", 0.5), ("bob", 0.5)] {
+        let mut body = instance_body(id);
+        body["cpu_limit"] = json!(cpu);
+        let (status, response) = harness
+            .request(Method::POST, "/api/instances", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+    }
+
+    // Unchanged: alice must not be counted on top of her own row.
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"cpu_limit": 0.5})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // Shrinking always fits.
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"cpu_limit": 0.1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(compose["services"]["agent"]["cpus"], "0.1");
+
+    // Growing past the cap (0.5 for bob + 0.9 for alice > 1.0) is refused.
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"cpu_limit": 0.9})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "cpu_cap_exceeded");
+    assert_eq!(error["details"]["used"], 0.5);
+    assert_eq!(error["details"]["requested"], 0.9);
+    assert_eq!(error["details"]["cap"], 1.0);
+
+    // The refused patch changed nothing.
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(parse(&body)["cpu_limit"], 0.1);
 }
 
 // ---------------------------------------------------------------------------

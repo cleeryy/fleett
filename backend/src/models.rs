@@ -10,6 +10,12 @@ pub const SHARE_NAME_MAX: usize = 32;
 pub const MEM_LIMIT_MIN_MB: u32 = 256;
 pub const MEM_LIMIT_MAX_MB: u32 = 8192;
 pub const DEFAULT_MEM_LIMIT_MB: u32 = 1536;
+pub const CPU_LIMIT_MIN: f64 = 0.1;
+pub const CPU_LIMIT_MAX: f64 = 8.0;
+pub const DEFAULT_CPU_LIMIT: f64 = 1.0;
+/// Written to `last_error` while the container health check keeps failing.
+pub const HEALTH_UNHEALTHY_MESSAGE: &str =
+    "container health check failed: the Hermes gateway is not answering on /opt/data/gateway.sock";
 pub const DEFAULT_TEMPLATE: &str = "guest";
 pub const DEFAULT_API_KEY_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
 pub const GATE_TOKEN_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
@@ -156,6 +162,45 @@ impl std::fmt::Display for Status {
     }
 }
 
+/// Container health, as reported by the Docker health check.
+///
+/// `Unknown` covers both "no container" and "no health check configured"; it is
+/// exposed as `"none"` in the API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Health {
+    Healthy,
+    Unhealthy,
+    Starting,
+    #[default]
+    Unknown,
+}
+
+impl Health {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+            Self::Starting => "starting",
+            Self::Unknown => "none",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "healthy" => Self::Healthy,
+            "unhealthy" => Self::Unhealthy,
+            "starting" => Self::Starting,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for Health {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Everything the control plane knows about one agent.
 ///
 /// This is the database row plus the share links; the compose file and the
@@ -171,6 +216,7 @@ pub struct InstanceSpec {
     pub channel: ChannelKind,
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
+    pub cpu_limit: f64,
     pub notes: String,
     pub status: Status,
     pub last_error: Option<String>,
@@ -200,7 +246,10 @@ pub struct InstanceSummary {
     pub model: String,
     pub channel: String,
     pub status: String,
+    pub health: String,
+    pub cpu_limit: f64,
     pub shares: Vec<String>,
+    pub last_error: Option<String>,
     pub created_at: String,
 }
 
@@ -214,8 +263,10 @@ pub struct InstanceDetail {
     pub api_key_env: String,
     pub channel: String,
     pub status: String,
+    pub health: String,
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
+    pub cpu_limit: f64,
     pub notes: String,
     pub created_at: String,
     pub updated_at: String,
@@ -287,6 +338,8 @@ pub struct CreateInstanceRequest {
     #[serde(default)]
     pub mem_limit_mb: Option<u32>,
     #[serde(default)]
+    pub cpu_limit: Option<f64>,
+    #[serde(default)]
     pub notes: Option<String>,
     /// Convenience field: stored as `HERMES_GATE_PROFILE_TOKEN` (and as
     /// `api_key_env` when the two differ).
@@ -313,6 +366,8 @@ pub struct PatchInstanceRequest {
     pub shares: Option<Vec<ShareRef>>,
     #[serde(default)]
     pub mem_limit_mb: Option<u32>,
+    #[serde(default)]
+    pub cpu_limit: Option<f64>,
     #[serde(default)]
     pub notes: Option<String>,
     #[serde(default)]
@@ -376,6 +431,15 @@ pub fn validate_mem_limit(value: u32) -> Result<(), String> {
     if !(MEM_LIMIT_MIN_MB..=MEM_LIMIT_MAX_MB).contains(&value) {
         return Err(format!(
             "mem_limit_mb must be between {MEM_LIMIT_MIN_MB} and {MEM_LIMIT_MAX_MB}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_cpu_limit(value: f64) -> Result<(), String> {
+    if !value.is_finite() || !(CPU_LIMIT_MIN..=CPU_LIMIT_MAX).contains(&value) {
+        return Err(format!(
+            "cpu_limit must be between {CPU_LIMIT_MIN} and {CPU_LIMIT_MAX}"
         ));
     }
     Ok(())
@@ -470,6 +534,36 @@ mod tests {
         assert!(validate_mem_limit(8192).is_ok());
         assert!(validate_mem_limit(255).is_err());
         assert!(validate_mem_limit(8193).is_err());
+    }
+
+    #[test]
+    fn cpu_limit_bounds() {
+        assert!(validate_cpu_limit(CPU_LIMIT_MIN).is_ok());
+        assert!(validate_cpu_limit(DEFAULT_CPU_LIMIT).is_ok());
+        assert!(validate_cpu_limit(CPU_LIMIT_MAX).is_ok());
+        assert!(validate_cpu_limit(0.0).is_err());
+        assert!(validate_cpu_limit(0.05).is_err());
+        assert!(validate_cpu_limit(8.1).is_err());
+        assert!(validate_cpu_limit(f64::NAN).is_err());
+        assert!(validate_cpu_limit(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn health_values_round_trip() {
+        for (text, expected) in [
+            ("healthy", Health::Healthy),
+            ("Unhealthy", Health::Unhealthy),
+            (" STARTING ", Health::Starting),
+            ("", Health::Unknown),
+            ("none", Health::Unknown),
+            ("weird", Health::Unknown),
+        ] {
+            assert_eq!(Health::parse(text), expected, "{text:?}");
+        }
+        assert_eq!(Health::Healthy.as_str(), "healthy");
+        assert_eq!(Health::Unhealthy.as_str(), "unhealthy");
+        assert_eq!(Health::Starting.as_str(), "starting");
+        assert_eq!(Health::Unknown.as_str(), "none");
     }
 
     #[test]

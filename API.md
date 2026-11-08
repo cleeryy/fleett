@@ -27,7 +27,8 @@ Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 `GET /api/instances` → `InstanceSummary[]`
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
- "channel":"telegram","status":"running","shares":["findings"],
+ "channel":"telegram","status":"running","health":"healthy","cpu_limit":1.0,
+ "shares":["findings"],"last_error":null,
  "created_at":"2026-11-08T01:00:00Z"}
 ```
 
@@ -39,7 +40,7 @@ Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"notes":""}
+ "mem_limit_mb":1536,"cpu_limit":1.0,"notes":""}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
 The token is **never** returned by the API.
@@ -59,7 +60,11 @@ The token is **never** returned by the API.
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
-`mem_limit_mb`, `notes`. Rewrites the compose file and runs `up -d`.
+`mem_limit_mb`, `cpu_limit`, `notes`. Rewrites the compose file and runs `up -d`.
+
+`cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
+`memswap_limit == mem_limit`. Optional fleet caps (`FLEET_MAX_TOTAL_CPU`,
+`FLEET_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
@@ -81,3 +86,7 @@ The token is **never** returned by the API.
 
 `status` is a cache: the authoritative value is read through `docker compose ps` on every
 `GET /api/instances` (driver `compose`). Under the `mock` driver the state is simulated.
+
+`health` is read from the container healthcheck (`healthy`, `unhealthy`, `starting`, `none`).
+The generated compose probes `/opt/data/gateway.sock` with the gateway's `identify` verb;
+`last_error` is set while the probe is unhealthy and cleared when it recovers.

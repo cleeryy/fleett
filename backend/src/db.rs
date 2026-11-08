@@ -12,7 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const SCHEMA: &str = r#"
+/// Ordered schema migrations, applied at startup through `PRAGMA user_version`.
+///
+/// Each entry is one transactional step. Append only: never edit, reorder or
+/// remove a released entry, or databases created by an older build will take a
+/// different upgrade path.
+const MIGRATIONS: &[&str] = &[
+    // v1 — baseline index schema (create-only, safe to replay on a v0 file).
+    r#"
 CREATE TABLE IF NOT EXISTS instances (
     id            TEXT PRIMARY KEY NOT NULL,
     name          TEXT NOT NULL,
@@ -42,12 +49,20 @@ CREATE TABLE IF NOT EXISTS share_links (
 );
 
 CREATE INDEX IF NOT EXISTS idx_share_links_instance ON share_links (instance_id);
-"#;
+"#,
+    // v2 — per-instance CPU quota (databases from v0/v1 get it through ALTER).
+    "ALTER TABLE instances ADD COLUMN cpu_limit REAL NOT NULL DEFAULT 1.0;",
+];
+
+/// Schema version this build expects, i.e. the number of applied migrations.
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("database schema v{found} is newer than this build supports (v{supported})")]
+    SchemaNewer { found: i64, supported: usize },
     #[error("{0} already exists")]
     Conflict(String),
     #[error("filesystem error: {0}")]
@@ -89,8 +104,14 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<(), DbError> {
-        self.lock().execute_batch(SCHEMA)?;
-        Ok(())
+        let mut conn = self.lock();
+        apply_migrations(&mut conn, MIGRATIONS)
+    }
+
+    /// Current `PRAGMA user_version`.
+    pub fn schema_version(&self) -> Result<i64, DbError> {
+        let conn = self.lock();
+        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<InstanceSpec>, DbError> {
@@ -98,7 +119,7 @@ impl Db {
         let stored = conn
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-                 last_error, mem_limit_mb, notes, created_at, updated_at \
+                 last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -115,7 +136,7 @@ impl Db {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-             last_error, mem_limit_mb, notes, created_at, updated_at \
+             last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -160,8 +181,8 @@ impl Db {
         }
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, channel, \
-             status, last_error, mem_limit_mb, notes, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             status, last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 spec.id,
                 spec.name,
@@ -173,6 +194,7 @@ impl Db {
                 spec.status.as_str(),
                 spec.last_error,
                 spec.mem_limit_mb,
+                spec.cpu_limit,
                 spec.notes,
                 spec.created_at,
                 spec.updated_at,
@@ -191,7 +213,7 @@ impl Db {
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, channel = ?7, status = ?8, last_error = ?9, mem_limit_mb = ?10, \
-             notes = ?11, updated_at = ?12 WHERE id = ?1",
+             cpu_limit = ?11, notes = ?12, updated_at = ?13 WHERE id = ?1",
             params![
                 spec.id,
                 spec.name,
@@ -203,6 +225,7 @@ impl Db {
                 spec.status.as_str(),
                 spec.last_error,
                 spec.mem_limit_mb,
+                spec.cpu_limit,
                 spec.notes,
                 spec.updated_at,
             ],
@@ -230,6 +253,15 @@ impl Db {
         self.lock().execute(
             "UPDATE instances SET status = ?2, last_error = ?3, updated_at = ?4 WHERE id = ?1",
             params![id, status.as_str(), last_error, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Update `last_error` alone (health probe failures do not change status).
+    pub fn set_last_error(&self, id: &str, last_error: Option<&str>) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE instances SET last_error = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, last_error, now_iso()],
         )?;
         Ok(())
     }
@@ -369,6 +401,30 @@ impl Db {
     }
 }
 
+/// Apply every migration above the recorded `PRAGMA user_version`.
+///
+/// One transaction per migration: a failing statement rolls back its own step
+/// (including the version bump) and leaves the database at the last version
+/// that applied cleanly.
+fn apply_migrations(conn: &mut Connection, migrations: &[&str]) -> Result<(), DbError> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let current = current.max(0) as usize;
+    if current > migrations.len() {
+        return Err(DbError::SchemaNewer {
+            found: current as i64,
+            supported: migrations.len(),
+        });
+    }
+    for (index, sql) in migrations.iter().enumerate().skip(current) {
+        let version = (index + 1) as i64;
+        let transaction = conn.transaction()?;
+        transaction.execute_batch(sql)?;
+        transaction.pragma_update(None, "user_version", version)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
 fn insert_link(conn: &Connection, share: &ShareRef, instance_id: &str) -> Result<(), DbError> {
     conn.execute(
         "INSERT INTO share_links (name, instance_id, mode) VALUES (?1, ?2, ?3) \
@@ -389,6 +445,7 @@ struct StoredRow {
     status: String,
     last_error: Option<String>,
     mem_limit_mb: i64,
+    cpu_limit: f64,
     notes: String,
     created_at: String,
     updated_at: String,
@@ -406,6 +463,11 @@ impl StoredRow {
             channel: ChannelKind::parse(&self.channel).unwrap_or(ChannelKind::None),
             shares,
             mem_limit_mb: self.mem_limit_mb.clamp(0, u32::MAX as i64) as u32,
+            cpu_limit: if crate::models::validate_cpu_limit(self.cpu_limit).is_ok() {
+                self.cpu_limit
+            } else {
+                crate::models::DEFAULT_CPU_LIMIT
+            },
             notes: self.notes,
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
             last_error: self.last_error,
@@ -427,6 +489,7 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         status: row.get("status")?,
         last_error: row.get("last_error")?,
         mem_limit_mb: row.get("mem_limit_mb")?,
+        cpu_limit: row.get("cpu_limit")?,
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -523,6 +586,7 @@ mod tests {
                 mode: ShareMode::Rw,
             }],
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
+            cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -582,5 +646,130 @@ mod tests {
 
         db.detach_share("findings", "alice").expect("detach");
         assert!(!db.is_share_attached("findings").expect("check"));
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some()
+    }
+
+    #[test]
+    fn fresh_database_is_created_at_the_current_schema_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
+        let conn = db.lock();
+        for table in ["instances", "shares", "share_links"] {
+            assert!(table_exists(&conn, table), "missing table {table}");
+        }
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(instances)")
+            .expect("table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns");
+        assert!(columns.iter().any(|column| column == "cpu_limit"));
+    }
+
+    #[test]
+    fn a_v0_database_is_migrated_in_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fleet.db");
+        {
+            // What a build from before CPU limits and schema versioning left:
+            // the v1 tables and `user_version = 0`.
+            let conn = Connection::open(&path).expect("create v0 file");
+            conn.execute_batch(MIGRATIONS[0]).expect("baseline schema");
+            conn.execute(
+                "INSERT INTO instances (id, name, template, model, base_url, api_key_env, \
+                 channel, status, last_error, mem_limit_mb, notes, created_at, updated_at) \
+                 VALUES ('alice', 'Alice', 'guest', 'm', 'https://example.test/v1', \
+                 'HERMES_GATE_PROFILE_TOKEN', 'telegram', 'running', NULL, 1024, '', \
+                 '2026-11-08T01:00:00Z', '2026-11-08T01:00:00Z')",
+                [],
+            )
+            .expect("seed v0 row");
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, 0);
+        }
+
+        let db = Db::open(&path).expect("migrate the v0 database");
+        assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
+        let alice = db.get("alice").expect("get").expect("kept row");
+        assert_eq!(alice.name, "Alice");
+        assert_eq!(alice.mem_limit_mb, 1024);
+        assert_eq!(alice.cpu_limit, crate::models::DEFAULT_CPU_LIMIT);
+        assert!(table_exists(&db.lock(), "share_links"));
+
+        // Re-opening an up-to-date database applies nothing.
+        drop(db);
+        let reopened = Db::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.schema_version().expect("version"),
+            SCHEMA_VERSION as i64
+        );
+    }
+
+    #[test]
+    fn a_failing_migration_rolls_back_and_keeps_the_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fleet.db");
+        let mut conn = Connection::open(&path).expect("open");
+
+        let err = apply_migrations(
+            &mut conn,
+            &["CREATE TABLE partial (id INTEGER);\nTHIS IS NOT SQL;"],
+        )
+        .expect_err("migration must fail");
+        assert!(matches!(err, DbError::Sqlite(_)));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 0, "a failed migration must not bump user_version");
+        assert!(
+            !table_exists(&conn, "partial"),
+            "statements of a failed migration must be rolled back"
+        );
+
+        // A step that succeeds commits and bumps the version; a later failing
+        // step leaves the database at that last good version.
+        apply_migrations(&mut conn, &["CREATE TABLE alpha (id INTEGER);"]).expect("first step");
+        let err = apply_migrations(
+            &mut conn,
+            &[
+                "CREATE TABLE alpha (id INTEGER);",
+                "CREATE TABLE beta (id INTEGER);",
+                "STILL NOT SQL;",
+            ],
+        )
+        .expect_err("third step fails");
+        assert!(matches!(err, DbError::Sqlite(_)));
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2);
+        assert!(table_exists(&conn, "beta"));
+    }
+
+    #[test]
+    fn refuses_a_database_from_a_newer_build() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fleet.db");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.pragma_update(None, "user_version", 99)
+                .expect("bump version");
+        }
+        let err = Db::open(&path).err().expect("newer schema is refused");
+        assert!(matches!(err, DbError::SchemaNewer { found: 99, .. }));
     }
 }

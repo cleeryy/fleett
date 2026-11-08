@@ -52,6 +52,11 @@ pub fn write_instance(
 
     write_file(&cfg.compose_path(&spec.id), &rendered.compose_yaml, 0o644)?;
     write_file(&data.join("config.yaml"), &rendered.config_yaml, 0o600)?;
+    write_file(
+        &data.join("healthcheck.py"),
+        render::HEALTHCHECK_SCRIPT,
+        0o644,
+    )?;
     if write_soul {
         if let Some(soul) = &rendered.soul_md {
             write_file(&data.join("SOUL.md"), soul, 0o600)?;
@@ -225,6 +230,18 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         .filter(|value| models::validate_mem_limit(*value).is_ok())
         .unwrap_or(models::DEFAULT_MEM_LIMIT_MB);
 
+    let cpu_limit = agent
+        .and_then(|service| service.get("cpus"))
+        .and_then(|value| {
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<f64>().ok())
+            })
+        })
+        .filter(|value| models::validate_cpu_limit(*value).is_ok())
+        .unwrap_or(models::DEFAULT_CPU_LIMIT);
+
     let shares = agent
         .and_then(|service| service.get("volumes"))
         .and_then(Value::as_sequence)
@@ -259,6 +276,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         channel,
         shares,
         mem_limit_mb,
+        cpu_limit,
         notes: String::new(),
         status: Status::Unknown,
         last_error: None,

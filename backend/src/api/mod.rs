@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::config::VERSION;
 use crate::db::{self, Db};
 use crate::driver::Driver;
-use crate::models::{InstanceSpec, Status};
+use crate::models::{Health, InstanceSpec, Status, HEALTH_UNHEALTHY_MESSAGE};
 use crate::store;
 use axum::middleware;
 use axum::routing::{delete, get, post};
@@ -227,16 +227,24 @@ pub(crate) async fn up_and_record(
 ) -> Result<(), ApiError> {
     match state.driver.up(spec).await {
         Ok(()) => {
-            let status = state
-                .driver
-                .ps(spec)
-                .await
+            let observed = state.driver.ps(spec).await.ok();
+            let status = observed
+                .as_ref()
                 .map(|result| result.status)
                 .unwrap_or(Status::Running);
+            let health = observed
+                .as_ref()
+                .map(|result| result.health)
+                .unwrap_or(Health::Unknown);
+            let last_error = match health {
+                Health::Unhealthy => Some(HEALTH_UNHEALTHY_MESSAGE),
+                _ => None,
+            };
             spec.status = status;
+            spec.last_error = last_error.map(str::to_string);
             state
                 .db
-                .set_status(&spec.id, status, None)
+                .set_status(&spec.id, status, last_error)
                 .map_err(ApiError::from)?;
             Ok(())
         }

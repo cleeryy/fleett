@@ -16,6 +16,8 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Optional machine-readable payload, returned as `error.details`.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -24,7 +26,14 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            details: None,
         }
+    }
+
+    /// Attach a structured payload (returned as `error.details`).
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
@@ -68,12 +77,13 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({
-            "error": {
-                "code": self.code,
-                "message": self.message,
-            }
-        });
+        let mut error = serde_json::Map::new();
+        error.insert("code".to_string(), json!(self.code));
+        error.insert("message".to_string(), json!(self.message));
+        if let Some(details) = self.details {
+            error.insert("details".to_string(), details);
+        }
+        let body = json!({ "error": error });
         (self.status, Json(body)).into_response()
     }
 }

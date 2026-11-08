@@ -5,7 +5,7 @@
 
 use super::{Driver, DriverError, DriverFuture, PsResult};
 use crate::config::Config;
-use crate::models::{ContainerInfo, InstanceSpec, Status};
+use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -243,6 +243,7 @@ fn parse_ps(stdout: &str) -> PsResult {
     let Some(object) = parse_ps_object(stdout) else {
         return PsResult {
             status: Status::Unknown,
+            health: Health::Unknown,
             container: None,
         };
     };
@@ -264,12 +265,39 @@ fn parse_ps(stdout: &str) -> PsResult {
 
     PsResult {
         status,
+        health: health_field(&object),
         container: Some(ContainerInfo {
             id: field(&object, &["id", "containerid"]),
             image: field(&object, &["image"]),
             uptime_s: None,
         }),
     }
+}
+
+/// Read the `Health` field of a `docker compose ps` object.
+///
+/// Compose exposes it as a string (`"healthy"`, `"unhealthy"`, `"starting"` or
+/// empty); some versions nest it as `{"Status": "healthy"}`. Anything absent or
+/// unrecognised maps to [`Health::Unknown`].
+fn health_field(object: &serde_json::Map<String, Value>) -> Health {
+    for (key, value) in object {
+        if !key.eq_ignore_ascii_case("health") {
+            continue;
+        }
+        if let Some(text) = value.as_str() {
+            return Health::parse(text);
+        }
+        if let Some(nested) = value.as_object() {
+            for (key, value) in nested {
+                if key.eq_ignore_ascii_case("status") {
+                    if let Some(text) = value.as_str() {
+                        return Health::parse(text);
+                    }
+                }
+            }
+        }
+    }
+    Health::Unknown
 }
 
 fn parse_ps_object(stdout: &str) -> Option<serde_json::Map<String, Value>> {
@@ -321,9 +349,10 @@ mod tests {
 
     #[test]
     fn parses_array_output() {
-        let stdout = r#"[{"ID":"abc123","Image":"hermes-agent:0.22.2-local","State":"running","Status":"Up 2 minutes"}]"#;
+        let stdout = r#"[{"ID":"abc123","Image":"hermes-agent:0.22.2-local","State":"running","Status":"Up 2 minutes","Health":"healthy"}]"#;
         let ps = parse_ps(stdout);
         assert_eq!(ps.status, Status::Running);
+        assert_eq!(ps.health, Health::Healthy);
         let container = ps.container.expect("container");
         assert_eq!(container.id.as_deref(), Some("abc123"));
         assert_eq!(
@@ -337,6 +366,7 @@ mod tests {
         let stdout = "{\"Id\":\"deadbeef\",\"State\":\"exited\",\"Image\":\"img\"}\n";
         let ps = parse_ps(stdout);
         assert_eq!(ps.status, Status::Stopped);
+        assert_eq!(ps.health, Health::Unknown);
         assert_eq!(
             ps.container.and_then(|container| container.id).as_deref(),
             Some("deadbeef")
@@ -344,9 +374,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_health_from_both_shapes() {
+        let cases = [
+            (
+                r#"[{"State":"running","Health":"unhealthy"}]"#,
+                Health::Unhealthy,
+            ),
+            (
+                "{\"State\":\"running\",\"Health\":\"starting\"}\n",
+                Health::Starting,
+            ),
+            (
+                r#"[{"State":"running","Health":{"Status":"healthy"}}]"#,
+                Health::Healthy,
+            ),
+            (r#"[{"State":"running","Health":""}]"#, Health::Unknown),
+            (r#"[{"State":"running"}]"#, Health::Unknown),
+        ];
+        for (stdout, expected) in cases {
+            assert_eq!(parse_ps(stdout).health, expected, "{stdout}");
+        }
+    }
+
+    #[test]
     fn empty_output_is_unknown() {
         let ps = parse_ps("");
         assert_eq!(ps.status, Status::Unknown);
+        assert_eq!(ps.health, Health::Unknown);
         assert!(ps.container.is_none());
     }
 }

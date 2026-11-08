@@ -7,7 +7,7 @@
 pub mod compose;
 pub mod mock;
 
-use crate::models::{ContainerInfo, InstanceSpec, Status};
+use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -15,6 +15,7 @@ use std::pin::Pin;
 #[derive(Debug, Clone)]
 pub struct PsResult {
     pub status: Status,
+    pub health: Health,
     pub container: Option<ContainerInfo>,
 }
 

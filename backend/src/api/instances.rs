@@ -3,11 +3,11 @@
 use crate::api::error::ApiError;
 use crate::api::{up_and_record, AppState};
 use crate::models::{
-    now_iso, validate_api_key_env, validate_base_url, validate_instance_id, validate_mem_limit,
-    validate_model, validate_notes, validate_secret_value, validate_share_name, ChannelKind,
-    ChannelRequest, ContainerInfo, CreateInstanceRequest, InstanceDetail, InstanceSpec,
-    InstanceSummary, PatchInstanceRequest, ShareRef, Status, DEFAULT_API_KEY_ENV,
-    DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
+    validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
+    ChannelKind, ChannelRequest, ContainerInfo, CreateInstanceRequest, Health, InstanceDetail,
+    InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status, DEFAULT_API_KEY_ENV,
+    DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE, HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
@@ -56,7 +56,9 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSumm
     let mut specs = state.db.list().map_err(ApiError::from)?;
     let mut summaries = Vec::with_capacity(specs.len());
     for spec in &mut specs {
+        let mut health = Health::Unknown;
         if let Ok(result) = state.driver.ps(spec).await {
+            health = result.health;
             let status = effective_status(spec.status, result.status);
             if status != spec.status {
                 spec.status = status;
@@ -64,8 +66,9 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSumm
                     .db
                     .set_status(&spec.id, status, spec.last_error.as_deref());
             }
+            record_health(&state, spec, health);
         }
-        summaries.push(to_summary(spec));
+        summaries.push(to_summary(spec, health));
     }
     Ok(Json(summaries))
 }
@@ -74,9 +77,9 @@ pub async fn get(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
-    let spec = load(&state, &id)?;
-    let (status, container) = observe(&state, &spec).await;
-    Ok(Json(to_detail(&state, &spec, status, container)))
+    let mut spec = load(&state, &id)?;
+    let (status, health, container) = observe(&state, &mut spec).await;
+    Ok(Json(to_detail(&state, &spec, status, health, container)))
 }
 
 pub async fn create(
@@ -98,6 +101,8 @@ pub async fn create(
         ));
     }
 
+    enforce_caps(&state, None, &spec)?;
+
     let rendered =
         render::render_instance(&state.cfg, &spec, &prepared.template).map_err(ApiError::from)?;
     let secrets = render::build_secrets(
@@ -116,14 +121,15 @@ pub async fn create(
     }
 
     up_and_record(&state, &mut spec).await?;
-    let (status, container) = match state.driver.ps(&spec).await {
-        Ok(result) => (result.status, result.container),
-        Err(_) => (Status::Running, None),
+    let (status, health, container) = match state.driver.ps(&spec).await {
+        Ok(result) => (result.status, result.health, result.container),
+        Err(_) => (Status::Running, Health::Unknown, None),
     };
-    let stored = load(&state, &spec.id)?;
+    let mut stored = load(&state, &spec.id)?;
+    record_health(&state, &mut stored, health);
     Ok((
         StatusCode::CREATED,
-        Json(to_detail(&state, &stored, status, container)),
+        Json(to_detail(&state, &stored, status, health, container)),
     ))
 }
 
@@ -137,6 +143,7 @@ pub async fn patch(
 
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
+    enforce_caps(&state, Some(&id), &spec)?;
 
     let rendered = render_for_update(&state, &spec)?;
     let existing = store::read_secrets(&state.cfg, &id);
@@ -155,11 +162,12 @@ pub async fn patch(
     state.db.update_instance(&spec).map_err(ApiError::from)?;
 
     up_and_record(&state, &mut spec).await?;
-    let (status, container) = match state.driver.ps(&spec).await {
-        Ok(result) => (result.status, result.container),
-        Err(_) => (Status::Running, None),
+    let (status, health, container) = match state.driver.ps(&spec).await {
+        Ok(result) => (result.status, result.health, result.container),
+        Err(_) => (Status::Running, Health::Unknown, None),
     };
-    Ok(Json(to_detail(&state, &spec, status, container)))
+    record_health(&state, &mut spec, health);
+    Ok(Json(to_detail(&state, &spec, status, health, container)))
 }
 
 pub async fn start(
@@ -311,7 +319,10 @@ fn load(state: &AppState, id: &str) -> Result<InstanceSpec, ApiError> {
         .ok_or_else(|| ApiError::not_found(format!("instance \"{id}\" not found")))
 }
 
-async fn observe(state: &AppState, spec: &InstanceSpec) -> (Status, Option<ContainerInfo>) {
+async fn observe(
+    state: &AppState,
+    spec: &mut InstanceSpec,
+) -> (Status, Health, Option<ContainerInfo>) {
     match state.driver.ps(spec).await {
         Ok(result) => {
             let status = effective_status(spec.status, result.status);
@@ -320,10 +331,94 @@ async fn observe(state: &AppState, spec: &InstanceSpec) -> (Status, Option<Conta
                     .db
                     .set_status(&spec.id, status, spec.last_error.as_deref());
             }
-            (status, result.container)
+            spec.status = status;
+            record_health(state, spec, result.health);
+            (status, result.health, result.container)
         }
-        Err(_) => (spec.status, None),
+        Err(_) => (spec.status, Health::Unknown, None),
     }
+}
+
+/// Keep `last_error` in sync with the container health.
+///
+/// An unhealthy container is still `running`, so the lifecycle status is left
+/// alone; only `last_error` is set (and cleared once the probe answers again).
+pub(crate) fn record_health(state: &AppState, spec: &mut InstanceSpec, health: Health) {
+    let is_health_error = spec.last_error.as_deref() == Some(HEALTH_UNHEALTHY_MESSAGE);
+    match health {
+        Health::Unhealthy if !is_health_error => {
+            let _ = state
+                .db
+                .set_last_error(&spec.id, Some(HEALTH_UNHEALTHY_MESSAGE));
+            spec.last_error = Some(HEALTH_UNHEALTHY_MESSAGE.to_string());
+        }
+        Health::Healthy | Health::Starting if is_health_error => {
+            let _ = state.db.set_last_error(&spec.id, None);
+            spec.last_error = None;
+        }
+        _ => {}
+    }
+}
+
+/// Reject a create/update that would push the fleet over a configured cap.
+///
+/// `replacing` is the instance being patched: its stored row is excluded from
+/// the sum so an unchanged or shrinking value never trips the cap.
+fn enforce_caps(
+    state: &AppState,
+    replacing: Option<&str>,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
+    let cfg = &state.cfg;
+    if cfg.max_total_cpu <= 0.0 && cfg.max_total_mem_mb == 0 {
+        return Ok(());
+    }
+
+    let mut used_cpu = 0.0f64;
+    let mut used_mem = 0u64;
+    for existing in state.db.list().map_err(ApiError::from)? {
+        if Some(existing.id.as_str()) == replacing {
+            continue;
+        }
+        used_cpu += existing.cpu_limit;
+        used_mem += u64::from(existing.mem_limit_mb);
+    }
+
+    // Float sums of decimal quotas are not exact; 1e-9 absorbs the noise.
+    const EPSILON: f64 = 1e-9;
+    if cfg.max_total_cpu > 0.0 && used_cpu + spec.cpu_limit > cfg.max_total_cpu + EPSILON {
+        return Err(ApiError::conflict(
+            "cpu_cap_exceeded",
+            format!(
+                "requested cpu_limit {} would bring the fleet to {} CPUs, above the configured cap of {}",
+                spec.cpu_limit,
+                used_cpu + spec.cpu_limit,
+                cfg.max_total_cpu
+            ),
+        )
+        .with_details(serde_json::json!({
+            "used": used_cpu,
+            "requested": spec.cpu_limit,
+            "cap": cfg.max_total_cpu,
+        })));
+    }
+    if cfg.max_total_mem_mb > 0 && used_mem + u64::from(spec.mem_limit_mb) > cfg.max_total_mem_mb {
+        return Err(ApiError::conflict(
+            "mem_cap_exceeded",
+            format!(
+                "requested mem_limit_mb {} would bring the fleet to {} MB, above the configured cap of {} MB",
+                spec.mem_limit_mb,
+                used_mem + u64::from(spec.mem_limit_mb),
+                cfg.max_total_mem_mb
+            ),
+        )
+        .with_details(serde_json::json!({
+            "used": used_mem,
+            "requested": spec.mem_limit_mb,
+            "cap": cfg.max_total_mem_mb,
+        })));
+    }
+    Ok(())
 }
 
 /// `docker compose ps` reports `unknown` when no container exists; keep a
@@ -336,7 +431,7 @@ fn effective_status(cached: Status, observed: Status) -> Status {
     }
 }
 
-fn to_summary(spec: &InstanceSpec) -> InstanceSummary {
+fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
     InstanceSummary {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -344,7 +439,10 @@ fn to_summary(spec: &InstanceSpec) -> InstanceSummary {
         model: spec.model.clone(),
         channel: spec.channel.as_str().to_string(),
         status: spec.status.as_str().to_string(),
+        health: health.as_str().to_string(),
+        cpu_limit: spec.cpu_limit,
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
+        last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
     }
 }
@@ -353,6 +451,7 @@ fn to_detail(
     state: &AppState,
     spec: &InstanceSpec,
     status: Status,
+    health: Health,
     container: Option<ContainerInfo>,
 ) -> InstanceDetail {
     InstanceDetail {
@@ -364,8 +463,10 @@ fn to_detail(
         api_key_env: spec.api_key_env.clone(),
         channel: spec.channel.as_str().to_string(),
         status: status.as_str().to_string(),
+        health: health.as_str().to_string(),
         shares: spec.shares.clone(),
         mem_limit_mb: spec.mem_limit_mb,
+        cpu_limit: spec.cpu_limit,
         notes: spec.notes.clone(),
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
@@ -434,6 +535,10 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     validate_mem_limit(mem_limit_mb)
         .map_err(|message| ApiError::bad_request("invalid_mem_limit", message))?;
 
+    let cpu_limit = request.cpu_limit.unwrap_or(DEFAULT_CPU_LIMIT);
+    validate_cpu_limit(cpu_limit)
+        .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
+
     let name = request
         .name
         .as_deref()
@@ -475,6 +580,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             channel,
             shares,
             mem_limit_mb,
+            cpu_limit,
             notes,
             status: Status::Created,
             last_error: None,
@@ -530,6 +636,11 @@ fn apply_patch(
         validate_mem_limit(mem_limit_mb)
             .map_err(|message| ApiError::bad_request("invalid_mem_limit", message))?;
         spec.mem_limit_mb = mem_limit_mb;
+    }
+    if let Some(cpu_limit) = request.cpu_limit {
+        validate_cpu_limit(cpu_limit)
+            .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
+        spec.cpu_limit = cpu_limit;
     }
     if let Some(notes) = request.notes.as_deref() {
         validate_notes(notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
