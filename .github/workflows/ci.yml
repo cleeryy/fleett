@@ -17,12 +17,15 @@ jobs:
         with:
           workspaces: backend
       - name: Format
+        if: ${{ hashFiles('backend/Cargo.toml') != '' }}
         working-directory: backend
         run: cargo fmt --all --check
       - name: Clippy
+        if: ${{ hashFiles('backend/Cargo.toml') != '' }}
         working-directory: backend
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
+        if: ${{ hashFiles('backend/Cargo.toml') != '' }}
         working-directory: backend
         run: cargo test --locked
 
@@ -39,8 +42,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install
+        if: ${{ hashFiles('web/package.json') != '' }}
         working-directory: web
         run: pnpm install --frozen-lockfile
       - name: Build
+        if: ${{ hashFiles('web/package.json') != '' }}
         working-directory: web
         run: pnpm build
