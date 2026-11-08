@@ -6,6 +6,7 @@ import { toApiError, type ApiError } from "@/api/errors";
 import type { ChannelType, ShareRef } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -27,7 +28,7 @@ import { navigate, setRouteGuard, useRoute } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
-const STEPS = ["Identity", "Template", "Model", "Channel", "Shares", "Review"] as const;
+const STEPS = ["Identity", "Template", "Model & network", "Channel", "Shares", "Review"] as const;
 const LAST_STEP = STEPS.length - 1;
 
 const CHANNELS: { value: ChannelType; label: string; hint: string }[] = [
@@ -50,6 +51,7 @@ interface Draft {
   token: string;
   shares: ShareRef[];
   memLimit: string;
+  allowLan: boolean;
   notes: string;
 }
 
@@ -67,6 +69,7 @@ const DEFAULT_DRAFT: Draft = {
   token: "",
   shares: [],
   memLimit: "1536",
+  allowLan: false,
   notes: "",
 };
 
@@ -283,19 +286,29 @@ export function NewInstancePage() {
         channel: draft.channel === "none" ? { type: "none" } : { type: draft.channel, token: draft.token },
         shares: draft.shares,
         mem_limit_mb: Number(draft.memLimit),
+        allow_lan: draft.allowLan,
         notes: draft.notes.trim(),
       });
       toast.success(`Instance ${detail.id} created.`);
       leaveWizard(`/instances/${detail.id}`);
     } catch (cause) {
       const error = toApiError(cause);
-      if (error.status === 409) {
+      if (error.status === 409 && error.code !== "egress_not_enforced") {
         setServerIdError(error.message);
         setStep(0);
         setAttempted(0);
         window.requestAnimationFrame(() => document.getElementById("id")?.focus());
       } else {
         setSubmitError(error);
+        if (error.code === "egress_not_enforced") {
+          // The host prerequisite lives on the network field: put the user there.
+          setStep(2);
+          setAttempted(null);
+          window.requestAnimationFrame(() => {
+            document.getElementById("wizard-allow-lan")?.focus({ preventScroll: true });
+            document.querySelector("[data-egress-alert]")?.scrollIntoView({ block: "center" });
+          });
+        }
       }
     } finally {
       setSubmitting(false);
@@ -315,6 +328,7 @@ export function NewInstancePage() {
 
   const templateList = templates.data ?? [];
   const shareList = shares.data ?? [];
+  const egressError = submitError?.code === "egress_not_enforced" ? submitError : null;
 
   return (
     <>
@@ -361,7 +375,7 @@ export function NewInstancePage() {
         </nav>
 
         <div className="min-w-0 max-w-2xl space-y-6">
-          {submitError ? <ErrorAlert error={submitError} /> : null}
+          {submitError && !(egressError && step === 2) ? <ErrorAlert error={submitError} /> : null}
 
           <form onSubmit={handleSubmit} noValidate className="space-y-6">
             {step === 0 ? (
@@ -584,6 +598,49 @@ export function NewInstancePage() {
                   />
                   <FieldError id="mem-limit-error" message={showErrors ? errors.memLimit : undefined} />
                 </div>
+
+                <div className="space-y-3 rounded-md border p-4">
+                  <p className="text-sm font-medium">Network</p>
+                  <div className="flex items-start gap-3">
+                    <Checkbox
+                      id="wizard-allow-lan"
+                      className="mt-0.5"
+                      checked={draft.allowLan}
+                      aria-describedby="wizard-allow-lan-help"
+                      onCheckedChange={(value) => {
+                        update("allowLan", value === true);
+                        if (egressError) setSubmitError(null);
+                      }}
+                    />
+                    <div className="min-w-0 space-y-1">
+                      <Label htmlFor="wizard-allow-lan" className="cursor-pointer">
+                        Allow LAN access
+                      </Label>
+                      <p id="wizard-allow-lan-help" className="text-xs text-muted-foreground">
+                        The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense
+                        and Infisical. Only enable for agents you trust.
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {draft.allowLan ? (
+                          <>
+                            Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
+                            <span className="font-mono">fleett</span> network.
+                          </>
+                        ) : (
+                          <>
+                            Stays on the restricted <span className="font-mono">fleett</span> network. No
+                            route to the LAN.
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                  {egressError ? (
+                    <div data-egress-alert>
+                      <ErrorAlert error={egressError} />
+                    </div>
+                  ) : null}
+                </div>
               </div>
             ) : null}
 
@@ -671,6 +728,20 @@ export function NewInstancePage() {
                   <ReviewRow
                     label="Memory limit"
                     value={<span className="font-mono">{draft.memLimit}&nbsp;MB</span>}
+                  />
+                  <ReviewRow
+                    label="LAN access"
+                    value={
+                      draft.allowLan ? (
+                        <span>
+                          Enabled · <span className="font-mono text-xs">fleett-lan</span>
+                        </span>
+                      ) : (
+                        <span>
+                          Restricted · <span className="font-mono text-xs">fleett</span>
+                        </span>
+                      )
+                    }
                   />
                   <ReviewRow label="Channel" value={draft.channel} />
                   {draft.channel !== "none" ? <ReviewRow label="Token" value="•••••••• set" /> : null}

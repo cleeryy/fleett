@@ -29,6 +29,27 @@ const DOCKER_ERROR =
   "compose up failed (exit 1): Error response from daemon: pull access denied for hermes-agent:0.22.2-local, " +
   "repository does not exist or may require 'docker login': denied: requested access to the resource is denied";
 
+const EGRESS_ERROR =
+  "LAN access is disabled for this instance, but the host egress firewall is not installed. " +
+  "The agent could reach private networks, so the change was refused.";
+
+/**
+ * Switchable mock behaviour, so the UI can be exercised in both worlds.
+ * `egressEnforced` mirrors `fleett egress install` on the host: when false,
+ * creating a restricted instance (or turning LAN access off) fails with
+ * 409 `egress_not_enforced`, exactly like the controller.
+ * Set `VITE_MOCK_EGRESS_ENFORCED=0` (dev/build) or assign `mockConfig.egressEnforced = false`.
+ */
+export const mockConfig = {
+  egressEnforced: (import.meta.env.VITE_MOCK_EGRESS_ENFORCED ?? "1") !== "0",
+};
+
+function assertEgress(allowLan: boolean): void {
+  if (!allowLan && !mockConfig.egressEnforced) {
+    fail(409, "egress_not_enforced", EGRESS_ERROR);
+  }
+}
+
 interface Stored {
   id: string;
   name: string;
@@ -42,6 +63,8 @@ interface Stored {
   status: InstanceStatus;
   shares: { name: string; mode: ShareMode }[];
   mem_limit_mb: number;
+  /** true = the compose service also joins `fleett-lan`. */
+  allow_lan: boolean;
   notes: string;
   created_at: string;
   updated_at: string;
@@ -109,6 +132,10 @@ function composeYaml(row: Stored): string {
     row.channel === "none"
       ? "      HERMES_CHANNEL: none"
       : `      HERMES_CHANNEL: ${row.channel}`;
+  const networkLines = ["    networks:", "      - fleett"];
+  if (row.allow_lan) networkLines.push("      - fleett-lan");
+  const networkDefs = ["networks:", "  fleett:", "    external: true"];
+  if (row.allow_lan) networkDefs.push("  fleett-lan:", "    external: true");
 
   return [
     "# Managed by fleett. Edit through the API: hand edits are overwritten.",
@@ -128,8 +155,7 @@ function composeYaml(row: Stored): string {
     channelLine,
     "    volumes:",
     ...mounts,
-    "    networks:",
-    "      - fleett",
+    ...networkLines,
     "    security_opt:",
     "      - no-new-privileges:true",
     "    cap_drop:",
@@ -144,9 +170,7 @@ function composeYaml(row: Stored): string {
     "        max-size: 10m",
     '        max-file: "3"',
     "",
-    "networks:",
-    "  fleett:",
-    "    external: true",
+    ...networkDefs,
     "",
   ].join("\n");
 }
@@ -168,6 +192,7 @@ function toDetail(row: Stored): InstanceDetail {
     status: row.status,
     shares: row.shares.map((share) => ({ ...share })),
     mem_limit_mb: row.mem_limit_mb,
+    allow_lan: row.allow_lan,
     notes: row.notes,
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -190,6 +215,7 @@ function toSummary(row: Stored): InstanceSummary {
     channel: row.channel,
     status: row.status,
     shares: row.shares.map((share) => share.name),
+    allow_lan: row.allow_lan,
     created_at: row.created_at,
   };
 }
@@ -309,6 +335,7 @@ function seedRow(input: {
   age_days: number;
   uptime_hours: number | null;
   mem_limit_mb?: number;
+  allow_lan?: boolean;
   notes?: string;
   last_error?: string | null;
   gate_token?: string;
@@ -327,6 +354,7 @@ function seedRow(input: {
     status: input.status,
     shares: input.shares,
     mem_limit_mb: input.mem_limit_mb ?? 1536,
+    allow_lan: input.allow_lan ?? false,
     notes: input.notes ?? "",
     created_at: iso(created),
     updated_at: iso(created + 2 * HOUR),
@@ -435,7 +463,8 @@ export function resetMock(): void {
       uptime_hours: 51,
       gate_token: "seed-ops",
       mem_limit_mb: 3072,
-      notes: "Homelab diagnostics. No Docker socket.",
+      allow_lan: true,
+      notes: "Homelab diagnostics. No Docker socket. Reaches the management VLAN.",
     }),
     seedRow({
       id: "school",
@@ -529,6 +558,7 @@ export const mockApi: FleetApi = {
     }
     validateChannel(input.channel, "none");
     assertSharesExist(input.shares);
+    assertEgress(input.allow_lan === true);
 
     const created = Date.now();
     const row: Stored = {
@@ -543,6 +573,7 @@ export const mockApi: FleetApi = {
       status: "running",
       shares: input.shares.map((share) => ({ name: share.name, mode: share.mode })),
       mem_limit_mb: input.mem_limit_mb,
+      allow_lan: input.allow_lan === true,
       notes: input.notes.trim(),
       created_at: iso(created),
       updated_at: iso(created),
@@ -574,6 +605,9 @@ export const mockApi: FleetApi = {
     }
     if (input.channel) validateChannel(input.channel, row.channel);
     if (input.shares) assertSharesExist(input.shares);
+    // Only a transition to restricted needs the host firewall; a stale
+    // allow_lan=false in a full form save must not block unrelated edits.
+    if (input.allow_lan === false && row.allow_lan) assertEgress(false);
 
     if (input.name !== undefined) row.name = input.name.trim();
     if (input.model !== undefined) row.model = input.model.trim();
@@ -583,6 +617,7 @@ export const mockApi: FleetApi = {
       row.gate_token = input.gate_token.trim();
     }
     if (input.mem_limit_mb !== undefined) row.mem_limit_mb = input.mem_limit_mb;
+    if (input.allow_lan !== undefined) row.allow_lan = input.allow_lan;
     if (input.notes !== undefined) row.notes = input.notes;
 
     if (input.channel) {

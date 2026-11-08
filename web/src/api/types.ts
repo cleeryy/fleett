@@ -28,6 +28,8 @@ export interface InstanceSummary {
   channel: string;
   status: InstanceStatus;
   shares: string[];
+  /** true = also attached to the `fleett-lan` network, so the LAN is reachable. */
+  allow_lan: boolean;
   created_at: string;
 }
 
@@ -54,6 +56,8 @@ export interface InstanceDetail {
   status: InstanceStatus;
   shares: ShareRef[];
   mem_limit_mb: number;
+  /** true = also attached to the `fleett-lan` network, so the LAN is reachable. */
+  allow_lan: boolean;
   notes: string;
   created_at: string;
   updated_at: string;
@@ -93,6 +97,8 @@ export interface CreateInstanceInput {
   channel: ChannelInput;
   shares: ShareRef[];
   mem_limit_mb: number;
+  /** false keeps the agent on the restricted `fleett` network only. */
+  allow_lan: boolean;
   notes: string;
 }
 
@@ -106,6 +112,8 @@ export interface PatchInstanceInput {
   channel?: ChannelInput;
   shares?: ShareRef[];
   mem_limit_mb?: number;
+  /** Turning LAN access off fails with 409 `egress_not_enforced` until the host firewall is installed. */
+  allow_lan?: boolean;
   notes?: string;
 }
 

@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -135,6 +136,24 @@ function OverviewTab({ detail, onConfigure }: { detail: InstanceDetail; onConfig
                 ),
               },
               { label: "Memory limit", value: `${detail.mem_limit_mb}\u00A0MB` },
+              {
+                label: "LAN access",
+                value: (
+                  <div className="space-y-1">
+                    <Badge
+                      variant={detail.allow_lan ? "secondary" : "outline"}
+                      className="font-mono text-xs font-normal"
+                    >
+                      {detail.allow_lan ? "enabled" : "restricted"}
+                    </Badge>
+                    <p className="text-xs text-muted-foreground">
+                      {detail.allow_lan
+                        ? "Can reach 10/8, 172.16/12 and 192.168/16."
+                        : "No LAN route. The agent only joins the fleett network."}
+                    </p>
+                  </div>
+                ),
+              },
             ]}
           />
         </Section>
@@ -259,6 +278,7 @@ interface ConfigDraft {
   api_key_env: string;
   gate_token: string;
   mem_limit_mb: string;
+  allow_lan: boolean;
   channel: ChannelType;
   token: string;
   notes: string;
@@ -275,6 +295,7 @@ function toConfigDraft(detail: InstanceDetail): ConfigDraft {
     api_key_env: detail.api_key_env,
     gate_token: "",
     mem_limit_mb: String(detail.mem_limit_mb),
+    allow_lan: detail.allow_lan,
     channel: (CHANNEL_TYPES.includes(detail.channel as ChannelType) ? detail.channel : "none") as ChannelType,
     token: "",
     notes: detail.notes,
@@ -327,6 +348,8 @@ function ConfigurationTab({
   const showErrors = attempted;
   const providerKeySet = detail.env_keys.includes("HERMES_GATE_PROFILE_TOKEN");
   const dirty = JSON.stringify(draft) !== JSON.stringify(toConfigDraft(detail));
+  // The prerequisite sits on the network field, so the alert belongs there.
+  const egressError = error?.code === "egress_not_enforced" ? error : null;
 
   function update<K extends keyof ConfigDraft>(key: K, value: ConfigDraft[K]) {
     onDraftChange({ ...draft, [key]: value } as ConfigDraft);
@@ -351,6 +374,7 @@ function ConfigurationTab({
         api_key_env: draft.api_key_env.trim(),
         gate_token: draft.gate_token.trim() || undefined,
         mem_limit_mb: Number(draft.mem_limit_mb),
+        allow_lan: draft.allow_lan,
         notes: draft.notes,
         channel:
           draft.channel === "none"
@@ -375,7 +399,7 @@ function ConfigurationTab({
 
   return (
     <form onSubmit={onSubmit} noValidate className="max-w-2xl space-y-6">
-      {error ? <ErrorAlert error={error} /> : null}
+      {error && !egressError ? <ErrorAlert error={error} /> : null}
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-2">
@@ -542,6 +566,45 @@ function ConfigurationTab({
           </div>
         ) : null}
       </div>
+
+      <fieldset className="min-w-0 space-y-3">
+        <legend className="text-sm font-medium">Network</legend>
+        <div className="flex items-start gap-3 rounded-md border p-4">
+          <Checkbox
+            id="cfg-allow-lan"
+            className="mt-0.5"
+            checked={draft.allow_lan}
+            aria-describedby="cfg-allow-lan-help"
+            onCheckedChange={(value) => {
+              update("allow_lan", value === true);
+              if (egressError) setError(null);
+            }}
+          />
+          <div className="min-w-0 space-y-1">
+            <Label htmlFor="cfg-allow-lan" className="cursor-pointer">
+              Allow LAN access
+            </Label>
+            <p id="cfg-allow-lan-help" className="text-xs text-muted-foreground">
+              The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense and
+              Infisical. Only enable for agents you trust.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {draft.allow_lan ? (
+                <>
+                  Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
+                  <span className="font-mono">fleett</span> network.
+                </>
+              ) : (
+                <>
+                  Stays on the restricted <span className="font-mono">fleett</span> network. No route to
+                  the LAN.
+                </>
+              )}
+            </p>
+          </div>
+        </div>
+        {egressError ? <ErrorAlert error={egressError} /> : null}
+      </fieldset>
 
       <fieldset className="min-w-0 space-y-3">
         <legend className="text-sm font-medium">Shares</legend>

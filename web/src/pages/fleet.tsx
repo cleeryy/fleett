@@ -6,6 +6,7 @@ import {
   Minus,
   MoreHorizontal,
   MessageSquare,
+  Network,
   Play,
   Plus,
   RefreshCw,
@@ -63,6 +64,21 @@ const persisted = { q: "", status: "all" as Filter };
 function ChannelIcon({ channel }: { channel: string }) {
   const Icon = channel === "telegram" ? Send : channel === "discord" ? MessageSquare : Minus;
   return <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />;
+}
+
+/** Quiet marker for the exception: this agent can reach the LAN. */
+function LanBadge() {
+  return (
+    <Badge
+      variant="secondary"
+      className="gap-1 px-1.5 font-mono text-[11px] font-normal"
+      aria-label="LAN access enabled"
+      title="LAN access enabled: can reach 10/8, 172.16/12 and 192.168/16"
+    >
+      <Network aria-hidden />
+      LAN
+    </Badge>
+  );
 }
 
 function RowMenu({
@@ -416,7 +432,12 @@ export function FleetPage() {
                             href={hrefFor(`/instances/${row.id}`)}
                             className="block max-w-[260px] rounded-sm"
                           >
-                            <span className="block truncate text-sm font-medium hover:underline">{row.name}</span>
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 truncate text-sm font-medium hover:underline">
+                                {row.name}
+                              </span>
+                              {row.allow_lan ? <LanBadge /> : null}
+                            </span>
                             <span className="block truncate font-mono text-xs text-muted-foreground">
                               {row.id}
                               <span aria-hidden> · </span>
@@ -485,13 +506,16 @@ export function FleetPage() {
                   <div key={row.id} className="space-y-3 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <a
-                          data-row-link
-                          href={hrefFor(`/instances/${row.id}`)}
-                          className="block truncate text-sm font-medium"
-                        >
-                          {row.name}
-                        </a>
+                        <div className="flex items-center gap-2">
+                          <a
+                            data-row-link
+                            href={hrefFor(`/instances/${row.id}`)}
+                            className="min-w-0 truncate text-sm font-medium"
+                          >
+                            {row.name}
+                          </a>
+                          {row.allow_lan ? <LanBadge /> : null}
+                        </div>
                         <p className="truncate font-mono text-xs text-muted-foreground">
                           {row.id}
                           <span aria-hidden> · </span>
