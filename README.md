@@ -16,6 +16,8 @@ was renamed from `hermes-fleet` in v0.2.0 — see [Upgrading from `hermes-fleet`
 - agents keep running when the console is stopped, updated or deleted: Docker owns them
 - sign in with SSO (OIDC/Authentik) or a bearer token, with `admin`/`viewer` roles, CSRF
   protection, named revocable API tokens and an audit log — see `docs/OIDC.md`
+- export one instance as a portable `.tgz` and import it under another id (same data, no
+  secrets), and run rotating host backups with `fleett backup` — see `docs/BACKUP.md`
 
 ## Install
 
@@ -27,7 +29,8 @@ fleett                           # reads ~/.fleett/fleett.env
 
 Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). The installer also creates a
 `hermes-fleet` symlink for scripts written against the old name. Details: `docs/INSTALL.md`,
-deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`.
+deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`,
+backups and instance archives: `docs/BACKUP.md`.
 
 ## Architecture
 

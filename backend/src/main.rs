@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use fleett::api::{self, AppState};
+use fleett::backup;
 use fleett::config::{Config, DriverKind, EgressMode, VERSION};
 use fleett::db::Db;
 use fleett::driver::compose::ComposeDriver;
@@ -10,6 +11,7 @@ use fleett::driver::Driver;
 use fleett::egress;
 use fleett::migrate;
 use fleett::secrets;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
@@ -51,6 +53,45 @@ enum Commands {
     Secrets {
         #[command(subcommand)]
         action: SecretsCommands,
+    },
+    /// Write a consistent, rotating backup of the whole fleet.
+    ///
+    /// Runs on the host, no bearer token is needed. See docs/BACKUP.md.
+    Backup {
+        /// Directory receiving the archive (default `<root>/backups`).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// Archives kept after the new one is written (default 7).
+        #[arg(long, default_value_t = backup::DEFAULT_KEEP)]
+        keep: usize,
+    },
+    /// List or restore existing backups.
+    ///
+    /// No bearer token is needed. Stop the control plane before a restore.
+    Backups {
+        #[command(subcommand)]
+        action: BackupCommands,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum BackupCommands {
+    /// List the archives of the backup directory, newest first.
+    List {
+        /// Directory holding the archives (default `<root>/backups`).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+    /// Restore one archive into an empty data root.
+    Restore {
+        /// Archive produced by `fleett backup`.
+        file: PathBuf,
+        /// Data root to restore into (default `FLEETT_ROOT`).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Accept a non-empty root and overwrite its files.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -121,6 +162,20 @@ async fn main() -> anyhow::Result<()> {
                 SecretsCommands::Init => secrets::run_init(&cfg),
                 SecretsCommands::Status => secrets::run_status(&cfg),
                 SecretsCommands::Migrate { apply } => secrets::run_migrate(&cfg, apply),
+            }
+        }
+        Commands::Backup { dest, keep } => {
+            // Backups never serve HTTP: no bearer token is needed.
+            let cfg = Config::from_env_for_maintenance()?;
+            backup::run_backup(&cfg, dest, keep)
+        }
+        Commands::Backups { action } => {
+            let cfg = Config::from_env_for_maintenance()?;
+            match action {
+                BackupCommands::List { dest } => backup::run_list(&cfg, dest),
+                BackupCommands::Restore { file, root, force } => {
+                    backup::run_restore(&cfg, file, root, force)
+                }
             }
         }
     }

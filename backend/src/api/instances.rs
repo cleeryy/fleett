@@ -7,6 +7,7 @@ use crate::auth::AuthContext;
 use crate::config::EgressMode;
 use crate::driver::LogsOptions;
 use crate::egress;
+use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
 use crate::models::{
     now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
@@ -18,12 +19,15 @@ use crate::models::{
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
-use axum::extract::{Extension, Path, Query, State};
+use axum::body::Body;
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use tokio::io::AsyncWriteExt;
 
 /// Lines returned when `?tail=` is omitted.
 pub const DEFAULT_LOGS_TAIL: u32 = 200;
@@ -405,6 +409,295 @@ pub async fn clone(
             &state, &stored, status, health, container, warnings,
         )),
     ))
+}
+
+/// `GET /api/instances/{id}/export`: portable `.tgz` of one instance.
+///
+/// The archive carries the manifest, the compose file and the full Hermes
+/// home. Shares and secrets are excluded: a share is fleet-wide, and a token
+/// must never leave the host in a file an operator copies around.
+pub async fn export(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let spec = load(&state, &id)?;
+    // The stored id, never the raw path segment, names the download.
+    let filename = spec.id.clone();
+    let cfg = state.cfg.clone();
+    let bytes = tokio::task::spawn_blocking(move || crate::instance_archive::export(&cfg, &spec))
+        .await
+        .map_err(|err| ApiError::internal(format!("the export task failed: {err}")))?
+        .map_err(|err| match err {
+            ArchiveError::Io(err) => ApiError::internal(format!("cannot build the archive: {err}")),
+            other => ApiError::internal(other.to_string()),
+        })?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}.tgz\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Query of `POST /api/instances/import`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImportQuery {
+    /// Id of the new instance (required, validated by the handler for a 400).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Start the instance once it is restored (default `false`).
+    #[serde(default)]
+    pub start: Option<bool>,
+}
+
+/// `POST /api/instances/import?id=<new_id>&start=false`.
+///
+/// The body is the raw gzip archive returned by [`export`]. Nothing is started
+/// unless `start=true`, and the imported instance has no secret at all: the
+/// response carries the warnings that tell the operator which tokens to PATCH.
+pub async fn import(
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    Query(query): Query<ImportQuery>,
+    request: Request,
+) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    let id = query.id.as_deref().unwrap_or_default().trim().to_string();
+    validate_instance_id(&id).map_err(|message| ApiError::bad_request("invalid_id", message))?;
+    let start = query.start.unwrap_or(false);
+
+    let lock = state.locks.for_id(&id);
+    let _guard = lock.lock().await;
+
+    if state.db.exists(&id).map_err(ApiError::from)? || state.cfg.instance_dir(&id).exists() {
+        return Err(ApiError::conflict(
+            "instance_exists",
+            format!("instance \"{id}\" already exists"),
+        ));
+    }
+
+    // The upload is streamed to disk: a Hermes home can be far larger than the
+    // JSON body limit, and the compressed size cap is enforced frame by frame.
+    let tmp_dir = state.cfg.root.join("tmp");
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|err| ApiError::internal(format!("cannot prepare the upload: {err}")))?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let archive_path = tmp_dir.join(format!("import-{token}.tgz"));
+    let staging = tmp_dir.join(format!("import-{token}"));
+
+    if let Err(err) = write_body_to_file(request.into_body(), &archive_path).await {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        return Err(err);
+    }
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|err| ApiError::internal(format!("cannot prepare the import: {err}")))?;
+
+    let outcome = import_archive(&state, &id, start, &archive_path, &staging).await;
+
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    let _ = tokio::fs::remove_file(&archive_path).await;
+
+    let (status, detail) = outcome?;
+    audit::record(
+        &state,
+        &context,
+        "instance.import",
+        &id,
+        Some(serde_json::json!({
+            "name": detail.name,
+            "template": detail.template,
+            "started": start,
+        })),
+    );
+    Ok((status, Json(detail)))
+}
+
+/// Stream one request body to `path`, enforcing the compressed size cap.
+async fn write_body_to_file(body: Body, path: &std::path::Path) -> Result<u64, ApiError> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|err| ApiError::internal(format!("cannot stage the upload: {err}")))?;
+    let mut body = body;
+    let mut written = 0u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| {
+            ApiError::bad_request(
+                "invalid_archive",
+                format!("cannot read the request body: {err}"),
+            )
+        })?;
+        let Some(chunk) = frame.data_ref() else {
+            continue;
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > MAX_ARCHIVE_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "archive_too_large",
+                format!(
+                    "the archive must be at most {} MiB compressed",
+                    MAX_ARCHIVE_BYTES / (1024 * 1024)
+                ),
+            ));
+        }
+        file.write_all(chunk)
+            .await
+            .map_err(|err| ApiError::internal(format!("cannot stage the upload: {err}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|err| ApiError::internal(format!("cannot stage the upload: {err}")))?;
+    if written == 0 {
+        return Err(ApiError::bad_request(
+            "empty_archive",
+            "the request body is empty; send the .tgz produced by GET /api/instances/{id}/export",
+        ));
+    }
+    Ok(written)
+}
+
+/// Extract, validate, write and (optionally) start one imported instance.
+///
+/// Every failure after the first write rolls the import back completely: a
+/// refused import never leaves an instance directory or a database row behind.
+async fn import_archive(
+    state: &AppState,
+    id: &str,
+    start: bool,
+    archive_path: &std::path::Path,
+    staging: &std::path::Path,
+) -> Result<(StatusCode, InstanceDetail), ApiError> {
+    let source = archive_path.to_path_buf();
+    let data_target = staging.join("data");
+    let extraction = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&data_target)?;
+        let file = std::fs::File::open(&source)?;
+        crate::instance_archive::extract(std::io::BufReader::new(file), &data_target)
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("the import task failed: {err}")))?
+    .map_err(import_error)?;
+
+    let mut spec = crate::instance_archive::spec_from_manifest(&extraction.manifest.instance, id)
+        .map_err(import_error)?;
+    spec.template = crate::instance_archive::settle_template(&state.cfg, &spec.template);
+    let secret_keys = extraction
+        .compose_yaml
+        .as_deref()
+        .map(crate::instance_archive::compose_secret_keys)
+        .unwrap_or_default();
+
+    let mut warnings = extraction.warnings;
+    let mut missing_shares = Vec::new();
+    spec.shares
+        .retain(|share| match state.db.share_exists(&share.name) {
+            Ok(true) => true,
+            _ => {
+                missing_shares.push(share.name.clone());
+                false
+            }
+        });
+    if !missing_shares.is_empty() {
+        warnings.push(format!(
+            "share(s) {} are not present on this host; create them and attach them again",
+            missing_shares.join(", ")
+        ));
+    }
+    let mut expected = vec![spec.api_key_env.clone()];
+    if let Some(env) = spec.channel.token_env() {
+        expected.push(env.to_string());
+    }
+    expected.sort();
+    expected.dedup();
+    warnings.push(format!(
+        "the archive carries no secrets: PATCH the instance to set {}",
+        expected.join(", ")
+    ));
+
+    enforce_caps(state, None, &spec)?;
+    check_egress_policy(state, &spec).await?;
+    ensure_lan_network(state, &spec).await?;
+
+    let compose =
+        render::render_compose(&state.cfg, &spec, &secret_keys).map_err(ApiError::from)?;
+
+    // From here on the instance exists on disk: any failure rolls it back.
+    let instance_dir = match store::create_instance_dir(&state.cfg, id) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ApiError::conflict(
+                "instance_exists",
+                format!("instance \"{id}\" already exists"),
+            ))
+        }
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "cannot create the instance directory: {err}"
+            )))
+        }
+    };
+    if let Err(err) = std::fs::rename(staging.join("data"), state.cfg.data_dir(id)) {
+        let _ = std::fs::remove_dir_all(&instance_dir);
+        return Err(ApiError::internal(format!(
+            "cannot move the imported data into place: {err}"
+        )));
+    }
+    if let Err(err) = store::finalize_imported_data(&state.cfg, id) {
+        let _ = std::fs::remove_dir_all(&instance_dir);
+        return Err(ApiError::internal(format!(
+            "cannot finalise the imported data: {err}"
+        )));
+    }
+    if let Err(err) = state.db.insert_instance(&spec) {
+        let _ = std::fs::remove_dir_all(&instance_dir);
+        return Err(ApiError::from(err));
+    }
+    if let Err(err) = store::write_compose(&state.cfg, id, &compose) {
+        let _ = state.db.delete_instance(id);
+        let _ = std::fs::remove_dir_all(&instance_dir);
+        return Err(ApiError::internal(format!(
+            "cannot write the compose file: {err}"
+        )));
+    }
+
+    if start {
+        up_and_record(state, &mut spec).await?;
+    }
+
+    let (status, health, container) = if start {
+        match state.driver.ps(&spec).await {
+            Ok(result) => (result.status, result.health, result.container),
+            Err(_) => (Status::Running, Health::Unknown, None),
+        }
+    } else {
+        (Status::Created, Health::Unknown, None)
+    };
+    let mut stored = load(state, id)?;
+    record_health(state, &mut stored, health);
+    warnings.extend(egress::warnings(&state.cfg, stored.allow_lan));
+    Ok((
+        StatusCode::CREATED,
+        to_detail(state, &stored, status, health, container, warnings),
+    ))
+}
+
+fn import_error(err: ArchiveError) -> ApiError {
+    match err {
+        ArchiveError::MissingManifest => ApiError::bad_request("invalid_archive", err.to_string()),
+        ArchiveError::Invalid(detail) => ApiError::bad_request("invalid_archive", detail),
+        ArchiveError::Unsupported { .. } => {
+            ApiError::bad_request("unsupported_archive", err.to_string())
+        }
+        ArchiveError::Manifest(detail) => ApiError::bad_request("invalid_manifest", detail),
+        other => ApiError::internal(other.to_string()),
+    }
 }
 
 pub async fn patch(

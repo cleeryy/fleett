@@ -1,11 +1,14 @@
 //! fleett — control plane for fleet-managed Hermes agents.
 
 pub mod api;
+pub mod archive;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod driver;
 pub mod egress;
+pub mod instance_archive;
 pub mod logs;
 pub mod migrate;
 pub mod models;

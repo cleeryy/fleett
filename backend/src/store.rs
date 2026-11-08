@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// UID/GID used by every agent container.
 pub const CONTAINER_UID: u32 = 10_000;
@@ -241,6 +241,64 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// Create `instances/<id>` (mode 0700) for an import.
+///
+/// Returns an error when the directory already exists: an import never adopts
+/// the files of another instance.
+pub fn create_instance_dir(cfg: &Config, id: &str) -> io::Result<PathBuf> {
+    let dir = cfg.instance_dir(id);
+    if dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", dir.display()),
+        ));
+    }
+    create_dir_private(&dir)?;
+    Ok(dir)
+}
+
+/// Normalise an imported `data/` tree: tight directory modes, container
+/// ownership, and the health probe when the archive did not carry one.
+pub fn finalize_imported_data(cfg: &Config, id: &str) -> io::Result<()> {
+    let data = cfg.data_dir(id);
+    create_dir_private(&data)?;
+    let healthcheck = data.join("healthcheck.py");
+    if !healthcheck.is_file() {
+        write_file(&healthcheck, render::HEALTHCHECK_SCRIPT, 0o644)?;
+    }
+    chown_tree(&data, CONTAINER_UID, CONTAINER_GID);
+    Ok(())
+}
+
+/// Best-effort ownership repair after `fleett backups restore`.
+///
+/// The archive format carries no ownership (and must not: it would let a
+/// crafted archive take files over). Every agent directory gets the container
+/// UID/GID back, so the restored agents can write their own memory files.
+pub fn adopt_restored_root(root: &Path) {
+    if let Ok(entries) = fs::read_dir(root.join("instances")) {
+        for entry in entries.flatten() {
+            let data = entry.path().join("data");
+            if data.is_dir() {
+                let _ = fs::set_permissions(&data, fs::Permissions::from_mode(0o700));
+                chown_quiet(&data, CONTAINER_UID, CONTAINER_GID);
+                chown_tree(&data, CONTAINER_UID, CONTAINER_GID);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(root.join("shares")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
+            chown_quiet(&path, CONTAINER_UID, CONTAINER_GID);
+            chown_tree(&path, CONTAINER_UID, CONTAINER_GID);
+        }
     }
 }
 

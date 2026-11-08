@@ -133,6 +133,7 @@ come from the clone's own rendering. `shares_inherit` (default `true`) copies on
 that still exist.
 
 `GET /api/instances/{id}/logs` → `text/plain` (default) or `application/json`.
+
 Query: `tail` (`1..=2000`, default `200`), `since` (Docker duration `30s|10m|2h|1h30m` or an
 RFC 3339 timestamp), `grep` (regex), `level=error|warn` (`warn` keeps warnings and above),
 `format=text|json`. The response is capped at 1 MiB; `grep`/`level` filtering runs in the app.
@@ -143,6 +144,25 @@ with a timestamp, and `[{"line":"…"}]` otherwise. Invalid values answer `400` 
 `GET /api/instances/{id}/errors?since=24h` → `{"count":2,"last":"…","last_at":"…"}`: counts
 the error/warn lines of a bounded window (at most 2000 lines) without returning the log.
 `last_at` is the parsed timestamp of the last matching line (`null` when it has none).
+
+`GET /api/instances/{id}/export` → `application/gzip`, `Content-Disposition: attachment;
+filename="<id>.tgz"`. A gzipped tar with `manifest.json` (format/version, `created_at` and the
+instance metadata: id, name, template, model, base_url, api_key_env, channel, mem_limit_mb,
+cpu_limit, allow_lan, shares, notes), `compose.yaml` and `data/` (the full Hermes home).
+Share contents and secrets are never included: no `secrets.env`, no `*.key`, no token value.
+
+`POST /api/instances/import?id=<new_id>&start=false` → `201 InstanceDetail`. The raw gzip
+archive is the request body (`Content-Type: application/gzip`); the id is required and must be
+free (`409 instance_exists`, nothing overwritten). Compression size cap: 2 GiB (`413
+archive_too_large`). Every archive entry is checked first: an absolute path or a `..` component
+answers `400 invalid_archive` before anything is written; an absent or incompatible manifest
+answers `400 invalid_archive` / `400 unsupported_archive` / `400 invalid_manifest`. The import
+rewrites the Compose project and container to `fleett-<new_id>`, strips `env_file` and
+re-renders the compose file with this build while keeping the `${KEY}` interpolation names.
+Secrets are not restored: `warnings` lists the variables to PATCH
+(`HERMES_GATE_PROFILE_TOKEN`, the platform bot token), and shares named by the manifest are
+attached only when they already exist on this host. Nothing is started unless `start=true`.
+See `docs/BACKUP.md`.
 
 ## Shares
 

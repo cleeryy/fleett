@@ -124,12 +124,14 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
         .route("/instances", get(instances::list).post(instances::create))
+        .route("/instances/import", post(instances::import))
         .route(
             "/instances/{id}",
             get(instances::get)
                 .patch(instances::patch)
                 .delete(instances::delete),
         )
+        .route("/instances/{id}/export", get(instances::export))
         .route("/instances/{id}/start", post(instances::start))
         .route("/instances/{id}/stop", post(instances::stop))
         .route("/instances/{id}/restart", post(instances::restart))
