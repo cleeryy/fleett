@@ -1,0 +1,31 @@
+# Build output
+backend/target
+target
+web/node_modules
+node_modules
+**/dist
+dist
+
+# Repository metadata and CI
+.git
+.gitignore
+.github
+
+# Runtime state: never bake a data root, instances, shares or backups into the
+# image context (they can be large and, for shares/instances, may hold secrets).
+data
+instances
+shares
+backups
+*.db
+*.db-journal
+
+# Local environment files
+.env
+.env.*
+!web/.env.example
+
+# Documentation and templates are not needed to build the image
+docs
+templates-reference
+*.md

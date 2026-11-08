@@ -1,0 +1,19 @@
+#!/bin/sh
+# fleett — postrm.
+#
+# Data is never deleted by the package: /var/lib/fleett (instances, shares,
+# backups, SQLite index) and /etc/fleett/secrets.key survive remove and purge.
+# Only the conffile /etc/fleett/fleett.env is removed by dpkg on purge, as for
+# every conffile.
+set -e
+
+case "${1:-}" in
+  remove|purge)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+    echo "fleett: kept /var/lib/fleett and /etc/fleett/secrets.key (remove them by hand to erase data)" >&2
+    ;;
+esac
+
+exit 0

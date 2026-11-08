@@ -1,0 +1,85 @@
+#!/bin/sh
+# fleett — postinst: user, data root, secrets key, systemd reload.
+#
+# Deliberately does NOT enable or start the unit: FLEETT_TOKEN in
+# /etc/fleett/fleett.env must be filled in first (the service exits with
+# "FLEETT_TOKEN is required" while it is empty).
+set -e
+
+USER_NAME=fleett
+GROUP_NAME=fleett
+ID=10000
+DATA_ROOT=/var/lib/fleett
+CONF_DIR=/etc/fleett
+ENV_FILE=$CONF_DIR/fleett.env
+KEY_FILE=$CONF_DIR/secrets.key
+
+case "${1:-configure}" in
+  configure|abort-upgrade|abort-remove|abort-deconfigure) ;;
+  *) exit 0 ;;
+esac
+
+# --- service account --------------------------------------------------------
+if ! getent group "$GROUP_NAME" >/dev/null; then
+  groupadd --system --gid "$ID" "$GROUP_NAME"
+fi
+
+if ! getent passwd "$USER_NAME" >/dev/null; then
+  # UID 10000 is above SYS_UID_MAX; useradd warns and proceeds, which is what
+  # we want (the agent containers use the same UID/GID).
+  useradd --system --uid "$ID" --gid "$ID" --home-dir "$DATA_ROOT" \
+    --no-create-home --shell /usr/sbin/nologin "$USER_NAME"
+else
+  if [ "$(id -u "$USER_NAME")" != "$ID" ]; then
+    echo "fleett: warning: user $USER_NAME already exists with UID $(id -u "$USER_NAME"), expected $ID" >&2
+  fi
+fi
+
+# Docker socket access. The group comes from the docker package; when the
+# daemon is installed after us, `usermod -aG docker` has to be re-run by hand.
+if getent group docker >/dev/null; then
+  usermod -aG docker "$USER_NAME"
+else
+  echo "fleett: warning: group docker is missing; install Docker, then run: usermod -aG docker $USER_NAME" >&2
+fi
+
+# --- directories ------------------------------------------------------------
+install -d -m 0700 -o "$USER_NAME" -g "$GROUP_NAME" "$DATA_ROOT"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$CONF_DIR"
+
+if [ -f "$ENV_FILE" ]; then
+  chown root:"$GROUP_NAME" "$ENV_FILE"
+  chmod 0640 "$ENV_FILE"
+fi
+
+# --- secrets key ------------------------------------------------------------
+# `fleett` expects base64 of 32 bytes (what `fleett secrets init` writes), not
+# raw bytes: 32 random bytes encoded in base64.
+if [ ! -e "$KEY_FILE" ]; then
+  umask 0077
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32 > "$KEY_FILE"
+  else
+    head -c 32 /dev/urandom | base64 > "$KEY_FILE"
+  fi
+  chown root:"$GROUP_NAME" "$KEY_FILE"
+  chmod 0640 "$KEY_FILE"
+  echo "fleett: created $KEY_FILE (0640 root:$GROUP_NAME); back it up separately:" >&2
+  echo "fleett: without it the encrypted instance secrets cannot be decrypted." >&2
+fi
+
+# --- systemd ----------------------------------------------------------------
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+fi
+
+if grep -Eq '^[[:space:]]*FLEETT_TOKEN=[[:space:]]*$' "$ENV_FILE" 2>/dev/null; then
+  cat >&2 <<EOF
+fleett: the service is installed but NOT started.
+fleett: 1. set FLEETT_TOKEN in $ENV_FILE (openssl rand -hex 32)
+fleett: 2. systemctl enable --now fleett
+fleett: 3. curl -fsS http://127.0.0.1:8090/api/health
+EOF
+fi
+
+exit 0

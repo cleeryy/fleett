@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: fleett
+Upstream-Contact: cleeryy <clery.arqueferradou@gmail.com>
+Source: https://github.com/cleeryy/fleett
+
+Files: *
+Copyright: 2026 cleeryy <clery.arqueferradou@gmail.com>
+License: no-upstream-license
+ The upstream repository does not ship a license file. All rights are
+ reserved by the copyright holder; redistribute or reuse only with the
+ author's permission.

@@ -1,0 +1,19 @@
+#!/bin/sh
+# fleett — prerm.
+#
+# Stop and disable the unit only on a real removal. On upgrade the running
+# control plane is left alone: `dpkg -i` replaces the binary, the unit keeps
+# running (agents are supervised by Docker and are not affected either way).
+set -e
+
+case "${1:-}" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl stop fleett.service 2>/dev/null || true
+      systemctl disable fleett.service 2>/dev/null || true
+    fi
+    ;;
+  upgrade|failed-upgrade) ;;
+esac
+
+exit 0

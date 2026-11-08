@@ -1,0 +1,24 @@
+[Unit]
+Description=fleett control plane
+Documentation=https://github.com/cleeryy/fleett
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=fleett
+Group=fleett
+# Needed to reach /var/run/docker.sock (and to run `docker compose`).
+SupplementaryGroups=docker
+EnvironmentFile=/etc/fleett/fleett.env
+ExecStart=/usr/bin/fleett serve
+Restart=on-failure
+RestartSec=2
+# Instances data is 0700; keep every file the control plane creates private.
+UMask=0077
+NoNewPrivileges=true
+# Deliberately no ProtectSystem/ProtectHome/PrivateDevices: the control plane
+# must talk to the Docker socket and write under /var/lib/fleett.
+
+[Install]
+WantedBy=multi-user.target
