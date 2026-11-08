@@ -1,0 +1,10 @@
+backend/target/
+web/node_modules/
+web/dist/
+templates-reference/
+*.db
+*.db-journal
+.env
+instances/
+shares/
+data/
