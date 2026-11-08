@@ -2,10 +2,11 @@
 
 use clap::{Parser, Subcommand};
 use fleett::api::{self, AppState};
-use fleett::config::{Config, DriverKind, VERSION};
+use fleett::config::{Config, DriverKind, EgressMode, VERSION};
 use fleett::driver::compose::ComposeDriver;
 use fleett::driver::mock::MockDriver;
 use fleett::driver::Driver;
+use fleett::egress;
 use fleett::migrate;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +35,37 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
+    /// Manage the host firewall that keeps agent egress off the LAN.
+    ///
+    /// Runs on the Docker host, as root or with CAP_NET_ADMIN; no bearer token
+    /// is needed. See docs/EGRESS.md.
+    Egress {
+        #[command(subcommand)]
+        action: EgressCommands,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
+enum EgressCommands {
+    /// Install the DOCKER-USER rules for the current fleett subnet (idempotent).
+    Install,
+    /// Delete the rules tagged `fleett-egress`, then the marker.
+    Remove,
+    /// Report whether every rule is installed (exit 0 when it is).
+    Status,
+    /// Print the exact iptables commands without running them.
+    Print,
+}
+
+impl From<EgressCommands> for egress::Action {
+    fn from(command: EgressCommands) -> Self {
+        match command {
+            EgressCommands::Install => Self::Install,
+            EgressCommands::Remove => Self::Remove,
+            EgressCommands::Status => Self::Status,
+            EgressCommands::Print => Self::Print,
+        }
+    }
 }
 
 #[tokio::main]
@@ -52,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
             // Migration never serves HTTP: no bearer token is needed.
             let cfg = Config::from_env_for_maintenance()?;
             migrate::run(&cfg, &from, apply).await
+        }
+        Commands::Egress { action } => {
+            // Firewall commands never serve HTTP: no bearer token is needed.
+            let cfg = Config::from_env_for_maintenance()?;
+            let code = egress::run(action.into(), &cfg)?;
+            std::process::exit(code);
         }
     }
 }
@@ -89,7 +127,7 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         }
         DriverKind::Compose => {
             let compose = ComposeDriver::new(&cfg);
-            match compose.ensure_network().await {
+            match compose.ensure_network_named(&cfg.network).await {
                 Ok(true) => tracing::info!(network = %cfg.network, "created the docker network"),
                 Ok(false) => {}
                 Err(err) => {
@@ -99,6 +137,8 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
             Arc::new(compose)
         }
     };
+
+    warn_about_egress(&cfg, driver.clone()).await;
 
     let state = AppState::bootstrap(cfg.clone(), driver)?;
     let app = api::router(state);
@@ -120,6 +160,32 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())
+}
+
+/// Warn once when the host egress firewall is not in force.
+///
+/// `FLEETT_EGRESS=restrict` (the default) is only meaningful when the operator
+/// ran `fleett egress install`; `off` is always reported.
+async fn warn_about_egress(cfg: &Config, driver: Arc<dyn Driver>) {
+    match cfg.egress {
+        EgressMode::Off => {
+            tracing::warn!(
+                "FLEETT_EGRESS=off: agents are not isolated from the LAN; set \
+                 FLEETT_EGRESS=restrict and run `sudo fleett egress install`"
+            );
+        }
+        EgressMode::Restrict => {
+            let marker = egress::read_marker(&cfg.egress_marker);
+            let subnet = driver.network_subnet(&cfg.network).await.ok().flatten();
+            if let Err(detail) = egress::check_marker(&marker, subnet.as_deref()) {
+                tracing::warn!(
+                    marker = %cfg.egress_marker.display(),
+                    %detail,
+                    "creating a restricted instance will be refused until the firewall is installed"
+                );
+            }
+        }
+    }
 }
 
 /// One warning (not one per instance) when legacy projects are still around.

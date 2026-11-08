@@ -28,7 +28,7 @@ Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "channel":"telegram","status":"running","health":"healthy","cpu_limit":1.0,
- "shares":["findings"],"last_error":null,
+ "allow_lan":false,"shares":["findings"],"last_error":null,
  "created_at":"2026-11-08T01:00:00Z"}
 ```
 
@@ -51,7 +51,8 @@ The token is **never** returned by the API.
  "base_url":"https://opencode.ai/inference/go/openai/v1",
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"notes":"","created_at":"...","updated_at":"...",
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,
+ "warnings":[],"notes":"","created_at":"...","updated_at":"...",
  "last_error":null,"data_dir":"/opt/fleett/instances/alice/data",
  "env_keys":["HERMES_GATE_PROFILE_TOKEN","TELEGRAM_BOT_TOKEN"],
  "container":{"id":"3f2a…","image":"hermes-agent:0.22.2-local","uptime_s":3600},
@@ -60,13 +61,27 @@ The token is **never** returned by the API.
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
-`mem_limit_mb`, `cpu_limit`, `notes`. Rewrites the compose file and runs `up -d`.
+`mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`. Rewrites the compose file and runs `up -d`.
 
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
-`memswap_limit == mem_limit`. `allow_lan` is `false` by default: the instance only joins the
-restricted `fleett` network. Setting it to `true` also attaches `fleett-lan`, which bypasses
-the host egress firewall and gives the agent LAN access. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
+`memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
 `FLEETT_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
+
+### LAN access and egress enforcement
+
+`allow_lan` is `false` by default: the instance only joins the restricted `fleett` network.
+Setting it to `true` also attaches `fleett-lan` (created on demand), which bypasses the host
+egress firewall and gives the agent LAN access; the detail then carries a warning in
+`warnings`. `docs/EGRESS.md` documents the firewall itself.
+
+With `FLEETT_EGRESS=restrict` (the default), creating or patching an instance that stays on
+the restricted network requires the marker written by `sudo fleett egress install`, whose
+subnet must match the current `fleett` network. Otherwise the request fails with
+`409 egress_not_enforced` (`error.details {egress, marker}`; the message points at the
+command to run). `FLEETT_EGRESS=off` disables the check and adds a warning to `warnings`.
+Start/stop/restart/delete are never blocked by this policy.
+
+`warnings` is a list of operator-facing strings (empty when there is nothing to report).
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.

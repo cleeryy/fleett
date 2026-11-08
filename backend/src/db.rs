@@ -52,6 +52,8 @@ CREATE INDEX IF NOT EXISTS idx_share_links_instance ON share_links (instance_id)
 "#,
     // v2 — per-instance CPU quota (databases from v0/v1 get it through ALTER).
     "ALTER TABLE instances ADD COLUMN cpu_limit REAL NOT NULL DEFAULT 1.0;",
+    // v3 — explicit LAN access flag (restricted `fleett` network by default).
+    "ALTER TABLE instances ADD COLUMN allow_lan INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -119,7 +121,7 @@ impl Db {
         let stored = conn
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-                 last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at \
+                 last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -136,7 +138,7 @@ impl Db {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-             last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at \
+             last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -181,8 +183,9 @@ impl Db {
         }
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, channel, \
-             status, last_error, mem_limit_mb, cpu_limit, notes, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             status, last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, \
+             updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 spec.id,
                 spec.name,
@@ -195,6 +198,7 @@ impl Db {
                 spec.last_error,
                 spec.mem_limit_mb,
                 spec.cpu_limit,
+                spec.allow_lan,
                 spec.notes,
                 spec.created_at,
                 spec.updated_at,
@@ -213,7 +217,7 @@ impl Db {
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, channel = ?7, status = ?8, last_error = ?9, mem_limit_mb = ?10, \
-             cpu_limit = ?11, notes = ?12, updated_at = ?13 WHERE id = ?1",
+             cpu_limit = ?11, allow_lan = ?12, notes = ?13, updated_at = ?14 WHERE id = ?1",
             params![
                 spec.id,
                 spec.name,
@@ -226,6 +230,7 @@ impl Db {
                 spec.last_error,
                 spec.mem_limit_mb,
                 spec.cpu_limit,
+                spec.allow_lan,
                 spec.notes,
                 spec.updated_at,
             ],
@@ -446,6 +451,7 @@ struct StoredRow {
     last_error: Option<String>,
     mem_limit_mb: i64,
     cpu_limit: f64,
+    allow_lan: bool,
     notes: String,
     created_at: String,
     updated_at: String,
@@ -468,6 +474,7 @@ impl StoredRow {
             } else {
                 crate::models::DEFAULT_CPU_LIMIT
             },
+            allow_lan: self.allow_lan,
             notes: self.notes,
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
             last_error: self.last_error,
@@ -490,6 +497,7 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         last_error: row.get("last_error")?,
         mem_limit_mb: row.get("mem_limit_mb")?,
         cpu_limit: row.get("cpu_limit")?,
+        allow_lan: row.get("allow_lan")?,
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -587,6 +595,7 @@ mod tests {
             }],
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
+            allow_lan: false,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -676,6 +685,7 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect columns");
         assert!(columns.iter().any(|column| column == "cpu_limit"));
+        assert!(columns.iter().any(|column| column == "allow_lan"));
     }
 
     #[test]
@@ -708,6 +718,7 @@ mod tests {
         assert_eq!(alice.name, "Alice");
         assert_eq!(alice.mem_limit_mb, 1024);
         assert_eq!(alice.cpu_limit, crate::models::DEFAULT_CPU_LIMIT);
+        assert!(!alice.allow_lan);
         assert!(table_exists(&db.lock(), "share_links"));
 
         // Re-opening an up-to-date database applies nothing.

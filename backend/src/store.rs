@@ -285,6 +285,17 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         .map(render::channel_from_config)
         .unwrap_or(ChannelKind::None);
 
+    let allow_lan = agent
+        .and_then(|service| service.get("networks"))
+        .and_then(Value::as_sequence)
+        .map(|networks| {
+            networks
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|network| network == "lan")
+        })
+        .unwrap_or(false);
+
     InstanceSpec {
         id: id.to_string(),
         name: id.to_string(),
@@ -296,6 +307,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         shares,
         mem_limit_mb,
         cpu_limit,
+        allow_lan,
         notes: String::new(),
         status: Status::Unknown,
         last_error: None,
@@ -368,6 +380,30 @@ mod tests {
         assert_eq!(ro.mode, ShareMode::Ro);
         assert!(parse_share_volume("/var/run/docker.sock:/var/run/docker.sock").is_none());
         assert!(parse_share_volume("../../shares/../x:/opt/data").is_none());
+    }
+
+    #[test]
+    fn lan_access_is_read_back_from_the_compose_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices:\n  agent:\n    networks:\n      - fleet\n      - lan\n",
+        )
+        .expect("compose file");
+
+        let specs = scan_instances(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].allow_lan, "the lan network must be read back");
+
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices:\n  agent:\n    networks:\n      - fleet\n",
+        )
+        .expect("compose file");
+        assert!(!scan_instances(&cfg)[0].allow_lan);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use fleett::api::{self, AppState};
-use fleett::config::Config;
+use fleett::config::{Config, EgressMode};
 use fleett::driver::mock::MockDriver;
 use fleett::models::Health;
 use http_body_util::BodyExt;
@@ -76,6 +76,24 @@ impl Harness {
         token: Option<&str>,
     ) -> (StatusCode, HeaderMap, String) {
         send_to(api::router(self.state.clone()), method, uri, body, token).await
+    }
+
+    /// Write the marker `fleett egress install` would leave behind.
+    fn write_egress_marker(&self, subnet: &str) {
+        let path = &self.state.cfg.egress_marker;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("marker dir");
+        }
+        std::fs::write(
+            path,
+            json!({
+                "subnet": subnet,
+                "installed_at": "2026-11-08T00:00:00Z",
+                "version": "0.2.0",
+            })
+            .to_string(),
+        )
+        .expect("marker file");
     }
 }
 
@@ -260,6 +278,7 @@ async fn creates_instance_and_writes_files() {
     assert_eq!(detail["channel"], "telegram");
     assert_eq!(detail["model"], MODEL);
     assert_eq!(detail["mem_limit_mb"], 1024);
+    assert_eq!(detail["allow_lan"], false);
     // Secrets never come back through the API.
     assert!(!response.contains("123:ABC"));
     assert!(!response.contains("gate-secret"));
@@ -946,6 +965,237 @@ async fn compose_file_is_restrictive() {
 
     assert_eq!(compose["networks"]["fleet"]["external"], true);
     assert_eq!(compose["networks"]["fleet"]["name"], "fleett");
+}
+
+// ---------------------------------------------------------------------------
+// Egress / LAN access
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn allow_lan_defaults_to_false_on_the_restricted_network() {
+    let harness = Harness::new();
+    let detail = create_instance(&harness, "alice").await;
+    assert_eq!(detail["allow_lan"], false);
+
+    let (_, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(parse(&body)[0]["allow_lan"], false);
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(compose["services"]["agent"]["networks"], json!(["fleet"]));
+    assert!(compose["networks"].get("lan").is_none());
+}
+
+#[tokio::test]
+async fn allow_lan_attaches_the_lan_network_and_warns() {
+    let harness = Harness::new();
+    let mut body = instance_body("alice");
+    body["allow_lan"] = json!(true);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+
+    let detail = parse(&response);
+    assert_eq!(detail["allow_lan"], true);
+    let warnings = detail["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|warning| warning.contains("fleett-lan")),
+        "{warnings:?}"
+    );
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(
+        compose["services"]["agent"]["networks"],
+        json!(["fleet", "lan"])
+    );
+    assert_eq!(compose["networks"]["lan"]["external"], true);
+    assert_eq!(compose["networks"]["lan"]["name"], "fleett-lan");
+
+    let (_, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(parse(&body)[0]["allow_lan"], true);
+
+    // Turning it back off detaches the network.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allow_lan"], false);
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(compose["services"]["agent"]["networks"], json!(["fleet"]));
+    assert!(compose["networks"].get("lan").is_none());
+}
+
+#[tokio::test]
+async fn restrict_mode_refuses_a_restricted_instance_without_a_marker() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+
+    let (status, body) = harness
+        .request(Method::POST, "/api/instances", Some(instance_body("alice")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "egress_not_enforced");
+    let message = error["message"].as_str().expect("message");
+    assert!(message.contains("fleett egress install"), "{message}");
+    assert_eq!(error["details"]["egress"], "restrict");
+    assert!(error["details"]["marker"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("egress.json")));
+    // Nothing was written for a refused create.
+    assert!(!harness.instance_dir("alice").exists());
+}
+
+#[tokio::test]
+async fn restrict_mode_accepts_a_matching_marker() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.mock.force_network_subnet(Some("172.18.0.0/16"));
+    harness.write_egress_marker("172.18.0.0/16");
+
+    let detail = create_instance(&harness, "alice").await;
+    assert_eq!(detail["allow_lan"], false);
+    let warnings = detail["warnings"].as_array().expect("warnings");
+    assert!(
+        !warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|warning| warning.contains("not installed")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        read_yaml(&harness.instance_dir("alice").join("compose.yaml"))["services"]["agent"]
+            ["networks"],
+        json!(["fleet"])
+    );
+}
+
+#[tokio::test]
+async fn restrict_mode_refuses_a_stale_marker() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    // The network was recreated with another subnet since the install.
+    harness.mock.force_network_subnet(Some("172.19.0.0/16"));
+    harness.write_egress_marker("172.18.0.0/16");
+
+    let (status, body) = harness
+        .request(Method::POST, "/api/instances", Some(instance_body("alice")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "egress_not_enforced");
+    let message = error["message"].as_str().expect("message");
+    assert!(message.contains("172.18.0.0/16"), "{message}");
+    assert!(message.contains("172.19.0.0/16"), "{message}");
+    assert!(!harness.instance_dir("alice").exists());
+}
+
+#[tokio::test]
+async fn restrict_mode_allows_lan_access_with_a_warning() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    let mut body = instance_body("alice");
+    body["allow_lan"] = json!(true);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let detail = parse(&response);
+    let warnings: Vec<&str> = detail["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("fleett-lan")));
+    assert!(!warnings
+        .iter()
+        .any(|warning| warning.contains("not installed")));
+}
+
+#[tokio::test]
+async fn restrict_mode_blocks_patching_back_to_the_restricted_network() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.mock.force_network_subnet(Some("172.18.0.0/16"));
+
+    let mut body = instance_body("alice");
+    body["allow_lan"] = json!(true);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "egress_not_enforced");
+    // The refused patch left the instance on the LAN.
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(parse(&body)["allow_lan"], true);
+
+    harness.write_egress_marker("172.18.0.0/16");
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allow_lan"], false);
+}
+
+#[tokio::test]
+async fn egress_off_allows_creation_with_a_warning() {
+    let harness = Harness::new();
+    assert_eq!(harness.state.cfg.egress, EgressMode::Off);
+    let detail = create_instance(&harness, "alice").await;
+    let warnings: Vec<&str> = detail["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("FLEETT_EGRESS=off")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_is_never_blocked_by_the_egress_policy() {
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.write_egress_marker("172.18.0.0/16");
+    create_instance(&harness, "alice").await;
+
+    // The firewall disappears (marker removed, rules flushed)…
+    std::fs::remove_file(&harness.state.cfg.egress_marker).expect("remove marker");
+
+    // …existing instances still stop and start.
+    for action in ["stop", "start"] {
+        let (status, body) = harness
+            .request(
+                Method::POST,
+                &format!("/api/instances/alice/{action}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{action}: {body}");
+    }
 }
 
 // ---------------------------------------------------------------------------

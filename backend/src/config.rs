@@ -18,6 +18,8 @@ pub const DEFAULT_ROOT: &str = "/opt/fleett";
 pub const DEFAULT_BIND: &str = "127.0.0.1:8090";
 pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
 pub const DEFAULT_NETWORK: &str = "fleett";
+/// Marker written by `fleett egress install` and read by the control plane.
+pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
 
 /// Name of the environment file inside `FLEETT_ROOT`.
 pub const ENV_FILE_NAME: &str = "fleett.env";
@@ -63,6 +65,40 @@ impl fmt::Display for DriverKind {
     }
 }
 
+/// How strictly the control plane enforces the host egress firewall.
+///
+/// `restrict` (default): creating or patching an instance that stays on the
+/// restricted network requires a fresh `fleett egress install` marker.
+/// `off`: no check, with a startup warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressMode {
+    Restrict,
+    Off,
+}
+
+impl EgressMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restrict => "restrict",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "restrict" => Some(Self::Restrict),
+            "off" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for EgressMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Fully resolved configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -77,6 +113,10 @@ pub struct Config {
     /// Optional fleet-wide caps. `0` (the default) disables the cap.
     pub max_total_cpu: f64,
     pub max_total_mem_mb: u64,
+    /// Enforcement of the host egress firewall (`FLEETT_EGRESS`).
+    pub egress: EgressMode,
+    /// Marker written by `fleett egress install` (`FLEETT_EGRESS_MARKER`).
+    pub egress_marker: PathBuf,
     /// Directory containing an on-disk frontend build, when one is present.
     pub web_dist: Option<PathBuf>,
 }
@@ -243,6 +283,18 @@ impl Config {
                 .find(|dir| dir.join("index.html").is_file())
         });
 
+        let egress = match get("EGRESS") {
+            None => EgressMode::Restrict,
+            Some(value) => EgressMode::parse(&value).ok_or_else(|| ConfigError::Invalid {
+                var: "FLEETT_EGRESS",
+                value: value.clone(),
+                detail: "expected \"restrict\" or \"off\"".to_string(),
+            })?,
+        };
+        let egress_marker = get("EGRESS_MARKER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_EGRESS_MARKER));
+
         Ok(Self {
             root,
             bind,
@@ -253,12 +305,19 @@ impl Config {
             network,
             max_total_cpu,
             max_total_mem_mb,
+            egress,
+            egress_marker,
             web_dist,
         })
     }
 
     /// Configuration used by the integration tests: mock driver, temp root.
+    ///
+    /// Egress enforcement is off by default here: tests that exercise the
+    /// policy opt in with `cfg.egress = EgressMode::Restrict`, and the marker
+    /// lives in the temporary root instead of `/etc/fleett`.
     pub fn for_tests(root: PathBuf) -> Self {
+        let egress_marker = root.join("egress.json");
         Self {
             root,
             bind: "127.0.0.1:0"
@@ -271,8 +330,15 @@ impl Config {
             network: DEFAULT_NETWORK.to_string(),
             max_total_cpu: 0.0,
             max_total_mem_mb: 0,
+            egress: EgressMode::Off,
+            egress_marker,
             web_dist: None,
         }
+    }
+
+    /// Name of the unrestricted network attached to `allow_lan` instances.
+    pub fn lan_network(&self) -> String {
+        format!("{}-lan", self.network)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -772,6 +838,49 @@ FLEETT_NETWORK='fleett-net'
                 "unexpected error for {var}={value}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn egress_mode_defaults_to_restrict_and_is_validated() {
+        let cfg = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert_eq!(cfg.egress, EgressMode::Restrict);
+        assert_eq!(cfg.egress_marker, PathBuf::from(DEFAULT_EGRESS_MARKER));
+        assert_eq!(cfg.lan_network(), "fleett-lan");
+
+        for value in ["off", "OFF", "disabled"] {
+            let cfg = Config::from_lookup(|key| match key {
+                "FLEETT_TOKEN" => Some("t".to_string()),
+                "FLEETT_EGRESS" => Some(value.to_string()),
+                _ => None,
+            })
+            .expect("off resolves");
+            assert_eq!(cfg.egress, EgressMode::Off, "{value}");
+        }
+
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_EGRESS" => Some("restrict".to_string()),
+            "FLEETT_EGRESS_MARKER" => Some("/tmp/marker.json".to_string()),
+            _ => None,
+        })
+        .expect("restrict resolves");
+        assert_eq!(cfg.egress, EgressMode::Restrict);
+        assert_eq!(cfg.egress_marker, PathBuf::from("/tmp/marker.json"));
+
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_EGRESS" => Some("sometimes".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid egress mode");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_EGRESS",
+                ..
+            }
+        ));
     }
 
     #[test]

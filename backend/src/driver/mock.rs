@@ -42,6 +42,8 @@ pub struct MockDriver {
     state: Mutex<HashMap<String, MockInstance>>,
     calls: Mutex<Vec<MockCall>>,
     failures: Mutex<HashMap<String, String>>,
+    /// Reported by `network_subnet`; `None` means "unknown".
+    network_subnet: Mutex<Option<String>>,
 }
 
 impl Default for MockDriver {
@@ -61,7 +63,16 @@ impl MockDriver {
             state: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
             failures: Mutex::new(HashMap::new()),
+            network_subnet: Mutex::new(None),
         }
+    }
+
+    /// Pretend the `fleett` network has this IPv4 subnet.
+    ///
+    /// The API compares the egress marker against it; `None` (the default)
+    /// keeps the marker authoritative, like a driver that cannot report one.
+    pub fn force_network_subnet(&self, subnet: Option<&str>) {
+        *lock(&self.network_subnet) = subnet.map(str::to_string);
     }
 
     /// Every call recorded so far, oldest first.
@@ -177,6 +188,17 @@ impl Driver for MockDriver {
 
     fn ping(&self) -> DriverFuture<'_, bool> {
         Box::pin(async move { true })
+    }
+
+    fn ensure_network<'a>(&'a self, _name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>> {
+        Box::pin(async move { Ok(false) })
+    }
+
+    fn network_subnet<'a>(
+        &'a self,
+        _name: &'a str,
+    ) -> DriverFuture<'a, Result<Option<String>, DriverError>> {
+        Box::pin(async move { Ok(lock(&self.network_subnet).clone()) })
     }
 
     fn up<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {

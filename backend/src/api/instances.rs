@@ -2,6 +2,8 @@
 
 use crate::api::error::ApiError;
 use crate::api::{up_and_record, AppState};
+use crate::config::EgressMode;
+use crate::egress;
 use crate::models::{
     now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
     validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
@@ -79,7 +81,10 @@ pub async fn get(
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let mut spec = load(&state, &id)?;
     let (status, health, container) = observe(&state, &mut spec).await;
-    Ok(Json(to_detail(&state, &spec, status, health, container)))
+    let warnings = egress::warnings(&state.cfg, spec.allow_lan);
+    Ok(Json(to_detail(
+        &state, &spec, status, health, container, warnings,
+    )))
 }
 
 pub async fn create(
@@ -102,6 +107,8 @@ pub async fn create(
     }
 
     enforce_caps(&state, None, &spec)?;
+    check_egress_policy(&state, &spec).await?;
+    ensure_lan_network(&state, &spec).await?;
 
     let rendered =
         render::render_instance(&state.cfg, &spec, &prepared.template).map_err(ApiError::from)?;
@@ -127,9 +134,12 @@ pub async fn create(
     };
     let mut stored = load(&state, &spec.id)?;
     record_health(&state, &mut stored, health);
+    let warnings = egress::warnings(&state.cfg, stored.allow_lan);
     Ok((
         StatusCode::CREATED,
-        Json(to_detail(&state, &stored, status, health, container)),
+        Json(to_detail(
+            &state, &stored, status, health, container, warnings,
+        )),
     ))
 }
 
@@ -144,6 +154,8 @@ pub async fn patch(
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
     enforce_caps(&state, Some(&id), &spec)?;
+    check_egress_policy(&state, &spec).await?;
+    ensure_lan_network(&state, &spec).await?;
 
     let rendered = render_for_update(&state, &spec)?;
     let existing = store::read_secrets(&state.cfg, &id);
@@ -167,7 +179,10 @@ pub async fn patch(
         Err(_) => (Status::Running, Health::Unknown, None),
     };
     record_health(&state, &mut spec, health);
-    Ok(Json(to_detail(&state, &spec, status, health, container)))
+    let warnings = egress::warnings(&state.cfg, spec.allow_lan);
+    Ok(Json(to_detail(
+        &state, &spec, status, health, container, warnings,
+    )))
 }
 
 pub async fn start(
@@ -369,7 +384,67 @@ pub(crate) fn record_health(state: &AppState, spec: &mut InstanceSpec, health: H
     }
 }
 
-/// Reject a create/update that would push the fleet over a configured cap.
+/// Enforce the host egress firewall policy on create and patch.
+///
+/// `allow_lan=true` always passes (with a warning in the detail): the operator
+/// opted in explicitly. A restricted instance needs proof that the firewall is
+/// installed for the current `fleett` subnet, i.e. a marker written by
+/// `fleett egress install` whose subnet still matches. Without it (or with
+/// `FLEETT_EGRESS=off`) the promise "no LAN access" cannot be kept, so the
+/// request is refused with `409 egress_not_enforced`.
+///
+/// Lifecycle calls (start/stop/restart) never go through this check.
+async fn check_egress_policy(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+    if spec.allow_lan || state.cfg.egress == EgressMode::Off {
+        return Ok(());
+    }
+
+    let marker_path = &state.cfg.egress_marker;
+    let marker = egress::read_marker(marker_path);
+    let current_subnet = match state.driver.network_subnet(&state.cfg.network).await {
+        Ok(subnet) => subnet,
+        Err(err) => {
+            return Err(egress_conflict(
+                format!(
+                    "the egress firewall cannot be verified: the subnet of the \"{}\" docker \
+                     network is unreadable ({})",
+                    state.cfg.network, err.detail
+                ),
+                marker_path,
+            ));
+        }
+    };
+
+    egress::check_marker(&marker, current_subnet.as_deref())
+        .map_err(|detail| egress_conflict(detail, marker_path))
+}
+
+fn egress_conflict(detail: String, marker_path: &std::path::Path) -> ApiError {
+    ApiError::conflict(
+        "egress_not_enforced",
+        format!("egress is not enforced: {detail}"),
+    )
+    .with_details(serde_json::json!({
+        "egress": EgressMode::Restrict.as_str(),
+        "marker": marker_path.display().to_string(),
+    }))
+}
+
+/// Create the unrestricted LAN network before an `allow_lan` instance joins it.
+async fn ensure_lan_network(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+    if !spec.allow_lan {
+        return Ok(());
+    }
+    let name = state.cfg.lan_network();
+    match state.driver.ensure_network(&name).await {
+        Ok(true) => tracing::info!(network = %name, "created the docker network"),
+        Ok(false) => {}
+        Err(err) => return Err(ApiError::driver(err)),
+    }
+    Ok(())
+}
+
+/// Refuse a create/update that would push the fleet over a configured cap.
 ///
 /// `replacing` is the instance being patched: its stored row is excluded from
 /// the sum so an unchanged or shrinking value never trips the cap.
@@ -450,6 +525,7 @@ fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
         status: spec.status.as_str().to_string(),
         health: health.as_str().to_string(),
         cpu_limit: spec.cpu_limit,
+        allow_lan: spec.allow_lan,
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
@@ -462,6 +538,7 @@ fn to_detail(
     status: Status,
     health: Health,
     container: Option<ContainerInfo>,
+    warnings: Vec<String>,
 ) -> InstanceDetail {
     InstanceDetail {
         id: spec.id.clone(),
@@ -476,6 +553,8 @@ fn to_detail(
         shares: spec.shares.clone(),
         mem_limit_mb: spec.mem_limit_mb,
         cpu_limit: spec.cpu_limit,
+        allow_lan: spec.allow_lan,
+        warnings,
         notes: spec.notes.clone(),
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
@@ -548,6 +627,8 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     validate_cpu_limit(cpu_limit)
         .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
 
+    let allow_lan = request.allow_lan.unwrap_or(false);
+
     let name = request
         .name
         .as_deref()
@@ -590,6 +671,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             shares,
             mem_limit_mb,
             cpu_limit,
+            allow_lan,
             notes,
             status: Status::Created,
             last_error: None,
@@ -650,6 +732,9 @@ fn apply_patch(
         validate_cpu_limit(cpu_limit)
             .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
         spec.cpu_limit = cpu_limit;
+    }
+    if let Some(allow_lan) = request.allow_lan {
+        spec.allow_lan = allow_lan;
     }
     if let Some(notes) = request.notes.as_deref() {
         validate_notes(notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;

@@ -247,7 +247,7 @@ pub async fn run(cfg: &Config, source: &str, apply: bool) -> anyhow::Result<()> 
 
     let driver = ComposeDriver::new(cfg);
     driver
-        .ensure_network()
+        .ensure_network_named(&cfg.network)
         .await
         .map_err(|err| anyhow::anyhow!("could not ensure the {} network: {err}", cfg.network))?;
 

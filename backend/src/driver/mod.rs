@@ -45,6 +45,18 @@ pub trait Driver: Send + Sync {
     /// Cheap liveness probe for `GET /api/health`.
     fn ping(&self) -> DriverFuture<'_, bool>;
 
+    /// Make sure a Docker network exists. `true` when it had to be created.
+    fn ensure_network<'a>(&'a self, name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>>;
+
+    /// IPv4 subnet of a Docker network, when it can be read.
+    ///
+    /// `Ok(None)` means "unknown" — the egress policy then trusts the marker as
+    /// it is instead of comparing subnets.
+    fn network_subnet<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> DriverFuture<'a, Result<Option<String>, DriverError>>;
+
     fn up<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
     fn stop<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
     fn start<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;

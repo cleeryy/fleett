@@ -69,7 +69,11 @@ simulates states without touching Docker. Tests never call Docker.
 
 ## Default isolation for an instance
 
-- dedicated bridge network `fleett` (never `network_mode: host`)
+- dedicated bridge network `fleett` (never `network_mode: host`); LAN egress is
+  filtered by host `DOCKER-USER` rules installed with `fleett egress install`
+  (see `docs/EGRESS.md`)
+- `allow_lan: false` by default; `true` attaches the unrestricted `fleett-lan`
+  network, created on demand, and surfaces a warning in the API/UI
 - no Docker socket mount
 - a single data mount: `./data:/opt/data`
 - `security_opt: no-new-privileges`, `cap_drop: NET_RAW`, `tmpfs: /tmp`

@@ -27,7 +27,6 @@ const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ComposeDriver {
     root: PathBuf,
     docker: PathBuf,
-    network: String,
 }
 
 impl ComposeDriver {
@@ -35,7 +34,6 @@ impl ComposeDriver {
         Self {
             root: cfg.root.clone(),
             docker: PathBuf::from("docker"),
-            network: cfg.network.clone(),
         }
     }
 
@@ -150,10 +148,10 @@ impl ComposeDriver {
     /// Make sure the external `fleett` network exists.
     ///
     /// Returns `true` when the network had to be created.
-    pub async fn ensure_network(&self) -> Result<bool, DriverError> {
+    pub async fn ensure_network_named(&self, name: &str) -> Result<bool, DriverError> {
         let mut inspect = Command::new(&self.docker);
         inspect
-            .args(["network", "inspect", &self.network])
+            .args(["network", "inspect", name])
             .stdin(Stdio::null())
             .kill_on_drop(true);
         let exists = matches!(
@@ -166,11 +164,21 @@ impl ComposeDriver {
 
         let mut create = Command::new(&self.docker);
         create
-            .args(["network", "create", &self.network])
+            .args(["network", "create", name])
             .stdin(Stdio::null())
             .kill_on_drop(true);
         run_command(create, "network create", CMD_TIMEOUT).await?;
         Ok(true)
+    }
+
+    /// Raw `docker network inspect <name>` output.
+    async fn inspect_network(&self, name: &str) -> Result<String, DriverError> {
+        let mut command = Command::new(&self.docker);
+        command
+            .args(["network", "inspect", name])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        run_command(command, "network inspect", PS_TIMEOUT).await
     }
 }
 
@@ -223,6 +231,22 @@ impl Driver for ComposeDriver {
                 tokio::time::timeout(PS_TIMEOUT, command.output()).await,
                 Ok(Ok(output)) if output.status.success()
             )
+        })
+    }
+
+    fn ensure_network<'a>(&'a self, name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>> {
+        Box::pin(async move { self.ensure_network_named(name).await })
+    }
+
+    fn network_subnet<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> DriverFuture<'a, Result<Option<String>, DriverError>> {
+        Box::pin(async move {
+            let json = self.inspect_network(name).await?;
+            crate::egress::first_ipv4_subnet(&json)
+                .map(Some)
+                .map_err(|detail| DriverError::new("network inspect", detail))
         })
     }
 

@@ -22,6 +22,7 @@ This is the central property of the design: the control plane is disposable.
 ```bash
 docker network create fleett                # optional: the app creates it
 docker image ls | grep hermes-agent         # image built from the fork
+sudo fleett egress install                  # LAN egress firewall (docs/EGRESS.md)
 ```
 
 The image is not built by this app. Build once, tag per version:
@@ -58,6 +59,7 @@ FLEETT_BIND=127.0.0.1:8090
 FLEETT_DRIVER=compose
 FLEETT_IMAGE=hermes-agent:0.22.2-local
 FLEETT_NETWORK=fleett
+FLEETT_EGRESS=restrict                      # off = no firewall check, with a warning
 FLEETT_TOKEN=<long token, generate with: openssl rand -hex 32>
 ```
 

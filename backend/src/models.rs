@@ -217,6 +217,8 @@ pub struct InstanceSpec {
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
+    /// Join the unrestricted `<network>-lan` network as well (LAN access).
+    pub allow_lan: bool,
     pub notes: String,
     pub status: Status,
     pub last_error: Option<String>,
@@ -248,6 +250,7 @@ pub struct InstanceSummary {
     pub status: String,
     pub health: String,
     pub cpu_limit: f64,
+    pub allow_lan: bool,
     pub shares: Vec<String>,
     pub last_error: Option<String>,
     pub created_at: String,
@@ -267,6 +270,9 @@ pub struct InstanceDetail {
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
+    pub allow_lan: bool,
+    /// Operator-facing security warnings (egress firewall, LAN access).
+    pub warnings: Vec<String>,
     pub notes: String,
     pub created_at: String,
     pub updated_at: String,
@@ -339,6 +345,9 @@ pub struct CreateInstanceRequest {
     pub mem_limit_mb: Option<u32>,
     #[serde(default)]
     pub cpu_limit: Option<f64>,
+    /// LAN access (default `false`). See `docs/EGRESS.md`.
+    #[serde(default)]
+    pub allow_lan: Option<bool>,
     #[serde(default)]
     pub notes: Option<String>,
     /// Convenience field: stored as `HERMES_GATE_PROFILE_TOKEN` (and as
@@ -368,6 +377,8 @@ pub struct PatchInstanceRequest {
     pub mem_limit_mb: Option<u32>,
     #[serde(default)]
     pub cpu_limit: Option<f64>,
+    #[serde(default)]
+    pub allow_lan: Option<bool>,
     #[serde(default)]
     pub notes: Option<String>,
     #[serde(default)]

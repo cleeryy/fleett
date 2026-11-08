@@ -418,6 +418,28 @@ pub fn render_compose_with_project(
     log_options.insert("max-size".to_string(), "10m".to_string());
     log_options.insert("max-file".to_string(), "3".to_string());
 
+    // The restricted network is always joined; `allow_lan` adds the
+    // unrestricted one, which the host egress firewall does not filter.
+    let mut service_networks = vec!["fleet".to_string()];
+    let mut networks = BTreeMap::new();
+    networks.insert(
+        "fleet".to_string(),
+        ComposeNetwork {
+            external: true,
+            name: cfg.network.clone(),
+        },
+    );
+    if spec.allow_lan {
+        service_networks.push("lan".to_string());
+        networks.insert(
+            "lan".to_string(),
+            ComposeNetwork {
+                external: true,
+                name: cfg.lan_network(),
+            },
+        );
+    }
+
     let service = ComposeService {
         image: cfg.image.clone(),
         container_name: project.clone(),
@@ -426,7 +448,7 @@ pub fn render_compose_with_project(
         env_file: vec!["secrets.env".to_string()],
         environment,
         volumes,
-        networks: vec!["fleet".to_string()],
+        networks: service_networks,
         security_opt: vec!["no-new-privileges:true".to_string()],
         cap_drop: vec!["NET_RAW".to_string()],
         tmpfs: vec!["/tmp".to_string()],
@@ -453,15 +475,6 @@ pub fn render_compose_with_project(
 
     let mut services = BTreeMap::new();
     services.insert("agent".to_string(), service);
-
-    let mut networks = BTreeMap::new();
-    networks.insert(
-        "fleet".to_string(),
-        ComposeNetwork {
-            external: true,
-            name: cfg.network.clone(),
-        },
-    );
 
     let compose = ComposeFile {
         name: project,
@@ -581,6 +594,7 @@ mod tests {
             ],
             mem_limit_mb: 1536,
             cpu_limit: DEFAULT_CPU_LIMIT,
+            allow_lan: false,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -753,6 +767,37 @@ mod tests {
         let fleet = networks.get("fleet").expect("fleet network");
         assert_eq!(fleet.get("external").and_then(Value::as_bool), Some(true));
         assert_eq!(fleet.get("name").and_then(Value::as_str), Some("fleett"));
+    }
+
+    #[test]
+    fn compose_attaches_the_lan_network_only_when_allowed() {
+        let mut instance = spec(ChannelKind::None);
+        instance.allow_lan = true;
+        let rendered = render_compose(&config(), &instance).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        let agent = &doc["services"]["agent"];
+        let networks: Vec<&str> = agent["networks"]
+            .as_sequence()
+            .expect("service networks")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(networks, ["fleet", "lan"]);
+        assert_eq!(doc["networks"]["fleet"]["name"].as_str(), Some("fleett"));
+        assert_eq!(doc["networks"]["lan"]["external"].as_bool(), Some(true));
+        assert_eq!(doc["networks"]["lan"]["name"].as_str(), Some("fleett-lan"));
+
+        instance.allow_lan = false;
+        let rendered = render_compose(&config(), &instance).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(doc["networks"].get("lan").is_none());
+        let networks: Vec<&str> = doc["services"]["agent"]["networks"]
+            .as_sequence()
+            .expect("service networks")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(networks, ["fleet"]);
     }
 
     #[test]
