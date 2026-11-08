@@ -47,8 +47,8 @@ skills:
 
 platform_toolsets:
   cli: [hermes-cli]
-  telegram: [web, file, vision, skills, todo]
-  discord: [web, file, vision, skills, todo]
+  telegram: [web, file, vision, skills, todo, memory]
+  discord: [web, file, vision, skills, todo, memory]
 
 platforms:
   telegram:
@@ -101,8 +101,8 @@ skills:
 
 platform_toolsets:
   cli: [hermes-cli]
-  telegram: [web, file, vision, skills, todo]
-  discord: [web, file, vision, skills, todo]
+  telegram: [web, file, vision, skills, todo, memory]
+  discord: [web, file, vision, skills, todo, memory]
 
 platforms:
   telegram:
