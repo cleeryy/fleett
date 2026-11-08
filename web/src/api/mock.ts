@@ -4,6 +4,7 @@ import type {
   AuthConfig,
   AuthMode,
   ChannelType,
+  CloneInstanceInput,
   CreateInstanceInput,
   CreateTokenInput,
   CreatedToken,
@@ -149,8 +150,8 @@ function delay(ms = 140 + Math.random() * 180): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function fail(status: number, code: string, message: string): never {
-  throw new ApiError(status, code, message);
+function fail(status: number, code: string, message: string, details?: unknown): never {
+  throw new ApiError(status, code, message, details);
 }
 
 function currentIdentity(): Identity | null {
@@ -206,12 +207,33 @@ function containerId(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+const GATE_ENV = "HERMES_GATE_PROFILE_TOKEN";
+
+function gateKeys(row: Stored): string[] {
+  const keys = [GATE_ENV];
+  if (row.api_key_env && row.api_key_env !== GATE_ENV) keys.push(row.api_key_env);
+  return keys;
+}
+
+function channelEnv(channel: ChannelType): string | null {
+  if (channel === "telegram") return "TELEGRAM_BOT_TOKEN";
+  if (channel === "discord") return "DISCORD_BOT_TOKEN";
+  return null;
+}
+
 function envKeys(row: Stored): string[] {
   const keys: string[] = [];
-  if (row.gate_token) keys.push("HERMES_GATE_PROFILE_TOKEN");
-  if (row.channel === "telegram") keys.push("TELEGRAM_BOT_TOKEN");
-  if (row.channel === "discord") keys.push("DISCORD_BOT_TOKEN");
+  if (row.gate_token) keys.push(...gateKeys(row));
+  const channel = channelEnv(row.channel);
+  if (channel) keys.push(channel);
   return [...new Set(keys)];
+}
+
+/** Display name of a clone when the request does not name it, like the controller. */
+function cloneDefaultName(source: string): string {
+  const suffix = " copy";
+  const base = source.trim().slice(0, 128 - suffix.length);
+  return base ? `${base}${suffix}` : "copy";
 }
 
 function composeYaml(row: Stored): string {
@@ -800,6 +822,96 @@ export const mockApi: FleetApi = {
     row.logs = makeLogs(row);
     rows.unshift(row);
     for (const share of row.shares) attachToShare(share.name, id, share.mode);
+    return toDetail(row);
+  },
+
+  async cloneInstance(id: string, input: CloneInstanceInput): Promise<InstanceDetail> {
+    requireWrite();
+    await delay(420);
+    const source = findRow(id);
+
+    const newId = input.new_id.trim();
+    if (!isValidSlug(newId)) {
+      fail(400, "invalid_id", "Id must be 2-32 characters: lowercase letters, digits, hyphens.");
+    }
+    if (newId === id) {
+      fail(400, "invalid_id", "The new id must differ from the source id.");
+    }
+    if (rows.some((row) => row.id === newId)) {
+      fail(409, "instance_exists", `Instance "${newId}" already exists.`);
+    }
+    if (input.name !== undefined && !input.name.trim()) {
+      fail(400, "invalid_name", "Name must not be empty.");
+    }
+    if (input.model !== undefined && !input.model.trim()) {
+      fail(400, "invalid_model", "Model must not be empty.");
+    }
+    assertSecretsKey(input.gate_token);
+    assertSecretsKey(input.channel_token);
+
+    // Tokens are never inherited, exactly like the controller: every token the
+    // source holds has to be replaced before anything is written.
+    const sourceKeys = envKeys(source);
+    const sourceChannelEnv = channelEnv(source.channel);
+    const gateToken = input.gate_token?.trim() ?? "";
+    const channelToken = input.channel_token?.trim() ?? "";
+    const missing: string[] = [];
+    if (!gateToken) {
+      missing.push(...gateKeys(source).filter((key) => sourceKeys.includes(key)));
+    }
+    if (!channelToken && sourceChannelEnv && sourceKeys.includes(sourceChannelEnv)) {
+      missing.push(sourceChannelEnv);
+    }
+    if (missing.length > 0) {
+      fail(
+        400,
+        "clone_token_required",
+        `Clones never inherit secrets. Supply a replacement for ${missing.join(", ")}.`,
+        { source: id, missing },
+      );
+    }
+
+    const copyData = input.copy_data !== false;
+    const created = Date.now();
+    const inherited =
+      input.shares_inherit === false
+        ? []
+        : source.shares.filter((ref) => shares.some((share) => share.name === ref.name));
+
+    const row: Stored = {
+      id: newId,
+      name: input.name?.trim() || cloneDefaultName(source.name),
+      template: source.template,
+      model: input.model?.trim() || source.model,
+      base_url: source.base_url,
+      api_key_env: source.api_key_env,
+      // Only the replacement token: the source secret is never copied.
+      gate_token: gateToken || null,
+      channel: source.channel,
+      status: "running",
+      shares: inherited.map((ref) => ({ ...ref })),
+      mem_limit_mb: source.mem_limit_mb,
+      allow_lan: source.allow_lan,
+      notes: source.notes,
+      created_at: iso(created),
+      updated_at: iso(created),
+      last_error: null,
+      container_id: containerId(),
+      started_at: created,
+      fail_next: false,
+      logs: [],
+    };
+    row.logs = makeLogs(row);
+    row.logs.unshift(
+      logLine(
+        created,
+        "INFO",
+        `clone of "${source.id}" (${copyData ? "data copied" : "fresh data"}, ` +
+          `${row.shares.length} share${row.shares.length === 1 ? "" : "s"} inherited)`,
+      ),
+    );
+    rows.unshift(row);
+    for (const share of row.shares) attachToShare(share.name, newId, share.mode);
     return toDetail(row);
   },
 

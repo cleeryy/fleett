@@ -164,6 +164,33 @@ export interface CreateInstanceInput {
   notes: string;
 }
 
+/**
+ * `POST /api/instances/{id}/clone`. The clone is independent: its own compose
+ * project, container, data directory and row. Secrets are never inherited, so
+ * every token the source holds must be replaced here.
+ */
+export interface CloneInstanceInput {
+  new_id: string;
+  /** Defaults to the source name plus " copy". */
+  name?: string;
+  /** Defaults to the source model. */
+  model?: string;
+  /** Replacement for `HERMES_GATE_PROFILE_TOKEN` (and `api_key_env`). */
+  gate_token?: string;
+  /** Replacement for the platform bot token of the source channel. */
+  channel_token?: string;
+  /** Copy the source shares that still exist. Defaults to true. */
+  shares_inherit?: boolean;
+  /** Copy the source data directory. Defaults to true. */
+  copy_data?: boolean;
+}
+
+/** `400 clone_token_required`: the env keys the clone needs a fresh value for. */
+export interface CloneTokenDetails {
+  source: string;
+  missing: string[];
+}
+
 export interface PatchInstanceInput {
   name?: string;
   model?: string;
@@ -198,6 +225,7 @@ export interface FleetApi {
   listInstances(): Promise<InstanceSummary[]>;
   getInstance(id: string): Promise<InstanceDetail>;
   createInstance(input: CreateInstanceInput): Promise<InstanceDetail>;
+  cloneInstance(id: string, input: CloneInstanceInput): Promise<InstanceDetail>;
   patchInstance(id: string, input: PatchInstanceInput): Promise<InstanceDetail>;
   action(id: string, action: "start" | "stop" | "restart"): Promise<LifecycleResult>;
   deleteInstance(id: string, purge: boolean): Promise<void>;

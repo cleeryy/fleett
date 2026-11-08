@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   AlertCircle,
+  CopyPlus,
   Loader2,
   MoreHorizontal,
   Play,
@@ -40,6 +41,7 @@ import { CodeBlock } from "@/components/code-block";
 import { CopyButton } from "@/components/copy-button";
 import { DataList, Section } from "@/components/data-list";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
+import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
@@ -764,6 +766,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ApiError | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [duplicateOpen, setDuplicateOpen] = useState(false);
 
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
 
@@ -904,6 +907,10 @@ export function InstanceDetailPage({ id }: { id: string }) {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
+                    <DropdownMenuItem onSelect={() => setDuplicateOpen(true)}>
+                      <CopyPlus aria-hidden />
+                      Duplicate instance…
+                    </DropdownMenuItem>
                     <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                       <Trash2 aria-hidden />
                       Delete instance…
@@ -961,15 +968,26 @@ export function InstanceDetailPage({ id }: { id: string }) {
       </Tabs>
 
       {canEdit ? (
-        <DeleteInstanceDialog
-          instance={{ id: data.id, name: data.name }}
-          open={deleteOpen}
-          onOpenChange={setDeleteOpen}
-          onDeleted={() => {
-            toast.success(`Instance ${data.id} deleted.`);
-            navigate("/instances");
-          }}
-        />
+        <>
+          <DuplicateInstanceDialog
+            source={data}
+            open={duplicateOpen}
+            onOpenChange={setDuplicateOpen}
+            onCloned={(clone) => {
+              toast.success(`Duplicated ${data.id} as ${clone.id}.`);
+              navigate(`/instances/${clone.id}`);
+            }}
+          />
+          <DeleteInstanceDialog
+            instance={{ id: data.id, name: data.name }}
+            open={deleteOpen}
+            onOpenChange={setDeleteOpen}
+            onDeleted={() => {
+              toast.success(`Instance ${data.id} deleted.`);
+              navigate("/instances");
+            }}
+          />
+        </>
       ) : null}
     </>
   );

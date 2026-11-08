@@ -70,13 +70,15 @@ async function request<T>(path: string, init: RequestInit = {}, options: Request
   if (!response.ok) {
     let code = "http_error";
     let message = response.statusText || `HTTP ${response.status}`;
+    let details: unknown;
     const contentType = response.headers.get("content-type") ?? "";
     if (contentType.includes("application/json")) {
       const body = (await response.json().catch(() => null)) as {
-        error?: { code?: string; message?: string };
+        error?: { code?: string; message?: string; details?: unknown };
       } | null;
       if (body?.error?.code) code = body.error.code;
       if (body?.error?.message) message = body.error.message;
+      details = body?.error?.details;
     }
 
     // Turn the two role/CSRF refusals into something a person can act on. The
@@ -91,7 +93,7 @@ async function request<T>(path: string, init: RequestInit = {}, options: Request
     if (response.status === 401 && options.signalUnauthorized !== false) {
       window.dispatchEvent(new CustomEvent("fleett:unauthorized"));
     }
-    throw new ApiError(response.status, code, message);
+    throw new ApiError(response.status, code, message, details);
   }
 
   if (response.status === 204) return undefined as T;
@@ -126,6 +128,12 @@ export const httpApi: FleetApi = {
 
   createInstance: (input: CreateInstanceInput) =>
     request<InstanceDetail>("/api/instances", { method: "POST", body: JSON.stringify(input) }),
+
+  cloneInstance: (id, input) =>
+    request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}/clone`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 
   patchInstance: (id, input: PatchInstanceInput) =>
     request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}`, {
