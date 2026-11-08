@@ -217,7 +217,13 @@ async fn the_scrape_exposes_the_fleet_in_the_prometheus_text_format() {
     }
 
     assert_eq!(
-        expect_value(&text, "fleett_build_info{version=\"0.3.0\"}"),
+        expect_value(
+            &text,
+            &format!(
+                "fleett_build_info{{version=\"{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            )
+        ),
         1.0
     );
     assert_eq!(expect_value(&text, "fleett_up"), 1.0);
