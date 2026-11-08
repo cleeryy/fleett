@@ -8,6 +8,7 @@ pub mod instances;
 pub mod shares;
 pub mod templates;
 pub mod tokens;
+pub mod usage;
 
 pub use error::ApiError;
 
@@ -123,6 +124,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
+        .route("/usage", get(usage::usage))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(

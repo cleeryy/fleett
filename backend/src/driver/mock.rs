@@ -4,7 +4,7 @@
 //! the next call of a given operation so error paths are testable without
 //! Docker.
 
-use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult};
+use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult, UsageSample};
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::HashMap;
@@ -50,6 +50,8 @@ pub struct MockDriver {
     logs_options: Mutex<Vec<(String, LogsOptions)>>,
     /// Canned `docker inspect` payloads, per instance (`force_inspect`).
     inspect: Mutex<HashMap<String, InspectInfo>>,
+    /// Canned usage samples, per instance (`force_usage`).
+    usage: Mutex<HashMap<String, UsageSample>>,
 }
 
 impl Default for MockDriver {
@@ -73,6 +75,7 @@ impl MockDriver {
             logs: Mutex::new(HashMap::new()),
             logs_options: Mutex::new(Vec::new()),
             inspect: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,6 +114,16 @@ impl MockDriver {
     /// Drop the canned inspect payload of one instance.
     pub fn clear_inspect(&self, id: &str) {
         lock(&self.inspect).remove(id);
+    }
+
+    /// Report a canned usage sample for one instance (used by the usage tests).
+    pub fn force_usage(&self, id: &str, sample: UsageSample) {
+        lock(&self.usage).insert(id.to_string(), sample);
+    }
+
+    /// Drop the canned usage sample of one instance.
+    pub fn clear_usage(&self, id: &str) {
+        lock(&self.usage).remove(id);
     }
 
     /// Make the next call of `operation` fail with `stderr`.
@@ -380,6 +393,63 @@ impl Driver for MockDriver {
             Ok(self.simulate_inspect(&spec.id))
         })
     }
+
+    fn usage<'a>(
+        &'a self,
+        specs: &'a [InstanceSpec],
+    ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>> {
+        Box::pin(async move {
+            for spec in specs {
+                self.record("usage", &spec.id);
+            }
+            self.fail_if_requested("usage")?;
+            let forced = lock(&self.usage);
+            let state = lock(&self.state);
+            Ok(specs
+                .iter()
+                .map(|spec| match forced.get(&spec.id) {
+                    Some(sample) => sample.clone(),
+                    None => {
+                        let running = state
+                            .get(&spec.id)
+                            .map(|entry| entry.status == Status::Running)
+                            .unwrap_or(false);
+                        simulate_usage(spec, running)
+                    }
+                })
+                .collect())
+        })
+    }
+}
+
+/// Stable simulated usage, derived from the instance id only.
+fn simulate_usage(spec: &InstanceSpec, running: bool) -> UsageSample {
+    let configured = u64::from(spec.mem_limit_mb) * 1024 * 1024;
+    if !running {
+        return UsageSample {
+            running: false,
+            mem_limit_bytes: configured,
+            ..UsageSample::default()
+        };
+    }
+    let seed = stable_hash(&spec.id);
+    UsageSample {
+        running: true,
+        cpu_pct: 0.25 + (seed % 400) as f64 / 100.0,
+        mem_used_bytes: configured * (30 + seed % 40) / 100,
+        mem_limit_bytes: configured,
+        disk_bytes: 8 * 1024 * 1024 + seed % (48 * 1024 * 1024),
+    }
+}
+
+/// FNV-1a: a stable hash, unlike `DefaultHasher` whose output may change.
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -446,5 +516,79 @@ mod tests {
         let broken = driver.inspect(&instance).await.expect("inspect");
         assert!(broken.oom_killed);
         assert!(broken.error_message().is_some());
+    }
+
+    #[tokio::test]
+    async fn usage_is_stable_and_zero_when_stopped() {
+        let driver = MockDriver::new();
+        let mut instance = spec("alice");
+        driver.up(&instance).await.expect("up");
+
+        let first = driver
+            .usage(std::slice::from_ref(&instance))
+            .await
+            .expect("usage");
+        let second = driver
+            .usage(std::slice::from_ref(&instance))
+            .await
+            .expect("usage");
+        assert_eq!(first, second, "simulated numbers are stable");
+        let sample = &first[0];
+        assert!(sample.running);
+        assert!(sample.cpu_pct > 0.0);
+        assert!(sample.mem_used_bytes > 0);
+        assert_eq!(
+            sample.mem_limit_bytes,
+            u64::from(instance.mem_limit_mb) * 1024 * 1024
+        );
+        assert!(sample.disk_bytes > 0);
+
+        instance.status = Status::Stopped;
+        driver.stop(&instance).await.expect("stop");
+        let stopped = driver
+            .usage(std::slice::from_ref(&instance))
+            .await
+            .expect("usage");
+        assert!(!stopped[0].running);
+        assert_eq!(stopped[0].cpu_pct, 0.0);
+        assert_eq!(stopped[0].mem_used_bytes, 0);
+        assert_eq!(stopped[0].disk_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn usage_can_be_forced_and_failures_are_injectable() {
+        let driver = MockDriver::new();
+        let instance = spec("alice");
+        driver.force_usage(
+            "alice",
+            UsageSample {
+                running: true,
+                cpu_pct: 2.5,
+                mem_used_bytes: 1024,
+                mem_limit_bytes: 2048,
+                disk_bytes: 4096,
+            },
+        );
+        let samples = driver
+            .usage(std::slice::from_ref(&instance))
+            .await
+            .expect("usage");
+        assert_eq!(samples[0].cpu_pct, 2.5);
+        assert_eq!(samples[0].disk_bytes, 4096);
+
+        driver.fail_next("usage", "Cannot connect to the Docker daemon");
+        let err = driver
+            .usage(std::slice::from_ref(&instance))
+            .await
+            .expect_err("injected failure");
+        assert!(err.detail.contains("Docker daemon"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn usage_of_an_empty_fleet_touches_nothing() {
+        let driver = MockDriver::new();
+        let samples = driver.usage(&[]).await.expect("usage");
+        assert!(samples.is_empty());
+        assert!(driver.calls().is_empty());
     }
 }

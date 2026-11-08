@@ -6,7 +6,7 @@
 //! projects created by older releases (`hermes-<id>`) remain manageable without
 //! being recreated.
 
-use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult};
+use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult, UsageSample};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -14,7 +14,8 @@ use crate::render;
 use crate::secrets;
 use crate::store::compose_project_name;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -25,6 +26,7 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 const PS_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(20);
+const STATS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ComposeDriver {
@@ -217,6 +219,21 @@ impl ComposeDriver {
             .kill_on_drop(true);
         run_command(command, "network inspect", PS_TIMEOUT).await
     }
+
+    /// `docker stats --no-stream --format json` for every running container.
+    ///
+    /// The whole host is sampled in one call and the result is keyed by
+    /// container name, so instances whose container is not running simply have
+    /// no entry (and therefore report zero usage).
+    async fn docker_stats(&self) -> Result<HashMap<String, StatsSample>, DriverError> {
+        let mut command = Command::new(&self.docker);
+        command
+            .args(["stats", "--no-stream", "--format", "json"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let stdout = run_command(command, "stats", STATS_TIMEOUT).await?;
+        Ok(parse_stats(&stdout))
+    }
 }
 
 async fn run_command(
@@ -382,6 +399,189 @@ impl Driver for ComposeDriver {
                 .ok_or_else(|| DriverError::new("inspect", "unparsable docker inspect output"))
         })
     }
+
+    fn usage<'a>(
+        &'a self,
+        specs: &'a [InstanceSpec],
+    ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>> {
+        Box::pin(async move {
+            // An empty fleet never talks to Docker: `fleett usage` on a fresh
+            // host must succeed even when the daemon is down.
+            if specs.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let stats = self.docker_stats().await?;
+            let cfg = self.cfg.clone();
+            let paths: Vec<PathBuf> = specs.iter().map(|spec| cfg.data_dir(&spec.id)).collect();
+            let disks = tokio::task::spawn_blocking(move || {
+                let mut sizes = Vec::with_capacity(paths.len());
+                for path in paths {
+                    sizes.push(du_bytes(&path)?);
+                }
+                Ok::<Vec<u64>, String>(sizes)
+            })
+            .await
+            .map_err(|err| DriverError::new("du", format!("the disk usage task failed: {err}")))?
+            .map_err(|detail| DriverError::new("du", detail))?;
+
+            Ok(specs
+                .iter()
+                .zip(disks)
+                .map(|(spec, disk_bytes)| {
+                    let configured_limit = u64::from(spec.mem_limit_mb) * 1024 * 1024;
+                    match stats.get(&self.project(&spec.id)) {
+                        Some(sample) => UsageSample {
+                            running: true,
+                            cpu_pct: sample.cpu_pct,
+                            mem_used_bytes: sample.mem_used_bytes,
+                            mem_limit_bytes: if sample.mem_limit_bytes > 0 {
+                                sample.mem_limit_bytes
+                            } else {
+                                configured_limit
+                            },
+                            disk_bytes,
+                        },
+                        None => UsageSample {
+                            running: false,
+                            cpu_pct: 0.0,
+                            mem_used_bytes: 0,
+                            mem_limit_bytes: configured_limit,
+                            disk_bytes,
+                        },
+                    }
+                })
+                .collect())
+        })
+    }
+}
+
+/// One line of `docker stats --no-stream --format json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct StatsSample {
+    cpu_pct: f64,
+    mem_used_bytes: u64,
+    mem_limit_bytes: u64,
+}
+
+/// Parse `docker stats --no-stream --format json` (one object per line).
+///
+/// An array is accepted too, and unnamed or malformed entries are ignored:
+/// another container on the host must never break `GET /api/usage`.
+fn parse_stats(stdout: &str) -> HashMap<String, StatsSample> {
+    let mut samples = HashMap::new();
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return samples;
+    }
+    let values: Vec<Value> = match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Array(items)) => items,
+        Ok(value @ Value::Object(_)) => vec![value],
+        _ => trimmed
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .collect(),
+    };
+    for value in values {
+        let Value::Object(object) = value else {
+            continue;
+        };
+        let Some(name) = field(&object, &["name"]) else {
+            continue;
+        };
+        let name = name.trim_start_matches('/').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let cpu_pct = field(&object, &["cpuperc"])
+            .and_then(|value| parse_percent(&value))
+            .unwrap_or(0.0);
+        let (mem_used_bytes, mem_limit_bytes) = field(&object, &["memusage"])
+            .and_then(|value| parse_mem_usage(&value))
+            .unwrap_or((0, 0));
+        samples.insert(
+            name,
+            StatsSample {
+                cpu_pct,
+                mem_used_bytes,
+                mem_limit_bytes,
+            },
+        );
+    }
+    samples
+}
+
+/// `"1.50%"` → `1.5`.
+fn parse_percent(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+/// `"128.5MiB / 1.5GiB"` → `(used, limit)`.
+fn parse_mem_usage(value: &str) -> Option<(u64, u64)> {
+    let (used, limit) = value.split_once('/')?;
+    Some((parse_size(used)?, parse_size(limit)?))
+}
+
+/// Parse a Docker size string (`0B`, `512KiB`, `1.5GiB`, `12MB`).
+fn parse_size(value: &str) -> Option<u64> {
+    let text = value.trim();
+    let split = text
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(text.len());
+    if split == 0 {
+        return None;
+    }
+    let number = text[..split].parse::<f64>().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    let multiplier = match text[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "kb" => 1e3,
+        "mb" => 1e6,
+        "gb" => 1e9,
+        "tb" => 1e12,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((number * multiplier).round() as u64)
+}
+
+/// Size of `path` in bytes, from `du -sb`.
+///
+/// A missing directory is an empty one: an instance whose data was never
+/// written must not fail the whole usage report.
+fn du_bytes(path: &Path) -> Result<u64, String> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let output = std::process::Command::new("du")
+        .arg("-sb")
+        .arg(path)
+        .output()
+        .map_err(|err| format!("cannot run du: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("du -sb {} failed", path.display())
+        } else {
+            stderr
+        });
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("unparsable du output for {}", path.display()))
 }
 
 /// Arguments of `docker compose logs` for the given options.
@@ -858,5 +1058,152 @@ mod tests {
             parse_inspect(r#"[{"Id":"abc"}]"#).is_none(),
             "no State block"
         );
+    }
+
+    #[test]
+    fn stats_lines_are_keyed_by_container_name() {
+        let stdout = "\
+{\"Name\":\"fleett-alice\",\"CPUPerc\":\"1.50%\",\"MemUsage\":\"128.5MiB / 1.5GiB\"}
+{\"Name\":\"fleett-bob\",\"CPUPerc\":\"0.00%\",\"MemUsage\":\"0B / 0B\"}
+";
+        let stats = parse_stats(stdout);
+        assert_eq!(stats.len(), 2);
+        let alice = stats.get("fleett-alice").expect("alice");
+        assert_eq!(alice.cpu_pct, 1.5);
+        assert_eq!(alice.mem_used_bytes, 134_742_016);
+        assert_eq!(alice.mem_limit_bytes, 1_610_612_736);
+        let bob = stats.get("fleett-bob").expect("bob");
+        assert_eq!(bob.cpu_pct, 0.0);
+        assert_eq!(bob.mem_used_bytes, 0);
+        assert_eq!(bob.mem_limit_bytes, 0);
+    }
+
+    #[test]
+    fn stats_accept_an_array_and_ignore_junk() {
+        let stdout =
+            r#"[{"Name":"/fleett-alice","CPUPerc":"2%","MemUsage":"1MiB / 2MiB"},{"Foo":1}]"#;
+        let stats = parse_stats(stdout);
+        assert_eq!(stats.len(), 1, "the unnamed entry is ignored");
+        assert_eq!(stats["fleett-alice"].cpu_pct, 2.0);
+
+        assert!(parse_stats("").is_empty());
+        assert!(parse_stats("not json").is_empty());
+        assert!(parse_stats("{\"Name\":\"x\",\"CPUPerc\":\"oops\"}")
+            .get("x")
+            .is_some_and(|sample| sample.cpu_pct == 0.0));
+    }
+
+    #[test]
+    fn sizes_are_parsed_like_docker_prints_them() {
+        for (text, expected) in [
+            ("0B", 0),
+            ("512B", 512),
+            ("1KiB", 1024),
+            ("1.5MiB", 1_572_864),
+            ("2GiB", 2_147_483_648),
+            ("12MB", 12_000_000),
+            ("1.5GB", 1_500_000_000),
+            ("3", 3),
+        ] {
+            assert_eq!(parse_size(text), Some(expected), "{text}");
+        }
+        for text in ["", "MiB", "-1MiB", "1XiB", "abc"] {
+            assert_eq!(parse_size(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn disk_usage_reads_the_data_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).expect("data dir");
+        std::fs::write(data.join("MEMORY.md"), "hello").expect("file");
+
+        let size = du_bytes(&data).expect("du");
+        assert!(size >= 5, "{size}");
+
+        // A missing directory is empty, not an error.
+        assert_eq!(du_bytes(&dir.path().join("missing")).expect("du"), 0);
+    }
+
+    fn usage_spec(id: &str) -> InstanceSpec {
+        InstanceSpec {
+            id: id.to_string(),
+            name: id.to_string(),
+            template: "guest".to_string(),
+            model: "m".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key_env: crate::models::DEFAULT_API_KEY_ENV.to_string(),
+            channel: crate::models::ChannelKind::None,
+            shares: Vec::new(),
+            mem_limit_mb: 512,
+            cpu_limit: 1.0,
+            allow_lan: false,
+            notes: String::new(),
+            status: Status::Created,
+            last_error: None,
+            created_at: crate::models::now_iso(),
+            updated_at: crate::models::now_iso(),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_maps_docker_stats_to_instances_without_docker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        crate::store::ensure_layout(&cfg).expect("layout");
+        for (id, bytes) in [("alice", 5u64), ("bob", 0)] {
+            std::fs::create_dir_all(cfg.instance_dir(id)).expect("instance dir");
+            std::fs::write(
+                cfg.compose_path(id),
+                format!("name: fleett-{id}\nservices: {{}}\n"),
+            )
+            .expect("compose file");
+            if bytes > 0 {
+                std::fs::create_dir_all(cfg.data_dir(id)).expect("data dir");
+                std::fs::write(cfg.data_dir(id).join("MEMORY.md"), "hello").expect("data file");
+            }
+        }
+
+        // A stand-in for the Docker CLI: only `docker stats` is answered.
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '%s\\n' '{\"Name\":\"fleett-alice\",\"CPUPerc\":\"2.50%\",\"MemUsage\":\"100MiB / 512MiB\"}'\n",
+        )
+        .expect("fake docker");
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let driver = ComposeDriver::new(&cfg).with_docker_binary(&docker);
+        let specs = vec![usage_spec("alice"), usage_spec("bob")];
+        let samples = driver.usage(&specs).await.expect("usage");
+
+        assert_eq!(samples.len(), 2);
+        let alice = &samples[0];
+        assert!(alice.running);
+        assert_eq!(alice.cpu_pct, 2.5);
+        assert_eq!(alice.mem_used_bytes, 100 * 1024 * 1024);
+        assert_eq!(alice.mem_limit_bytes, 512 * 1024 * 1024);
+        assert!(alice.disk_bytes >= 5, "{}", alice.disk_bytes);
+
+        let bob = &samples[1];
+        assert!(!bob.running, "no stats line means stopped");
+        assert_eq!(bob.cpu_pct, 0.0);
+        assert_eq!(bob.mem_used_bytes, 0);
+        assert_eq!(
+            bob.mem_limit_bytes,
+            512 * 1024 * 1024,
+            "the configured limit is reported for a stopped instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_without_instances_never_runs_docker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let driver = driver_in(dir.path()).with_docker_binary(dir.path().join("missing-docker"));
+        let samples = driver.usage(&[]).await.expect("usage");
+        assert!(samples.is_empty());
     }
 }

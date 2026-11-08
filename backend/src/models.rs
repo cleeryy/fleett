@@ -283,6 +283,42 @@ pub struct InstanceDetail {
     pub compose_yaml: String,
 }
 
+/// One instance of `GET /api/usage`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageEntry {
+    pub id: String,
+    pub status: String,
+    /// Percent of one CPU core, as reported by `docker stats`.
+    pub cpu_pct: f64,
+    pub mem_used_bytes: u64,
+    pub mem_limit_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+/// Fleet-wide sums of [`UsageEntry`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageTotals {
+    pub cpu_pct: f64,
+    pub mem_used_bytes: u64,
+    pub mem_limit_bytes: u64,
+    pub disk_bytes: u64,
+}
+
+/// Configured fleet caps (`FLEETT_MAX_TOTAL_CPU`, `FLEETT_MAX_TOTAL_MEM_MB`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageCaps {
+    pub max_cpu: f64,
+    pub max_mem_mb: u64,
+}
+
+/// Body of `GET /api/usage`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageResponse {
+    pub instances: Vec<UsageEntry>,
+    pub totals: UsageTotals,
+    pub caps: UsageCaps,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateInfo {
     pub id: String,

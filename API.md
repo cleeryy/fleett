@@ -21,7 +21,7 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 
 | Method | Route | Response |
 |---|---|---|
-| GET | `/api/health` | `{"ok":true,"version":"0.2.0","driver":"mock\|compose","docker":{"ok":true}}` |
+| GET | `/api/health` | `{"ok":true,"version":"0.3.0","driver":"mock\|compose","docker":{"ok":true},"uptime_s":42,"secrets":{"key":true,"key_error":null,"encrypted":2,"plaintext":0},"egress":{"mode":"restrict\|off","marker":true}}` |
 | GET | `/api/auth/config` | `{"mode":"bearer\|oidc\|both","oidc":{"enabled":true,"login_url":"/auth/login"},"bearer":{"enabled":true}}` |
 | GET | `/api/auth/check` | `204` when the credential is valid |
 | GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions) |
@@ -184,3 +184,27 @@ See `docs/BACKUP.md`.
 `health` is read from the container healthcheck (`healthy`, `unhealthy`, `starting`, `none`).
 The generated compose probes `/opt/data/gateway.sock` with the gateway's `identify` verb;
 `last_error` is set while the probe is unhealthy and cleared when it recovers.
+
+## Usage
+
+`GET /api/usage` → `200`, any authenticated role (read-only):
+```json
+{"instances":[{"id":"alice","status":"running","cpu_pct":1.5,
+               "mem_used_bytes":134742016,"mem_limit_bytes":1610612736,
+               "disk_bytes":12582912}],
+ "totals":{"cpu_pct":1.5,"mem_used_bytes":134742016,
+           "mem_limit_bytes":1610612736,"disk_bytes":12582912},
+ "caps":{"max_cpu":8.0,"max_mem_mb":16384}}
+```
+
+With `FLEETT_DRIVER=compose`, `cpu_pct`/`mem_used_bytes` come from one
+`docker stats --no-stream --format json` call (containers are matched by name), `disk_bytes`
+from `du -sb` on `instances/<id>/data`, and `mem_limit_bytes` from the container limit (or the
+configured limit when the container is absent). Stopped instances report zero CPU and memory.
+`totals` sums every instance; `caps` echoes `FLEETT_MAX_TOTAL_CPU` and
+`FLEETT_MAX_TOTAL_MEM_MB` (`0` = unlimited). The endpoint answers `502 usage_unavailable`
+when Docker fails, and an empty fleet answers zeros without touching Docker. Under
+`FLEETT_DRIVER=mock` the numbers are stable simulations.
+
+The fleet is also checked by `fleett doctor`, which reads `docker`, `secrets` and `egress`
+from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.

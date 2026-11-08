@@ -38,6 +38,23 @@ impl Default for LogsOptions {
     }
 }
 
+/// Runtime usage of one instance, read by the driver.
+///
+/// The compose driver fills it from one `docker stats` call plus `du -sb` on
+/// the instance data directory; the mock driver simulates stable numbers.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageSample {
+    /// The container was seen running when the sample was taken.
+    pub running: bool,
+    /// CPU usage in percent of one core (`docker stats` `CPUPerc`).
+    pub cpu_pct: f64,
+    pub mem_used_bytes: u64,
+    /// Container limit, or the configured limit when the container is absent.
+    pub mem_limit_bytes: u64,
+    /// Size of the instance data directory (`du -sb`).
+    pub disk_bytes: u64,
+}
+
 /// Runtime state of one instance container, read with `docker inspect`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InspectInfo {
@@ -143,6 +160,16 @@ pub trait Driver: Send + Sync {
         &'a self,
         spec: &'a InstanceSpec,
     ) -> DriverFuture<'a, Result<InspectInfo, DriverError>>;
+
+    /// Runtime usage of the given instances, in the same order.
+    ///
+    /// One call covers the whole fleet: the compose driver runs a single
+    /// `docker stats` for every running container and measures each data
+    /// directory. Empty input never touches Docker.
+    fn usage<'a>(
+        &'a self,
+        specs: &'a [InstanceSpec],
+    ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>>;
 }
 
 #[cfg(test)]

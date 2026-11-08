@@ -18,6 +18,8 @@ was renamed from `hermes-fleet` in v0.2.0 — see [Upgrading from `hermes-fleet`
   protection, named revocable API tokens and an audit log — see `docs/OIDC.md`
 - export one instance as a portable `.tgz` and import it under another id (same data, no
   secrets), and run rotating host backups with `fleett backup` — see `docs/BACKUP.md`
+- drive everything from a terminal: `fleett ls`, `ps`, `logs`, `create`, `start`/`stop`/
+  `restart`, `delete`, `usage`, `doctor` — see `docs/CLI.md`
 
 ## Install
 

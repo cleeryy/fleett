@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use fleett::api::{self, AppState};
 use fleett::backup;
+use fleett::cli;
 use fleett::config::{Config, DriverKind, EgressMode, VERSION};
 use fleett::db::Db;
 use fleett::driver::compose::ComposeDriver;
@@ -22,6 +23,9 @@ use tracing_subscriber::EnvFilter;
     about = "Control plane for fleet-managed Hermes agents"
 )]
 struct Cli {
+    /// Machine-readable JSON output (client commands).
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -72,6 +76,100 @@ enum Commands {
         #[command(subcommand)]
         action: BackupCommands,
     },
+    /// List the instances of the fleet (client mode).
+    Ls,
+    /// Show the running instance containers (client mode).
+    Ps {
+        /// Include stopped instances.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print the logs of one instance (client mode).
+    Logs {
+        /// Instance id.
+        id: String,
+        /// Number of trailing lines (1..=2000).
+        #[arg(long, default_value_t = cli::DEFAULT_LOG_TAIL)]
+        tail: u32,
+        /// Docker duration (30s, 10m, 2h) or an RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only keep the lines matching this regex.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Only keep `error` or `warn` lines (`warn` keeps warnings and above).
+        #[arg(long)]
+        level: Option<String>,
+    },
+    /// Create an instance (client mode).
+    Create {
+        /// Instance id (`[a-z0-9-]{2,32}`).
+        #[arg(long)]
+        id: String,
+        /// Display name (defaults to the id).
+        #[arg(long)]
+        name: Option<String>,
+        /// Template id (default `guest`).
+        #[arg(long)]
+        template: Option<String>,
+        /// Model served by the gateway.
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Environment variable holding the provider key.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Value for `HERMES_GATE_PROFILE_TOKEN` and `api_key_env`.
+        #[arg(long)]
+        gate_token: Option<String>,
+        /// Messaging platform: `telegram`, `discord` or `none`.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Bot token of the platform.
+        #[arg(long)]
+        channel_token: Option<String>,
+        /// Attach the instance to the unrestricted LAN network.
+        #[arg(long)]
+        allow_lan: bool,
+        /// CPU limit, in CPUs (0.1..=8.0).
+        #[arg(long)]
+        cpu: Option<f64>,
+        /// Memory limit, in MB (256..=8192).
+        #[arg(long)]
+        mem: Option<u32>,
+        /// Free-form operator note.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Start an instance (client mode).
+    Start {
+        /// Instance id.
+        id: String,
+    },
+    /// Stop an instance (client mode).
+    Stop {
+        /// Instance id.
+        id: String,
+    },
+    /// Restart an instance (client mode).
+    Restart {
+        /// Instance id.
+        id: String,
+    },
+    /// Delete an instance (client mode).
+    Delete {
+        /// Instance id.
+        id: String,
+        /// Also erase the instance data directory.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Show the CPU, memory and disk usage of the fleet (client mode).
+    Usage,
+    /// Check the API, authentication, Docker, secrets and egress (client mode).
+    Doctor,
 }
 
 #[derive(Subcommand, Clone)]
@@ -135,25 +233,31 @@ impl From<EgressCommands> for egress::Action {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = cli.json;
 
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // Logs never pollute the machine-readable stdout of the CLI.
+        .with_writer(std::io::stderr)
         .init();
 
-    match cli.command.unwrap_or(Commands::Serve) {
-        Commands::Serve => serve(Config::from_env()?).await,
+    let code = match cli.command.unwrap_or(Commands::Serve) {
+        Commands::Serve => {
+            serve(Config::from_env()?).await?;
+            0
+        }
         Commands::Migrate { from, apply } => {
             // Migration never serves HTTP: no bearer token is needed.
             let cfg = Config::from_env_for_maintenance()?;
-            migrate::run(&cfg, &from, apply).await
+            migrate::run(&cfg, &from, apply).await?;
+            0
         }
         Commands::Egress { action } => {
             // Firewall commands never serve HTTP: no bearer token is needed.
             let cfg = Config::from_env_for_maintenance()?;
-            let code = egress::run(action.into(), &cfg)?;
-            std::process::exit(code);
+            egress::run(action.into(), &cfg)?
         }
         Commands::Secrets { action } => {
             // Key management never serves HTTP: no bearer token is needed.
@@ -162,12 +266,14 @@ async fn main() -> anyhow::Result<()> {
                 SecretsCommands::Init => secrets::run_init(&cfg),
                 SecretsCommands::Status => secrets::run_status(&cfg),
                 SecretsCommands::Migrate { apply } => secrets::run_migrate(&cfg, apply),
-            }
+            }?;
+            0
         }
         Commands::Backup { dest, keep } => {
             // Backups never serve HTTP: no bearer token is needed.
             let cfg = Config::from_env_for_maintenance()?;
-            backup::run_backup(&cfg, dest, keep)
+            backup::run_backup(&cfg, dest, keep)?;
+            0
         }
         Commands::Backups { action } => {
             let cfg = Config::from_env_for_maintenance()?;
@@ -176,9 +282,79 @@ async fn main() -> anyhow::Result<()> {
                 BackupCommands::Restore { file, root, force } => {
                     backup::run_restore(&cfg, file, root, force)
                 }
-            }
+            }?;
+            0
         }
+        // Client commands read ~/.config/fleett/config.toml and never touch
+        // the local data root or Docker.
+        Commands::Ls => cli::run(cli::Command::Ls, json).await,
+        Commands::Ps { all } => cli::run(cli::Command::Ps { all }, json).await,
+        Commands::Logs {
+            id,
+            tail,
+            since,
+            grep,
+            level,
+        } => {
+            cli::run(
+                cli::Command::Logs(cli::LogsArgs {
+                    id,
+                    tail,
+                    since,
+                    grep,
+                    level,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Create {
+            id,
+            name,
+            template,
+            model,
+            base_url,
+            api_key_env,
+            gate_token,
+            channel,
+            channel_token,
+            allow_lan,
+            cpu,
+            mem,
+            note,
+        } => {
+            cli::run(
+                cli::Command::Create(cli::CreateArgs {
+                    id,
+                    name,
+                    template,
+                    model,
+                    base_url,
+                    api_key_env,
+                    gate_token,
+                    channel,
+                    channel_token,
+                    allow_lan,
+                    cpu,
+                    mem,
+                    note,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Start { id } => cli::run(cli::Command::Start(id), json).await,
+        Commands::Stop { id } => cli::run(cli::Command::Stop(id), json).await,
+        Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
+        Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
+        Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+    };
+
+    if code != 0 {
+        std::process::exit(code);
     }
+    Ok(())
 }
 
 async fn serve(cfg: Config) -> anyhow::Result<()> {
