@@ -3,11 +3,13 @@
 use clap::{Parser, Subcommand};
 use fleett::api::{self, AppState};
 use fleett::config::{Config, DriverKind, EgressMode, VERSION};
+use fleett::db::Db;
 use fleett::driver::compose::ComposeDriver;
 use fleett::driver::mock::MockDriver;
 use fleett::driver::Driver;
 use fleett::egress;
 use fleett::migrate;
+use fleett::secrets;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +44,27 @@ enum Commands {
     Egress {
         #[command(subcommand)]
         action: EgressCommands,
+    },
+    /// Manage the key that encrypts instance secrets at rest.
+    ///
+    /// No bearer token is needed. See docs/SECRETS.md.
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsCommands,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
+enum SecretsCommands {
+    /// Generate the key file (0640); refuses to overwrite an existing one.
+    Init,
+    /// Show the key source and the encrypted vs legacy instance counts.
+    Status,
+    /// Encrypt every legacy secrets.env into the database.
+    Migrate {
+        /// Delete the plaintext files once they are encrypted.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -91,6 +114,15 @@ async fn main() -> anyhow::Result<()> {
             let code = egress::run(action.into(), &cfg)?;
             std::process::exit(code);
         }
+        Commands::Secrets { action } => {
+            // Key management never serves HTTP: no bearer token is needed.
+            let cfg = Config::from_env_for_maintenance()?;
+            match action {
+                SecretsCommands::Init => secrets::run_init(&cfg),
+                SecretsCommands::Status => secrets::run_status(&cfg),
+                SecretsCommands::Migrate { apply } => secrets::run_migrate(&cfg, apply),
+            }
+        }
     }
 }
 
@@ -118,6 +150,11 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&cfg.root)?;
 
+    // One database handle shared by the index, the compose driver (which reads
+    // the encrypted secrets) and the HTTP state.
+    let db = Db::open(&cfg.db_path())?;
+    secrets::startup(&cfg, &db);
+
     warn_about_legacy_projects(&cfg);
 
     let driver: Arc<dyn Driver> = match cfg.driver {
@@ -126,7 +163,7 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
             Arc::new(MockDriver::with_image(cfg.image.clone()))
         }
         DriverKind::Compose => {
-            let compose = ComposeDriver::new(&cfg);
+            let compose = ComposeDriver::new(&cfg).with_secrets(db.clone());
             match compose.ensure_network_named(&cfg.network).await {
                 Ok(true) => tracing::info!(network = %cfg.network, "created the docker network"),
                 Ok(false) => {}
@@ -140,7 +177,7 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     warn_about_egress(&cfg, driver.clone()).await;
 
-    let state = AppState::bootstrap(cfg.clone(), driver)?;
+    let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

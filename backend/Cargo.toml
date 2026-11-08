@@ -13,10 +13,13 @@ default = []
 embed-web = ["dep:rust-embed"]
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 rusqlite = { version = "0.41", features = ["bundled"] }
 rust-embed = { version = "8", optional = true }
 serde = { version = "1", features = ["derive"] }

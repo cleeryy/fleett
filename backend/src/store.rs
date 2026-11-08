@@ -37,11 +37,14 @@ fn create_dir_private(path: &Path) -> io::Result<()> {
 }
 
 /// Write every generated file for one instance.
+///
+/// Secrets are not written here any more: they go to the encrypted store (see
+/// [`crate::secrets`]), or to a legacy `secrets.env` for instances that still
+/// use one.
 pub fn write_instance(
     cfg: &Config,
     spec: &InstanceSpec,
     rendered: &RenderedInstance,
-    secrets: &BTreeMap<String, String>,
     write_soul: bool,
 ) -> io::Result<()> {
     let dir = cfg.instance_dir(&spec.id);
@@ -62,12 +65,18 @@ pub fn write_instance(
             write_file(&data.join("SOUL.md"), soul, 0o600)?;
         }
     }
-    write_secrets(cfg, &spec.id, secrets)?;
     Ok(())
 }
 
-/// Write `secrets.env` with mode 0600.
-pub fn write_secrets(cfg: &Config, id: &str, secrets: &BTreeMap<String, String>) -> io::Result<()> {
+/// Write the legacy plaintext `secrets.env` with mode 0600.
+///
+/// Only used by instances that were created before the encrypted store and
+/// have not been migrated yet.
+pub fn write_legacy_secrets(
+    cfg: &Config,
+    id: &str,
+    secrets: &BTreeMap<String, String>,
+) -> io::Result<()> {
     let mut text = String::new();
     for (key, value) in secrets {
         text.push_str(key);
@@ -94,17 +103,12 @@ fn format_secret_value(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Read `secrets.env` back. Missing files yield an empty map.
-pub fn read_secrets(cfg: &Config, id: &str) -> BTreeMap<String, String> {
+/// Read a legacy `secrets.env` back. Missing files yield an empty map.
+pub fn read_legacy_secrets(cfg: &Config, id: &str) -> BTreeMap<String, String> {
     match fs::read_to_string(cfg.secrets_path(id)) {
         Ok(text) => parse_env_file(&text),
         Err(_) => BTreeMap::new(),
     }
-}
-
-/// Sorted secret keys, for `InstanceDetail::env_keys`.
-pub fn read_env_keys(cfg: &Config, id: &str) -> Vec<String> {
-    read_secrets(cfg, id).into_keys().collect()
 }
 
 /// The on-disk compose file, or an empty string when it is missing.
@@ -441,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn secrets_round_trip_with_quotes() {
+    fn legacy_secrets_round_trip_with_quotes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let cfg = Config::for_tests(dir.path().to_path_buf());
         ensure_layout(&cfg).expect("layout");
@@ -451,12 +455,12 @@ mod tests {
             "WEIRD".to_string(),
             "value with spaces # and \"quotes\"".to_string(),
         );
-        write_secrets(&cfg, "alice", &secrets).expect("write secrets");
+        write_legacy_secrets(&cfg, "alice", &secrets).expect("write secrets");
 
         let metadata = fs::metadata(cfg.secrets_path("alice")).expect("metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
-        let read = read_secrets(&cfg, "alice");
+        let read = read_legacy_secrets(&cfg, "alice");
         assert_eq!(
             read.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
             Some("123:ABC")

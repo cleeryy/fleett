@@ -245,14 +245,14 @@ pub async fn run(cfg: &Config, source: &str, apply: bool) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let driver = ComposeDriver::new(cfg);
+    let db = Db::open(&cfg.db_path())?;
+    db::reconcile(cfg, &db)?;
+
+    let driver = ComposeDriver::new(cfg).with_secrets(db.clone());
     driver
         .ensure_network_named(&cfg.network)
         .await
         .map_err(|err| anyhow::anyhow!("could not ensure the {} network: {err}", cfg.network))?;
-
-    let db = Db::open(&cfg.db_path())?;
-    db::reconcile(cfg, &db)?;
 
     let mut failures = 0usize;
     for entry in &entries {

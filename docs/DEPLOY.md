@@ -31,6 +31,14 @@ The image is not built by this app. Build once, tag per version:
 docker build -t hermes-agent:0.22.2-local /path/to/hermes-official-v0.22.2
 ```
 
+Then create the encryption key for instance secrets (once per host, outside
+`FLEETT_ROOT`; see [SECRETS.md](SECRETS.md)):
+
+```bash
+sudo fleett secrets init                    # /etc/fleett/secrets.key, mode 0640
+fleett secrets migrate                      # dry run: what would be encrypted
+```
+
 The image name, `/opt/data`, `HERMES_UID` and `HERMES_GID` are unchanged by the rename.
 
 ## Install
@@ -60,6 +68,7 @@ FLEETT_DRIVER=compose
 FLEETT_IMAGE=hermes-agent:0.22.2-local
 FLEETT_NETWORK=fleett
 FLEETT_EGRESS=restrict                      # off = no firewall check, with a warning
+FLEETT_SECRETS_KEY_FILE=/etc/fleett/secrets.key  # AES-256 key, outside FLEETT_ROOT
 FLEETT_TOKEN=<long token, generate with: openssl rand -hex 32>
 ```
 
@@ -127,7 +136,8 @@ reverse proxy in front.
 
 ## Backup
 
-All state lives under `FLEETT_ROOT`:
+All state lives under `FLEETT_ROOT`, **except the secrets key**, which lives
+outside it on purpose (`/etc/fleett/secrets.key` by default):
 
 ```bash
 tar czf fleett-$(date +%F).tgz -C /opt fleett
@@ -135,6 +145,11 @@ tar czf fleett-$(date +%F).tgz -C /opt fleett
 
 Containers can be recreated from `instances/*/compose.yaml`; the data
 (`instances/*/data`, `shares/*`) is the only irreplaceable part.
+
+Instance secrets are encrypted in `fleet.db` with the key file. Back the key up
+**separately** (never in the same archive as the root): without it the
+encrypted rows are unreadable, and without `fleet.db` the tokens are gone. See
+[SECRETS.md](SECRETS.md).
 
 ## Update
 

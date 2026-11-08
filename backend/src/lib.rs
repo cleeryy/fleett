@@ -8,6 +8,7 @@ pub mod egress;
 pub mod migrate;
 pub mod models;
 pub mod render;
+pub mod secrets;
 pub mod store;
 pub mod templates_builtin;
 

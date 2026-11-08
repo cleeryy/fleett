@@ -577,8 +577,9 @@ export function NewInstancePage() {
                     onChange={(event) => update("providerToken", event.target.value)}
                   />
                   <p id="provider-token-help" className="text-xs text-muted-foreground">
-                    Stored in <span className="font-mono">secrets.env</span> (0600) and never returned by the
-                    API. Without it the agent cannot call the model.
+                    Encrypted at rest and never returned by the API. The host needs its secrets key
+                    (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
+                    cannot call the model.
                   </p>
                 </div>
 
@@ -689,8 +690,7 @@ export function NewInstancePage() {
                       onChange={(event) => update("token", event.target.value)}
                     />
                     <p id="channel-token-help" className="text-xs text-muted-foreground">
-                      Written to <span className="font-mono">secrets.env</span> with mode 0600. The API never
-                      returns it.
+                      Encrypted at rest. The API never returns it.
                     </p>
                     <FieldError id="channel-token-error" message={showErrors ? errors.token : undefined} />
                   </div>

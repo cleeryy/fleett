@@ -111,7 +111,7 @@ $FLEETT_ROOT/
 │   │   ├── config.yaml       # generated from the template
 │   │   ├── healthcheck.py    # generated probe used by the Docker health check
 │   │   └── SOUL.md           # generated from the template (create only)
-│   └── secrets.env           # mode 0600, bot token + gate token
+│   └── secrets.env           # legacy only: plaintext, removed by `fleett secrets migrate --apply`
 ├── shares/<name>/            # mounted at /opt/data/shared/<name>
 └── templates/<id>/           # optional overrides: config.yaml, SOUL.md, template.yaml
 ```
@@ -189,10 +189,15 @@ are covered by Docker-free unit tests.
 - **`FLEETT_ALLOW_NO_AUTH=1` is dangerous.** It disables authentication for
   everyone who can reach the port; the process prints a multi-line warning.
   Bind it to localhost or put it behind an authenticating proxy.
-- **Secrets stay on the host.** `secrets.env` is `0600`, owned by the control
-  plane user. It is passed to the container as an `env_file`, never as
-  `environment:` values, so tokens do not appear in `docker inspect` output.
-  The API only exposes key names (`env_keys`), never values.
+- **Secrets are encrypted at rest.** Provider keys and bot tokens are stored as
+  one AES-256-GCM blob per instance in `instance_secrets` (`fleet.db`), with a
+  key kept outside `FLEETT_ROOT` (`/etc/fleett/secrets.key`, `0640`). The
+  compose file declares them as `${KEY}` and the driver injects the decrypted
+  values into the `docker compose` child environment, so a `tar` of the root
+  contains no usable token. See [docs/SECRETS.md](../docs/SECRETS.md). The API
+  only exposes key names (`env_keys`), never values.
+  Instances that still have a plaintext `secrets.env` keep working in legacy
+  mode (with a warning) until `fleett secrets migrate --apply`.
 - **Container hardening** (written into every compose file): dedicated bridge
   network (never `network_mode: host`), no Docker socket mount, single data
   bind mount plus explicit share mounts, `security_opt:
@@ -242,8 +247,8 @@ are covered by Docker-free unit tests.
 - `logs` returns a fixed set of `[mock]` lines, bounded by `tail`;
 - `ping` always reports Docker as healthy.
 
-Everything else is real: compose files, `config.yaml`, `SOUL.md`, `secrets.env`
-(with `0600`), shares on disk, validation, auth, SQLite index and reconciliation.
+Everything else is real: compose files, `config.yaml`, `SOUL.md`, the encrypted
+secrets table, shares on disk, validation, auth, SQLite index and reconciliation.
 The test suite uses `MockDriver` exclusively and never needs a Docker daemon.
 
 ## Tests
@@ -288,8 +293,9 @@ contract):
   `error.details: {used, requested, cap}`.
 - `POST /api/instances` accepts `gate_token` (stored as
   `HERMES_GATE_PROFILE_TOKEN`, and also under `api_key_env` when the two
-  differ) and `env` (extra `KEY=VALUE` pairs for `secrets.env`, value names
-  validated, newlines rejected).
+  differ) and `env` (extra `KEY=VALUE` secrets, value names validated,
+  newlines rejected). Secrets are encrypted; without a key configured a create
+  that carries one returns `409 secrets_key_missing`.
 - `PATCH /api/instances/{id}` also accepts `gate_token` to rotate the gate
   token; `channel.token` remains the documented way to rotate a bot token.
 - `GET /api/health` adds `uptime_s` (control-plane uptime in seconds).

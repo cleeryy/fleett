@@ -43,8 +43,14 @@ impl AppState {
     /// Open the database, rebuild the index from the filesystem and return the
     /// ready state.
     pub fn bootstrap(cfg: Config, driver: Arc<dyn Driver>) -> anyhow::Result<Self> {
-        store::ensure_layout(&cfg)?;
         let db = Db::open(&cfg.db_path())?;
+        Self::bootstrap_with_db(cfg, driver, db)
+    }
+
+    /// Same as [`AppState::bootstrap`] with an already open database, so the
+    /// compose driver and the state share one connection pool.
+    pub fn bootstrap_with_db(cfg: Config, driver: Arc<dyn Driver>, db: Db) -> anyhow::Result<Self> {
+        store::ensure_layout(&cfg)?;
         db::reconcile(&cfg, &db)?;
         Ok(Self {
             cfg: Arc::new(cfg),
@@ -215,8 +221,10 @@ pub(crate) async fn apply_compose(
     spec: &mut InstanceSpec,
 ) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
-    let compose = crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref())
-        .map_err(ApiError::from)?;
+    let keys = crate::secrets::env_keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
+    let compose =
+        crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
+            .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
         .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))?;
     up_and_record(state, spec).await

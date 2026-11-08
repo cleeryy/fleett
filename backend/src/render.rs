@@ -234,12 +234,17 @@ fn detected_channel(doc: Option<&Value>) -> Option<String> {
 }
 
 /// Render every generated file for an instance.
+///
+/// `secret_keys` are the environment variable names the instance holds: they
+/// are declared in the compose file as `${KEY}` and resolved by the driver at
+/// runtime, so no secret value is ever written here.
 pub fn render_instance(
     cfg: &Config,
     spec: &InstanceSpec,
     template: &TemplateSource,
+    secret_keys: &[String],
 ) -> Result<RenderedInstance, RenderError> {
-    render_instance_with_project(cfg, spec, template, None)
+    render_instance_with_project(cfg, spec, template, None, secret_keys)
 }
 
 /// Same as [`render_instance`], keeping an explicit compose project name.
@@ -252,9 +257,10 @@ pub fn render_instance_with_project(
     spec: &InstanceSpec,
     template: &TemplateSource,
     project: Option<&str>,
+    secret_keys: &[String],
 ) -> Result<RenderedInstance, RenderError> {
     Ok(RenderedInstance {
-        compose_yaml: render_compose_with_project(cfg, spec, project)?,
+        compose_yaml: render_compose_with_project(cfg, spec, project, secret_keys)?,
         config_yaml: render_config(spec, &template.config_yaml)?,
         soul_md: template.soul_md.as_ref().map(|soul| substitute(soul, spec)),
     })
@@ -339,7 +345,6 @@ struct ComposeService {
     container_name: String,
     restart: String,
     command: Vec<String>,
-    env_file: Vec<String>,
     environment: BTreeMap<String, String>,
     volumes: Vec<String>,
     networks: Vec<String>,
@@ -384,8 +389,16 @@ pub fn project_name(id: &str) -> String {
 }
 
 /// Render `instances/<id>/compose.yaml`.
-pub fn render_compose(cfg: &Config, spec: &InstanceSpec) -> Result<String, RenderError> {
-    render_compose_with_project(cfg, spec, None)
+///
+/// Secret values never appear in the document: every key is declared as
+/// `${KEY}` and resolved from the `docker compose` process environment by the
+/// driver (`environment` is a Compose interpolation, not a literal).
+pub fn render_compose(
+    cfg: &Config,
+    spec: &InstanceSpec,
+    secret_keys: &[String],
+) -> Result<String, RenderError> {
+    render_compose_with_project(cfg, spec, None, secret_keys)
 }
 
 /// Same as [`render_compose`] with an explicit project (and container) name.
@@ -393,6 +406,7 @@ pub fn render_compose_with_project(
     cfg: &Config,
     spec: &InstanceSpec,
     project: Option<&str>,
+    secret_keys: &[String],
 ) -> Result<String, RenderError> {
     let project = project
         .map(str::to_string)
@@ -413,6 +427,11 @@ pub fn render_compose_with_project(
     let mut environment = BTreeMap::new();
     environment.insert("HERMES_UID".to_string(), "10000".to_string());
     environment.insert("HERMES_GID".to_string(), "10000".to_string());
+    for key in secret_keys {
+        if crate::models::validate_secret_name(key).is_ok() {
+            environment.insert(key.clone(), format!("${{{key}}}"));
+        }
+    }
 
     let mut log_options = BTreeMap::new();
     log_options.insert("max-size".to_string(), "10m".to_string());
@@ -445,7 +464,6 @@ pub fn render_compose_with_project(
         container_name: project.clone(),
         restart: "unless-stopped".to_string(),
         command: vec!["gateway".to_string(), "run".to_string()],
-        env_file: vec!["secrets.env".to_string()],
         environment,
         volumes,
         networks: service_networks,
@@ -697,7 +715,7 @@ mod tests {
     #[test]
     fn compose_has_the_expected_shape() {
         let instance = spec(ChannelKind::Telegram);
-        let rendered = render_compose(&config(), &instance).expect("compose renders");
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
         let doc: Value = serde_yaml::from_str(&rendered).expect("compose YAML parses");
         let agent = doc
             .get("services")
@@ -726,6 +744,10 @@ mod tests {
         );
         assert_eq!(agent.get("cpus").and_then(Value::as_str), Some("1"));
         assert_eq!(agent.get("pids_limit").and_then(Value::as_u64), Some(256));
+        assert!(
+            agent.get("env_file").is_none(),
+            "secrets are interpolated, not read from a file"
+        );
 
         let healthcheck = agent.get("healthcheck").expect("healthcheck");
         let test: Vec<&str> = healthcheck
@@ -770,10 +792,67 @@ mod tests {
     }
 
     #[test]
+    fn compose_interpolates_secret_keys_without_writing_values() {
+        let instance = spec(ChannelKind::Telegram);
+        let keys = vec![
+            "TELEGRAM_BOT_TOKEN".to_string(),
+            "HERMES_GATE_PROFILE_TOKEN".to_string(),
+        ];
+        let rendered = render_compose(&config(), &instance, &keys).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        let agent = &doc["services"]["agent"];
+        assert!(agent.get("env_file").is_none(), "{rendered}");
+        let environment = agent["environment"].as_mapping().expect("environment");
+        assert_eq!(
+            environment
+                .get(Value::from("TELEGRAM_BOT_TOKEN"))
+                .and_then(Value::as_str),
+            Some("${TELEGRAM_BOT_TOKEN}")
+        );
+        assert_eq!(
+            environment
+                .get(Value::from("HERMES_GATE_PROFILE_TOKEN"))
+                .and_then(Value::as_str),
+            Some("${HERMES_GATE_PROFILE_TOKEN}")
+        );
+        assert_eq!(
+            environment
+                .get(Value::from("HERMES_UID"))
+                .and_then(Value::as_str),
+            Some("10000")
+        );
+        assert_eq!(
+            environment
+                .get(Value::from("HERMES_GID"))
+                .and_then(Value::as_str),
+            Some("10000")
+        );
+        assert!(!rendered.contains("123:ABC"));
+    }
+
+    #[test]
+    fn compose_ignores_invalid_secret_names() {
+        let instance = spec(ChannelKind::None);
+        let keys = vec!["NOT-A-NAME".to_string(), "VALID".to_string()];
+        let rendered = render_compose(&config(), &instance, &keys).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        let environment = doc["services"]["agent"]["environment"]
+            .as_mapping()
+            .expect("environment");
+        assert!(environment.get(Value::from("NOT-A-NAME")).is_none());
+        assert_eq!(
+            environment
+                .get(Value::from("VALID"))
+                .and_then(Value::as_str),
+            Some("${VALID}")
+        );
+    }
+
+    #[test]
     fn compose_attaches_the_lan_network_only_when_allowed() {
         let mut instance = spec(ChannelKind::None);
         instance.allow_lan = true;
-        let rendered = render_compose(&config(), &instance).expect("compose renders");
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
         let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
         let agent = &doc["services"]["agent"];
         let networks: Vec<&str> = agent["networks"]
@@ -788,7 +867,7 @@ mod tests {
         assert_eq!(doc["networks"]["lan"]["name"].as_str(), Some("fleett-lan"));
 
         instance.allow_lan = false;
-        let rendered = render_compose(&config(), &instance).expect("compose renders");
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
         let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
         assert!(doc["networks"].get("lan").is_none());
         let networks: Vec<&str> = doc["services"]["agent"]["networks"]
@@ -803,7 +882,7 @@ mod tests {
     #[test]
     fn compose_can_keep_an_explicit_project_name() {
         let instance = spec(ChannelKind::None);
-        let rendered = render_compose_with_project(&config(), &instance, Some("hermes-alice"))
+        let rendered = render_compose_with_project(&config(), &instance, Some("hermes-alice"), &[])
             .expect("compose renders");
         let doc: Value = serde_yaml::from_str(&rendered).expect("compose YAML parses");
         assert_eq!(
@@ -824,7 +903,7 @@ mod tests {
         let mut instance = spec(ChannelKind::None);
         for (value, expected) in [(0.5, "0.5"), (1.0, "1"), (2.25, "2.25")] {
             instance.cpu_limit = value;
-            let rendered = render_compose(&config(), &instance).expect("compose renders");
+            let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
             let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
             assert_eq!(
                 doc.get("services")

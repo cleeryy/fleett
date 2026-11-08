@@ -8,8 +8,10 @@
 
 use super::{Driver, DriverError, DriverFuture, PsResult};
 use crate::config::Config;
+use crate::db::Db;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use crate::render;
+use crate::secrets;
 use crate::store::compose_project_name;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -25,16 +27,27 @@ const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ComposeDriver {
-    root: PathBuf,
+    cfg: Config,
     docker: PathBuf,
+    /// Encrypted secrets live in the index database; without it the driver
+    /// falls back to a legacy `secrets.env` file.
+    db: Option<Db>,
 }
 
 impl ComposeDriver {
     pub fn new(cfg: &Config) -> Self {
         Self {
-            root: cfg.root.clone(),
+            cfg: cfg.clone(),
             docker: PathBuf::from("docker"),
+            db: None,
         }
+    }
+
+    /// Read the instance secrets from the encrypted store and inject them into
+    /// every `docker compose` child process.
+    pub fn with_secrets(mut self, db: Db) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Override the docker binary (useful for unusual installs).
@@ -44,7 +57,11 @@ impl ComposeDriver {
     }
 
     fn compose_path(&self, id: &str) -> PathBuf {
-        self.root.join("instances").join(id).join("compose.yaml")
+        self.cfg
+            .root
+            .join("instances")
+            .join(id)
+            .join("compose.yaml")
     }
 
     /// Project name declared by the instance compose file.
@@ -59,7 +76,23 @@ impl ComposeDriver {
             .unwrap_or_else(|| render::project_name(id))
     }
 
-    fn command_for(&self, id: &str, project: &str) -> Command {
+    /// Environment of the compose process: the instance secrets, decrypted.
+    ///
+    /// The compose file declares `${KEY}` for every secret, so the values only
+    /// exist in this child process (`docker inspect` sees them per container).
+    fn environment(
+        &self,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, DriverError> {
+        let secrets = match &self.db {
+            Some(db) => secrets::load(&self.cfg, db, id),
+            None => Ok(crate::store::read_legacy_secrets(&self.cfg, id)),
+        };
+        secrets.map_err(|err| DriverError::new("secrets", err.to_string()))
+    }
+
+    fn command_for(&self, id: &str, project: &str) -> Result<Command, DriverError> {
+        let environment = self.environment(id)?;
         let mut command = Command::new(&self.docker);
         command
             .arg("compose")
@@ -67,12 +100,15 @@ impl ComposeDriver {
             .arg(self.compose_path(id))
             .arg("-p")
             .arg(project);
+        // An empty map keeps the parent environment untouched (a fresh driver
+        // without secrets must still be able to run `docker compose down`).
+        command.envs(environment);
         command.stdin(Stdio::null());
         command.kill_on_drop(true);
-        command
+        Ok(command)
     }
 
-    fn command(&self, id: &str) -> Command {
+    fn command(&self, id: &str) -> Result<Command, DriverError> {
         self.command_for(id, &self.project(id))
     }
 
@@ -83,7 +119,7 @@ impl ComposeDriver {
         operation: &str,
         timeout: Duration,
     ) -> Result<String, DriverError> {
-        let mut command = self.command(id);
+        let mut command = self.command(id)?;
         command.args(args);
         run_command(command, operation, timeout).await
     }
@@ -100,7 +136,7 @@ impl ComposeDriver {
         operation: &str,
         timeout: Duration,
     ) -> Result<String, DriverError> {
-        let mut command = self.command_for(id, project);
+        let mut command = self.command_for(id, project)?;
         command.args(args);
         run_command(command, operation, timeout).await
     }
@@ -487,7 +523,7 @@ mod tests {
         )
         .expect("compose file");
 
-        let command = driver.command("alice");
+        let command = driver.command("alice").expect("command");
         let args: Vec<String> = command
             .as_std()
             .get_args()
@@ -501,6 +537,105 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg.ends_with("instances/alice/compose.yaml")));
+    }
+
+    fn env_of(command: &Command) -> std::collections::BTreeMap<String, String> {
+        command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compose_commands_receive_the_decrypted_secrets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut cfg = Config::for_tests(dir.path().join("root"));
+        crate::store::ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+        cfg.secrets_key = Some(secrets::encode_key(&[7u8; 32]));
+
+        let db = Db::open(&cfg.db_path()).expect("db");
+        let mut stored = std::collections::BTreeMap::new();
+        stored.insert("TELEGRAM_BOT_TOKEN".to_string(), "123:ABC".to_string());
+        stored.insert("HERMES_GATE_PROFILE_TOKEN".to_string(), "gate".to_string());
+        secrets::store(&cfg, &db, "alice", &stored).expect("store secrets");
+
+        let driver = ComposeDriver::new(&cfg).with_secrets(db);
+        let environment = env_of(&driver.command("alice").expect("command"));
+        assert_eq!(
+            environment.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+            Some("123:ABC")
+        );
+        assert_eq!(
+            environment
+                .get("HERMES_GATE_PROFILE_TOKEN")
+                .map(String::as_str),
+            Some("gate")
+        );
+    }
+
+    #[test]
+    fn compose_commands_fall_back_to_a_legacy_secrets_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        crate::store::ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+        let mut stored = std::collections::BTreeMap::new();
+        stored.insert("DISCORD_BOT_TOKEN".to_string(), "legacy-token".to_string());
+        crate::store::write_legacy_secrets(&cfg, "alice", &stored).expect("legacy file");
+
+        let db = Db::open(&cfg.db_path()).expect("db");
+        let driver = ComposeDriver::new(&cfg).with_secrets(db);
+        let environment = env_of(&driver.command("alice").expect("command"));
+        assert_eq!(
+            environment.get("DISCORD_BOT_TOKEN").map(String::as_str),
+            Some("legacy-token")
+        );
+    }
+
+    #[test]
+    fn an_encrypted_instance_without_a_key_fails_loudly() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut cfg = Config::for_tests(dir.path().join("root"));
+        crate::store::ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+        cfg.secrets_key = Some(secrets::encode_key(&[7u8; 32]));
+        let db = Db::open(&cfg.db_path()).expect("db");
+        let mut stored = std::collections::BTreeMap::new();
+        stored.insert("TELEGRAM_BOT_TOKEN".to_string(), "123:ABC".to_string());
+        secrets::store(&cfg, &db, "alice", &stored).expect("store");
+
+        // Same database, key gone: the compose command must not run with an
+        // empty token.
+        cfg.secrets_key = None;
+        cfg.secrets_key_file = cfg.root.with_extension("missing.key");
+        let driver = ComposeDriver::new(&cfg).with_secrets(db);
+        let err = driver.command("alice").expect_err("no key");
+        assert_eq!(err.operation, "secrets");
+        assert!(err.detail.contains("fleett secrets init"), "{err}");
     }
 
     #[test]

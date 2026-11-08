@@ -20,6 +20,11 @@ pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
 pub const DEFAULT_NETWORK: &str = "fleett";
 /// Marker written by `fleett egress install` and read by the control plane.
 pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
+/// Key file used to encrypt instance secrets at rest.
+///
+/// Outside `FLEETT_ROOT` on purpose: a backup of the data root must never
+/// contain the key that decrypts the secrets stored in it.
+pub const DEFAULT_SECRETS_KEY_FILE: &str = "/etc/fleett/secrets.key";
 
 /// Name of the environment file inside `FLEETT_ROOT`.
 pub const ENV_FILE_NAME: &str = "fleett.env";
@@ -117,6 +122,12 @@ pub struct Config {
     pub egress: EgressMode,
     /// Marker written by `fleett egress install` (`FLEETT_EGRESS_MARKER`).
     pub egress_marker: PathBuf,
+    /// Base64 AES-256 key (`FLEETT_SECRETS_KEY`), when set directly.
+    pub secrets_key: Option<String>,
+    /// Key file (`FLEETT_SECRETS_KEY_FILE`), read when no inline key is set.
+    pub secrets_key_file: PathBuf,
+    /// Delete imported `secrets.env` files at startup (`FLEETT_SECRETS_AUTOIMPORT`).
+    pub secrets_autoimport: bool,
     /// Directory containing an on-disk frontend build, when one is present.
     pub web_dist: Option<PathBuf>,
 }
@@ -295,6 +306,15 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_EGRESS_MARKER));
 
+        let secrets_key = get("SECRETS_KEY");
+        let secrets_key_file = get("SECRETS_KEY_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_KEY_FILE));
+        let secrets_autoimport = matches!(
+            get("SECRETS_AUTOIMPORT").as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "on")
+        );
+
         Ok(Self {
             root,
             bind,
@@ -307,6 +327,9 @@ impl Config {
             max_total_mem_mb,
             egress,
             egress_marker,
+            secrets_key,
+            secrets_key_file,
+            secrets_autoimport,
             web_dist,
         })
     }
@@ -318,6 +341,9 @@ impl Config {
     /// lives in the temporary root instead of `/etc/fleett`.
     pub fn for_tests(root: PathBuf) -> Self {
         let egress_marker = root.join("egress.json");
+        // The key file lives next to the root, never inside it, exactly like
+        // the production default (`/etc/fleett/secrets.key` vs `/opt/fleett`).
+        let secrets_key_file = root.with_extension("secrets.key");
         Self {
             root,
             bind: "127.0.0.1:0"
@@ -332,6 +358,9 @@ impl Config {
             max_total_mem_mb: 0,
             egress: EgressMode::Off,
             egress_marker,
+            secrets_key: None,
+            secrets_key_file,
+            secrets_autoimport: false,
             web_dist: None,
         }
     }

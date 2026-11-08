@@ -92,7 +92,7 @@ export interface CreateInstanceInput {
   model: string;
   base_url: string;
   api_key_env: string;
-  /** Write-only. Stored in secrets.env as HERMES_GATE_PROFILE_TOKEN. */
+  /** Write-only. Encrypted at rest as HERMES_GATE_PROFILE_TOKEN. */
   gate_token?: string;
   channel: ChannelInput;
   shares: ShareRef[];

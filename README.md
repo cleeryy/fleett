@@ -25,7 +25,7 @@ fleett                           # reads ~/.fleett/fleett.env
 
 Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). The installer also creates a
 `hermes-fleet` symlink for scripts written against the old name. Details: `docs/INSTALL.md`,
-deployment as a service: `docs/DEPLOY.md`.
+deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`.
 
 ## Architecture
 

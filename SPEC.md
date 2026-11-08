@@ -33,7 +33,7 @@ The web app is a control plane only: it supervises no process.
 ├── instances/<id>/
 │   ├── compose.yaml
 │   ├── data/                      # mounted at /opt/data (full Hermes home)
-│   └── secrets.env                # 0600, bot token + gate token
+│   └── secrets.env                # legacy only: plaintext, migrated on request
 ├── shares/<name>/                 # directories shared across instances
 └── templates/<template>/          # config.yaml + SOUL.md templates
 ```
@@ -84,7 +84,7 @@ simulates states without touching Docker. Tests never call Docker.
 
 | Action | Effect | Container |
 |---|---|---|
-| create | writes compose + data + secrets, `up -d` | running |
+| create | writes compose + data, encrypts secrets, `up -d` | running |
 | stop | `compose stop` | stopped (does not restart) |
 | start | `compose start` | running |
 | restart | `compose restart` | running |

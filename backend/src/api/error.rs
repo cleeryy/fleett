@@ -3,6 +3,7 @@
 use crate::db::DbError;
 use crate::driver::DriverError;
 use crate::render::RenderError;
+use crate::secrets::{SecretsError, MISSING_KEY_CODE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -109,6 +110,17 @@ impl From<RenderError> for ApiError {
                 "invalid_template",
                 format!("the template does not render to valid Hermes YAML: {detail}"),
             ),
+            other => ApiError::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<SecretsError> for ApiError {
+    fn from(err: SecretsError) -> Self {
+        match err {
+            SecretsError::MissingKey => {
+                ApiError::conflict(MISSING_KEY_CODE, SecretsError::MissingKey.to_string())
+            }
             other => ApiError::internal(other.to_string()),
         }
     }

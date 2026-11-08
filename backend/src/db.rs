@@ -3,6 +3,11 @@
 //! The database caches what the filesystem already says. It is reconciled from
 //! `instances/*/compose.yaml` and `shares/*` at every start, so deleting
 //! `fleet.db` only loses notes and timestamps, never an agent.
+//!
+//! One exception: `instance_secrets` holds the AES-256-GCM blobs of the
+//! instance secrets (see [`crate::secrets`]). That table is *not* rebuildable
+//! from disk; losing the database loses the stored tokens, and they cannot be
+//! decrypted without the key that lives outside `FLEETT_ROOT`.
 
 use crate::config::Config;
 use crate::models::{now_iso, ChannelKind, InstanceSpec, ShareMode, ShareRef, Status};
@@ -54,6 +59,16 @@ CREATE INDEX IF NOT EXISTS idx_share_links_instance ON share_links (instance_id)
     "ALTER TABLE instances ADD COLUMN cpu_limit REAL NOT NULL DEFAULT 1.0;",
     // v3 — explicit LAN access flag (restricted `fleett` network by default).
     "ALTER TABLE instances ADD COLUMN allow_lan INTEGER NOT NULL DEFAULT 0;",
+    // v4 — instance secrets encrypted at rest (one AES-256-GCM blob per
+    // instance). The plaintext never reaches the database.
+    r#"
+CREATE TABLE IF NOT EXISTS instance_secrets (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    nonce        BLOB NOT NULL,
+    ciphertext   BLOB NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -77,8 +92,18 @@ pub struct ShareRecord {
     pub created_at: String,
 }
 
+/// One encrypted secrets blob, as stored in `instance_secrets`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRecord {
+    pub instance_id: String,
+    /// AES-GCM nonce (96 bits).
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub updated_at: String,
+}
+
 /// Handle to the index database.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
@@ -278,9 +303,78 @@ impl Db {
             "DELETE FROM share_links WHERE instance_id = ?1",
             params![id],
         )?;
+        transaction.execute(
+            "DELETE FROM instance_secrets WHERE instance_id = ?1",
+            params![id],
+        )?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Encrypted secrets blob of one instance, when it has one.
+    pub fn sealed(&self, id: &str) -> Result<Option<SealedRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT instance_id, nonce, ciphertext, updated_at FROM instance_secrets \
+                 WHERE instance_id = ?1",
+                params![id],
+                |row| {
+                    Ok(SealedRecord {
+                        instance_id: row.get(0)?,
+                        nonce: row.get(1)?,
+                        ciphertext: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Insert or replace the encrypted secrets blob of one instance.
+    ///
+    /// A fresh nonce must be generated for every value: the caller encrypts
+    /// first, this only records the bytes.
+    pub fn put_sealed(&self, id: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO instance_secrets (instance_id, nonce, ciphertext, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (instance_id) DO UPDATE SET \
+                 nonce = excluded.nonce, \
+                 ciphertext = excluded.ciphertext, \
+                 updated_at = excluded.updated_at",
+            params![id, nonce, ciphertext, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_sealed(&self, id: &str) -> Result<(), DbError> {
+        self.lock().execute(
+            "DELETE FROM instance_secrets WHERE instance_id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of every instance that has an encrypted secrets blob.
+    pub fn sealed_ids(&self) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT instance_id FROM instance_secrets ORDER BY instance_id")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn sealed_count(&self) -> Result<usize, DbError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM instance_secrets", [], |row| {
+            row.get(0)
+        })?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn share_exists(&self, name: &str) -> Result<bool, DbError> {
@@ -674,7 +768,7 @@ mod tests {
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
         let conn = db.lock();
-        for table in ["instances", "shares", "share_links"] {
+        for table in ["instances", "shares", "share_links", "instance_secrets"] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
         let columns: Vec<String> = conn
@@ -780,7 +874,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 99)
                 .expect("bump version");
         }
-        let err = Db::open(&path).err().expect("newer schema is refused");
+        let err = Db::open(&path).expect_err("newer schema is refused");
         assert!(matches!(err, DbError::SchemaNewer { found: 99, .. }));
     }
 }

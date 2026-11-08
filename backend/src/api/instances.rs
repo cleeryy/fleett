@@ -110,17 +110,27 @@ pub async fn create(
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
 
-    let rendered =
-        render::render_instance(&state.cfg, &spec, &prepared.template).map_err(ApiError::from)?;
     let secrets = render::build_secrets(
         &spec,
         prepared.gate_token.as_deref(),
         prepared.channel_token.as_deref(),
         &prepared.extras,
     );
+    // Refuse a create that could not store its tokens *before* writing any
+    // file, so a refused create leaves nothing behind.
+    crate::secrets::check_storable(&state.cfg, &state.db, &spec.id, &secrets)
+        .map_err(ApiError::from)?;
+    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
+
+    let rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &secret_keys)
+        .map_err(ApiError::from)?;
 
     state.db.insert_instance(&spec).map_err(ApiError::from)?;
-    if let Err(err) = store::write_instance(&state.cfg, &spec, &rendered, &secrets, true) {
+    if let Err(err) = crate::secrets::store(&state.cfg, &state.db, &spec.id, &secrets) {
+        let _ = state.db.delete_instance(&spec.id);
+        return Err(ApiError::from(err));
+    }
+    if let Err(err) = store::write_instance(&state.cfg, &spec, &rendered, true) {
         let _ = state.db.delete_instance(&spec.id);
         return Err(ApiError::internal(format!(
             "failed to write instance files: {err}"
@@ -157,16 +167,21 @@ pub async fn patch(
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
 
-    let rendered = render_for_update(&state, &spec)?;
-    let existing = store::read_secrets(&state.cfg, &id);
+    let existing = crate::secrets::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     let secrets = render::merge_secrets(
         existing,
         &spec,
         request.gate_token.as_deref(),
         channel_token.as_deref(),
     );
+    crate::secrets::check_storable(&state.cfg, &state.db, &id, &secrets).map_err(ApiError::from)?;
+    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
+    let rendered = render_for_update(&state, &spec, &secret_keys)?;
+    // Rotation is durable before the compose file starts referencing the new
+    // key name; the driver reads the row on its next `docker compose` call.
+    crate::secrets::store(&state.cfg, &state.db, &id, &secrets).map_err(ApiError::from)?;
 
-    store::write_instance(&state.cfg, &spec, &rendered, &secrets, false)
+    store::write_instance(&state.cfg, &spec, &rendered, false)
         .map_err(|err| ApiError::internal(format!("failed to write instance files: {err}")))?;
     spec.updated_at = now_iso();
     spec.status = Status::Created;
@@ -303,15 +318,20 @@ async fn lifecycle(
 fn render_for_update(
     state: &AppState,
     spec: &InstanceSpec,
+    secret_keys: &[String],
 ) -> Result<render::RenderedInstance, ApiError> {
     // Keep the project already declared on disk: an instance created by an
     // older release stays on `hermes-<id>` until it is migrated explicitly.
     let project = store::declared_project(&state.cfg, &spec.id);
     match render::load_template(&state.cfg, &spec.template) {
-        Ok(template) => {
-            render::render_instance_with_project(&state.cfg, spec, &template, project.as_deref())
-                .map_err(ApiError::from)
-        }
+        Ok(template) => render::render_instance_with_project(
+            &state.cfg,
+            spec,
+            &template,
+            project.as_deref(),
+            secret_keys,
+        )
+        .map_err(ApiError::from),
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
             let config_path = state.cfg.data_dir(&spec.id).join("config.yaml");
             let existing = std::fs::read_to_string(&config_path).map_err(|err| {
@@ -325,6 +345,7 @@ fn render_for_update(
                     &state.cfg,
                     spec,
                     project.as_deref(),
+                    secret_keys,
                 )
                 .map_err(ApiError::from)?,
                 config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
@@ -538,8 +559,18 @@ fn to_detail(
     status: Status,
     health: Health,
     container: Option<ContainerInfo>,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> InstanceDetail {
+    let env_keys = match crate::secrets::env_keys(&state.cfg, &state.db, &spec.id) {
+        Ok(keys) => keys,
+        Err(err) => {
+            warnings.push(format!("secrets are unreadable: {err}"));
+            Vec::new()
+        }
+    };
+    if crate::secrets::has_plaintext_file(&state.cfg, &spec.id) {
+        warnings.push(crate::secrets::WARNING_LEGACY.to_string());
+    }
     InstanceDetail {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -560,7 +591,7 @@ fn to_detail(
         updated_at: spec.updated_at.clone(),
         last_error: spec.last_error.clone(),
         data_dir: state.cfg.data_dir(&spec.id).display().to_string(),
-        env_keys: store::read_env_keys(&state.cfg, &spec.id),
+        env_keys,
         container,
         compose_yaml: store::read_compose(&state.cfg, &spec.id),
     }

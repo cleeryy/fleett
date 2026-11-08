@@ -11,6 +11,7 @@ use fleett::driver::mock::MockDriver;
 use fleett::models::Health;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,8 @@ use tower::ServiceExt;
 const TOKEN: &str = "test-token";
 const BASE_URL: &str = "https://opencode.ai/inference/go/openai/v1";
 const MODEL: &str = "deepseek-v4.1-flash";
+/// AES-256 key used by the harness unless a test opts out.
+const SECRETS_KEY_BYTES: [u8; 32] = [7u8; 32];
 
 struct Harness {
     dir: tempfile::TempDir,
@@ -34,6 +37,9 @@ impl Harness {
     fn with_config(configure: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut cfg = Config::for_tests(dir.path().to_path_buf());
+        // Most tests exercise the encrypted path; the legacy/no-key paths opt
+        // out explicitly in their own tests.
+        cfg.secrets_key = Some(fleett::secrets::encode_key(&SECRETS_KEY_BYTES));
         configure(&mut cfg);
         let mock = Arc::new(MockDriver::new());
         let state = AppState::bootstrap(cfg, mock.clone()).expect("bootstrap state");
@@ -46,6 +52,32 @@ impl Harness {
 
     fn instance_dir(&self, id: &str) -> PathBuf {
         self.root().join("instances").join(id)
+    }
+
+    /// Decrypted secrets of an instance, read from the control plane store.
+    fn instance_secrets(&self, id: &str) -> BTreeMap<String, String> {
+        fleett::secrets::load(&self.state.cfg, &self.state.db, id).expect("secrets readable")
+    }
+
+    /// Every file under the instance directory, concatenated.
+    fn instance_files(&self, id: &str) -> String {
+        fn read_tree(dir: &Path, out: &mut String) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    read_tree(&path, out);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+        }
+        let mut out = String::new();
+        read_tree(&self.instance_dir(id), &mut out);
+        out
     }
 
     async fn request(
@@ -286,18 +318,28 @@ async fn creates_instance_and_writes_files() {
     // compose.yaml parses and names the project.
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
     assert_eq!(compose["name"], "fleett-alice");
-
-    // secrets.env is 0600 and contains the expected keys.
-    let secrets_path = harness.instance_dir("alice").join("secrets.env");
-    let metadata = std::fs::metadata(&secrets_path).expect("secrets metadata");
-    assert_eq!(metadata.mode() & 0o777, 0o600);
-    let secrets = std::fs::read_to_string(&secrets_path).expect("secrets");
-    assert!(secrets.contains("TELEGRAM_BOT_TOKEN=123:ABC"), "{secrets}");
-    assert!(
-        secrets.contains("HERMES_GATE_PROFILE_TOKEN=gate-secret"),
-        "{secrets}"
+    assert!(compose["services"]["agent"].get("env_file").is_none());
+    assert_eq!(
+        compose["services"]["agent"]["environment"]["TELEGRAM_BOT_TOKEN"],
+        "${TELEGRAM_BOT_TOKEN}"
     );
-    assert!(secrets.contains("EXTRA_FLAG=1"), "{secrets}");
+
+    // No plaintext secrets file: the values are encrypted in the index.
+    let secrets_path = harness.instance_dir("alice").join("secrets.env");
+    assert!(!secrets_path.exists());
+    let secrets = harness.instance_secrets("alice");
+    assert_eq!(
+        secrets.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+        Some("123:ABC")
+    );
+    assert_eq!(
+        secrets.get("HERMES_GATE_PROFILE_TOKEN").map(String::as_str),
+        Some("gate-secret")
+    );
+    assert_eq!(secrets.get("EXTRA_FLAG").map(String::as_str), Some("1"));
+    let on_disk = harness.instance_files("alice");
+    assert!(!on_disk.contains("123:ABC"), "{on_disk}");
+    assert!(!on_disk.contains("gate-secret"), "{on_disk}");
 
     // config.yaml parses and has the mandated model block.
     let config = read_yaml(&harness.instance_dir("alice").join("data/config.yaml"));
@@ -524,9 +566,11 @@ async fn patch_rewrites_compose_and_keeps_data() {
         "keep me"
     );
     // Channel token survives a patch that does not mention it.
-    let secrets = std::fs::read_to_string(harness.instance_dir("alice").join("secrets.env"))
-        .expect("secrets");
-    assert!(secrets.contains("TELEGRAM_BOT_TOKEN=123:ABC"), "{secrets}");
+    let secrets = harness.instance_secrets("alice");
+    assert_eq!(
+        secrets.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+        Some("123:ABC")
+    );
 }
 
 #[tokio::test]
@@ -582,17 +626,174 @@ async fn patch_can_rotate_the_channel_token() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(parse(&body)["channel"], "discord");
 
-    let secrets = std::fs::read_to_string(harness.instance_dir("alice").join("secrets.env"))
-        .expect("secrets");
-    assert!(
-        secrets.contains("DISCORD_BOT_TOKEN=discord-secret"),
-        "{secrets}"
+    let secrets = harness.instance_secrets("alice");
+    assert_eq!(
+        secrets.get("DISCORD_BOT_TOKEN").map(String::as_str),
+        Some("discord-secret")
     );
-    assert!(!secrets.contains("TELEGRAM_BOT_TOKEN"), "{secrets}");
+    assert!(!secrets.contains_key("TELEGRAM_BOT_TOKEN"));
+    assert!(!harness.instance_dir("alice").join("secrets.env").exists());
+
+    // The compose file follows the new channel: the old key is gone, the new
+    // one is interpolated from the driver environment.
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    let environment = compose["services"]["agent"]["environment"]
+        .as_object()
+        .expect("environment");
+    assert_eq!(environment["DISCORD_BOT_TOKEN"], "${DISCORD_BOT_TOKEN}");
+    assert!(!environment.contains_key("TELEGRAM_BOT_TOKEN"));
 
     let config = read_yaml(&harness.instance_dir("alice").join("data/config.yaml"));
     assert_eq!(config["platforms"]["discord"]["enabled"], true);
     assert_eq!(config["platforms"]["telegram"]["enabled"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Secrets at rest
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_without_a_key_is_refused_with_a_hint() {
+    let harness = Harness::with_config(|cfg| {
+        cfg.secrets_key = None;
+        cfg.secrets_key_file = cfg.root.with_extension("missing.key");
+    });
+
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(instance_body("alice")))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "secrets_key_missing");
+    let message = error["message"].as_str().expect("message");
+    assert!(message.contains("fleett secrets init"), "{message}");
+
+    // Nothing was written: no directory, no row.
+    assert!(!harness.instance_dir("alice").exists());
+    assert!(harness.state.db.sealed("alice").expect("sealed").is_none());
+}
+
+#[tokio::test]
+async fn a_legacy_secrets_env_keeps_working_without_a_key() {
+    let harness = Harness::with_config(|cfg| {
+        cfg.secrets_key = None;
+        cfg.secrets_key_file = cfg.root.with_extension("missing.key");
+    });
+
+    // An instance without any secret needs no key at all.
+    let body = json!({
+        "id": "alice",
+        "name": "Agent alice",
+        "template": "solo",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "none"},
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert!(!harness.instance_dir("alice").join("secrets.env").exists());
+
+    // Simulate an instance adopted from an older release: plaintext file on
+    // disk, no encrypted row.
+    std::fs::write(
+        harness.instance_dir("alice").join("secrets.env"),
+        "TELEGRAM_BOT_TOKEN=111:OLD\n",
+    )
+    .expect("legacy secrets");
+
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"channel": {"type": "telegram", "token": "222:NEW"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // Rotation still works, in legacy mode, on the plaintext file.
+    let text = std::fs::read_to_string(harness.instance_dir("alice").join("secrets.env"))
+        .expect("legacy secrets");
+    assert!(text.contains("TELEGRAM_BOT_TOKEN=222:NEW"), "{text}");
+    assert!(harness.state.db.sealed("alice").expect("sealed").is_none());
+    assert!(harness
+        .instance_secrets("alice")
+        .contains_key("TELEGRAM_BOT_TOKEN"));
+
+    // The operator is warned loudly.
+    let detail = parse(&response);
+    let warnings = detail["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|warning| warning.contains("plain text")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn secrets_migration_dry_run_then_apply() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    // Roll the instance back to what an older release left on disk: an
+    // encrypted row removed, a plaintext file, a compose file with env_file.
+    harness.state.db.delete_sealed("alice").expect("drop row");
+    std::fs::write(
+        harness.instance_dir("alice").join("secrets.env"),
+        "TELEGRAM_BOT_TOKEN=123:ABC\nHERMES_GATE_PROFILE_TOKEN=gate-secret\n",
+    )
+    .expect("legacy secrets");
+    let legacy_compose = "name: fleett-alice\n\
+                          services:\n\
+                          \x20 agent:\n\
+                          \x20   image: hermes-agent:0.22.2-local\n\
+                          \x20   env_file:\n\
+                          \x20     - secrets.env\n\
+                          \x20   environment:\n\
+                          \x20     HERMES_UID: '10000'\n";
+    std::fs::write(
+        harness.instance_dir("alice").join("compose.yaml"),
+        legacy_compose,
+    )
+    .expect("legacy compose");
+
+    // Dry run: the plan is reported, nothing changes.
+    let dry = fleett::secrets::migrate(&harness.state.cfg, false).expect("dry run");
+    assert!(!dry.applied);
+    assert_eq!(dry.entries.len(), 1);
+    assert_eq!(dry.entries[0].instance_id, "alice");
+    assert!(dry.entries[0].compose_references_env_file);
+    assert!(harness.instance_dir("alice").join("secrets.env").is_file());
+    assert_eq!(
+        std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+            .expect("compose"),
+        legacy_compose
+    );
+
+    // Apply: encrypted, compose rewritten, plaintext deleted.
+    let applied = fleett::secrets::migrate(&harness.state.cfg, true).expect("apply");
+    assert_eq!(applied.migrated, vec!["alice".to_string()]);
+    assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+    assert!(!harness.instance_dir("alice").join("secrets.env").exists());
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    let agent = &compose["services"]["agent"];
+    assert!(agent.get("env_file").is_none());
+    assert_eq!(
+        agent["environment"]["TELEGRAM_BOT_TOKEN"],
+        "${TELEGRAM_BOT_TOKEN}"
+    );
+    assert_eq!(agent["environment"]["HERMES_UID"], "10000");
+
+    let secrets = harness.instance_secrets("alice");
+    assert_eq!(
+        secrets.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+        Some("123:ABC")
+    );
+    assert!(!harness.instance_files("alice").contains("123:ABC"));
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +1075,10 @@ async fn delete_keeps_data_by_default() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(!harness.instance_dir("alice").join("compose.yaml").exists());
     assert!(!harness.instance_dir("alice").join("secrets.env").exists());
+    assert!(
+        harness.state.db.sealed("alice").expect("sealed").is_none(),
+        "the encrypted secrets row must be deleted with the instance"
+    );
     assert!(marker.is_file(), "data directory must be preserved");
     assert_eq!(
         std::fs::read_to_string(&marker).expect("marker"),
@@ -924,7 +1129,11 @@ async fn compose_file_is_restrictive() {
     assert_eq!(agent["container_name"], "fleett-alice");
     assert_eq!(agent["restart"], "unless-stopped");
     assert_eq!(agent["command"], json!(["gateway", "run"]));
-    assert_eq!(agent["env_file"], json!(["secrets.env"]));
+    assert!(agent.get("env_file").is_none());
+    assert_eq!(
+        agent["environment"]["TELEGRAM_BOT_TOKEN"],
+        "${TELEGRAM_BOT_TOKEN}"
+    );
     assert_eq!(agent["environment"]["HERMES_UID"], "10000");
     assert_eq!(agent["environment"]["HERMES_GID"], "10000");
     assert_eq!(agent["networks"], json!(["fleet"]));

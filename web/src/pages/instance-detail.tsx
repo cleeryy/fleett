@@ -517,7 +517,8 @@ function ConfigurationTab({
           {providerKeySet
             ? "A provider key is stored. Leave empty to keep it."
             : "No provider key stored. The agent cannot call the model without one."}{" "}
-          Written to <span className="font-mono">secrets.env</span> (0600) and never returned by the API.
+          Encrypted at rest and never returned by the API. The host needs its secrets key
+          (<span className="font-mono">sudo fleett secrets init</span>).
         </p>
       </div>
 
