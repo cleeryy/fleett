@@ -457,7 +457,11 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     warn_about_egress(&cfg, driver.clone()).await;
 
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
-    let app = api::router(state);
+    let app = api::router(state.clone());
+
+    if let Some(bind) = cfg.metrics.bind {
+        spawn_metrics_listener(state.clone(), bind).await?;
+    }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(
@@ -475,6 +479,28 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         .await?;
 
     tracing::info!("control plane stopped; agents keep running");
+    Ok(())
+}
+
+/// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).
+///
+/// It is a second, independent listener: a scrape never reaches the API port and
+/// never needs an API token. A bind failure is fatal — an operator who asked for
+/// metrics must not discover months later that the port was never opened.
+async fn spawn_metrics_listener(state: AppState, bind: std::net::SocketAddr) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(
+        bind = %bind,
+        path = %fleett::metrics::METRICS_PATH,
+        token = state.cfg.metrics.requires_token(),
+        "metrics listening"
+    );
+    let app = fleett::metrics::router(state);
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::error!(%err, "the metrics listener stopped");
+        }
+    });
     Ok(())
 }
 

@@ -893,8 +893,14 @@ pub async fn delete(
     if let Err(err) = state.driver.down(&spec).await {
         let detail = err.detail.clone();
         let _ = state.db.set_status(&id, Status::Error, Some(&detail));
+        state
+            .metrics
+            .record_compose_action("down", crate::metrics::RESULT_ERROR);
         return Err(ApiError::driver(err));
     }
+    state
+        .metrics
+        .record_compose_action("down", crate::metrics::RESULT_OK);
     state.db.delete_instance(&id).map_err(ApiError::from)?;
     store::remove_instance(&state.cfg, &id, purge)
         .map_err(|err| ApiError::internal(format!("failed to remove instance files: {err}")))?;
@@ -925,6 +931,11 @@ async fn lifecycle(
     let _guard = lock.lock().await;
 
     let spec = load(&state, &id)?;
+    let action = match operation {
+        Lifecycle::Start => "start",
+        Lifecycle::Stop => "stop",
+        Lifecycle::Restart => "restart",
+    };
     let result = match operation {
         Lifecycle::Start => state.driver.start(&spec).await,
         Lifecycle::Stop => state.driver.stop(&spec).await,
@@ -933,8 +944,14 @@ async fn lifecycle(
     if let Err(err) = result {
         let detail = err.detail.clone();
         let _ = state.db.set_status(&id, Status::Error, Some(&detail));
+        state
+            .metrics
+            .record_compose_action(action, crate::metrics::RESULT_ERROR);
         return Err(ApiError::driver(err));
     }
+    state
+        .metrics
+        .record_compose_action(action, crate::metrics::RESULT_OK);
 
     let fallback = if operation == Lifecycle::Stop {
         Status::Stopped
@@ -951,12 +968,12 @@ async fn lifecycle(
         .db
         .set_status(&id, status, None)
         .map_err(ApiError::from)?;
-    let action = match operation {
+    let audit_action = match operation {
         Lifecycle::Start => "instance.start",
         Lifecycle::Stop => "instance.stop",
         Lifecycle::Restart => "instance.restart",
     };
-    audit::record(&state, &context, action, &id, None);
+    audit::record(&state, &context, audit_action, &id, None);
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),
     }))

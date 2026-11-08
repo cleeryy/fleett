@@ -44,6 +44,8 @@ pub struct AppState {
     pub locks: Arc<InstanceLocks>,
     /// Last (or running) rolling upgrade (`POST /api/upgrade`).
     pub upgrade: Arc<upgrade::UpgradeManager>,
+    /// Prometheus counters and the cached utilisation sample (`GET /metrics`).
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub started_at: Instant,
 }
 
@@ -79,6 +81,7 @@ impl AppState {
             auth: Arc::new(auth),
             locks: Arc::new(InstanceLocks::default()),
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
             started_at: Instant::now(),
         })
     }
@@ -104,7 +107,10 @@ impl InstanceLocks {
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     let api = api_routes(state.clone());
-    finalize(api, auth_pages(), state)
+    finalize(api, auth_pages(), state.clone()).layer(middleware::from_fn_with_state(
+        state,
+        crate::metrics::track_request,
+    ))
 }
 
 /// Browser-facing authentication routes (outside `/api` so a reverse proxy
@@ -325,12 +331,18 @@ pub(crate) async fn up_and_record(
                 .db
                 .set_status(&spec.id, status, last_error)
                 .map_err(ApiError::from)?;
+            state
+                .metrics
+                .record_compose_action("up", crate::metrics::RESULT_OK);
             Ok(())
         }
         Err(err) => {
             let detail = err.detail.clone();
             spec.status = Status::Error;
             let _ = state.db.set_status(&spec.id, Status::Error, Some(&detail));
+            state
+                .metrics
+                .record_compose_action("up", crate::metrics::RESULT_ERROR);
             Err(ApiError::driver(err))
         }
     }

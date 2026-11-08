@@ -104,6 +104,69 @@ impl fmt::Display for EgressMode {
     }
 }
 
+/// How strictly the agent containers are hardened (`FLEETT_HARDENING`).
+///
+/// `standard` is the historical posture: `no-new-privileges`, `NET_RAW` dropped
+/// and a writable `/tmp` tmpfs. `strict` makes the root filesystem read-only and
+/// drops every capability; it needs an image that can start without writing
+/// outside its data volume (see docs/HARDENING.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Hardening {
+    #[default]
+    Standard,
+    Strict,
+}
+
+impl Hardening {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" | "default" => Some(Self::Standard),
+            "strict" | "hardened" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Hardening {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Settings of the dedicated Prometheus listener (`FLEETT_METRICS_*`).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct MetricsConfig {
+    /// `None` disables the listener (`FLEETT_METRICS_BIND` empty).
+    pub bind: Option<SocketAddr>,
+    /// Bearer token required by `GET /metrics`, when one is configured.
+    pub token: Option<String>,
+}
+
+impl MetricsConfig {
+    /// Whether a scrape has to carry a bearer token.
+    pub fn requires_token(&self) -> bool {
+        self.token.is_some()
+    }
+}
+
+/// `Debug` is implemented by hand: the metrics token must never reach a log
+/// line, exactly like the OIDC secrets.
+impl fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("bind", &self.bind)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Authentication mode selected by `FLEETT_AUTH`.
 ///
 /// `bearer` is the historical behaviour (one static token plus named API
@@ -237,6 +300,9 @@ impl fmt::Debug for OidcConfig {
     }
 }
 
+/// Default bind of the dedicated Prometheus listener (`GET /metrics`).
+pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9100";
+
 pub const DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:8090";
 pub const DEFAULT_OIDC_SCOPES: &str = "openid profile email";
 pub const DEFAULT_OIDC_ADMIN_GROUP: &str = "fleett-admins";
@@ -275,6 +341,10 @@ pub struct Config {
     pub secrets_autoimport: bool,
     /// Directory containing an on-disk frontend build, when one is present.
     pub web_dist: Option<PathBuf>,
+    /// Security posture of the rendered agent containers (`FLEETT_HARDENING`).
+    pub hardening: Hardening,
+    /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,6 +365,11 @@ pub enum ConfigError {
         var: &'static str,
         mode: &'static str,
     },
+    #[error(
+        "FLEETT_METRICS_TOKEN is required when FLEETT_METRICS_BIND ({bind}) is not a loopback \
+         address: without it anyone who can reach the port reads the fleet layout"
+    )]
+    MetricsTokenRequired { bind: SocketAddr },
 }
 
 impl Config {
@@ -360,7 +435,7 @@ impl Config {
     /// `FLEETT_TOKEN` or the legacy `FLEET_TOKEN` freely.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         Self::assemble(
-            &|suffix| resolve_var(&lookup, suffix),
+            &|suffix| resolve_var_raw(&lookup, suffix),
             PathBuf::from(DEFAULT_ROOT),
             true,
         )
@@ -371,11 +446,10 @@ impl Config {
         default_root: PathBuf,
         require_token: bool,
     ) -> Result<Self, ConfigError> {
-        let get = |suffix: &str| {
-            get(suffix)
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        };
+        // `get` drops blank values (a variable set to nothing is "unset"); the
+        // two variables where the empty string is meaningful read `get_raw`.
+        let get_raw = |suffix: &str| get(suffix).map(|value| value.trim().to_string());
+        let get = |suffix: &str| get_raw(suffix).filter(|value| !value.is_empty());
 
         let root = get("ROOT").map(PathBuf::from).unwrap_or(default_root);
 
@@ -482,6 +556,17 @@ impl Config {
             Some("1" | "true" | "TRUE" | "yes" | "on")
         );
 
+        let hardening = match get("HARDENING") {
+            None => Hardening::Standard,
+            Some(value) => Hardening::parse(&value).ok_or_else(|| ConfigError::Invalid {
+                var: "FLEETT_HARDENING",
+                value: value.clone(),
+                detail: "expected \"standard\" or \"strict\"".to_string(),
+            })?,
+        };
+
+        let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
+
         Ok(Self {
             root,
             bind,
@@ -500,6 +585,8 @@ impl Config {
             secrets_key_file,
             secrets_autoimport,
             web_dist,
+            hardening,
+            metrics,
         })
     }
 
@@ -533,6 +620,9 @@ impl Config {
             secrets_key_file,
             secrets_autoimport: false,
             web_dist: None,
+            hardening: Hardening::Standard,
+            // The listener is started by `serve` only: tests never bind a port.
+            metrics: MetricsConfig::default(),
         }
     }
 
@@ -693,8 +783,60 @@ fn decode_session_secret(value: &str) -> Option<Vec<u8>> {
     (bytes.len() >= MIN_SESSION_SECRET_BYTES).then_some(bytes)
 }
 
+/// Resolve `FLEETT_METRICS_*` and enforce the listen-address policy.
+///
+/// The listener is on by default (`127.0.0.1:9100`, no token needed). An empty
+/// value — or `off` — disables it; any other value is parsed as a socket
+/// address, and a non-loopback bind then requires a token.
+fn resolve_metrics(
+    bind: Option<String>,
+    token: Option<String>,
+) -> Result<MetricsConfig, ConfigError> {
+    let bind = match bind.as_deref().map(str::trim) {
+        None => Some(
+            DEFAULT_METRICS_BIND
+                .parse::<SocketAddr>()
+                .expect("the default metrics bind is a valid socket address"),
+        ),
+        Some(value)
+            if value.is_empty()
+                || matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "off" | "none" | "disabled" | "false"
+                ) =>
+        {
+            None
+        }
+        Some(value) => Some(
+            value
+                .parse::<SocketAddr>()
+                .map_err(|err| ConfigError::Invalid {
+                    var: "FLEETT_METRICS_BIND",
+                    value: value.to_string(),
+                    detail: err.to_string(),
+                })?,
+        ),
+    };
+
+    if let Some(addr) = bind {
+        if !addr.ip().is_loopback() && token.is_none() {
+            return Err(ConfigError::MetricsTokenRequired { bind: addr });
+        }
+    }
+
+    Ok(MetricsConfig { bind, token })
+}
+
 /// Resolve one configuration variable: `FLEETT_<suffix>` then `FLEET_<suffix>`.
 fn resolve_var(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<String> {
+    resolve_var_raw(lookup, suffix).filter(|value| !value.is_empty())
+}
+
+/// Same as [`resolve_var`] keeping a blank value.
+///
+/// `FLEETT_METRICS_BIND=` (an empty value) is the documented way to disable the
+/// metrics listener, so the resolver must be able to see it.
+fn resolve_var_raw(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<String> {
     [
         format!("{PREFIX}{suffix}"),
         format!("{LEGACY_PREFIX}{suffix}"),
@@ -702,7 +844,6 @@ fn resolve_var(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<
     .iter()
     .find_map(|name| lookup(name))
     .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
 }
 
 /// Existing environment file in `root`: `fleett.env` wins over `fleet.env`.
@@ -1389,5 +1530,137 @@ FLEETT_NETWORK='fleett-net'
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_hardening_posture_defaults_to_standard_and_is_validated() {
+        let cfg = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert_eq!(cfg.hardening, Hardening::Standard);
+
+        for value in ["standard", "DEFAULT", " strict ", "hardened"] {
+            let cfg = Config::from_lookup(|key| match key {
+                "FLEETT_TOKEN" => Some("t".to_string()),
+                "FLEETT_HARDENING" => Some(value.to_string()),
+                _ => None,
+            })
+            .expect("hardening resolves");
+            let expected = if value.trim().eq_ignore_ascii_case("strict")
+                || value.trim().eq_ignore_ascii_case("hardened")
+            {
+                Hardening::Strict
+            } else {
+                Hardening::Standard
+            };
+            assert_eq!(cfg.hardening, expected, "{value:?}");
+        }
+
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_HARDENING" => Some("paranoid".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid hardening");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_HARDENING",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_metrics_listener_defaults_to_loopback_without_a_token() {
+        let cfg = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert_eq!(
+            cfg.metrics.bind,
+            Some("127.0.0.1:9100".parse().expect("valid address"))
+        );
+        assert!(cfg.metrics.token.is_none());
+        assert!(!cfg.metrics.requires_token());
+    }
+
+    #[test]
+    fn an_empty_metrics_bind_disables_the_listener() {
+        for value in ["", "  ", "off", "none", "disabled", "false"] {
+            let cfg = Config::from_lookup(|key| match key {
+                "FLEETT_TOKEN" => Some("t".to_string()),
+                "FLEETT_METRICS_BIND" => Some(value.to_string()),
+                _ => None,
+            })
+            .expect("disabled resolves");
+            assert_eq!(
+                cfg.metrics.bind, None,
+                "{value:?} must disable the listener"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_metrics_bind_requires_a_token() {
+        let public = |token: Option<&'static str>| {
+            Config::from_lookup(move |key| match key {
+                "FLEETT_TOKEN" => Some("t".to_string()),
+                "FLEETT_METRICS_BIND" => Some("0.0.0.0:9100".to_string()),
+                "FLEETT_METRICS_TOKEN" => token.map(str::to_string),
+                _ => None,
+            })
+        };
+
+        let err = public(None).expect_err("a public bind needs a token");
+        assert!(
+            matches!(err, ConfigError::MetricsTokenRequired { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("FLEETT_METRICS_TOKEN"), "{err}");
+
+        let cfg = public(Some("scrape-me")).expect("public bind with a token");
+        assert_eq!(
+            cfg.metrics.bind,
+            Some("0.0.0.0:9100".parse().expect("valid address"))
+        );
+        assert!(cfg.metrics.requires_token());
+
+        // A loopback bind never needs a token, and the token is accepted anyway.
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_METRICS_BIND" => Some("127.0.0.1:9999".to_string()),
+            _ => None,
+        })
+        .expect("loopback resolves");
+        assert_eq!(
+            cfg.metrics.bind,
+            Some("127.0.0.1:9999".parse().expect("addr"))
+        );
+        assert!(cfg.metrics.token.is_none());
+
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_METRICS_BIND" => Some("not-an-address".to_string()),
+            _ => None,
+        })
+        .expect_err("bad metrics bind");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_METRICS_BIND",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_metrics_token_never_reaches_the_debug_output() {
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_METRICS_TOKEN" => Some("scrape-me".to_string()),
+            _ => None,
+        })
+        .expect("resolves");
+        let debug = format!("{:?}", cfg.metrics);
+        assert!(!debug.contains("scrape-me"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }

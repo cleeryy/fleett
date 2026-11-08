@@ -22,6 +22,10 @@ was renamed from `hermes-fleet` in v0.2.0 — see [Upgrading from `hermes-fleet`
   default, health-checked, with automatic rollback to the previous tag — see `docs/UPGRADE.md`
 - drive everything from a terminal: `fleett ls`, `ps`, `logs`, `create`, `start`/`stop`/
   `restart`, `delete`, `usage`, `images`, `upgrade`, `doctor` — see `docs/CLI.md`
+- scrape the fleet from Prometheus on a dedicated loopback listener (`GET /metrics`,
+  optional bearer token) — see `docs/METRICS.md`
+- harden the agent container on demand: `FLEETT_HARDENING=strict` adds a read-only
+  rootfs and `cap_drop: [ALL]` — see `docs/HARDENING.md`
 
 ## Install
 
@@ -34,7 +38,8 @@ fleett                           # reads ~/.fleett/fleett.env
 Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). The installer also creates a
 `hermes-fleet` symlink for scripts written against the old name. Details: `docs/INSTALL.md`,
 deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`,
-backups and instance archives: `docs/BACKUP.md`, rolling image upgrades: `docs/UPGRADE.md`.
+backups and instance archives: `docs/BACKUP.md`, rolling image upgrades: `docs/UPGRADE.md`,
+metrics: `docs/METRICS.md`, container hardening: `docs/HARDENING.md`.
 
 ## Architecture
 

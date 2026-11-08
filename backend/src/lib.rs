@@ -11,6 +11,7 @@ pub mod driver;
 pub mod egress;
 pub mod instance_archive;
 pub mod logs;
+pub mod metrics;
 pub mod migrate;
 pub mod models;
 pub mod render;

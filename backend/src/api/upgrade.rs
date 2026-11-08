@@ -259,6 +259,32 @@ async fn run_job(state: AppState, context: AuthContext, job_id: String) {
     while tasks.join_next().await.is_some() {}
 
     state.upgrade.finish(&job_id);
+    if let Some(job) = state.upgrade.current().filter(|job| job.id == job_id) {
+        state.metrics.record_upgrade_job(job_result(&job));
+    }
+}
+
+/// Final result label of one job (`fleett_upgrade_jobs_total`).
+///
+/// A job that lost at least one instance is a failure even when the others were
+/// moved; a clean rollback is reported apart because it needs operator action
+/// but left the fleet running.
+fn job_result(job: &UpgradeJob) -> &'static str {
+    if job
+        .results
+        .iter()
+        .any(|result| result.status == UpgradeStatus::Failed)
+    {
+        "failed"
+    } else if job
+        .results
+        .iter()
+        .any(|result| result.status == UpgradeStatus::RolledBack)
+    {
+        "rolled_back"
+    } else {
+        "success"
+    }
 }
 
 /// Upgrade one instance, rolling back when the new image never gets healthy.
@@ -334,8 +360,18 @@ async fn upgrade_one(
         Err(format!("cannot write the compose file: {}", err.message))
     } else {
         match state.driver.up(&spec).await {
-            Ok(()) => Ok(()),
-            Err(err) => Err(format!("docker compose up failed: {}", err.detail.trim())),
+            Ok(()) => {
+                state
+                    .metrics
+                    .record_compose_action("upgrade", crate::metrics::RESULT_OK);
+                Ok(())
+            }
+            Err(err) => {
+                state
+                    .metrics
+                    .record_compose_action("upgrade", crate::metrics::RESULT_ERROR);
+                Err(format!("docker compose up failed: {}", err.detail.trim()))
+            }
         }
     };
 
@@ -476,8 +512,18 @@ async fn rollback(
     spec.previous_image = previous_before;
     let restored = match write_compose_file(state, spec) {
         Ok(()) => match state.driver.up(spec).await {
-            Ok(()) => Ok(()),
-            Err(err) => Err(err.detail.trim().to_string()),
+            Ok(()) => {
+                state
+                    .metrics
+                    .record_compose_action("rollback", crate::metrics::RESULT_OK);
+                Ok(())
+            }
+            Err(err) => {
+                state
+                    .metrics
+                    .record_compose_action("rollback", crate::metrics::RESULT_ERROR);
+                Err(err.detail.trim().to_string())
+            }
         },
         Err(err) => Err(err.message),
     };
@@ -634,6 +680,50 @@ mod tests {
         assert_eq!(
             poll_interval(Duration::from_secs(10)),
             Duration::from_millis(500)
+        );
+    }
+
+    fn job_with(statuses: &[UpgradeStatus]) -> UpgradeJob {
+        UpgradeJob {
+            id: "job-1".to_string(),
+            image: "agent:2".to_string(),
+            started_at: now_iso(),
+            finished_at: None,
+            dry_run: false,
+            parallel: 1,
+            timeout_s: 180,
+            results: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| UpgradeResult {
+                    id: format!("instance-{index}"),
+                    from: Some("agent:1".to_string()),
+                    to: "agent:2".to_string(),
+                    status: *status,
+                    error: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_job_result_reports_the_worst_outcome() {
+        assert_eq!(job_result(&job_with(&[UpgradeStatus::Healthy])), "success");
+        assert_eq!(
+            job_result(&job_with(&[
+                UpgradeStatus::Healthy,
+                UpgradeStatus::RolledBack
+            ])),
+            "rolled_back",
+            "one rollback makes the whole job a rollback"
+        );
+        assert_eq!(
+            job_result(&job_with(&[
+                UpgradeStatus::RolledBack,
+                UpgradeStatus::Failed
+            ])),
+            "failed",
+            "a failure dominates a rollback"
         );
     }
 }

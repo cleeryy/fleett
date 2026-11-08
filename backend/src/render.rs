@@ -4,7 +4,7 @@
 //! with `serde_yaml` from typed structs, and the Hermes config is a template
 //! with a small, fixed set of placeholders.
 
-use crate::config::Config;
+use crate::config::{Config, Hardening};
 use crate::models::{
     ChannelKind, InstanceSpec, ShareMode, TemplateInfo, TemplateMeta, DEFAULT_API_KEY_ENV,
     DEFAULT_TEMPLATE, GATE_TOKEN_ENV,
@@ -353,6 +353,10 @@ struct ComposeService {
     security_opt: Vec<String>,
     cap_drop: Vec<String>,
     tmpfs: Vec<String>,
+    /// `read_only: true` only under `FLEETT_HARDENING=strict`; omitted
+    /// otherwise so the standard compose file keeps its historical bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only: Option<bool>,
     pids_limit: u32,
     mem_limit: String,
     memswap_limit: String,
@@ -461,6 +465,8 @@ pub fn render_compose_with_project(
         );
     }
 
+    let (read_only, security_opt, cap_drop, tmpfs) = security_posture(cfg.hardening);
+
     let service = ComposeService {
         image: if spec.image.trim().is_empty() {
             cfg.image.clone()
@@ -486,9 +492,10 @@ pub fn render_compose_with_project(
                 );
                 labels
             }),
-        security_opt: vec!["no-new-privileges:true".to_string()],
-        cap_drop: vec!["NET_RAW".to_string()],
-        tmpfs: vec!["/tmp".to_string()],
+        security_opt,
+        cap_drop,
+        tmpfs,
+        read_only,
         pids_limit: 256,
         mem_limit: format!("{}m", spec.mem_limit_mb),
         memswap_limit: format!("{}m", spec.mem_limit_mb),
@@ -520,6 +527,34 @@ pub fn render_compose_with_project(
     };
 
     serde_yaml::to_string(&compose).map_err(|err| RenderError::Compose(err.to_string()))
+}
+
+/// Security posture of the rendered service (`FLEETT_HARDENING`).
+///
+/// `standard` is what every release before issue #18 produced, byte for byte:
+/// `no-new-privileges`, `NET_RAW` dropped, a single `/tmp` tmpfs. `strict` makes
+/// the root filesystem read-only, drops every capability, mounts the three
+/// scratch directories the Hermes entrypoint may touch, and keeps
+/// `no-new-privileges` exactly once.
+///
+/// The image runs as root and drops to `HERMES_UID` through its s6 entrypoint,
+/// which is why `/run` and `/var/tmp` must stay writable: see docs/HARDENING.md.
+fn security_posture(hardening: Hardening) -> (Option<bool>, Vec<String>, Vec<String>, Vec<String>) {
+    let no_new_privileges = vec!["no-new-privileges:true".to_string()];
+    match hardening {
+        Hardening::Standard => (
+            None,
+            no_new_privileges,
+            vec!["NET_RAW".to_string()],
+            vec!["/tmp".to_string()],
+        ),
+        Hardening::Strict => (
+            Some(true),
+            no_new_privileges,
+            vec!["ALL".to_string()],
+            ["/tmp", "/run", "/var/tmp"].map(str::to_string).to_vec(),
+        ),
+    }
 }
 
 /// Render a CPU quota the way Compose accepts it (`1`, `0.5`, `2.25`).
@@ -731,6 +766,119 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    /// Compose file produced by every release before issue #18.
+    ///
+    /// `FLEETT_HARDENING=standard` (the default) must keep producing exactly
+    /// these bytes: operators diff their compose files, and an unexpected new
+    /// key would look like a silent policy change.
+    const STANDARD_COMPOSE: &str = "\
+name: fleett-alice
+services:
+  agent:
+    image: hermes-agent:0.22.2-local
+    container_name: fleett-alice
+    restart: unless-stopped
+    command:
+    - gateway
+    - run
+    environment:
+      HERMES_GID: '10000'
+      HERMES_UID: '10000'
+    volumes:
+    - ./data:/opt/data
+    - ../../shares/findings:/opt/data/shared/findings
+    - ../../shares/archive:/opt/data/shared/archive:ro
+    networks:
+    - fleet
+    security_opt:
+    - no-new-privileges:true
+    cap_drop:
+    - NET_RAW
+    tmpfs:
+    - /tmp
+    pids_limit: 256
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    cpus: '1'
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - /opt/data/healthcheck.py
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-file: '3'
+        max-size: 10m
+networks:
+  fleet:
+    external: true
+    name: fleett
+";
+
+    fn string_list(value: &Value) -> Vec<&str> {
+        value
+            .as_sequence()
+            .unwrap_or_else(|| panic!("expected a list, got {value:?}"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn standard_hardening_keeps_the_historical_compose_bytes() {
+        let instance = spec(ChannelKind::Telegram);
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
+        assert_eq!(rendered, STANDARD_COMPOSE);
+
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(
+            doc["services"]["agent"].get("read_only").is_none(),
+            "standard mode never sets read_only"
+        );
+    }
+
+    #[test]
+    fn strict_hardening_makes_the_rootfs_read_only_and_drops_every_capability() {
+        let mut cfg = config();
+        cfg.hardening = Hardening::Strict;
+        let instance = spec(ChannelKind::Telegram);
+        let rendered = render_compose(&cfg, &instance, &[]).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        let agent = &doc["services"]["agent"];
+
+        assert_eq!(agent["read_only"].as_bool(), Some(true));
+        assert_eq!(string_list(&agent["cap_drop"]), ["ALL"]);
+        assert_eq!(
+            string_list(&agent["tmpfs"]),
+            ["/tmp", "/run", "/var/tmp"],
+            "the writable scratch directories of the s6 entrypoint"
+        );
+        assert_eq!(
+            string_list(&agent["security_opt"]),
+            ["no-new-privileges:true"],
+            "the flag must appear exactly once"
+        );
+
+        // Nothing else moves: the strict mode only adds restrictions.
+        assert_eq!(agent["mem_limit"].as_str(), Some("1536m"));
+        assert_eq!(agent["memswap_limit"].as_str(), Some("1536m"));
+        assert_eq!(agent["pids_limit"].as_u64(), Some(256));
+        assert_eq!(agent["restart"].as_str(), Some("unless-stopped"));
+        assert!(string_list(&agent["volumes"]).contains(&"./data:/opt/data"));
+
+        // Rendering is a pure function of the configuration: switching back to
+        // standard reproduces the historical bytes, key for key.
+        let mut standard = config();
+        standard.hardening = Hardening::Standard;
+        let back = render_compose(&standard, &instance, &[]).expect("compose renders");
+        assert_eq!(back, STANDARD_COMPOSE);
     }
 
     #[test]
