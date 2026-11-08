@@ -95,6 +95,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     revoked_at  TEXT
 );
 "#,
+    // v6 — per-instance container image (copy of `services.agent.image`).
+    // Rolling upgrades move one instance at a time between tags.
+    "ALTER TABLE instances ADD COLUMN image TEXT NOT NULL DEFAULT '';",
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -226,7 +229,8 @@ impl Db {
         let stored = conn
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-                 last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, updated_at \
+                 last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
+                 updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -243,7 +247,8 @@ impl Db {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-             last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, updated_at \
+             last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
+             updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -288,9 +293,9 @@ impl Db {
         }
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, channel, \
-             status, last_error, mem_limit_mb, cpu_limit, allow_lan, notes, created_at, \
+             status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
              updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 spec.id,
                 spec.name,
@@ -303,6 +308,7 @@ impl Db {
                 spec.last_error,
                 spec.mem_limit_mb,
                 spec.cpu_limit,
+                spec.image,
                 spec.allow_lan,
                 spec.notes,
                 spec.created_at,
@@ -322,7 +328,8 @@ impl Db {
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, channel = ?7, status = ?8, last_error = ?9, mem_limit_mb = ?10, \
-             cpu_limit = ?11, allow_lan = ?12, notes = ?13, updated_at = ?14 WHERE id = ?1",
+             cpu_limit = ?11, image = ?12, allow_lan = ?13, notes = ?14, updated_at = ?15 \
+             WHERE id = ?1",
             params![
                 spec.id,
                 spec.name,
@@ -335,6 +342,7 @@ impl Db {
                 spec.last_error,
                 spec.mem_limit_mb,
                 spec.cpu_limit,
+                spec.image,
                 spec.allow_lan,
                 spec.notes,
                 spec.updated_at,
@@ -372,6 +380,18 @@ impl Db {
         self.lock().execute(
             "UPDATE instances SET last_error = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, last_error, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Record the container image of one instance.
+    ///
+    /// Only the image column (and `updated_at`) move: a rolling upgrade must
+    /// never rewrite the notes, the limits or the share links of the instance.
+    pub fn set_image(&self, id: &str, image: &str) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE instances SET image = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, image, now_iso()],
         )?;
         Ok(())
     }
@@ -748,6 +768,7 @@ struct StoredRow {
     last_error: Option<String>,
     mem_limit_mb: i64,
     cpu_limit: f64,
+    image: String,
     allow_lan: bool,
     notes: String,
     created_at: String,
@@ -771,6 +792,10 @@ impl StoredRow {
             } else {
                 crate::models::DEFAULT_CPU_LIMIT
             },
+            image: self.image,
+            // Only the compose file carries the previous tag; the reconciler
+            // reads it back when the instance is rendered.
+            previous_image: None,
             allow_lan: self.allow_lan,
             notes: self.notes,
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
@@ -794,6 +819,7 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         last_error: row.get("last_error")?,
         mem_limit_mb: row.get("mem_limit_mb")?,
         cpu_limit: row.get("cpu_limit")?,
+        image: row.get("image")?,
         allow_lan: row.get("allow_lan")?,
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
@@ -842,13 +868,22 @@ fn load_all_links(conn: &Connection) -> Result<HashMap<String, Vec<ShareRef>>, D
 
 /// Rebuild the index from the filesystem. Instances whose compose file
 /// disappeared are dropped from the index; new directories are adopted.
+///
+/// The image column follows the compose file: an instance whose
+/// `services.agent.image` changed on disk (an upgrade, a hand edit, a restore)
+/// is resynced instead of keeping a stale tag.
 pub fn reconcile(cfg: &Config, db: &Db) -> Result<(), DbError> {
     let disk = store::scan_instances(cfg);
     let disk_ids: HashSet<&str> = disk.iter().map(|spec| spec.id.as_str()).collect();
 
     for spec in &disk {
-        if db.get(&spec.id)?.is_none() {
-            db.insert_instance(spec)?;
+        match db.get(&spec.id)? {
+            None => db.insert_instance(spec)?,
+            Some(existing) => {
+                if !spec.image.is_empty() && existing.image != spec.image {
+                    db.set_image(&spec.id, &spec.image)?;
+                }
+            }
         }
     }
     for existing in db.list()? {
@@ -892,6 +927,8 @@ mod tests {
             }],
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
+            image: "hermes-agent:0.22.2-local".to_string(),
+            previous_image: None,
             allow_lan: false,
             notes: String::new(),
             status: Status::Created,
@@ -915,9 +952,11 @@ mod tests {
         let stored = db.get("alice").expect("get").expect("present");
         assert_eq!(stored.shares.len(), 1);
         assert_eq!(stored.shares[0].name, "findings");
+        assert_eq!(stored.image, "hermes-agent:0.22.2-local");
 
         let mut updated = stored.clone();
         updated.name = "Alice".to_string();
+        updated.image = "hermes-agent:0.23.0-local".to_string();
         updated.shares = vec![ShareRef {
             name: "archive".to_string(),
             mode: ShareMode::Ro,
@@ -925,6 +964,7 @@ mod tests {
         db.update_instance(&updated).expect("update");
         let stored = db.get("alice").expect("get").expect("present");
         assert_eq!(stored.name, "Alice");
+        assert_eq!(stored.image, "hermes-agent:0.23.0-local");
         assert_eq!(stored.shares[0].name, "archive");
 
         db.delete_instance("alice").expect("delete");
@@ -990,6 +1030,7 @@ mod tests {
             .expect("collect columns");
         assert!(columns.iter().any(|column| column == "cpu_limit"));
         assert!(columns.iter().any(|column| column == "allow_lan"));
+        assert!(columns.iter().any(|column| column == "image"));
     }
 
     #[test]
@@ -1023,6 +1064,7 @@ mod tests {
         assert_eq!(alice.mem_limit_mb, 1024);
         assert_eq!(alice.cpu_limit, crate::models::DEFAULT_CPU_LIMIT);
         assert!(!alice.allow_lan);
+        assert_eq!(alice.image, "", "a v0 row starts without an image");
         assert!(table_exists(&db.lock(), "share_links"));
 
         // Re-opening an up-to-date database applies nothing.

@@ -111,6 +111,8 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/restart", post(restart_instance))
         .route("/api/instances/{id}/logs", get(logs))
         .route("/api/usage", get(usage))
+        .route("/api/images", get(images))
+        .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
         .route("/api/health", get(health))
         .route("/api/auth/me", get(me))
         .with_state(state.clone())
@@ -290,6 +292,62 @@ async fn usage() -> Json<Value> {
                    "mem_limit_bytes": 3221225472u64, "disk_bytes": 12582912},
         "caps": {"max_cpu": 8.0, "max_mem_mb": 16384}
     }))
+}
+
+async fn images() -> Json<Value> {
+    Json(json!([
+        {"tag": "hermes-agent:0.22.2-local",
+         "id": "sha256:3f2a9c1d4b5e6f708192a3",
+         "size": "1.2GB",
+         "created": "2026-11-08 01:02:03 +0000 UTC",
+         "instances": ["alice"]},
+        {"tag": "hermes-agent:0.23.0",
+         "id": "sha256:9d8c7b6a5f4e3d2c1b0a9",
+         "size": "1.3GB",
+         "created": "2026-11-09 02:03:04 +0000 UTC",
+         "instances": []}
+    ]))
+}
+
+fn upgrade_job(image: &str, dry_run: bool) -> Value {
+    let broken = image.contains("broken");
+    let results = vec![
+        json!({"id": "alice", "from": "hermes-agent:0.22.2-local", "to": image,
+               "status": if dry_run { "pending" } else { "healthy" }}),
+        json!({"id": "bob", "from": "hermes-agent:0.22.2-local", "to": image,
+        "status": if dry_run {
+            "pending"
+        } else if broken {
+            "rolled_back"
+        } else {
+            "healthy"
+        },
+        "error": if broken && !dry_run {
+            json!("upgrade failed: the container reported unhealthy; rolled back to hermes-agent:0.22.2-local")
+        } else {
+            Value::Null
+        }}),
+    ];
+    json!({
+        "id": "job-1",
+        "image": image,
+        "started_at": "2026-11-08T01:00:00Z",
+        "finished_at": "2026-11-08T01:03:00Z",
+        "dry_run": dry_run,
+        "parallel": 1,
+        "timeout_s": 180,
+        "results": results,
+    })
+}
+
+async fn start_upgrade(Json(body): Json<Value>) -> Response {
+    let image = body["image"].as_str().unwrap_or("agent:0").to_string();
+    let dry_run = body["dry_run"].as_bool().unwrap_or(false);
+    Json(upgrade_job(&image, dry_run)).into_response()
+}
+
+async fn upgrade_status() -> Json<Value> {
+    Json(upgrade_job("hermes-agent:0.23.0", false))
 }
 
 async fn health(State(state): State<MockState>) -> Json<Value> {
@@ -749,4 +807,128 @@ async fn an_unreachable_server_is_a_connection_error() {
     let text = stderr(&output);
     assert!(text.contains("cannot reach"), "{text}");
     assert!(text.contains("127.0.0.1:1"), "{text}");
+}
+
+#[tokio::test]
+async fn upgrade_sends_the_options_and_prints_the_results() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "upgrade",
+            "--image",
+            "hermes-agent:0.23.0",
+            "--parallel",
+            "2",
+            "--timeout",
+            "30",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let body = server.request("POST", "/api/upgrade").body.expect("body");
+    assert_eq!(body["image"], "hermes-agent:0.23.0");
+    assert_eq!(body["parallel"], 2);
+    assert_eq!(body["timeout_s"], 30);
+    assert_eq!(body["dry_run"], false);
+
+    let text = stdout(&output);
+    assert!(text.contains("alice"), "{text}");
+    assert!(text.contains("bob"), "{text}");
+    assert!(text.contains("healthy"), "{text}");
+    assert!(text.contains("hermes-agent:0.23.0"), "{text}");
+}
+
+#[tokio::test]
+async fn upgrade_dry_run_lists_the_plan_without_running_it() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(
+        &server,
+        home.path(),
+        &["upgrade", "--image", "hermes-agent:0.23.0", "--dry-run"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let body = server.request("POST", "/api/upgrade").body.expect("body");
+    assert_eq!(body["dry_run"], true);
+
+    let text = stdout(&output);
+    assert!(text.contains("dry run"), "{text}");
+    assert!(text.contains("alice"), "{text}");
+    assert!(
+        text.contains("hermes-agent:0.22.2-local -> hermes-agent:0.23.0"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_json_prints_the_final_job() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "upgrade", "--image", "hermes-agent:0.23.0"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["id"], "job-1");
+    assert_eq!(value["image"], "hermes-agent:0.23.0");
+    assert_eq!(value["finished_at"], "2026-11-08T01:03:00Z");
+    assert_eq!(value["results"][0]["status"], "healthy");
+}
+
+#[tokio::test]
+async fn a_rolled_back_upgrade_exits_non_zero() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["upgrade", "--image", "broken:1"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(text.contains("rolled_back"), "{text}");
+    assert!(text.contains("rolled back to"), "{text}");
+    // The results table is the report; no extra error line.
+    assert!(
+        !stderr(&output).contains("one or more"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[tokio::test]
+async fn images_prints_the_tags_and_their_instances() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["images"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let text = stdout(&output);
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    assert!(header.contains("TAG"), "{text}");
+    assert!(header.contains("INSTANCES"), "{text}");
+    assert!(text.contains("hermes-agent:0.22.2-local"), "{text}");
+    assert!(text.contains("hermes-agent:0.23.0"), "{text}");
+    assert!(text.contains("alice"), "{text}");
+    assert!(text.contains("3f2a9c1d4b5e"), "short id: {text}");
+}
+
+#[tokio::test]
+async fn images_json_passes_the_server_payload_through() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["--json", "images"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    let images = value.as_array().expect("array");
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0]["instances"], json!(["alice"]));
 }

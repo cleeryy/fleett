@@ -4,12 +4,15 @@
 //! the next call of a given operation so error paths are testable without
 //! Docker.
 
-use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult, UsageSample};
+use super::{
+    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+};
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -52,6 +55,18 @@ pub struct MockDriver {
     inspect: Mutex<HashMap<String, InspectInfo>>,
     /// Canned usage samples, per instance (`force_usage`).
     usage: Mutex<HashMap<String, UsageSample>>,
+    /// Health reported once an instance runs the given image (`set_image_health`).
+    image_health: Mutex<HashMap<String, Health>>,
+    /// Images whose pull must fail (`fail_image_pull`).
+    pull_failures: Mutex<HashMap<String, String>>,
+    /// Images present in the simulated local store.
+    known_images: Mutex<Vec<String>>,
+    /// Every `ensure_image` target, oldest first.
+    image_calls: Mutex<Vec<String>>,
+    /// `up` sleeps this long, so the upgrade tests can observe concurrency.
+    up_delay: Mutex<Option<Duration>>,
+    in_flight_ups: AtomicUsize,
+    max_in_flight_ups: AtomicUsize,
 }
 
 impl Default for MockDriver {
@@ -66,8 +81,13 @@ impl MockDriver {
     }
 
     pub fn with_image(image: impl Into<String>) -> Self {
+        let image = image.into();
+        let mut known = vec![DEFAULT_IMAGE.to_string()];
+        if !known.contains(&image) {
+            known.push(image.clone());
+        }
         Self {
-            image: image.into(),
+            image,
             state: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
             failures: Mutex::new(HashMap::new()),
@@ -76,7 +96,57 @@ impl MockDriver {
             logs_options: Mutex::new(Vec::new()),
             inspect: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
+            image_health: Mutex::new(HashMap::new()),
+            pull_failures: Mutex::new(HashMap::new()),
+            known_images: Mutex::new(known),
+            image_calls: Mutex::new(Vec::new()),
+            up_delay: Mutex::new(None),
+            in_flight_ups: AtomicUsize::new(0),
+            max_in_flight_ups: AtomicUsize::new(0),
         }
+    }
+
+    /// Report an unhealthy (or starting) container as soon as it runs `image`.
+    ///
+    /// `up` sets the image of the instance to `spec.image`, then looks the
+    /// health up here instead of the usual `healthy`. This is how the tests
+    /// simulate a broken image without Docker.
+    pub fn set_image_health(&self, image: &str, health: Health) {
+        lock(&self.image_health).insert(image.to_string(), health);
+    }
+
+    /// Make `ensure_image` fail for one tag, as a registry would.
+    pub fn fail_image_pull(&self, image: &str, detail: impl Into<String>) {
+        lock(&self.pull_failures).insert(image.to_string(), detail.into());
+    }
+
+    /// Pretend `image` is already present locally.
+    pub fn register_image(&self, image: &str) {
+        let mut known = lock(&self.known_images);
+        if !known.iter().any(|tag| tag == image) {
+            known.push(image.to_string());
+        }
+        known.sort();
+    }
+
+    /// Make every `up` sleep, so a test can observe how many run at once.
+    pub fn set_up_delay(&self, delay: Duration) {
+        *lock(&self.up_delay) = Some(delay);
+    }
+
+    /// Highest number of `up` calls that ran at the same time.
+    pub fn max_concurrent_ups(&self) -> usize {
+        self.max_in_flight_ups.load(Ordering::SeqCst)
+    }
+
+    /// Every image passed to `ensure_image`, oldest first.
+    pub fn image_calls(&self) -> Vec<String> {
+        lock(&self.image_calls).clone()
+    }
+
+    /// Image the simulated container of `id` currently runs.
+    pub fn image_of(&self, id: &str) -> Option<String> {
+        lock(&self.state).get(id).map(|entry| entry.image.clone())
     }
 
     /// Pretend the `fleett` network has this IPv4 subnet.
@@ -281,12 +351,27 @@ impl Driver for MockDriver {
         Box::pin(async move {
             self.record("up", &spec.id);
             self.fail_if_requested("up")?;
+            let delay = *lock(&self.up_delay);
+            if let Some(delay) = delay {
+                let running = self.in_flight_ups.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight_ups.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                self.in_flight_ups.fetch_sub(1, Ordering::SeqCst);
+            }
             let mut state = self.ensure_instance(&spec.id);
             if let Some(entry) = state.get_mut(&spec.id) {
                 entry.status = Status::Running;
-                entry.health = Health::Healthy;
                 entry.started_at = Some(SystemTime::now());
                 entry.ups += 1;
+                if !spec.image.trim().is_empty() {
+                    entry.image = spec.image.clone();
+                }
+                // A tag whose container never becomes healthy can be declared
+                // per image, which is what the rolling-upgrade tests use.
+                entry.health = lock(&self.image_health)
+                    .get(&entry.image)
+                    .copied()
+                    .unwrap_or(Health::Healthy);
             }
             Ok(())
         })
@@ -420,6 +505,33 @@ impl Driver for MockDriver {
                 .collect())
         })
     }
+
+    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            lock(&self.image_calls).push(image.to_string());
+            if let Some(detail) = lock(&self.pull_failures).get(image).cloned() {
+                return Err(DriverError::new("image pull", detail));
+            }
+            self.register_image(image);
+            Ok(())
+        })
+    }
+
+    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>> {
+        Box::pin(async move {
+            self.fail_if_requested("images")?;
+            let known = lock(&self.known_images);
+            Ok(known
+                .iter()
+                .map(|tag| ImageRecord {
+                    tag: tag.clone(),
+                    id: format!("sha256:{:016x}", stable_hash(tag)),
+                    size: "1.2GB".to_string(),
+                    created: "2026-11-08T00:00:00Z".to_string(),
+                })
+                .collect())
+        })
+    }
 }
 
 /// Stable simulated usage, derived from the instance id only.
@@ -468,6 +580,8 @@ mod tests {
             shares: Vec::new(),
             mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
+            image: "hermes-agent:0.22.2-local".to_string(),
+            previous_image: None,
             allow_lan: false,
             notes: String::new(),
             status: Status::Created,
@@ -590,5 +704,43 @@ mod tests {
         let samples = driver.usage(&[]).await.expect("usage");
         assert!(samples.is_empty());
         assert!(driver.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn up_tracks_the_image_and_its_forced_health() {
+        let driver = MockDriver::new();
+        let mut instance = spec("alice");
+        driver.set_image_health("broken:1", Health::Unhealthy);
+
+        instance.image = "good:1".to_string();
+        driver.up(&instance).await.expect("up");
+        assert_eq!(driver.image_of("alice").as_deref(), Some("good:1"));
+        let healthy = driver.ps(&instance).await.expect("ps");
+        assert_eq!(healthy.health, Health::Healthy);
+
+        instance.image = "broken:1".to_string();
+        driver.up(&instance).await.expect("up");
+        assert_eq!(driver.image_of("alice").as_deref(), Some("broken:1"));
+        let broken = driver.ps(&instance).await.expect("ps");
+        assert_eq!(broken.health, Health::Unhealthy);
+    }
+
+    #[tokio::test]
+    async fn ensure_image_records_calls_and_can_fail() {
+        let driver = MockDriver::new();
+        driver.ensure_image("agent:1").await.expect("ensure");
+        assert_eq!(driver.image_calls(), vec!["agent:1".to_string()]);
+
+        driver.fail_image_pull("agent:9", "manifest unknown");
+        let err = driver
+            .ensure_image("agent:9")
+            .await
+            .expect_err("pull failure");
+        assert!(err.detail.contains("manifest unknown"), "{err}");
+
+        let images = driver.list_images().await.expect("images");
+        let tags: Vec<&str> = images.iter().map(|image| image.tag.as_str()).collect();
+        assert!(tags.contains(&"agent:1"), "{tags:?}");
+        assert!(!tags.contains(&"agent:9"), "a failed pull is not local");
     }
 }

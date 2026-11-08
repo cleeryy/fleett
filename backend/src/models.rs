@@ -217,6 +217,15 @@ pub struct InstanceSpec {
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
+    /// Container image the instance runs (`services.agent.image` of its
+    /// compose file). Empty only for instances adopted from a compose file
+    /// that declares no image, which the renderer then fills from
+    /// `FLEETT_IMAGE`.
+    pub image: String,
+    /// Image the instance ran before its last successful upgrade. Only ever
+    /// written as the `fleett.previous_image` compose label; the compose file
+    /// remains the source of truth.
+    pub previous_image: Option<String>,
     /// Join the unrestricted `<network>-lan` network as well (LAN access).
     pub allow_lan: bool,
     pub notes: String,
@@ -246,6 +255,7 @@ pub struct InstanceSummary {
     pub name: String,
     pub template: String,
     pub model: String,
+    pub image: String,
     pub channel: String,
     pub status: String,
     pub health: String,
@@ -262,6 +272,7 @@ pub struct InstanceDetail {
     pub name: String,
     pub template: String,
     pub model: String,
+    pub image: String,
     pub base_url: String,
     pub api_key_env: String,
     pub channel: String,
@@ -317,6 +328,110 @@ pub struct UsageResponse {
     pub instances: Vec<UsageEntry>,
     pub totals: UsageTotals,
     pub caps: UsageCaps,
+}
+
+/// Parallel upgrades allowed by one job.
+pub const UPGRADE_PARALLEL_MAX: usize = 16;
+/// Default per-instance health timeout of an upgrade.
+pub const UPGRADE_TIMEOUT_DEFAULT_S: u64 = 180;
+/// Upper bound of the per-instance health timeout.
+pub const UPGRADE_TIMEOUT_MAX_S: u64 = 3600;
+
+/// Body of `POST /api/upgrade`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpgradeRequest {
+    /// Image tag every instance is moved to (required).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Instances upgraded at once (default `1`, i.e. sequential).
+    #[serde(default)]
+    pub parallel: Option<usize>,
+    /// Only list the planned changes, never write anything.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Per-instance health timeout, in seconds (default `180`).
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+}
+
+/// State of one instance inside an upgrade job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeStatus {
+    /// Not started yet (or planned, for a dry run).
+    Pending,
+    Upgrading,
+    /// Running the new image and reported healthy.
+    Healthy,
+    /// The new image did not become healthy; the old one was restored.
+    RolledBack,
+    /// The upgrade failed without a rollback (for example a failed pull).
+    Failed,
+}
+
+impl UpgradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Upgrading => "upgrading",
+            Self::Healthy => "healthy",
+            Self::RolledBack => "rolled_back",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// `true` when the instance no longer runs the target image.
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::RolledBack | Self::Failed)
+    }
+}
+
+impl std::fmt::Display for UpgradeStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-instance outcome of an upgrade job.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradeResult {
+    pub id: String,
+    /// Image the instance ran when the job started.
+    pub from: Option<String>,
+    /// Image the job targets.
+    pub to: String,
+    pub status: UpgradeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `POST /api/upgrade` and `GET /api/upgrade` payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradeJob {
+    pub id: String,
+    pub image: String,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    pub dry_run: bool,
+    pub parallel: usize,
+    pub timeout_s: u64,
+    pub results: Vec<UpgradeResult>,
+}
+
+/// One local Docker image, as reported by `GET /api/images`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageInfo {
+    /// `repository:tag`, as instances reference it.
+    pub tag: String,
+    /// Short image id (`sha256:…`).
+    pub id: String,
+    /// Human size (`1.2GB`), verbatim from Docker.
+    pub size: String,
+    /// Creation date, verbatim from Docker.
+    pub created: String,
+    /// Ids of the instances whose compose file uses this tag.
+    pub instances: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -528,6 +643,30 @@ pub fn validate_model(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a Docker image reference (`repo/name:tag`, `name@sha256:…`).
+///
+/// This is not the full distribution-reference grammar: it only refuses what
+/// would break the compose document or the command line (empty value, spaces,
+/// control characters, a leading dash).
+pub fn validate_image(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("image must not be empty".to_string());
+    }
+    if value.len() > 256 {
+        return Err("image must be at most 256 characters".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("image must not start with '-'".to_string());
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+    {
+        return Err("image must not contain whitespace, quotes or control characters".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate_base_url(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err("base_url must not be empty".to_string());
@@ -647,5 +786,31 @@ mod tests {
         assert!(validate_secret_name("lower_case").is_ok());
         assert!(validate_secret_name("1BAD").is_err());
         assert!(validate_secret_name("WITH-DASH").is_err());
+    }
+
+    #[test]
+    fn image_references_are_validated() {
+        for valid in [
+            "hermes-agent:0.22.2-local",
+            "ghcr.io/cleeryy/hermes-agent:0.23.0",
+            "registry.example.test:5000/agent",
+            "agent@sha256:0123abcd",
+        ] {
+            assert!(validate_image(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "  ", "with space:1", "-agent:1", "a\nb", "quote\"d"] {
+            assert!(validate_image(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_image(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn upgrade_statuses_report_attention() {
+        assert!(!UpgradeStatus::Pending.needs_attention());
+        assert!(!UpgradeStatus::Upgrading.needs_attention());
+        assert!(!UpgradeStatus::Healthy.needs_attention());
+        assert!(UpgradeStatus::RolledBack.needs_attention());
+        assert!(UpgradeStatus::Failed.needs_attention());
+        assert_eq!(UpgradeStatus::RolledBack.to_string(), "rolled_back");
     }
 }

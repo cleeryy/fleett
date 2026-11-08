@@ -51,6 +51,8 @@ fleett stop <id>
 fleett restart <id>
 fleett delete <id> [--purge]
 fleett usage
+fleett images
+fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett doctor
 ```
 
@@ -133,6 +135,39 @@ fleett --json usage | jq '.totals, .caps'
 A stopped instance reports zero CPU/memory usage; its disk usage is still measured. Docker
 failures answer `502 usage_unavailable` with the Docker error.
 
+### `images`
+
+Lists the container images present on the host, with the instances that use each tag:
+
+```bash
+fleett images
+fleett --json images | jq '.[] | select(.instances | length > 0)'
+```
+
+Columns: `TAG` (`repository:tag`), `ID` (first 12 hex characters), `SIZE`, `CREATED` and
+`INSTANCES` (comma-separated ids, `-` when the tag is unused). Dangling images (`<none>:<none>`)
+are omitted. A Docker failure answers `502 images_unavailable` with the Docker error.
+
+### `upgrade`
+
+Moves every agent to another image, one instance at a time by default, and rolls back the
+instances that never become healthy. See `docs/UPGRADE.md` for the procedure and the rollback
+semantics.
+
+```bash
+fleett upgrade --image hermes-agent:0.23.0-local --dry-run
+fleett upgrade --image hermes-agent:0.23.0-local
+fleett upgrade --image hermes-agent:0.23.0-local --parallel 2 --timeout 300
+fleett --json upgrade --image hermes-agent:0.23.0-local | jq '.results[] | {id, status}'
+```
+
+The command posts the job, polls `GET /api/upgrade` every 2 s and prints a line whenever an
+instance changes state, then a final table (`ID`, `FROM`, `TO`, `STATUS`) with the error of
+each instance that did not keep the new image. `--dry-run` only prints the plan
+(`id  from -> to`), the server writes nothing. Exit code `1` when at least one instance ends
+`rolled_back` or `failed`; the table is still printed. `--json` prints the final job and
+nothing intermediate.
+
 ### `doctor`
 
 Prints a checklist and exits non-zero when a check fails:
@@ -154,7 +189,7 @@ fleett --json doctor
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | API error, connection error, configuration error, or a failed `doctor` check |
+| `1` | API error, connection error, configuration error, a failed `doctor` check, or an `upgrade` with a rolled-back/failed instance |
 | `2` | invalid command line (clap) |
 
 API errors print the API `error.message` and `error.code` on stderr:
@@ -178,4 +213,7 @@ fleett doctor >/dev/null || echo "fleett is degraded" | mail -s fleett admin@exa
 # Create an agent and print its id.
 id=$(fleett --json create --id ci-agent --template guest --gate-token "$TOKEN" | jq -r .id)
 fleett stop "$id"
+
+# Fail a deployment when a rolling upgrade did not stick.
+fleett upgrade --image "$TAG" || echo "some agents were rolled back" >&2
 ```

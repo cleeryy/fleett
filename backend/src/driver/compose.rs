@@ -6,7 +6,9 @@
 //! projects created by older releases (`hermes-<id>`) remain manageable without
 //! being recreated.
 
-use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult, UsageSample};
+use super::{
+    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -27,6 +29,8 @@ const PS_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(20);
 const STATS_TIMEOUT: Duration = Duration::from_secs(30);
+const PULL_TIMEOUT: Duration = Duration::from_secs(1800);
+const IMAGES_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ComposeDriver {
@@ -454,6 +458,45 @@ impl Driver for ComposeDriver {
                 .collect())
         })
     }
+
+    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            // `docker image inspect` exits non-zero when the tag is absent, so
+            // its output is not parsed: only the exit status matters.
+            let mut inspect = Command::new(&self.docker);
+            inspect
+                .args(["image", "inspect", image])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let present = matches!(
+                tokio::time::timeout(PS_TIMEOUT, inspect.output()).await,
+                Ok(Ok(output)) if output.status.success()
+            );
+            if present {
+                return Ok(());
+            }
+
+            let mut pull = Command::new(&self.docker);
+            pull.args(["pull", image])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            run_command(pull, "image pull", PULL_TIMEOUT)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>> {
+        Box::pin(async move {
+            let mut command = Command::new(&self.docker);
+            command
+                .args(["images", "--format", "json"])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let stdout = run_command(command, "images", IMAGES_TIMEOUT).await?;
+            Ok(parse_images(&stdout))
+        })
+    }
 }
 
 /// One line of `docker stats --no-stream --format json`.
@@ -582,6 +625,45 @@ fn du_bytes(path: &Path) -> Result<u64, String> {
         .next()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| format!("unparsable du output for {}", path.display()))
+}
+
+/// Parse `docker images --format json` (one object per line, an array is
+/// accepted too).
+///
+/// Dangling images (`<none>:<none>`) are skipped: no instance may reference
+/// them, and `fleett images` is meant to answer "what can I upgrade to".
+fn parse_images(stdout: &str) -> Vec<ImageRecord> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let values: Vec<Value> = match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Array(items)) => items,
+        Ok(value @ Value::Object(_)) => vec![value],
+        _ => trimmed
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .collect(),
+    };
+    let mut images: Vec<ImageRecord> = Vec::new();
+    for value in values {
+        let Value::Object(object) = value else {
+            continue;
+        };
+        let repository = field(&object, &["repository"]).unwrap_or_default();
+        let tag = field(&object, &["tag"]).unwrap_or_default();
+        if repository.is_empty() || tag.is_empty() || repository == "<none>" || tag == "<none>" {
+            continue;
+        }
+        images.push(ImageRecord {
+            tag: format!("{repository}:{tag}"),
+            id: field(&object, &["id", "imageid"]).unwrap_or_default(),
+            size: field(&object, &["size"]).unwrap_or_default(),
+            created: field(&object, &["createdat", "createdsince", "created"]).unwrap_or_default(),
+        });
+    }
+    images.sort_by(|left, right| left.tag.cmp(&right.tag));
+    images
 }
 
 /// Arguments of `docker compose logs` for the given options.
@@ -1138,6 +1220,8 @@ mod tests {
             shares: Vec::new(),
             mem_limit_mb: 512,
             cpu_limit: 1.0,
+            image: "hermes-agent:0.22.2-local".to_string(),
+            previous_image: None,
             allow_lan: false,
             notes: String::new(),
             status: Status::Created,
@@ -1205,5 +1289,98 @@ mod tests {
         let driver = driver_in(dir.path()).with_docker_binary(dir.path().join("missing-docker"));
         let samples = driver.usage(&[]).await.expect("usage");
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn images_are_parsed_from_ndjson() {
+        let stdout = "\
+{\"Containers\":\"0\",\"CreatedAt\":\"2026-11-08 01:02:03 +0000 UTC\",\"ID\":\"sha256:aaa\",\"Repository\":\"hermes-agent\",\"Size\":\"1.2GB\",\"Tag\":\"0.23.0\"}
+{\"ID\":\"sha256:bbb\",\"Repository\":\"hermes-agent\",\"Size\":\"1.1GB\",\"Tag\":\"0.22.2-local\"}
+{\"ID\":\"sha256:ccc\",\"Repository\":\"<none>\",\"Tag\":\"<none>\"}
+";
+        let images = parse_images(stdout);
+        assert_eq!(images.len(), 2, "dangling images are skipped");
+        assert_eq!(images[0].tag, "hermes-agent:0.22.2-local");
+        assert_eq!(images[1].tag, "hermes-agent:0.23.0");
+        assert_eq!(images[1].id, "sha256:aaa");
+        assert_eq!(images[1].size, "1.2GB");
+        assert_eq!(images[1].created, "2026-11-08 01:02:03 +0000 UTC");
+
+        assert!(parse_images("").is_empty());
+        assert!(parse_images("not json").is_empty());
+        let array = r#"[{"Repository":"agent","Tag":"1"}]"#;
+        assert_eq!(parse_images(array)[0].tag, "agent:1");
+    }
+
+    fn fake_docker(dir: &std::path::Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("docker");
+        std::fs::write(&path, script).expect("fake docker");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    #[tokio::test]
+    async fn ensure_image_inspects_then_pulls_only_when_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let calls = dir.path().join("calls");
+        // A local tag: `docker image inspect` succeeds and nothing is pulled.
+        let docker = fake_docker(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1 $2\" in\n  \"image inspect\") exit 0;;\n  *) exit 1;;\nesac\n",
+                calls = calls.display()
+            ),
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        driver.ensure_image("agent:1").await.expect("local image");
+        assert_eq!(
+            std::fs::read_to_string(&calls).expect("calls"),
+            "image inspect agent:1\n"
+        );
+
+        // A missing tag: the inspect fails and the pull runs.
+        let docker = fake_docker(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1 $2\" in\n  \"image inspect\") exit 1;;\n  \"pull agent:2\") exit 0;;\nesac\nexit 3\n",
+                calls = calls.display()
+            ),
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        driver.ensure_image("agent:2").await.expect("pulled image");
+        let recorded = std::fs::read_to_string(&calls).expect("calls");
+        assert!(recorded.contains("image inspect agent:2"), "{recorded}");
+        assert!(recorded.contains("pull agent:2"), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_pull_is_reported_verbatim() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let docker = fake_docker(
+            dir.path(),
+            "#!/bin/sh\nif [ \"$1\" = image ]; then exit 1; fi\necho 'manifest unknown' >&2\nexit 1\n",
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let err = driver
+            .ensure_image("agent:9")
+            .await
+            .expect_err("pull fails");
+        assert_eq!(err.operation, "image pull");
+        assert!(err.detail.contains("manifest unknown"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn images_can_be_listed_without_docker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let docker = fake_docker(
+            dir.path(),
+            "#!/bin/sh\necho '{\"ID\":\"sha256:aaa\",\"Repository\":\"agent\",\"Tag\":\"2\",\"Size\":\"9MB\",\"CreatedAt\":\"now\"}'\n",
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let images = driver.list_images().await.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].tag, "agent:2");
+        assert_eq!(images[0].size, "9MB");
     }
 }

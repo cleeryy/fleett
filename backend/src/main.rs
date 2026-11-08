@@ -168,6 +168,25 @@ enum Commands {
     },
     /// Show the CPU, memory and disk usage of the fleet (client mode).
     Usage,
+    /// List the container images present on the host and their instances
+    /// (client mode).
+    Images,
+    /// Move every agent to another container image, rolling back the ones
+    /// that never become healthy (client mode). See docs/UPGRADE.md.
+    Upgrade {
+        /// Image tag every instance is moved to.
+        #[arg(long)]
+        image: String,
+        /// Instances upgraded at once (default 1: sequential).
+        #[arg(long, default_value_t = 1)]
+        parallel: usize,
+        /// Only list the planned changes, never touch an instance.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds to wait for an instance to become healthy (default 180).
+        #[arg(long, default_value_t = fleett::models::UPGRADE_TIMEOUT_DEFAULT_S)]
+        timeout: u64,
+    },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
 }
@@ -348,6 +367,24 @@ async fn main() -> anyhow::Result<()> {
         Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
         Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
         Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Images => cli::run(cli::Command::Images, json).await,
+        Commands::Upgrade {
+            image,
+            parallel,
+            dry_run,
+            timeout,
+        } => {
+            cli::run(
+                cli::Command::Upgrade(cli::UpgradeArgs {
+                    image,
+                    parallel,
+                    dry_run,
+                    timeout_s: timeout,
+                }),
+                json,
+            )
+            .await
+        }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
     };
 

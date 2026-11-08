@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 pub const CONTAINER_UID: u32 = 10_000;
 pub const CONTAINER_GID: u32 = 10_000;
 
+/// Compose label recording the image an instance ran before its last
+/// successful upgrade (kept for reproducibility).
+pub const PREVIOUS_IMAGE_LABEL: &str = "fleett.previous_image";
+
 /// Create the directory layout if it does not exist yet.
 pub fn ensure_layout(cfg: &Config) -> io::Result<()> {
     for dir in [
@@ -133,6 +137,36 @@ pub(crate) fn compose_project_name(text: &str) -> Option<String> {
     let doc: Value = serde_yaml::from_str(text).ok()?;
     let name = doc.get("name")?.as_str()?.trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Container image declared by a compose document (`services.agent.image`).
+pub(crate) fn compose_image(text: &str) -> Option<String> {
+    let doc: Value = serde_yaml::from_str(text).ok()?;
+    let image = doc
+        .get("services")?
+        .get("agent")?
+        .get("image")?
+        .as_str()?
+        .trim();
+    (!image.is_empty()).then(|| image.to_string())
+}
+
+/// `fleett.previous_image` label of an instance, read back from its compose
+/// file.
+///
+/// The label is the reproducibility record of the last successful upgrade; the
+/// compose file is the only place that keeps it.
+pub fn previous_image(cfg: &Config, id: &str) -> Option<String> {
+    let text = fs::read_to_string(cfg.compose_path(id)).ok()?;
+    previous_image_from_compose(&text)
+}
+
+/// Read `fleett.previous_image` from a compose document.
+pub(crate) fn previous_image_from_compose(text: &str) -> Option<String> {
+    let doc: Value = serde_yaml::from_str(text).ok()?;
+    let labels = doc.get("services")?.get("agent")?.get("labels")?;
+    let value = labels.get(PREVIOUS_IMAGE_LABEL)?.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Write the compose file only (share changes do not touch the Hermes config).
@@ -435,6 +469,21 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         })
         .unwrap_or(false);
 
+    let image = agent
+        .and_then(|service| service.get("image"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|image| !image.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let previous_image = agent
+        .and_then(|service| service.get("labels"))
+        .and_then(|labels| labels.get(PREVIOUS_IMAGE_LABEL))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|image| !image.is_empty())
+        .map(str::to_string);
+
     InstanceSpec {
         id: id.to_string(),
         name: id.to_string(),
@@ -446,6 +495,8 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         shares,
         mem_limit_mb,
         cpu_limit,
+        image,
+        previous_image,
         allow_lan,
         notes: String::new(),
         status: Status::Unknown,
@@ -570,6 +621,38 @@ mod tests {
         assert_eq!(compose_project_name("services: {}\n"), None);
         assert_eq!(compose_project_name("name: \" \"\n"), None);
         assert_eq!(compose_project_name("name: [unclosed\n"), None);
+    }
+
+    #[test]
+    fn the_image_and_the_previous_tag_are_read_back_from_the_compose_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices:\n  agent:\n    image: agent:2\n    labels:\n      \
+             fleett.previous_image: agent:1\n",
+        )
+        .expect("compose file");
+
+        let specs = scan_instances(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].image, "agent:2");
+        assert_eq!(specs[0].previous_image.as_deref(), Some("agent:1"));
+        assert_eq!(previous_image(&cfg, "alice").as_deref(), Some("agent:1"));
+        assert_eq!(
+            compose_image("services:\n  agent:\n    image: agent:3\n").as_deref(),
+            Some("agent:3")
+        );
+
+        // A compose file without an image or a label reports none.
+        std::fs::write(cfg.compose_path("alice"), "name: fleett-alice\n").expect("compose file");
+        let specs = scan_instances(&cfg);
+        assert_eq!(specs[0].image, "");
+        assert!(specs[0].previous_image.is_none());
+        assert!(previous_image(&cfg, "alice").is_none());
+        assert!(previous_image(&cfg, "ghost").is_none());
     }
 
     #[test]

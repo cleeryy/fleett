@@ -8,6 +8,7 @@ pub mod instances;
 pub mod shares;
 pub mod templates;
 pub mod tokens;
+pub mod upgrade;
 pub mod usage;
 
 pub use error::ApiError;
@@ -41,6 +42,8 @@ pub struct AppState {
     pub driver: Arc<dyn Driver>,
     pub auth: Arc<AuthService>,
     pub locks: Arc<InstanceLocks>,
+    /// Last (or running) rolling upgrade (`POST /api/upgrade`).
+    pub upgrade: Arc<upgrade::UpgradeManager>,
     pub started_at: Instant,
 }
 
@@ -75,6 +78,7 @@ impl AppState {
             driver,
             auth: Arc::new(auth),
             locks: Arc::new(InstanceLocks::default()),
+            upgrade: Arc::new(upgrade::UpgradeManager::default()),
             started_at: Instant::now(),
         })
     }
@@ -125,6 +129,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
         .route("/usage", get(usage::usage))
+        .route("/images", get(upgrade::images))
+        .route("/upgrade", get(upgrade::status).post(upgrade::start))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(
@@ -265,14 +271,32 @@ pub(crate) async fn apply_compose(
     state: &AppState,
     spec: &mut InstanceSpec,
 ) -> Result<(), ApiError> {
+    crate::api::hydrate_previous_image(state, spec);
+    write_compose_file(state, spec)?;
+    up_and_record(state, spec).await
+}
+
+/// Write `instances/<id>/compose.yaml` from the spec, without touching Docker.
+///
+/// The declared project is kept (an instance created by an older release stays
+/// on `hermes-<id>`), and the secret keys are re-declared as `${KEY}` so the
+/// driver keeps injecting them at runtime.
+pub(crate) fn write_compose_file(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
     let keys = crate::secrets::env_keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
     let compose =
         crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
             .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
-        .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))?;
-    up_and_record(state, spec).await
+        .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))
+}
+
+/// Carry the `fleett.previous_image` label of the compose file into the spec
+/// before a rewrite, so a PATCH never drops the upgrade history.
+pub(crate) fn hydrate_previous_image(state: &AppState, spec: &mut InstanceSpec) {
+    if spec.previous_image.is_none() {
+        spec.previous_image = store::previous_image(&state.cfg, &spec.id);
+    }
 }
 
 /// `docker compose up -d`, then record the resulting status.

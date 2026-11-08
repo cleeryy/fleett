@@ -119,6 +119,19 @@ impl DriverError {
     }
 }
 
+/// One image present in the local Docker image store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageRecord {
+    /// `repository:tag`, exactly as an instance would reference it.
+    pub tag: String,
+    /// Short image id (`sha256:…`), when Docker reports one.
+    pub id: String,
+    /// Human size (`1.2GB`), verbatim from Docker.
+    pub size: String,
+    /// Creation date, verbatim from Docker.
+    pub created: String,
+}
+
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Lifecycle operations the control plane needs.
@@ -170,6 +183,16 @@ pub trait Driver: Send + Sync {
         &'a self,
         specs: &'a [InstanceSpec],
     ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>>;
+
+    /// Make sure `image` is present locally, pulling it when it is not.
+    ///
+    /// `docker image inspect` first so a local tag is never re-pulled; the
+    /// pull error is returned verbatim so the API can answer `502` with the
+    /// Docker detail.
+    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// Images present in the local Docker image store.
+    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>>;
 }
 
 #[cfg(test)]

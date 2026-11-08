@@ -348,6 +348,8 @@ struct ComposeService {
     environment: BTreeMap<String, String>,
     volumes: Vec<String>,
     networks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, String>>,
     security_opt: Vec<String>,
     cap_drop: Vec<String>,
     tmpfs: Vec<String>,
@@ -460,13 +462,30 @@ pub fn render_compose_with_project(
     }
 
     let service = ComposeService {
-        image: cfg.image.clone(),
+        image: if spec.image.trim().is_empty() {
+            cfg.image.clone()
+        } else {
+            spec.image.clone()
+        },
         container_name: project.clone(),
         restart: "unless-stopped".to_string(),
         command: vec!["gateway".to_string(), "run".to_string()],
         environment,
         volumes,
         networks: service_networks,
+        labels: spec
+            .previous_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .map(|image| {
+                let mut labels = BTreeMap::new();
+                labels.insert(
+                    crate::store::PREVIOUS_IMAGE_LABEL.to_string(),
+                    image.to_string(),
+                );
+                labels
+            }),
         security_opt: vec!["no-new-privileges:true".to_string()],
         cap_drop: vec!["NET_RAW".to_string()],
         tmpfs: vec!["/tmp".to_string()],
@@ -612,6 +631,8 @@ mod tests {
             ],
             mem_limit_mb: 1536,
             cpu_limit: DEFAULT_CPU_LIMIT,
+            image: "hermes-agent:0.22.2-local".to_string(),
+            previous_image: None,
             allow_lan: false,
             notes: String::new(),
             status: Status::Created,
@@ -895,6 +916,48 @@ mod tests {
                 .and_then(|agent| agent.get("container_name"))
                 .and_then(Value::as_str),
             Some("hermes-alice")
+        );
+    }
+
+    #[test]
+    fn compose_renders_the_image_of_the_spec() {
+        let mut instance = spec(ChannelKind::None);
+        instance.image = "hermes-agent:0.23.0".to_string();
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["image"].as_str(),
+            Some("hermes-agent:0.23.0")
+        );
+        assert!(
+            doc["services"]["agent"].get("labels").is_none(),
+            "no label when no upgrade happened yet"
+        );
+
+        // An adopted instance without an image keeps the configured default.
+        instance.image = String::new();
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["image"].as_str(),
+            Some(config().image.as_str())
+        );
+    }
+
+    #[test]
+    fn compose_records_the_previous_image_as_a_label() {
+        let mut instance = spec(ChannelKind::None);
+        instance.image = "hermes-agent:0.23.0".to_string();
+        instance.previous_image = Some("hermes-agent:0.22.2-local".to_string());
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["labels"]["fleett.previous_image"].as_str(),
+            Some("hermes-agent:0.22.2-local")
+        );
+        assert_eq!(
+            crate::store::previous_image_from_compose(&rendered).as_deref(),
+            Some("hermes-agent:0.22.2-local")
         );
     }
 

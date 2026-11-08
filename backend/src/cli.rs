@@ -21,6 +21,8 @@ pub const TOKEN_ENV: &str = "FLEETT_TOKEN";
 pub const DEFAULT_LOG_TAIL: u32 = 200;
 /// Default provider base URL, the same one the web console pre-fills.
 pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/inference/go/openai/v1";
+/// Interval between two `GET /api/upgrade` polls of `fleett upgrade`.
+pub const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -148,6 +150,9 @@ pub enum CliError {
     /// carries the failure.
     #[error("one or more checks failed")]
     ChecksFailed,
+    /// `fleett upgrade` already printed the per-instance results.
+    #[error("one or more instances were not upgraded")]
+    UpgradeIncomplete,
 }
 
 impl CliError {
@@ -159,6 +164,7 @@ impl CliError {
             Self::Api { code, .. } => code,
             Self::Decode(_) => "decode_error",
             Self::ChecksFailed => "checks_failed",
+            Self::UpgradeIncomplete => "upgrade_incomplete",
         }
     }
 
@@ -303,7 +309,29 @@ pub enum Command {
     Restart(String),
     Delete { id: String, purge: bool },
     Usage,
+    Images,
+    Upgrade(UpgradeArgs),
     Doctor,
+}
+
+/// Arguments of `fleett upgrade`.
+#[derive(Debug, Clone)]
+pub struct UpgradeArgs {
+    pub image: String,
+    pub parallel: usize,
+    pub dry_run: bool,
+    pub timeout_s: u64,
+}
+
+impl Default for UpgradeArgs {
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            parallel: 1,
+            dry_run: false,
+            timeout_s: 180,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -356,13 +384,16 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Restart(id) => lifecycle(&client, json, &id, "restart").await,
         Command::Delete { id, purge } => delete(&client, json, &id, purge).await,
         Command::Usage => usage(&client, json).await,
+        Command::Images => images(&client, json).await,
+        Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
     }
 }
 
 fn print_error(err: &CliError, json: bool) {
-    // The doctor checklist already carries the failure (and its exit code).
-    if matches!(err, CliError::ChecksFailed) {
+    // The doctor checklist and the upgrade table already carry the failure
+    // (and their exit code); repeating it would only add noise.
+    if matches!(err, CliError::ChecksFailed | CliError::UpgradeIncomplete) {
         return;
     }
     if json {
@@ -455,6 +486,56 @@ struct UsageReport {
     instances: Vec<UsageEntry>,
     totals: UsageTotals,
     caps: UsageCaps,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ImageView {
+    tag: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    created: String,
+    #[serde(default)]
+    instances: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct UpgradeResultView {
+    id: String,
+    #[serde(default)]
+    from: Option<String>,
+    to: String,
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct UpgradeJobView {
+    id: String,
+    image: String,
+    started_at: String,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    results: Vec<UpgradeResultView>,
+}
+
+impl UpgradeJobView {
+    fn finished(&self) -> bool {
+        self.finished_at.is_some()
+    }
+
+    /// `true` when at least one instance does not run the target image.
+    fn needs_attention(&self) -> bool {
+        self.results
+            .iter()
+            .any(|result| matches!(result.status.as_str(), "rolled_back" | "failed"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,6 +830,145 @@ async fn usage(client: &Client, json: bool) -> Result<(), CliError> {
     );
     println!("{}", caps_line(&report.caps));
     Ok(())
+}
+
+async fn images(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client.value(Method::GET, "/api/images", &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let images: Vec<ImageView> = decode(value)?;
+    let rows: Vec<Vec<String>> = images
+        .iter()
+        .map(|image| {
+            vec![
+                image.tag.clone(),
+                short_id(&image.id),
+                image.size.clone(),
+                image.created.clone(),
+                if image.instances.is_empty() {
+                    "-".to_string()
+                } else {
+                    image.instances.join(",")
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["TAG", "ID", "SIZE", "CREATED", "INSTANCES"], &rows)
+    );
+    Ok(())
+}
+
+async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), CliError> {
+    let body = json!({
+        "image": args.image,
+        "parallel": args.parallel,
+        "dry_run": args.dry_run,
+        "timeout_s": args.timeout_s,
+    });
+    let value = client
+        .value(Method::POST, "/api/upgrade", &[], Some(body))
+        .await?;
+    let mut job: UpgradeJobView = decode(value)?;
+
+    if json {
+        // The machine-readable output is always the final job.
+        while !job.finished() {
+            tokio::time::sleep(UPGRADE_POLL_INTERVAL).await;
+            job = fetch_upgrade(client).await?;
+        }
+        print_json(&job)?;
+        return upgrade_status(&job);
+    }
+
+    println!(
+        "upgrade {}: {} instance(s) to {}{}",
+        job.id,
+        job.results.len(),
+        job.image,
+        if job.dry_run { " (dry run)" } else { "" }
+    );
+    if job.dry_run {
+        for result in &job.results {
+            println!(
+                "  {:<16} {} -> {}",
+                result.id,
+                result.from.as_deref().unwrap_or("-"),
+                result.to
+            );
+        }
+        return Ok(());
+    }
+
+    // Print a line every time an instance changes state, then the final table.
+    let mut seen: Vec<(String, String)> = job
+        .results
+        .iter()
+        .map(|result| (result.id.clone(), result.status.clone()))
+        .collect();
+    while !job.finished() {
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL).await;
+        job = fetch_upgrade(client).await?;
+        for result in &job.results {
+            if let Some(previous) = seen
+                .iter_mut()
+                .find(|(id, _)| id == &result.id)
+                .map(|(_, status)| status)
+            {
+                if *previous != result.status {
+                    println!("  {:<16} {}", result.id, result.status);
+                    *previous = result.status.clone();
+                }
+            }
+        }
+    }
+    println!();
+    print_upgrade_table(&job);
+    upgrade_status(&job)
+}
+
+async fn fetch_upgrade(client: &Client) -> Result<UpgradeJobView, CliError> {
+    let value = client.value(Method::GET, "/api/upgrade", &[], None).await?;
+    decode(value)
+}
+
+fn print_upgrade_table(job: &UpgradeJobView) {
+    let rows: Vec<Vec<String>> = job
+        .results
+        .iter()
+        .map(|result| {
+            vec![
+                result.id.clone(),
+                result.from.clone().unwrap_or_else(|| "-".to_string()),
+                result.to.clone(),
+                result.status.clone(),
+            ]
+        })
+        .collect();
+    print!("{}", render_table(&["ID", "FROM", "TO", "STATUS"], &rows));
+    for result in &job.results {
+        if let Some(error) = &result.error {
+            println!("  {}: {error}", result.id);
+        }
+    }
+}
+
+fn upgrade_status(job: &UpgradeJobView) -> Result<(), CliError> {
+    if job.needs_attention() {
+        return Err(CliError::UpgradeIncomplete);
+    }
+    Ok(())
+}
+
+fn short_id(id: &str) -> String {
+    if id.is_empty() {
+        return "-".to_string();
+    }
+    // `sha256:` plus the first 12 hex characters, like `docker ps`.
+    let digest = id.strip_prefix("sha256:").unwrap_or(id);
+    digest.chars().take(12).collect()
 }
 
 async fn doctor(client: &Client, json: bool, url: &str) -> Result<(), CliError> {

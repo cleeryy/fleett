@@ -54,9 +54,9 @@ SHA-256 digest only.
 `GET /api/instances` → `InstanceSummary[]`
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
- "channel":"telegram","status":"running","health":"healthy","cpu_limit":1.0,
- "allow_lan":false,"shares":["findings"],"last_error":null,
- "created_at":"2026-11-08T01:00:00Z"}
+ "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
+ "health":"healthy","cpu_limit":1.0,"allow_lan":false,"shares":["findings"],
+ "last_error":null,"created_at":"2026-11-08T01:00:00Z"}
 ```
 
 `POST /api/instances` → `201 InstanceDetail`
@@ -75,6 +75,7 @@ The token is **never** returned by the API.
 `GET /api/instances/{id}` → `InstanceDetail`
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
+ "image":"hermes-agent:0.22.2-local",
  "base_url":"https://opencode.ai/inference/go/openai/v1",
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
@@ -85,6 +86,10 @@ The token is **never** returned by the API.
  "container":{"id":"3f2a…","image":"hermes-agent:0.22.2-local","uptime_s":3600},
  "compose_yaml":"name: fleett-alice\n…"}
 ```
+
+`image` is the value of `services.agent.image` in the instance compose file (the image the
+next `up -d` uses); `container.image` is what Docker reports for the running container, so the
+two differ while an upgrade is in flight or after a failed rollback.
 
 `last_error` carries the last known failure: the health-probe message while the container stays
 unhealthy, or the `docker inspect` cause (`State.Error`, `OOMKilled`, non-zero exit code) when
@@ -208,3 +213,53 @@ when Docker fails, and an empty fleet answers zeros without touching Docker. Und
 
 The fleet is also checked by `fleett doctor`, which reads `docker`, `secrets` and `egress`
 from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
+
+## Images and rolling upgrades
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/images` | — | `[{"tag":"hermes-agent:0.22.2-local","id":"sha256:…","size":"1.2GB","created":"…","instances":["alice"]}]` |
+| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180}` | `202 UpgradeJob` · `409 upgrade_in_progress` · `502 image_unavailable` |
+| GET | `/api/upgrade` | — | `200 UpgradeJob` (current or last) · `404` before the first job |
+
+`UpgradeJob`:
+```json
+{"id":"2b6d…","image":"hermes-agent:0.23.0-local",
+ "started_at":"2026-11-08T01:00:00Z","finished_at":"2026-11-08T01:04:12Z",
+ "dry_run":false,"parallel":1,"timeout_s":180,
+ "results":[{"id":"alice","from":"hermes-agent:0.22.2-local",
+             "to":"hermes-agent:0.23.0-local","status":"healthy"},
+            {"id":"bob","from":"hermes-agent:0.22.2-local",
+             "to":"hermes-agent:0.23.0-local","status":"rolled_back",
+             "error":"upgrade failed: the container reported unhealthy; rolled back to hermes-agent:0.22.2-local"}]}
+```
+
+`status` per instance: `pending`, `upgrading`, `healthy`, `rolled_back`, `failed`. `from` is
+`null` only when the instance had no image recorded yet. `finished_at` is absent while the job
+runs and on a dry run is equal to `started_at`.
+
+`POST /api/upgrade` pulls the image first (`docker image inspect`, then `docker pull`) and
+answers `502 image_unavailable` with the Docker detail when it cannot; nothing is written in
+that case. Requests are validated: `image` is required (`400 invalid_image`), `parallel` is
+`1..=16` (default `1`, i.e. sequential), `timeout_s` is `1..=3600` (default `180`). A second
+job while one runs answers `409 upgrade_in_progress`, whatever the body. Admin only: a viewer
+gets `403 forbidden` like every other mutation.
+
+Per instance, the job:
+
+1. makes sure the image is local (skipped in a dry run);
+2. records `from` and moves `services.agent.image` to the new tag, keeping the old one as the
+   `fleett.previous_image` label of the compose file;
+3. runs `docker compose up -d` and polls `ps` until the container reports `healthy`;
+4. on `unhealthy` or after `timeout_s`, rewrites the previous tag, runs `up -d` again and sets
+   `last_error` to `upgrade failed: <reason>; rolled back to <old>` with status `rolled_back`;
+   a failed rollback leaves the instance `error` and the result `failed`.
+
+A pull failure for one instance (after the initial check) marks that instance `failed` without
+touching it. Every result is audited: `instance.upgrade` on success, `instance.upgrade.rollback`
+on a restore. A dry run lists the planned changes (`results[*].status = "pending"`), writes no
+file, pulls nothing and audits nothing.
+
+The compose file is the source of truth: the database `image` column is resynchronised from
+`services.agent.image` at startup, so a hand edit or a restore is picked up. See
+`docs/UPGRADE.md` for the operator procedure.

@@ -1160,6 +1160,8 @@ mod tests {
             shares: Vec::new(),
             mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
+            image: "hermes-agent:0.22.2-local".to_string(),
+            previous_image: None,
             allow_lan: false,
             notes: String::new(),
             status: crate::models::Status::Created,

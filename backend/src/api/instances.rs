@@ -353,6 +353,9 @@ pub async fn clone(
     };
     clone.status = Status::Created;
     clone.last_error = None;
+    // The target image is inherited, but the clone has no upgrade history of
+    // its own: the previous tag belongs to the source instance.
+    clone.previous_image = None;
     let now = now_iso();
     clone.created_at = now.clone();
     clone.updated_at = now;
@@ -588,6 +591,13 @@ async fn import_archive(
     let mut spec = crate::instance_archive::spec_from_manifest(&extraction.manifest.instance, id)
         .map_err(import_error)?;
     spec.template = crate::instance_archive::settle_template(&state.cfg, &spec.template);
+    // Keep the image the archived instance ran; an archive without one falls
+    // back to this build's `FLEETT_IMAGE`.
+    spec.image = extraction
+        .compose_yaml
+        .as_deref()
+        .and_then(store::compose_image)
+        .unwrap_or_else(|| state.cfg.image.clone());
     let secret_keys = extraction
         .compose_yaml
         .as_deref()
@@ -965,6 +975,9 @@ fn render_for_update(
     // Keep the project already declared on disk: an instance created by an
     // older release stays on `hermes-<id>` until it is migrated explicitly.
     let project = store::declared_project(&state.cfg, &spec.id);
+    let mut spec = spec.clone();
+    crate::api::hydrate_previous_image(state, &mut spec);
+    let spec = &spec;
     match render::load_template(&state.cfg, &spec.template) {
         Ok(template) => render::render_instance_with_project(
             &state.cfg,
@@ -1184,6 +1197,7 @@ fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
         name: spec.name.clone(),
         template: spec.template.clone(),
         model: spec.model.clone(),
+        image: spec.image.clone(),
         channel: spec.channel.as_str().to_string(),
         status: spec.status.as_str().to_string(),
         health: health.as_str().to_string(),
@@ -1218,6 +1232,7 @@ fn to_detail(
         name: spec.name.clone(),
         template: spec.template.clone(),
         model: spec.model.clone(),
+        image: spec.image.clone(),
         base_url: spec.base_url.clone(),
         api_key_env: spec.api_key_env.clone(),
         channel: spec.channel.as_str().to_string(),
@@ -1344,6 +1359,8 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             shares,
             mem_limit_mb,
             cpu_limit,
+            image: state.cfg.image.clone(),
+            previous_image: None,
             allow_lan,
             notes,
             status: Status::Created,
