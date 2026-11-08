@@ -32,10 +32,21 @@ docker build -t hermes-agent:0.22.2-local /path/to/hermes-official-v0.22.2
 
 ## Install
 
+The control plane and every agent container share **UID/GID 10000**, so bind-mounted
+data stays readable and writable by both without running the app as root.
+
 ```bash
-install -d -m 700 /opt/hermes-fleet
-install -d -m 700 /opt/hermes-fleet/instances /opt/hermes-fleet/shares
+groupadd --system --gid 10000 hermes-fleet 2>/dev/null || true
+useradd --system --uid 10000 --gid 10000 \
+  --home /opt/hermes-fleet --shell /usr/sbin/nologin hermes-fleet 2>/dev/null || true
+usermod -aG docker hermes-fleet
+
+install -d -m 700 -o 10000 -g 10000 /opt/hermes-fleet
+install -d -m 700 -o 10000 -g 10000 /opt/hermes-fleet/instances /opt/hermes-fleet/shares
 ```
+
+If you run the app as root instead, it still works (it can chown the instance data), but
+the UID 10000 model is the intended one.
 
 `/etc/hermes-fleet.env` (0600):
 
@@ -61,9 +72,10 @@ EnvironmentFile=/etc/hermes-fleet.env
 ExecStart=/usr/local/bin/hermes-fleet
 Restart=on-failure
 RestartSec=2
-# the app must reach the Docker socket: docker group, not root
+# same UID as HERMES_UID/GID inside the containers; docker group for the socket
 User=hermes-fleet
-Group=docker
+Group=hermes-fleet
+SupplementaryGroups=docker
 
 [Install]
 WantedBy=multi-user.target
