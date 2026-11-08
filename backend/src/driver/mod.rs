@@ -19,6 +19,72 @@ pub struct PsResult {
     pub container: Option<ContainerInfo>,
 }
 
+/// Options of one `logs` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsOptions {
+    /// Number of trailing lines. The API bounds it to `1..=2000`.
+    pub tail: u32,
+    /// Docker `--since`: a duration (`30s`, `10m`, `2h`, `1h30m`) or an
+    /// RFC 3339 timestamp.
+    pub since: Option<String>,
+}
+
+impl Default for LogsOptions {
+    fn default() -> Self {
+        Self {
+            tail: 200,
+            since: None,
+        }
+    }
+}
+
+/// Runtime state of one instance container, read with `docker inspect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectInfo {
+    /// `State.Status`: `running`, `exited`, `dead`, `created`, …
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub oom_killed: bool,
+    /// `State.Error`, when Docker recorded one.
+    pub error: Option<String>,
+    /// `State.StartedAt` as RFC 3339, when the container has ever started.
+    pub started_at: Option<String>,
+}
+
+impl InspectInfo {
+    /// Operator-facing failure message, when Docker reports one.
+    ///
+    /// A clean stop (exit code `0`, no `Error`, not OOM-killed) yields `None`,
+    /// so a deliberately stopped instance never looks broken.
+    pub fn error_message(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if let Some(error) = self
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+        {
+            reasons.push(error.to_string());
+        }
+        if self.oom_killed {
+            reasons.push("the container was killed by the OOM killer".to_string());
+        }
+        if let Some(code) = self.exit_code.filter(|code| *code != 0) {
+            reasons.push(format!("the container exited with code {code}"));
+        }
+        if reasons.is_empty() {
+            return None;
+        }
+        let state = self.state.trim();
+        let detail = reasons.join("; ");
+        Some(if state.is_empty() {
+            detail
+        } else {
+            format!("container state \"{state}\": {detail}")
+        })
+    }
+}
+
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("docker compose {operation} failed: {detail}")]
@@ -63,9 +129,92 @@ pub trait Driver: Send + Sync {
     fn restart<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
     fn down<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
     fn ps<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<PsResult, DriverError>>;
+
+    /// Tail of the container logs, filtered by the driver-level options only
+    /// (`tail`, `since`); `grep`/`level` filtering happens in the API.
     fn logs<'a>(
         &'a self,
         spec: &'a InstanceSpec,
-        tail: u32,
+        options: &'a LogsOptions,
     ) -> DriverFuture<'a, Result<String, DriverError>>;
+
+    /// `docker inspect` state of the instance container.
+    fn inspect<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(state: &str, exit_code: Option<i32>) -> InspectInfo {
+        InspectInfo {
+            state: state.to_string(),
+            exit_code,
+            ..InspectInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_running_container_has_no_error() {
+        assert_eq!(info("running", Some(0)).error_message(), None);
+        assert_eq!(info("created", Some(0)).error_message(), None);
+        assert_eq!(info("exited", Some(0)).error_message(), None);
+    }
+
+    #[test]
+    fn a_clean_container_without_state_is_fine() {
+        assert_eq!(InspectInfo::default().error_message(), None);
+    }
+
+    #[test]
+    fn a_non_zero_exit_code_is_reported() {
+        let message = info("exited", Some(137)).error_message().expect("error");
+        assert!(message.contains("137"), "{message}");
+        assert!(message.contains("exited"), "{message}");
+    }
+
+    #[test]
+    fn an_oom_kill_is_reported() {
+        let info = InspectInfo {
+            state: "exited".to_string(),
+            exit_code: Some(137),
+            oom_killed: true,
+            ..InspectInfo::default()
+        };
+        let message = info.error_message().expect("error");
+        assert!(message.contains("OOM"), "{message}");
+        assert!(message.contains("137"), "{message}");
+    }
+
+    #[test]
+    fn a_docker_error_is_reported_verbatim() {
+        let info = InspectInfo {
+            state: "dead".to_string(),
+            error: Some("oci runtime error: exec failed".to_string()),
+            ..InspectInfo::default()
+        };
+        let message = info.error_message().expect("error");
+        assert!(message.contains("oci runtime error"), "{message}");
+    }
+
+    #[test]
+    fn a_blank_docker_error_is_ignored() {
+        let info = InspectInfo {
+            state: "exited".to_string(),
+            error: Some("   ".to_string()),
+            exit_code: Some(0),
+            ..InspectInfo::default()
+        };
+        assert_eq!(info.error_message(), None);
+    }
+
+    #[test]
+    fn logs_options_default_to_a_bounded_tail() {
+        let options = LogsOptions::default();
+        assert_eq!(options.tail, 200);
+        assert!(options.since.is_none());
+    }
 }

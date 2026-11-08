@@ -8,7 +8,8 @@ use axum::Router;
 use fleett::api::{self, AppState};
 use fleett::config::{Config, EgressMode};
 use fleett::driver::mock::MockDriver;
-use fleett::models::Health;
+use fleett::driver::InspectInfo;
+use fleett::models::{Health, Status};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -1771,4 +1772,621 @@ async fn startup_drops_index_rows_without_compose_file() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(parse(&body), json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// Logs: filtering, structured output and error summaries (#12)
+// ---------------------------------------------------------------------------
+
+/// Mixed log stream: timestamps, a warning, an error, a clean line.
+const MIXED_LOGS: &str = "\
+2026-11-08T01:00:00Z starting gateway
+fleett-alice  | 2026-11-08T01:01:00Z WARNING: slow upstream
+2026-11-08T01:02:00Z ERROR: gateway.sock refused
+no timestamp on this line
+";
+
+#[tokio::test]
+async fn logs_can_be_grepped_and_filtered_by_level() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_logs("alice", MIXED_LOGS);
+
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/logs?grep=gateway[.]sock",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(body.lines().count(), 1);
+    assert!(body.contains("gateway.sock refused"), "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/logs?level=error", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.lines().count(), 1);
+    assert!(body.contains("ERROR"), "{body}");
+
+    // `warn` means warnings and above.
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/logs?level=warn", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.lines().count(), 2, "{body}");
+
+    // grep and level combine.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/logs?level=warn&grep=upstream",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.lines().count(), 1, "{body}");
+    assert!(body.contains("slow upstream"), "{body}");
+
+    for (query, code) in [
+        ("level=debug", "invalid_level"),
+        ("grep=%28unclosed", "invalid_grep"),
+        ("format=xml", "invalid_format"),
+        ("since=soon", "invalid_since"),
+        ("since=", "invalid_since"),
+    ] {
+        let (status, body) = harness
+            .request(
+                Method::GET,
+                &format!("/api/instances/alice/logs?{query}"),
+                None,
+            )
+            .await;
+        if query == "since=" {
+            // An empty value is treated as absent, not as an error.
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(parse(&body)["error"]["code"], code, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn logs_json_output_is_structured() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_logs("alice", MIXED_LOGS);
+
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/logs?format=json",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let entries = parse(&body);
+    let entries = entries.as_array().expect("array");
+    assert_eq!(entries.len(), 4, "{body}");
+    assert_eq!(
+        entries[0],
+        json!({"time": "2026-11-08T01:00:00Z", "message": "starting gateway"})
+    );
+    assert_eq!(
+        entries[1],
+        json!({"time": "2026-11-08T01:01:00Z", "message": "WARNING: slow upstream"}),
+        "the docker compose prefix is not part of the timestamp"
+    );
+    assert_eq!(entries[3], json!({"line": "no timestamp on this line"}));
+
+    // A filtered JSON response keeps the shape.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/logs?format=json&level=error",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = parse(&body);
+    assert_eq!(entries.as_array().expect("array").len(), 1);
+    assert_eq!(entries[0]["time"], "2026-11-08T01:02:00Z");
+    assert_eq!(entries[0]["message"], "ERROR: gateway.sock refused");
+}
+
+#[tokio::test]
+async fn logs_forward_the_tail_and_since_to_the_driver() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/logs?tail=7&since=10m",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (instance, options) = harness.mock.logs_calls().pop().expect("logs call");
+    assert_eq!(instance, "alice");
+    assert_eq!(options.tail, 7);
+    assert_eq!(options.since.as_deref(), Some("10m"));
+
+    let (status, _) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/logs?since=2026-11-08T01%3A00%3A00Z",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, options) = harness.mock.logs_calls().pop().expect("logs call");
+    assert_eq!(options.since.as_deref(), Some("2026-11-08T01:00:00Z"));
+    assert_eq!(options.tail, 200, "the default tail is forwarded");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/logs?tail=0", None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "invalid_tail");
+}
+
+#[tokio::test]
+async fn errors_endpoint_summarises_the_recent_failures() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_logs("alice", MIXED_LOGS);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/errors", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = parse(&body);
+    assert_eq!(summary["count"], 2, "{body}");
+    assert_eq!(
+        summary["last"],
+        "2026-11-08T01:02:00Z ERROR: gateway.sock refused"
+    );
+    assert_eq!(summary["last_at"], "2026-11-08T01:02:00Z");
+
+    let (_, options) = harness.mock.logs_calls().pop().expect("logs call");
+    assert_eq!(options.since.as_deref(), Some("24h"), "default window");
+    assert_eq!(options.tail, 2000, "the scan is bounded");
+
+    let (status, _) = harness
+        .request(Method::GET, "/api/instances/alice/errors?since=2h", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, options) = harness.mock.logs_calls().pop().expect("logs call");
+    assert_eq!(options.since.as_deref(), Some("2h"));
+
+    harness.mock.set_logs("alice", "all good\n");
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/errors", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = parse(&body);
+    assert_eq!(summary["count"], 0);
+    assert!(summary["last"].is_null(), "{summary}");
+    assert!(summary["last_at"].is_null(), "{summary}");
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/errors?since=someday",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "invalid_since");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/ghost/errors", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(parse(&body)["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn the_detail_reports_the_docker_inspect_failure() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body)["last_error"].is_null(), "{body}");
+
+    harness.mock.force_status("alice", Status::Error);
+    harness.mock.force_health("alice", Health::Unknown);
+    harness.mock.force_inspect(
+        "alice",
+        InspectInfo {
+            state: "exited".to_string(),
+            exit_code: Some(137),
+            oom_killed: true,
+            error: Some("task: non-zero exit (137)".to_string()),
+            started_at: None,
+        },
+    );
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    let last_error = detail["last_error"].as_str().expect("last error");
+    assert!(last_error.contains("OOM"), "{last_error}");
+    assert!(last_error.contains("137"), "{last_error}");
+
+    // Persisted: the list shows the same cause without another inspect call.
+    let (status, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = parse(&body);
+    assert_eq!(list[0]["last_error"], detail["last_error"]);
+    assert!(harness
+        .mock
+        .calls()
+        .iter()
+        .any(|call| call.operation == "inspect" && call.instance == "alice"));
+}
+
+// ---------------------------------------------------------------------------
+// Clone (#9)
+// ---------------------------------------------------------------------------
+
+async fn clone_instance(harness: &Harness, source: &str, body: Value) -> (StatusCode, Value) {
+    let (status, response) = harness
+        .request(
+            Method::POST,
+            &format!("/api/instances/{source}/clone"),
+            Some(body),
+        )
+        .await;
+    (status, parse(&response))
+}
+
+#[tokio::test]
+async fn clone_creates_an_independent_instance() {
+    let harness = Harness::new();
+    create_share(&harness, "findings").await;
+    let mut body = instance_body("alice");
+    body["gate_token"] = json!("gate-alice");
+    body["shares"] = json!([{"name": "findings", "mode": "rw"}]);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    std::fs::write(
+        harness.instance_dir("alice").join("data/MEMORY.md"),
+        "remember alice",
+    )
+    .expect("memory file");
+
+    let (status, detail) = clone_instance(
+        &harness,
+        "alice",
+        json!({
+            "new_id": "bob",
+            "name": "Bob",
+            "channel_token": "999:BOB",
+            "gate_token": "gate-bob",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{detail}");
+    assert_eq!(detail["id"], "bob");
+    assert_eq!(detail["name"], "Bob");
+    assert_eq!(detail["status"], "running");
+    assert_eq!(
+        detail["shares"],
+        json!([{"name": "findings", "mode": "rw"}])
+    );
+    assert_eq!(detail["model"], MODEL);
+
+    // Own compose project, own container, own directory.
+    let clone_compose = read_yaml(&harness.instance_dir("bob").join("compose.yaml"));
+    assert_eq!(clone_compose["name"], "fleett-bob");
+    assert_eq!(
+        clone_compose["services"]["agent"]["container_name"],
+        "fleett-bob"
+    );
+    let source_compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(source_compose["name"], "fleett-alice");
+    assert_ne!(
+        harness.instance_dir("alice").join("data"),
+        harness.instance_dir("bob").join("data")
+    );
+
+    // The data copy keeps the memory files; the generated files are the
+    // clone's own (same model here, but a different instance directory).
+    assert_eq!(
+        std::fs::read_to_string(harness.instance_dir("bob").join("data/MEMORY.md"))
+            .expect("memory copied"),
+        "remember alice"
+    );
+    let clone_config = read_yaml(&harness.instance_dir("bob").join("data/config.yaml"));
+    assert_eq!(clone_config["model"]["default"], MODEL);
+    assert!(harness.instance_dir("bob").join("data/SOUL.md").is_file());
+    assert!(harness
+        .instance_dir("bob")
+        .join("data/healthcheck.py")
+        .is_file());
+
+    // Tokens are the replacements, never the source ones.
+    let source_secrets = harness.instance_secrets("alice");
+    assert_eq!(
+        source_secrets.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+        Some("123:ABC")
+    );
+    assert_eq!(
+        source_secrets
+            .get("HERMES_GATE_PROFILE_TOKEN")
+            .map(String::as_str),
+        Some("gate-alice")
+    );
+    let clone_secrets = harness.instance_secrets("bob");
+    assert_eq!(
+        clone_secrets.get("TELEGRAM_BOT_TOKEN").map(String::as_str),
+        Some("999:BOB")
+    );
+    assert_eq!(
+        clone_secrets
+            .get("HERMES_GATE_PROFILE_TOKEN")
+            .map(String::as_str),
+        Some("gate-bob")
+    );
+    assert!(!harness.instance_files("bob").contains("gate-alice"));
+
+    // Two rows, two containers.
+    let (status, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = parse(&body);
+    assert_eq!(list.as_array().expect("array").len(), 2);
+    let calls = harness.mock.calls();
+    let ups: Vec<&str> = calls
+        .iter()
+        .filter(|call| call.operation == "up" && call.instance == "bob")
+        .map(|call| call.instance.as_str())
+        .collect();
+    assert_eq!(ups, ["bob"]);
+
+    let actions: Vec<String> = harness
+        .state
+        .db
+        .list_audit(10)
+        .expect("audit")
+        .into_iter()
+        .map(|entry| entry.action)
+        .collect();
+    assert!(
+        actions.contains(&"instance.clone".to_string()),
+        "{actions:?}"
+    );
+}
+
+#[tokio::test]
+async fn clone_without_replacement_tokens_is_refused_before_writing() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await; // holds TELEGRAM_BOT_TOKEN only
+
+    let (status, error) = clone_instance(&harness, "alice", json!({ "new_id": "bob" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["code"], "clone_token_required");
+    assert_eq!(
+        error["error"]["details"]["missing"],
+        json!(["TELEGRAM_BOT_TOKEN"])
+    );
+    assert!(!harness.instance_dir("bob").exists(), "nothing written");
+    assert!(harness.state.db.get("bob").expect("get").is_none());
+    assert!(harness.state.db.sealed("bob").expect("sealed").is_none());
+    assert!(
+        harness.instance_dir("alice").join("compose.yaml").is_file(),
+        "the source is untouched"
+    );
+
+    // A gate token does not replace the channel token.
+    let (status, error) = clone_instance(
+        &harness,
+        "alice",
+        json!({"new_id": "carol", "gate_token": "gate"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error["error"]["details"]["missing"],
+        json!(["TELEGRAM_BOT_TOKEN"])
+    );
+
+    // A missing source and a duplicate id are rejected too.
+    let (status, error) = clone_instance(
+        &harness,
+        "ghost",
+        json!({"new_id": "bob", "channel_token": "1:2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error["error"]["code"], "not_found");
+
+    let (status, error) = clone_instance(
+        &harness,
+        "alice",
+        json!({"new_id": "alice", "channel_token": "1:2"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"]["code"], "invalid_id");
+}
+
+#[tokio::test]
+async fn clone_can_start_empty_and_without_shares() {
+    let harness = Harness::new();
+    create_share(&harness, "findings").await;
+    let mut body = instance_body("alice");
+    body["shares"] = json!([{"name": "findings", "mode": "rw"}]);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    std::fs::write(
+        harness.instance_dir("alice").join("data/MEMORY.md"),
+        "remember alice",
+    )
+    .expect("memory file");
+
+    let (status, detail) = clone_instance(
+        &harness,
+        "alice",
+        json!({
+            "new_id": "bob",
+            "channel_token": "999:BOB",
+            "model": "clone-model",
+            "copy_data": false,
+            "shares_inherit": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{detail}");
+    assert_eq!(detail["shares"], json!([]));
+    assert_eq!(detail["model"], "clone-model");
+    assert_eq!(detail["name"], "Agent alice copy", "default display name");
+    assert!(
+        !harness.instance_dir("bob").join("data/MEMORY.md").exists(),
+        "copy_data=false must start empty"
+    );
+    // The generated files are always written.
+    assert!(harness
+        .instance_dir("bob")
+        .join("data/config.yaml")
+        .is_file());
+    assert!(harness.instance_dir("bob").join("data/SOUL.md").is_file());
+    assert!(harness
+        .instance_dir("bob")
+        .join("data/healthcheck.py")
+        .is_file());
+    let config = read_yaml(&harness.instance_dir("bob").join("data/config.yaml"));
+    assert_eq!(config["model"]["default"], "clone-model");
+}
+
+#[tokio::test]
+async fn clone_inherits_only_the_shares_that_still_exist() {
+    let harness = Harness::new();
+    create_share(&harness, "findings").await;
+    let mut body = instance_body("alice");
+    body["shares"] = json!([{"name": "findings", "mode": "ro"}]);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+
+    // The share directory disappears behind the control plane's back.
+    harness
+        .state
+        .db
+        .delete_share("findings")
+        .expect("drop share");
+    std::fs::remove_dir_all(harness.root().join("shares/findings")).expect("remove share dir");
+
+    let (status, detail) = clone_instance(
+        &harness,
+        "alice",
+        json!({"new_id": "bob", "channel_token": "999:BOB"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{detail}");
+    assert_eq!(
+        detail["shares"],
+        json!([]),
+        "a deleted share is not inherited"
+    );
+    let compose = read_yaml(&harness.instance_dir("bob").join("compose.yaml"));
+    assert!(!compose["services"]["agent"]["volumes"]
+        .as_array()
+        .expect("volumes")
+        .iter()
+        .any(|volume| volume.as_str().is_some_and(|text| text.contains("shares/"))));
+}
+
+#[tokio::test]
+async fn stopping_and_deleting_the_clone_leaves_the_source_alone() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    std::fs::write(
+        harness.instance_dir("alice").join("data/MEMORY.md"),
+        "remember alice",
+    )
+    .expect("memory file");
+
+    let (status, detail) = clone_instance(
+        &harness,
+        "alice",
+        json!({"new_id": "bob", "channel_token": "999:BOB"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{detail}");
+
+    let (status, body) = harness
+        .request(Method::POST, "/api/instances/bob/stop", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse(&body)["status"],
+        "running",
+        "the source keeps running"
+    );
+    assert!(harness.instance_dir("alice").join("compose.yaml").is_file());
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/bob?purge=true", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!harness.instance_dir("bob").exists());
+    assert!(harness.instance_dir("alice").join("compose.yaml").is_file());
+    assert!(harness
+        .instance_dir("alice")
+        .join("data/healthcheck.py")
+        .is_file());
+    assert_eq!(
+        std::fs::read_to_string(harness.instance_dir("alice").join("data/MEMORY.md"))
+            .expect("memory file kept"),
+        "remember alice"
+    );
+    assert!(harness.state.db.get("alice").expect("get").is_some());
+    assert_eq!(
+        harness
+            .instance_secrets("alice")
+            .get("TELEGRAM_BOT_TOKEN")
+            .map(String::as_str),
+        Some("123:ABC"),
+        "the source token is untouched"
+    );
+
+    let calls = harness.mock.calls();
+    let downs: Vec<&str> = calls
+        .iter()
+        .filter(|call| call.operation == "down")
+        .map(|call| call.instance.as_str())
+        .collect();
+    assert_eq!(downs, ["bob"], "only the clone was brought down");
 }

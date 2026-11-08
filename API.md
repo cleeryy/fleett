@@ -86,6 +86,10 @@ The token is **never** returned by the API.
  "compose_yaml":"name: fleett-alice\n…"}
 ```
 
+`last_error` carries the last known failure: the health-probe message while the container stays
+unhealthy, or the `docker inspect` cause (`State.Error`, `OOMKilled`, non-zero exit code) when
+the container is not healthy. It is `null` for a healthy container and for a clean stop.
+
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
 `mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`. Rewrites the compose file and runs `up -d`.
@@ -112,7 +116,33 @@ Start/stop/restart/delete are never blocked by this policy.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
-`GET /api/instances/{id}/logs?tail=200` → `text/plain`
+
+`POST /api/instances/{id}/clone` → `201 InstanceDetail`. Body:
+```json
+{"new_id":"bob","name":"Bob","model":"…",
+ "gate_token":"…","channel_token":"…",
+ "shares_inherit":true,"copy_data":true}
+```
+The clone gets its own Compose project (`fleett-<new_id>`), container, data directory and
+database row. Secrets are **never** copied: every token the source holds must be replaced
+(`gate_token` for `HERMES_GATE_PROFILE_TOKEN`/`api_key_env`, `channel_token` for the platform
+bot token). A missing replacement fails with `400 clone_token_required`
+(`error.details {source, missing}`) before anything is written. `copy_data` (default `true`)
+copies `data/` recursively; the generated `config.yaml`, `SOUL.md` and health probe always
+come from the clone's own rendering. `shares_inherit` (default `true`) copies only the shares
+that still exist.
+
+`GET /api/instances/{id}/logs` → `text/plain` (default) or `application/json`.
+Query: `tail` (`1..=2000`, default `200`), `since` (Docker duration `30s|10m|2h|1h30m` or an
+RFC 3339 timestamp), `grep` (regex), `level=error|warn` (`warn` keeps warnings and above),
+`format=text|json`. The response is capped at 1 MiB; `grep`/`level` filtering runs in the app.
+`format=json` returns `[{"time":"2026-11-08T01:02:03Z","message":"…"}]` for lines that start
+with a timestamp, and `[{"line":"…"}]` otherwise. Invalid values answer `400` with
+`invalid_tail`, `invalid_since`, `invalid_grep`, `invalid_level` or `invalid_format`.
+
+`GET /api/instances/{id}/errors?since=24h` → `{"count":2,"last":"…","last_at":"…"}`: counts
+the error/warn lines of a bounded window (at most 2000 lines) without returning the log.
+`last_at` is the parsed timestamp of the last matching line (`null` when it has none).
 
 ## Shares
 

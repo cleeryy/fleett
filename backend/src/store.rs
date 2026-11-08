@@ -140,6 +140,83 @@ pub fn write_compose(cfg: &Config, id: &str, compose_yaml: &str) -> io::Result<(
     write_file(&cfg.compose_path(id), compose_yaml, 0o644)
 }
 
+/// Recursively copy the `data/` directory of `from` into the one of `to`.
+///
+/// Used by `POST /api/instances/{id}/clone`: the clone receives its own copy
+/// (independent data directory), and the generated files written afterwards by
+/// [`write_instance`] stay authoritative. Returns the number of bytes copied.
+///
+/// The copy preserves modes and symlinks, and normalises ownership to the
+/// container UID/GID so the agent can write its own memory files. A missing
+/// source directory simply copies nothing.
+pub fn copy_data(cfg: &Config, from: &str, to: &str) -> io::Result<u64> {
+    if from == to {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot copy an instance data directory onto itself",
+        ));
+    }
+    let source = cfg.data_dir(from);
+    let destination = cfg.data_dir(to);
+    if !source.is_dir() {
+        return Ok(0);
+    }
+    let copied = copy_tree(&source, &destination)?;
+    chown_tree(&destination, CONTAINER_UID, CONTAINER_GID);
+    Ok(copied)
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> io::Result<u64> {
+    fs::create_dir_all(destination)?;
+    let mut copied = 0u64;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from)?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            copied += copy_tree(&from, &to)?;
+            continue;
+        }
+        if file_type.is_symlink() {
+            let target = fs::read_link(&from)?;
+            let _ = fs::remove_file(&to);
+            std::os::unix::fs::symlink(target, &to)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            // Sockets, FIFOs and device nodes are runtime artifacts, not data.
+            continue;
+        }
+        copied += fs::copy(&from, &to)?;
+        fs::set_permissions(
+            &to,
+            fs::Permissions::from_mode(metadata.permissions().mode()),
+        )?;
+    }
+    Ok(copied)
+}
+
+/// Best-effort recursive ownership change (a non-root process keeps its files).
+fn chown_tree(path: &Path, uid: u32, gid: u32) {
+    chown_quiet(path, uid, gid);
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if fs::symlink_metadata(&child)
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+        {
+            chown_tree(&child, uid, gid);
+        } else {
+            chown_quiet(&child, uid, gid);
+        }
+    }
+}
+
 /// Remove the generated files of an instance.
 ///
 /// The data directory survives unless `purge` is set, so a later create with
@@ -442,6 +519,49 @@ mod tests {
         assert_eq!(parse_memory_mb("1536m"), Some(1536));
         assert_eq!(parse_memory_mb("256M"), Some(256));
         assert_eq!(parse_memory_mb("nope"), None);
+    }
+
+    #[test]
+    fn data_directories_are_copied_recursively() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        ensure_layout(&cfg).expect("layout");
+
+        let source = cfg.data_dir("alice");
+        std::fs::create_dir_all(source.join("sessions")).expect("source tree");
+        std::fs::write(source.join("config.yaml"), "model: {}\n").expect("config");
+        std::fs::write(source.join("sessions/one.json"), "{}").expect("session");
+        std::fs::write(source.join("MEMORY.md"), "remember\n").expect("memory");
+        std::os::unix::fs::symlink("MEMORY.md", source.join("latest.md")).expect("symlink");
+
+        let copied = copy_data(&cfg, "alice", "bob").expect("copy");
+        assert!(copied > 0);
+
+        let destination = cfg.data_dir("bob");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("MEMORY.md")).expect("memory"),
+            "remember\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("sessions/one.json")).expect("session"),
+            "{}"
+        );
+        assert!(destination.join("sessions").is_dir());
+        let link = std::fs::read_link(destination.join("latest.md")).expect("symlink kept");
+        assert_eq!(link, std::path::PathBuf::from("MEMORY.md"));
+
+        // The source is untouched and the copy is a real copy.
+        std::fs::write(source.join("MEMORY.md"), "changed\n").expect("source write");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("MEMORY.md")).expect("memory"),
+            "remember\n"
+        );
+
+        assert_eq!(
+            copy_data(&cfg, "ghost", "carol").expect("missing source"),
+            0
+        );
+        assert!(copy_data(&cfg, "alice", "alice").is_err());
     }
 
     #[test]

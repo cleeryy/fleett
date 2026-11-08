@@ -359,6 +359,32 @@ pub struct CreateInstanceRequest {
     pub env: Option<BTreeMap<String, String>>,
 }
 
+/// `POST /api/instances/{id}/clone`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CloneInstanceRequest {
+    /// Id of the new instance; required (validated by the handler for a 400).
+    #[serde(default)]
+    pub new_id: Option<String>,
+    /// Display name (defaults to the source name plus " copy").
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Model of the clone (defaults to the source model).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Replacement for `HERMES_GATE_PROFILE_TOKEN` (and `api_key_env`).
+    #[serde(default)]
+    pub gate_token: Option<String>,
+    /// Replacement for the platform bot token of the source channel.
+    #[serde(default)]
+    pub channel_token: Option<String>,
+    /// Copy the source shares that still exist (default `true`).
+    #[serde(default)]
+    pub shares_inherit: Option<bool>,
+    /// Copy the source `data/` directory (default `true`).
+    #[serde(default)]
+    pub copy_data: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PatchInstanceRequest {
     #[serde(default)]

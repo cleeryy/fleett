@@ -4,7 +4,7 @@
 //! the next call of a given operation so error paths are testable without
 //! Docker.
 
-use super::{Driver, DriverError, DriverFuture, PsResult};
+use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult};
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::HashMap;
@@ -44,6 +44,12 @@ pub struct MockDriver {
     failures: Mutex<HashMap<String, String>>,
     /// Reported by `network_subnet`; `None` means "unknown".
     network_subnet: Mutex<Option<String>>,
+    /// Canned log output, per instance (`set_logs`).
+    logs: Mutex<HashMap<String, String>>,
+    /// Every `logs` call with the options the API passed down.
+    logs_options: Mutex<Vec<(String, LogsOptions)>>,
+    /// Canned `docker inspect` payloads, per instance (`force_inspect`).
+    inspect: Mutex<HashMap<String, InspectInfo>>,
 }
 
 impl Default for MockDriver {
@@ -64,6 +70,9 @@ impl MockDriver {
             calls: Mutex::new(Vec::new()),
             failures: Mutex::new(HashMap::new()),
             network_subnet: Mutex::new(None),
+            logs: Mutex::new(HashMap::new()),
+            logs_options: Mutex::new(Vec::new()),
+            inspect: Mutex::new(HashMap::new()),
         }
     }
 
@@ -82,6 +91,26 @@ impl MockDriver {
 
     pub fn clear_calls(&self) {
         lock(&self.calls).clear();
+    }
+
+    /// Every `logs` call, with the options the API passed to the driver.
+    pub fn logs_calls(&self) -> Vec<(String, LogsOptions)> {
+        lock(&self.logs_options).clone()
+    }
+
+    /// Replace the log output of one instance (used by the filter tests).
+    pub fn set_logs(&self, id: &str, text: impl Into<String>) {
+        lock(&self.logs).insert(id.to_string(), text.into());
+    }
+
+    /// Report a canned `docker inspect` payload for one instance.
+    pub fn force_inspect(&self, id: &str, info: InspectInfo) {
+        lock(&self.inspect).insert(id.to_string(), info);
+    }
+
+    /// Drop the canned inspect payload of one instance.
+    pub fn clear_inspect(&self, id: &str) {
+        lock(&self.inspect).remove(id);
     }
 
     /// Make the next call of `operation` fail with `stderr`.
@@ -178,6 +207,40 @@ impl MockDriver {
         let mut selected = lines[start..].join("\n");
         selected.push('\n');
         selected
+    }
+
+    /// Last `tail` lines of `text`, with a trailing newline like Docker.
+    fn tail_lines(text: &str, tail: u32) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(tail as usize);
+        let mut selected = lines[start..].join("\n");
+        if !selected.is_empty() {
+            selected.push('\n');
+        }
+        selected
+    }
+
+    fn simulate_inspect(&self, id: &str) -> InspectInfo {
+        if let Some(info) = lock(&self.inspect).get(id) {
+            return info.clone();
+        }
+        let state = lock(&self.state);
+        match state.get(id) {
+            Some(entry) => InspectInfo {
+                state: entry.status.as_str().to_string(),
+                exit_code: Some(0),
+                oom_killed: false,
+                error: None,
+                started_at: entry.started_at.map(|started| {
+                    chrono::DateTime::<chrono::Utc>::from(started)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                }),
+            },
+            None => InspectInfo {
+                state: "missing".to_string(),
+                ..InspectInfo::default()
+            },
+        }
     }
 }
 
@@ -291,12 +354,97 @@ impl Driver for MockDriver {
     fn logs<'a>(
         &'a self,
         spec: &'a InstanceSpec,
-        tail: u32,
+        options: &'a LogsOptions,
     ) -> DriverFuture<'a, Result<String, DriverError>> {
         Box::pin(async move {
             self.record("logs", &spec.id);
+            lock(&self.logs_options).push((spec.id.clone(), options.clone()));
             self.fail_if_requested("logs")?;
-            Ok(self.logs_for(&spec.id, tail))
+            let text = match lock(&self.logs).get(&spec.id) {
+                Some(text) => text.clone(),
+                None => self.logs_for(&spec.id, options.tail),
+            };
+            // The mock has no timestamps: `since` only bounds what Docker
+            // would return, so it is recorded but not simulated.
+            Ok(Self::tail_lines(&text, options.tail))
         })
+    }
+
+    fn inspect<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>> {
+        Box::pin(async move {
+            self.record("inspect", &spec.id);
+            self.fail_if_requested("inspect")?;
+            Ok(self.simulate_inspect(&spec.id))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(id: &str) -> InstanceSpec {
+        InstanceSpec {
+            id: id.to_string(),
+            name: id.to_string(),
+            template: "guest".to_string(),
+            model: "m".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            api_key_env: crate::models::DEFAULT_API_KEY_ENV.to_string(),
+            channel: crate::models::ChannelKind::None,
+            shares: Vec::new(),
+            mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
+            cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
+            allow_lan: false,
+            notes: String::new(),
+            status: Status::Created,
+            last_error: None,
+            created_at: crate::models::now_iso(),
+            updated_at: crate::models::now_iso(),
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_are_tailed_and_the_options_are_recorded() {
+        let driver = MockDriver::new();
+        let instance = spec("alice");
+        driver.set_logs("alice", "one\ntwo\nthree\n");
+
+        let options = LogsOptions {
+            tail: 2,
+            since: Some("10m".to_string()),
+        };
+        let text = driver.logs(&instance, &options).await.expect("logs");
+        assert_eq!(text, "two\nthree\n");
+        assert_eq!(driver.logs_calls(), vec![("alice".to_string(), options)]);
+    }
+
+    #[tokio::test]
+    async fn inspect_simulates_the_container_state() {
+        let driver = MockDriver::new();
+        let instance = spec("alice");
+        driver.up(&instance).await.expect("up");
+
+        let clean = driver.inspect(&instance).await.expect("inspect");
+        assert_eq!(clean.state, "running");
+        assert_eq!(clean.exit_code, Some(0));
+        assert!(clean.error_message().is_none());
+
+        driver.force_inspect(
+            "alice",
+            InspectInfo {
+                state: "exited".to_string(),
+                exit_code: Some(137),
+                oom_killed: true,
+                error: None,
+                started_at: None,
+            },
+        );
+        let broken = driver.inspect(&instance).await.expect("inspect");
+        assert!(broken.oom_killed);
+        assert!(broken.error_message().is_some());
     }
 }

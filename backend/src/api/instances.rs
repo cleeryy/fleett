@@ -5,13 +5,16 @@ use crate::api::error::ApiError;
 use crate::api::{up_and_record, AppState};
 use crate::auth::AuthContext;
 use crate::config::EgressMode;
+use crate::driver::LogsOptions;
 use crate::egress;
+use crate::logs;
 use crate::models::{
     now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
     validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
-    ChannelKind, ChannelRequest, ContainerInfo, CreateInstanceRequest, Health, InstanceDetail,
-    InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status, DEFAULT_API_KEY_ENV,
-    DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE, HEALTH_UNHEALTHY_MESSAGE,
+    ChannelKind, ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest,
+    Health, InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
+    TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
@@ -22,10 +25,63 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Deserialize)]
+/// Lines returned when `?tail=` is omitted.
+pub const DEFAULT_LOGS_TAIL: u32 = 200;
+/// Upper bound of `?tail=`.
+pub const MAX_LOGS_TAIL: u32 = 2000;
+/// Window used by `GET /api/instances/{id}/errors` when `?since=` is omitted.
+pub const DEFAULT_ERRORS_SINCE: &str = "24h";
+/// Lines scanned by the error counter.
+pub const ERRORS_TAIL: u32 = 2000;
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LogsQuery {
     #[serde(default)]
     pub tail: Option<u32>,
+    /// Docker duration (`10m`, `2h`) or an RFC 3339 timestamp.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Regex the line must match.
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// `error` or `warn`.
+    #[serde(default)]
+    pub level: Option<String>,
+    /// `text` (default) or `json`.
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Response format of the logs endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" | "plain" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ErrorsQuery {
+    /// Docker duration or RFC 3339 timestamp (default `24h`).
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// Recent error/warn lines of one instance, without the full log.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorsResponse {
+    pub count: usize,
+    pub last: Option<String>,
+    pub last_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -83,6 +139,7 @@ pub async fn get(
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let mut spec = load(&state, &id)?;
     let (status, health, container) = observe(&state, &mut spec).await;
+    record_inspect_error(&state, &mut spec, health).await;
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
@@ -156,6 +213,189 @@ pub async fn create(
             "name": stored.name,
             "template": stored.template,
             "allow_lan": stored.allow_lan,
+        })),
+    );
+    let warnings = egress::warnings(&state.cfg, stored.allow_lan);
+    Ok((
+        StatusCode::CREATED,
+        Json(to_detail(
+            &state, &stored, status, health, container, warnings,
+        )),
+    ))
+}
+
+/// Duplicate an instance under a new id.
+///
+/// The clone is a completely independent instance: its own compose project,
+/// container, data directory and database row. Secrets are never copied — the
+/// request must replace every token the source holds, and a missing token
+/// refuses the clone *before anything is written*.
+pub async fn clone(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    Json(request): Json<CloneInstanceRequest>,
+) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    let new_id = request
+        .new_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    validate_instance_id(&new_id)
+        .map_err(|message| ApiError::bad_request("invalid_id", message))?;
+    if new_id == id {
+        return Err(ApiError::bad_request(
+            "invalid_id",
+            "new_id must differ from the source instance",
+        ));
+    }
+    let shares_inherit = request.shares_inherit.unwrap_or(true);
+    let copy_data = request.copy_data.unwrap_or(true);
+
+    // Two instance locks, always taken in the same order so two concurrent
+    // clones of the same pair cannot deadlock on each other.
+    let (first, second) = if id < new_id {
+        (id.clone(), new_id.clone())
+    } else {
+        (new_id.clone(), id.clone())
+    };
+    let first_lock = state.locks.for_id(&first);
+    let _first = first_lock.lock_owned().await;
+    let second_lock = state.locks.for_id(&second);
+    let _second = second_lock.lock_owned().await;
+
+    let source = load(&state, &id)?;
+    if state.db.exists(&new_id).map_err(ApiError::from)? || state.cfg.compose_path(&new_id).exists()
+    {
+        return Err(ApiError::conflict(
+            "instance_exists",
+            format!("instance \"{new_id}\" already exists"),
+        ));
+    }
+
+    let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
+    let channel_token = normalize_token(request.channel_token.as_deref(), "invalid_channel_token")?;
+
+    // Tokens are never inherited: every token the source holds has to be
+    // replaced by the request. Checked before the first write so a refused
+    // clone leaves nothing behind.
+    let source_secrets =
+        crate::secrets::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let mut missing: Vec<String> = Vec::new();
+    if gate_token.is_none() {
+        missing.extend(
+            gate_secret_keys(&source)
+                .into_iter()
+                .filter(|key| source_secrets.contains_key(*key))
+                .map(str::to_string),
+        );
+    }
+    if channel_token.is_none() {
+        if let Some(env) = source.channel.token_env() {
+            if source_secrets.contains_key(env) {
+                missing.push(env.to_string());
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(ApiError::bad_request(
+            "clone_token_required",
+            format!(
+                "the clone never inherits secrets: supply the replacement token(s) for {}",
+                missing.join(", ")
+            ),
+        )
+        .with_details(serde_json::json!({
+            "source": id,
+            "missing": missing,
+        })));
+    }
+
+    let mut clone = source.clone();
+    clone.id = new_id.clone();
+    if let Some(name) = request.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ApiError::bad_request(
+                "invalid_name",
+                "name must not be empty",
+            ));
+        }
+        if name.chars().count() > 128 {
+            return Err(ApiError::bad_request(
+                "invalid_name",
+                "name must be at most 128 characters",
+            ));
+        }
+        clone.name = name.to_string();
+    } else {
+        clone.name = clone_default_name(&source.name);
+    }
+    if let Some(model) = request.model.as_deref() {
+        let model = model.trim();
+        validate_model(model).map_err(|message| ApiError::bad_request("invalid_model", message))?;
+        clone.model = model.to_string();
+    }
+    clone.shares = if shares_inherit {
+        source
+            .shares
+            .iter()
+            .filter(|share| state.db.share_exists(&share.name).unwrap_or(false))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    clone.status = Status::Created;
+    clone.last_error = None;
+    let now = now_iso();
+    clone.created_at = now.clone();
+    clone.updated_at = now;
+
+    enforce_caps(&state, None, &clone)?;
+    check_egress_policy(&state, &clone).await?;
+    ensure_lan_network(&state, &clone).await?;
+
+    let template = clone_template(&state, &source)?;
+    let secrets = render::build_secrets(
+        &clone,
+        gate_token.as_deref(),
+        channel_token.as_deref(),
+        &BTreeMap::new(),
+    );
+    crate::secrets::check_storable(&state.cfg, &state.db, &new_id, &secrets)
+        .map_err(ApiError::from)?;
+    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
+    let rendered = render::render_instance(&state.cfg, &clone, &template, &secret_keys)
+        .map_err(ApiError::from)?;
+
+    // From here on the clone exists: any failure rolls it back completely.
+    state.db.insert_instance(&clone).map_err(ApiError::from)?;
+    if let Err(err) = write_clone(&state, &source.id, &clone, &secrets, &rendered, copy_data).await
+    {
+        rollback_clone(&state, &new_id);
+        return Err(err);
+    }
+
+    up_and_record(&state, &mut clone).await?;
+    let (status, health, container) = match state.driver.ps(&clone).await {
+        Ok(result) => (result.status, result.health, result.container),
+        Err(_) => (Status::Running, Health::Unknown, None),
+    };
+    let mut stored = load(&state, &new_id)?;
+    record_health(&state, &mut stored, health);
+    audit::record(
+        &state,
+        &context,
+        "instance.clone",
+        &stored.id,
+        Some(serde_json::json!({
+            "source": source.id,
+            "name": stored.name,
+            "model": stored.model,
+            "copy_data": copy_data,
+            "shares_inherit": shares_inherit,
         })),
     );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
@@ -245,20 +485,95 @@ pub async fn logs(
     Query(query): Query<LogsQuery>,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
-    let tail = query.tail.unwrap_or(200);
-    if !(1..=2000).contains(&tail) {
-        return Err(ApiError::bad_request(
-            "invalid_tail",
-            "tail must be between 1 and 2000",
-        ));
+    let tail = query.tail.unwrap_or(DEFAULT_LOGS_TAIL);
+    if !(1..=MAX_LOGS_TAIL).contains(&tail) {
+        return Err(invalid_tail());
     }
+    let since = match query
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(value) => Some(
+            logs::normalize_since(value)
+                .map_err(|message| ApiError::bad_request("invalid_since", message))?,
+        ),
+        None => None,
+    };
+    let format = match query
+        .format
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => LogFormat::parse(value).ok_or_else(|| {
+            ApiError::bad_request("invalid_format", "format must be \"text\" or \"json\"")
+        })?,
+        None => LogFormat::Text,
+    };
+    let filters =
+        logs::Filters::new(query.grep.as_deref(), query.level.as_deref()).map_err(filter_error)?;
+
     let spec = load(&state, &id)?;
-    let logs = state
+    let raw = state
         .driver
-        .logs(&spec, tail)
+        .logs(&spec, &LogsOptions { tail, since })
         .await
         .map_err(ApiError::driver)?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], logs).into_response())
+    let raw = logs::truncate(&raw, logs::MAX_SCAN_BYTES);
+    let lines = filters.apply(raw);
+
+    match format {
+        LogFormat::Text => Ok((
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            logs::render_text(&lines, logs::MAX_RESPONSE_BYTES),
+        )
+            .into_response()),
+        LogFormat::Json => Ok((
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(logs::entries(&lines, logs::MAX_RESPONSE_BYTES)),
+        )
+            .into_response()),
+    }
+}
+
+/// Recent error/warn lines of one instance.
+///
+/// Scans a bounded window (`since`, at most [`ERRORS_TAIL`] lines) so the web
+/// console can show "3 errors, last at 12:04" without downloading the log.
+pub async fn errors(
+    Path(id): Path<String>,
+    Query(query): Query<ErrorsQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<ErrorsResponse>, ApiError> {
+    let since = query
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ERRORS_SINCE);
+    let since = logs::normalize_since(since)
+        .map_err(|message| ApiError::bad_request("invalid_since", message))?;
+
+    let spec = load(&state, &id)?;
+    let raw = state
+        .driver
+        .logs(
+            &spec,
+            &LogsOptions {
+                tail: ERRORS_TAIL,
+                since: Some(since),
+            },
+        )
+        .await
+        .map_err(ApiError::driver)?;
+    let summary = logs::error_summary(logs::truncate(&raw, logs::MAX_SCAN_BYTES));
+    Ok(Json(ErrorsResponse {
+        count: summary.count,
+        last: summary.last,
+        last_at: summary.last_at,
+    }))
 }
 
 pub async fn delete(
@@ -893,4 +1208,142 @@ fn validate_extras(
         out.insert(key.clone(), value.clone());
     }
     Ok(out)
+}
+
+fn invalid_tail() -> ApiError {
+    ApiError::bad_request(
+        "invalid_tail",
+        format!("tail must be between 1 and {MAX_LOGS_TAIL}"),
+    )
+}
+
+fn filter_error(err: logs::FilterError) -> ApiError {
+    let message = err.to_string();
+    match err {
+        logs::FilterError::InvalidLevel => ApiError::bad_request("invalid_level", message),
+        logs::FilterError::GrepTooLong | logs::FilterError::InvalidGrep(_) => {
+            ApiError::bad_request("invalid_grep", message)
+        }
+    }
+}
+
+/// Trim and validate a replacement token (empty means "not supplied").
+fn normalize_token(value: Option<&str>, code: &'static str) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    validate_secret_value(value).map_err(|message| ApiError::bad_request(code, message))?;
+    Ok(Some(value.to_string()))
+}
+
+/// Secret keys replaced by `gate_token`.
+fn gate_secret_keys(spec: &InstanceSpec) -> Vec<&str> {
+    let mut keys = vec![GATE_TOKEN_ENV];
+    if spec.api_key_env != GATE_TOKEN_ENV {
+        keys.push(spec.api_key_env.as_str());
+    }
+    keys
+}
+
+/// Display name of a clone when the request does not name it.
+fn clone_default_name(source: &str) -> String {
+    let suffix = " copy";
+    let budget = 128usize.saturating_sub(suffix.chars().count());
+    let base: String = source.trim().chars().take(budget).collect();
+    if base.is_empty() {
+        return "copy".to_string();
+    }
+    format!("{base}{suffix}")
+}
+
+/// Template of a clone: the source template, or its on-disk config when the
+/// source was adopted from disk (`custom`).
+fn clone_template(state: &AppState, source: &InstanceSpec) -> Result<TemplateSource, ApiError> {
+    match render::load_template(&state.cfg, &source.template) {
+        Ok(template) => Ok(template),
+        Err(RenderError::UnknownTemplate(_)) if source.template == "custom" => {
+            let config_path = state.cfg.data_dir(&source.id).join("config.yaml");
+            let config_yaml = std::fs::read_to_string(&config_path).map_err(|err| {
+                ApiError::internal(format!(
+                    "failed to read the source config at {}: {err}",
+                    config_path.display()
+                ))
+            })?;
+            let soul_md =
+                std::fs::read_to_string(state.cfg.data_dir(&source.id).join("SOUL.md")).ok();
+            Ok(TemplateSource {
+                id: source.template.clone(),
+                config_yaml,
+                soul_md,
+                meta: TemplateMeta::default(),
+            })
+        }
+        Err(err) => Err(ApiError::from(err)),
+    }
+}
+
+/// Persist the clone: secrets, optional data copy, then the generated files.
+///
+/// The generated files are written last so the clone's own `config.yaml`,
+/// `SOUL.md` and health probe always win over the copied ones.
+async fn write_clone(
+    state: &AppState,
+    source_id: &str,
+    spec: &InstanceSpec,
+    secrets: &BTreeMap<String, String>,
+    rendered: &render::RenderedInstance,
+    copy_data: bool,
+) -> Result<(), ApiError> {
+    crate::secrets::store(&state.cfg, &state.db, &spec.id, secrets).map_err(ApiError::from)?;
+
+    if copy_data {
+        let cfg = state.cfg.clone();
+        let from = source_id.to_string();
+        let to = spec.id.clone();
+        match tokio::task::spawn_blocking(move || store::copy_data(&cfg, &from, &to)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                return Err(ApiError::internal(format!(
+                    "failed to copy the instance data: {err}"
+                )))
+            }
+            Err(err) => {
+                return Err(ApiError::internal(format!(
+                    "failed to copy the instance data: {err}"
+                )))
+            }
+        }
+    }
+
+    store::write_instance(&state.cfg, spec, rendered, true)
+        .map_err(|err| ApiError::internal(format!("failed to write instance files: {err}")))
+}
+
+/// Remove every trace of a clone that failed halfway through.
+fn rollback_clone(state: &AppState, id: &str) {
+    let _ = state.db.delete_instance(id);
+    let _ = std::fs::remove_dir_all(state.cfg.instance_dir(id));
+}
+
+/// Record the `docker inspect` failure of a non-healthy container.
+///
+/// Docker knows *why* a container died (`State.Error`, `OOMKilled`, exit
+/// code); the health probe only knows that it did. When the probe is unhappy,
+/// the inspect answer becomes `last_error` so the UI can show the cause
+/// without the full log.
+async fn record_inspect_error(state: &AppState, spec: &mut InstanceSpec, health: Health) {
+    if health == Health::Healthy {
+        return;
+    }
+    let Ok(info) = state.driver.inspect(spec).await else {
+        return;
+    };
+    let Some(message) = info.error_message() else {
+        return;
+    };
+    if spec.last_error.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    let _ = state.db.set_last_error(&spec.id, Some(&message));
+    spec.last_error = Some(message);
 }

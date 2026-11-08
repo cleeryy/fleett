@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod driver;
 pub mod egress;
+pub mod logs;
 pub mod migrate;
 pub mod models;
 pub mod render;

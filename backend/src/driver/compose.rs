@@ -6,7 +6,7 @@
 //! projects created by older releases (`hermes-<id>`) remain manageable without
 //! being recreated.
 
-use super::{Driver, DriverError, DriverFuture, PsResult};
+use super::{Driver, DriverError, DriverFuture, InspectInfo, LogsOptions, PsResult};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -24,6 +24,7 @@ const DOWN_TIMEOUT: Duration = Duration::from_secs(120);
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 const PS_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGS_TIMEOUT: Duration = Duration::from_secs(30);
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct ComposeDriver {
@@ -353,19 +354,99 @@ impl Driver for ComposeDriver {
     fn logs<'a>(
         &'a self,
         spec: &'a InstanceSpec,
-        tail: u32,
+        options: &'a LogsOptions,
     ) -> DriverFuture<'a, Result<String, DriverError>> {
         Box::pin(async move {
-            let tail = tail.to_string();
-            self.compose(
-                &spec.id,
-                &["logs", "--no-color", "--tail", &tail],
-                "logs",
-                LOGS_TIMEOUT,
-            )
-            .await
+            let args = logs_arguments(options.tail, options.since.as_deref());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.compose(&spec.id, &args, "logs", LOGS_TIMEOUT).await
         })
     }
+
+    fn inspect<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>> {
+        Box::pin(async move {
+            // `container_name` is always the compose project name (see
+            // `render::render_compose`), and reading the declared project keeps
+            // containers created by older releases (`hermes-<id>`) addressable.
+            let container = self.project(&spec.id);
+            let mut command = Command::new(&self.docker);
+            command
+                .args(["inspect", "--type", "container", &container])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let stdout = run_command(command, "inspect", INSPECT_TIMEOUT).await?;
+            parse_inspect(&stdout)
+                .ok_or_else(|| DriverError::new("inspect", "unparsable docker inspect output"))
+        })
+    }
+}
+
+/// Arguments of `docker compose logs` for the given options.
+///
+/// Kept separate from the process call so the `--tail`/`--since` wiring is
+/// testable without Docker.
+fn logs_arguments(tail: u32, since: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "logs".to_string(),
+        "--no-color".to_string(),
+        "--tail".to_string(),
+        tail.to_string(),
+    ];
+    if let Some(since) = since {
+        args.push("--since".to_string());
+        args.push(since.to_string());
+    }
+    args
+}
+
+/// Parse `docker inspect --type container <name>` output.
+///
+/// Docker returns an array with one object; the `State` block carries
+/// `Status`, `ExitCode`, `OOMKilled`, `Error` and `StartedAt`.
+fn parse_inspect(stdout: &str) -> Option<InspectInfo> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let object = value_object(value)?;
+    let state = object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("state"))
+        .and_then(|(_, value)| value.as_object())?;
+
+    let text = |names: &[&str]| -> Option<String> {
+        for (key, value) in state {
+            let key = key.to_ascii_lowercase();
+            if names.contains(&key.as_str()) {
+                if let Some(text) = value.as_str() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        None
+    };
+    let started_at = text(&["startedat"]).filter(|started| !is_zero_timestamp(started));
+
+    Some(InspectInfo {
+        state: text(&["status"]).unwrap_or_default(),
+        exit_code: state
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("exitcode"))
+            .and_then(|(_, value)| value.as_i64())
+            .and_then(|code| i32::try_from(code).ok()),
+        oom_killed: state
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("oomkilled"))
+            .and_then(|(_, value)| value.as_bool())
+            .unwrap_or(false),
+        error: text(&["error"]).filter(|error| !error.trim().is_empty()),
+        started_at,
+    })
+}
+
+/// `docker inspect` reports this placeholder before the first start.
+fn is_zero_timestamp(value: &str) -> bool {
+    value.starts_with("0001-01-01")
 }
 
 /// Parse `docker compose ps --format json`.
@@ -693,5 +774,89 @@ mod tests {
         assert_eq!(ps.status, Status::Unknown);
         assert_eq!(ps.health, Health::Unknown);
         assert!(ps.container.is_none());
+    }
+
+    #[test]
+    fn logs_arguments_carry_the_tail_and_since() {
+        assert_eq!(
+            logs_arguments(200, None),
+            ["logs", "--no-color", "--tail", "200"]
+                .map(str::to_string)
+                .to_vec()
+        );
+        assert_eq!(
+            logs_arguments(25, Some("10m")),
+            ["logs", "--no-color", "--tail", "25", "--since", "10m"]
+                .map(str::to_string)
+                .to_vec()
+        );
+        assert_eq!(
+            logs_arguments(2000, Some("2026-11-08T01:00:00Z")),
+            [
+                "logs",
+                "--no-color",
+                "--tail",
+                "2000",
+                "--since",
+                "2026-11-08T01:00:00Z"
+            ]
+            .map(str::to_string)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn parses_a_running_container() {
+        let stdout = r#"[{
+            "Id": "abc",
+            "Name": "/fleett-alice",
+            "State": {
+                "Status": "running",
+                "Running": true,
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "Error": "",
+                "StartedAt": "2026-11-08T01:02:03.456789Z",
+                "FinishedAt": "0001-01-01T00:00:00Z"
+            }
+        }]"#;
+        let info = parse_inspect(stdout).expect("parsed");
+        assert_eq!(info.state, "running");
+        assert_eq!(info.exit_code, Some(0));
+        assert!(!info.oom_killed);
+        assert_eq!(info.error, None);
+        assert_eq!(
+            info.started_at.as_deref(),
+            Some("2026-11-08T01:02:03.456789Z")
+        );
+        assert!(info.error_message().is_none());
+    }
+
+    #[test]
+    fn parses_a_crashed_container() {
+        let stdout = r#"[{"State":{"status":"exited","exitcode":137,"oomkilled":true,
+            "error":"task: non-zero exit (137)","startedAt":"0001-01-01T00:00:00Z"}}]"#;
+        let info = parse_inspect(stdout).expect("parsed");
+        assert_eq!(info.state, "exited");
+        assert_eq!(info.exit_code, Some(137));
+        assert!(info.oom_killed);
+        assert_eq!(info.error.as_deref(), Some("task: non-zero exit (137)"));
+        assert_eq!(
+            info.started_at, None,
+            "the zero timestamp means never started"
+        );
+        let message = info.error_message().expect("failure");
+        assert!(message.contains("137"), "{message}");
+        assert!(message.contains("OOM"), "{message}");
+    }
+
+    #[test]
+    fn inspect_output_must_be_json() {
+        assert!(parse_inspect("").is_none());
+        assert!(parse_inspect("Error: No such object: fleett-alice").is_none());
+        assert!(
+            parse_inspect(r#"[{"Id":"abc"}]"#).is_none(),
+            "no State block"
+        );
     }
 }
