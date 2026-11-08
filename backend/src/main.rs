@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(cfg: Config) -> anyhow::Result<()> {
-    if cfg.token.is_none() {
+    if cfg.allow_no_auth {
         tracing::warn!(
             bind = %cfg.bind,
             "FLEETT_ALLOW_NO_AUTH=1: authentication is disabled, everyone who can reach the \
@@ -140,6 +140,17 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
             cfg.bind
         );
     }
+    if cfg.allow_no_auth && cfg.auth.oidc_enabled() {
+        tracing::warn!(
+            "FLEETT_ALLOW_NO_AUTH=1 bypasses the OIDC login: any request without a session is \
+             treated as an anonymous admin"
+        );
+    }
+    tracing::info!(
+        auth = %cfg.auth,
+        oidc = cfg.auth.oidc_enabled(),
+        "authentication configured"
+    );
 
     if cfg.env_file_path().is_file() {
         tracing::info!(

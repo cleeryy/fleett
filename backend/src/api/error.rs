@@ -45,8 +45,16 @@ impl ApiError {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "missing or invalid bearer token",
+            "authentication required: send a bearer token or a valid session cookie",
         )
+    }
+
+    pub fn unauthorized_with(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, code, message)
+    }
+
+    pub fn forbidden(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {

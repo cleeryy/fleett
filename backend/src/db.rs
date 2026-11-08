@@ -69,6 +69,32 @@ CREATE TABLE IF NOT EXISTS instance_secrets (
     updated_at   TEXT NOT NULL
 );
 "#,
+    // v5 — authentication: the audit trail and the named API tokens (only a
+    // SHA-256 digest is stored, never the token itself).
+    r#"
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    method     TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    ip         TEXT,
+    details    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log (at);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    hash        TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    revoked_at  TEXT
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -100,6 +126,60 @@ pub struct SealedRecord {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
     pub updated_at: String,
+}
+
+/// One audit log entry, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub at: String,
+    pub actor: String,
+    pub role: String,
+    pub method: String,
+    pub action: String,
+    pub target: String,
+    pub ip: Option<String>,
+    /// JSON text, when the action carries structured details.
+    pub details: Option<String>,
+}
+
+/// A row to append to `audit_log`.
+#[derive(Debug, Clone)]
+pub struct NewAuditRecord {
+    pub at: String,
+    pub actor: String,
+    pub role: String,
+    pub method: String,
+    pub action: String,
+    pub target: String,
+    pub ip: Option<String>,
+    pub details: Option<String>,
+}
+
+/// A named API token. The secret is never stored, only its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTokenRecord {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+impl ApiTokenRecord {
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+/// A token row to insert (already hashed).
+#[derive(Debug, Clone)]
+pub struct NewApiToken {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub hash: String,
+    pub created_at: String,
 }
 
 /// Handle to the index database.
@@ -498,6 +578,129 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Append one mutation to the audit trail, returning its row id.
+    pub fn record_audit(&self, entry: &NewAuditRecord) -> Result<i64, DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO audit_log (at, actor, role, method, action, target, ip, details) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.at,
+                entry.actor,
+                entry.role,
+                entry.method,
+                entry.action,
+                entry.target,
+                entry.ip,
+                entry.details,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Most recent entries first.
+    pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, at, actor, role, method, action, target, ip, details \
+             FROM audit_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(AuditRecord {
+                    id: row.get(0)?,
+                    at: row.get(1)?,
+                    actor: row.get(2)?,
+                    role: row.get(3)?,
+                    method: row.get(4)?,
+                    action: row.get(5)?,
+                    target: row.get(6)?,
+                    ip: row.get(7)?,
+                    details: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_api_token(&self, token: &NewApiToken) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO api_tokens (id, name, role, hash, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                token.id,
+                token.name,
+                token.role,
+                token.hash,
+                token.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, name, role, created_at, revoked_at FROM api_tokens ORDER BY created_at, id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ApiTokenRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    role: row.get(2)?,
+                    created_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Set `revoked_at` on an active token. Returns `false` when the id is
+    /// unknown (an already revoked token keeps its first timestamp).
+    pub fn revoke_api_token(&self, id: &str, at: &str) -> Result<bool, DbError> {
+        let updated = self.lock().execute(
+            "UPDATE api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, at],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn api_token_exists(&self, id: &str) -> Result<bool, DbError> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM api_tokens WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Active (non-revoked) token matching a digest.
+    pub fn active_token_by_hash(&self, hash: &str) -> Result<Option<ApiTokenRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT id, name, role, created_at, revoked_at FROM api_tokens \
+                 WHERE hash = ?1 AND revoked_at IS NULL",
+                params![hash],
+                |row| {
+                    Ok(ApiTokenRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        role: row.get(2)?,
+                        created_at: row.get(3)?,
+                        revoked_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
 }
 
 /// Apply every migration above the recorded `PRAGMA user_version`.
@@ -768,7 +971,14 @@ mod tests {
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
         let conn = db.lock();
-        for table in ["instances", "shares", "share_links", "instance_secrets"] {
+        for table in [
+            "instances",
+            "shares",
+            "share_links",
+            "instance_secrets",
+            "audit_log",
+            "api_tokens",
+        ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
         let columns: Vec<String> = conn
@@ -863,6 +1073,78 @@ mod tests {
             .expect("version");
         assert_eq!(version, 2);
         assert!(table_exists(&conn, "beta"));
+    }
+
+    #[test]
+    fn audit_entries_are_appended_and_listed_newest_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        for (index, action) in ["instance.create", "instance.start"].iter().enumerate() {
+            db.record_audit(&NewAuditRecord {
+                at: format!("2026-11-08T00:00:0{index}Z"),
+                actor: "cleeryy@example.test".to_string(),
+                role: "admin".to_string(),
+                method: "session".to_string(),
+                action: action.to_string(),
+                target: "alice".to_string(),
+                ip: Some("10.1.20.50".to_string()),
+                details: None,
+            })
+            .expect("record");
+        }
+
+        let entries = db.list_audit(10).expect("list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].action, "instance.start");
+        assert_eq!(entries[1].action, "instance.create");
+        assert_eq!(entries[0].actor, "cleeryy@example.test");
+        assert_eq!(entries[0].ip.as_deref(), Some("10.1.20.50"));
+        assert_eq!(db.list_audit(1).expect("limit").len(), 1);
+    }
+
+    #[test]
+    fn api_tokens_are_stored_hashed_and_revoked_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        let hash = "a".repeat(64);
+        db.insert_api_token(&NewApiToken {
+            id: "tok-1".to_string(),
+            name: "ci".to_string(),
+            role: "viewer".to_string(),
+            hash: hash.clone(),
+            created_at: "2026-11-08T00:00:00Z".to_string(),
+        })
+        .expect("insert");
+
+        let found = db
+            .active_token_by_hash(&hash)
+            .expect("lookup")
+            .expect("active");
+        assert_eq!(found.name, "ci");
+        assert_eq!(found.role, "viewer");
+        assert!(found.is_active());
+        assert!(db
+            .active_token_by_hash(&"b".repeat(64))
+            .expect("lookup")
+            .is_none());
+
+        assert!(db
+            .revoke_api_token("tok-1", "2026-11-08T01:00:00Z")
+            .expect("revoke"));
+        // A second revoke does not overwrite the timestamp.
+        assert!(!db
+            .revoke_api_token("tok-1", "2026-11-08T02:00:00Z")
+            .expect("revoke again"));
+        assert!(db.active_token_by_hash(&hash).expect("lookup").is_none());
+        let listed = db.list_api_tokens().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].revoked_at.as_deref(),
+            Some("2026-11-08T01:00:00Z")
+        );
+        assert!(db.api_token_exists("tok-1").expect("exists"));
+        assert!(!db.api_token_exists("tok-2").expect("exists"));
     }
 
     #[test]

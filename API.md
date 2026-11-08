@@ -1,18 +1,45 @@
 # fleett — API v1
 
-Base: `http://127.0.0.1:8090`. Every `/api/*` route requires
-`Authorization: Bearer <FLEETT_TOKEN>`, except `GET /api/health`.
+Base: `http://127.0.0.1:8090`. Every `/api/*` route requires a bearer token
+(`Authorization: Bearer <FLEETT_TOKEN>`) or, when `FLEETT_AUTH` includes
+`oidc`, a `fleett_session` cookie, except `GET /api/health` and
+`GET /api/auth/config`. See `docs/OIDC.md` for the SSO setup.
 
 Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
-(`400` invalid input, `401` missing/wrong token, `404` unknown, `409` conflict,
-`422` invalid YAML/compose, `502` Docker failure).
+(`400` invalid input, `401` missing/wrong credential, `403` role or CSRF
+refusal, `404` unknown, `409` conflict, `422` invalid YAML/compose,
+`502` Docker or provider failure). Unauthenticated API calls never redirect:
+`401` JSON, always.
+
+Credentials are resolved in this order: session cookie, then bearer token
+(`FLEETT_TOKEN` = admin, then named tokens). `viewer` tokens and sessions may
+only `GET`/`HEAD`; a mutation returns `403 forbidden`. A cookie-authenticated
+mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
+`403 csrf_required`; bearer clients are exempt.
 
 ## Health and auth
 
 | Method | Route | Response |
 |---|---|---|
 | GET | `/api/health` | `{"ok":true,"version":"0.2.0","driver":"mock\|compose","docker":{"ok":true}}` |
-| GET | `/api/auth/check` | `204` when the token is valid |
+| GET | `/api/auth/config` | `{"mode":"bearer\|oidc\|both","oidc":{"enabled":true,"login_url":"/auth/login"},"bearer":{"enabled":true}}` |
+| GET | `/api/auth/check` | `204` when the credential is valid |
+| GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions) |
+| GET | `/auth/login` | `303` to the IdP; `404` when OIDC is disabled |
+| GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; `400 invalid_state`, `401 oidc_failed`, `403 forbidden` |
+| POST | `/auth/logout` | `204`, clears the fleett cookies |
+
+## Audit and tokens
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/audit?limit=200` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","details":{…}}]`, newest first, admin only |
+| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null}]`, never the secret, admin only |
+| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin"}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
+| DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
+
+`role` defaults to `viewer`. Revoking is idempotent. Tokens are stored as a
+SHA-256 digest only.
 
 ## Templates
 

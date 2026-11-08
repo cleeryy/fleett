@@ -1,13 +1,15 @@
 //! Share endpoints: named directories mounted into one or more instances.
 
+use crate::api::audit;
 use crate::api::error::ApiError;
 use crate::api::{apply_compose, AppState};
+use crate::auth::AuthContext;
 use crate::models::{
     now_iso, validate_share_name, AttachShareRequest, CreateShareRequest, DetachShareRequest,
     ShareInfo, ShareInstance, ShareMode, ShareRef,
 };
 use crate::store;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<ShareInfo>>,
 
 pub async fn create(
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
     Json(request): Json<CreateShareRequest>,
 ) -> Result<(StatusCode, Json<ShareInfo>), ApiError> {
     let name = request
@@ -54,6 +57,7 @@ pub async fn create(
     store::ensure_share_dir(&state.cfg, &name)
         .map_err(|err| ApiError::internal(format!("failed to create share directory: {err}")))?;
     state.db.insert_share(&name).map_err(ApiError::from)?;
+    audit::record(&state, &context, "share.create", &name, None);
     Ok((
         StatusCode::CREATED,
         Json(ShareInfo {
@@ -67,6 +71,7 @@ pub async fn create(
 pub async fn delete(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
 ) -> Result<StatusCode, ApiError> {
     if !state.db.share_exists(&name).map_err(ApiError::from)? {
         return Err(ApiError::not_found(format!("share \"{name}\" not found")));
@@ -88,12 +93,14 @@ pub async fn delete(
     store::remove_share_dir(&state.cfg, &name)
         .map_err(|err| ApiError::internal(format!("failed to delete share directory: {err}")))?;
     state.db.delete_share(&name).map_err(ApiError::from)?;
+    audit::record(&state, &context, "share.delete", &name, None);
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn attach(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
     Json(request): Json<AttachShareRequest>,
 ) -> Result<StatusCode, ApiError> {
     let mode = match request.mode.as_deref() {
@@ -145,12 +152,20 @@ pub async fn attach(
 
     state.db.update_instance(&spec).map_err(ApiError::from)?;
     apply_compose(&state, &mut spec).await?;
+    audit::record(
+        &state,
+        &context,
+        "share.attach",
+        &name,
+        Some(serde_json::json!({ "instance": instance, "mode": mode.as_str() })),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn detach(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
     Json(request): Json<DetachShareRequest>,
 ) -> Result<StatusCode, ApiError> {
     if !state.db.share_exists(&name).map_err(ApiError::from)? {
@@ -187,5 +202,12 @@ pub async fn detach(
 
     state.db.update_instance(&spec).map_err(ApiError::from)?;
     apply_compose(&state, &mut spec).await?;
+    audit::record(
+        &state,
+        &context,
+        "share.detach",
+        &name,
+        Some(serde_json::json!({ "instance": instance })),
+    );
     Ok(StatusCode::NO_CONTENT)
 }

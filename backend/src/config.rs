@@ -104,14 +104,159 @@ impl fmt::Display for EgressMode {
     }
 }
 
+/// Authentication mode selected by `FLEETT_AUTH`.
+///
+/// `bearer` is the historical behaviour (one static token plus named API
+/// tokens), `oidc` only trusts browser sessions, `both` accepts either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    Bearer,
+    Oidc,
+    Both,
+}
+
+impl AuthMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Oidc => "oidc",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bearer" | "token" => Some(Self::Bearer),
+            "oidc" | "sso" => Some(Self::Oidc),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Whether browser sessions (the OIDC flow) are accepted.
+    pub fn oidc_enabled(self) -> bool {
+        matches!(self, Self::Oidc | Self::Both)
+    }
+
+    /// Whether `Authorization: Bearer` is accepted.
+    pub fn bearer_enabled(self) -> bool {
+        matches!(self, Self::Bearer | Self::Both)
+    }
+}
+
+impl fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `FLEETT_COOKIE_SECURE`: force the `Secure` cookie attribute or derive it
+/// from `FLEETT_PUBLIC_URL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieSecure {
+    Auto,
+    Always,
+    Never,
+}
+
+impl CookieSecure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "true",
+            Self::Never => "false",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "true" | "1" | "yes" | "on" => Some(Self::Always),
+            "false" | "0" | "no" | "off" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// Resolve the attribute against the public URL.
+    pub fn resolve(self, public_url: &str) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => public_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("https://"),
+        }
+    }
+}
+
+/// Settings of the OpenID Connect provider (`FLEETT_OIDC_*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcSettings {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_url: String,
+    /// Space-separated scopes, `openid` first.
+    pub scopes: String,
+    pub admin_group: String,
+    pub viewer_group: String,
+}
+
+/// Resolved OIDC configuration: the provider settings plus everything the
+/// session cookie needs.
+///
+/// `Debug` is implemented by hand: the client secret and the session key must
+/// never reach a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OidcConfig {
+    pub public_url: String,
+    pub settings: OidcSettings,
+    /// HMAC key of the session and state cookies (at least 32 bytes).
+    pub session_secret: Vec<u8>,
+    pub session_ttl_secs: u64,
+    /// `Secure` attribute of every cookie we set.
+    pub cookie_secure: bool,
+}
+
+impl fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("public_url", &self.public_url)
+            .field("issuer", &self.settings.issuer)
+            .field("client_id", &self.settings.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", &self.settings.redirect_url)
+            .field("scopes", &self.settings.scopes)
+            .field("admin_group", &self.settings.admin_group)
+            .field("viewer_group", &self.settings.viewer_group)
+            .field("session_secret", &"<redacted>")
+            .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("cookie_secure", &self.cookie_secure)
+            .finish()
+    }
+}
+
+pub const DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:8090";
+pub const DEFAULT_OIDC_SCOPES: &str = "openid profile email";
+pub const DEFAULT_OIDC_ADMIN_GROUP: &str = "fleett-admins";
+pub const DEFAULT_OIDC_VIEWER_GROUP: &str = "fleett-viewers";
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 28800;
+/// Minimum length of the decoded `FLEETT_SESSION_SECRET`.
+pub const MIN_SESSION_SECRET_BYTES: usize = 32;
+
 /// Fully resolved configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
     pub bind: SocketAddr,
-    /// `None` only when `FLEETT_ALLOW_NO_AUTH=1`.
+    /// `None` only when `FLEETT_ALLOW_NO_AUTH=1` or OIDC is the only mode.
     pub token: Option<String>,
     pub allow_no_auth: bool,
+    /// `FLEETT_AUTH` (`bearer` by default).
+    pub auth: AuthMode,
+    /// `FLEETT_OIDC_*`, present when `FLEETT_AUTH` includes `oidc`.
+    pub oidc: Option<OidcConfig>,
     pub driver: DriverKind,
     pub image: String,
     pub network: String,
@@ -145,6 +290,11 @@ pub enum ConfigError {
          or set FLEETT_ALLOW_NO_AUTH=1 to explicitly disable authentication)"
     )]
     MissingToken,
+    #[error("{var} is required when FLEETT_AUTH={mode}")]
+    MissingOidcVar {
+        var: &'static str,
+        mode: &'static str,
+    },
 }
 
 impl Config {
@@ -238,14 +388,31 @@ impl Config {
                 detail: err.to_string(),
             })?;
 
+        let auth = match get("AUTH") {
+            None => AuthMode::Bearer,
+            Some(value) => AuthMode::parse(&value).ok_or_else(|| ConfigError::Invalid {
+                var: "FLEETT_AUTH",
+                value: value.clone(),
+                detail: "expected \"bearer\", \"oidc\" or \"both\"".to_string(),
+            })?,
+        };
+
         let allow_no_auth = matches!(
             get("ALLOW_NO_AUTH").as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "on")
         );
+        // With OIDC the browser session is the credential; FLEETT_TOKEN is only
+        // the optional bootstrap token and named tokens live in the database.
         let token = get("TOKEN");
-        if token.is_none() && !allow_no_auth && require_token {
+        if auth == AuthMode::Bearer && token.is_none() && !allow_no_auth && require_token {
             return Err(ConfigError::MissingToken);
         }
+
+        let oidc = if auth.oidc_enabled() {
+            Some(resolve_oidc(&get, auth)?)
+        } else {
+            None
+        };
 
         let driver = match get("DRIVER") {
             None => DriverKind::Mock,
@@ -320,6 +487,8 @@ impl Config {
             bind,
             token,
             allow_no_auth,
+            auth,
+            oidc,
             driver,
             image,
             network,
@@ -351,6 +520,8 @@ impl Config {
                 .expect("literal socket address is valid"),
             token: Some("test-token".to_string()),
             allow_no_auth: false,
+            auth: AuthMode::Bearer,
+            oidc: None,
             driver: DriverKind::Mock,
             image: DEFAULT_IMAGE.to_string(),
             network: DEFAULT_NETWORK.to_string(),
@@ -418,6 +589,108 @@ impl Config {
     pub fn template_config_path(&self, id: &str) -> PathBuf {
         self.template_dir(id).join("config.yaml")
     }
+}
+
+/// Resolve and validate `FLEETT_OIDC_*` when OIDC is enabled.
+fn resolve_oidc(
+    get: &dyn Fn(&str) -> Option<String>,
+    mode: AuthMode,
+) -> Result<OidcConfig, ConfigError> {
+    fn required(
+        get: &dyn Fn(&str) -> Option<String>,
+        var: &'static str,
+        suffix: &str,
+        mode: AuthMode,
+    ) -> Result<String, ConfigError> {
+        get(suffix).ok_or(ConfigError::MissingOidcVar {
+            var,
+            mode: mode.as_str(),
+        })
+    }
+
+    let public_url = get("PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
+    let issuer = required(get, "FLEETT_OIDC_ISSUER", "OIDC_ISSUER", mode)?;
+    let client_id = required(get, "FLEETT_OIDC_CLIENT_ID", "OIDC_CLIENT_ID", mode)?;
+    let client_secret = required(get, "FLEETT_OIDC_CLIENT_SECRET", "OIDC_CLIENT_SECRET", mode)?;
+    let redirect_url = get("OIDC_REDIRECT_URL")
+        .unwrap_or_else(|| format!("{}/auth/callback", public_url.trim_end_matches('/')));
+    let mut scopes = get("OIDC_SCOPES").unwrap_or_else(|| DEFAULT_OIDC_SCOPES.to_string());
+    if !scopes.split_whitespace().any(|scope| scope == "openid") {
+        scopes = format!("openid {scopes}");
+    }
+    let admin_group =
+        get("OIDC_ADMIN_GROUP").unwrap_or_else(|| DEFAULT_OIDC_ADMIN_GROUP.to_string());
+    let viewer_group =
+        get("OIDC_VIEWER_GROUP").unwrap_or_else(|| DEFAULT_OIDC_VIEWER_GROUP.to_string());
+
+    let session_secret_raw = required(get, "FLEETT_SESSION_SECRET", "SESSION_SECRET", mode)?;
+    let session_secret =
+        decode_session_secret(&session_secret_raw).ok_or_else(|| ConfigError::Invalid {
+            var: "FLEETT_SESSION_SECRET",
+            value: "<redacted>".to_string(),
+            detail: format!(
+                "expected base64 of at least {MIN_SESSION_SECRET_BYTES} bytes; generate one with \
+                 `openssl rand -base64 32`"
+            ),
+        })?;
+
+    let session_ttl_secs = match get("SESSION_TTL_SECS") {
+        None => DEFAULT_SESSION_TTL_SECS,
+        Some(value) => {
+            let parsed = value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_SESSION_TTL_SECS",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?;
+            if parsed == 0 {
+                return Err(ConfigError::Invalid {
+                    var: "FLEETT_SESSION_TTL_SECS",
+                    value,
+                    detail: "expected a positive number of seconds".to_string(),
+                });
+            }
+            parsed
+        }
+    };
+
+    let cookie_secure = match get("COOKIE_SECURE") {
+        None => CookieSecure::Auto,
+        Some(value) => CookieSecure::parse(&value).ok_or_else(|| ConfigError::Invalid {
+            var: "FLEETT_COOKIE_SECURE",
+            value: value.clone(),
+            detail: "expected \"auto\", \"true\" or \"false\"".to_string(),
+        })?,
+    };
+
+    Ok(OidcConfig {
+        cookie_secure: cookie_secure.resolve(&public_url),
+        public_url,
+        settings: OidcSettings {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_url,
+            scopes,
+            admin_group,
+            viewer_group,
+        },
+        session_secret,
+        session_ttl_secs,
+    })
+}
+
+/// Decode `FLEETT_SESSION_SECRET`, accepting standard or URL-safe base64.
+fn decode_session_secret(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+
+    let bytes = STANDARD
+        .decode(value)
+        .or_else(|_| STANDARD_NO_PAD.decode(value))
+        .or_else(|_| URL_SAFE.decode(value))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(value))
+        .ok()?;
+    (bytes.len() >= MIN_SESSION_SECRET_BYTES).then_some(bytes)
 }
 
 /// Resolve one configuration variable: `FLEETT_<suffix>` then `FLEET_<suffix>`.
@@ -571,6 +844,7 @@ fn unquote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn parses_env_file_and_ignores_comments() {
@@ -907,6 +1181,180 @@ FLEETT_NETWORK='fleett-net'
             err,
             ConfigError::Invalid {
                 var: "FLEETT_EGRESS",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bearer_is_the_default_auth_mode() {
+        let cfg = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert_eq!(cfg.auth, AuthMode::Bearer);
+        assert!(cfg.oidc.is_none());
+        assert!(cfg.auth.bearer_enabled());
+        assert!(!cfg.auth.oidc_enabled());
+    }
+
+    #[test]
+    fn oidc_mode_resolves_its_defaults() {
+        let secret = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_AUTH" => Some("oidc".to_string()),
+            "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test/application/o/fleett/".into()),
+            "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+            "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".into()),
+            "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+            "FLEETT_PUBLIC_URL" => Some("https://fleett.example.test".into()),
+            _ => None,
+        })
+        .expect("oidc config resolves");
+
+        assert_eq!(cfg.auth, AuthMode::Oidc);
+        // No bearer token is required in oidc mode.
+        assert!(cfg.token.is_none());
+        let oidc = cfg.oidc.expect("oidc enabled");
+        assert_eq!(oidc.public_url, "https://fleett.example.test");
+        assert_eq!(
+            oidc.settings.redirect_url,
+            "https://fleett.example.test/auth/callback"
+        );
+        assert_eq!(oidc.settings.scopes, DEFAULT_OIDC_SCOPES);
+        assert_eq!(oidc.settings.admin_group, DEFAULT_OIDC_ADMIN_GROUP);
+        assert_eq!(oidc.settings.viewer_group, DEFAULT_OIDC_VIEWER_GROUP);
+        assert_eq!(oidc.session_secret, vec![9u8; 32]);
+        assert_eq!(oidc.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
+        assert!(oidc.cookie_secure, "auto follows the https public url");
+    }
+
+    #[test]
+    fn oidc_cookies_are_insecure_on_plain_http_unless_forced() {
+        let secret = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let base = |extra: (&str, &str)| {
+            let secret = secret.clone();
+            let (extra_var, extra_value) = (extra.0.to_string(), extra.1.to_string());
+            move |key: &str| match key {
+                "FLEETT_AUTH" => Some("oidc".to_string()),
+                "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".into()),
+                "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+                "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".into()),
+                "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+                other if other == extra_var => Some(extra_value.clone()),
+                _ => None,
+            }
+        };
+
+        let cfg = Config::from_lookup(base(("FLEETT_PUBLIC_URL", "http://127.0.0.1:8090")))
+            .expect("http config");
+        assert!(!cfg.oidc.expect("oidc").cookie_secure);
+
+        let cfg = Config::from_lookup(base(("FLEETT_COOKIE_SECURE", "true"))).expect("forced");
+        assert!(cfg.oidc.expect("oidc").cookie_secure);
+
+        let cfg = Config::from_lookup(base(("FLEETT_PUBLIC_URL", "https://x.test"))).expect("auto");
+        assert!(cfg.oidc.expect("oidc").cookie_secure);
+    }
+
+    #[test]
+    fn the_oidc_debug_representation_redacts_secrets() {
+        let secret = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_AUTH" => Some("oidc".to_string()),
+            "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".into()),
+            "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+            "FLEETT_OIDC_CLIENT_SECRET" => Some("super-client-secret".into()),
+            "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+            _ => None,
+        })
+        .expect("oidc config resolves");
+        let debug = format!("{:?}", cfg);
+        assert!(!debug.contains("super-client-secret"), "{debug}");
+        assert!(!debug.contains(&secret), "{debug}");
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn oidc_requires_its_variables() {
+        for var in [
+            "FLEETT_OIDC_ISSUER",
+            "FLEETT_OIDC_CLIENT_ID",
+            "FLEETT_OIDC_CLIENT_SECRET",
+            "FLEETT_SESSION_SECRET",
+        ] {
+            let secret = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+            let err = Config::from_lookup(|key| {
+                let provided = match key {
+                    "FLEETT_AUTH" => Some("both".to_string()),
+                    "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".to_string()),
+                    "FLEETT_OIDC_CLIENT_ID" => Some("client".to_string()),
+                    "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".to_string()),
+                    "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+                    _ => None,
+                };
+                provided.filter(|_| key != var)
+            })
+            .expect_err("missing variable must fail");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::MissingOidcVar { var: reported, .. } if reported == var
+                ),
+                "unexpected error for {var}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_session_secret_is_rejected() {
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_AUTH" => Some("oidc".to_string()),
+            "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".into()),
+            "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+            "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".into()),
+            "FLEETT_SESSION_SECRET" => Some("c2hvcnQ=".into()),
+            _ => None,
+        })
+        .expect_err("short secret");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_SESSION_SECRET",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_auth_mode_and_ttl_are_rejected() {
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_AUTH" => Some("saml".to_string()),
+            _ => None,
+        })
+        .expect_err("bad auth mode");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_AUTH",
+                ..
+            }
+        ));
+
+        let secret = base64::engine::general_purpose::STANDARD.encode([4u8; 32]);
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_AUTH" => Some("oidc".to_string()),
+            "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".into()),
+            "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+            "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".into()),
+            "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+            "FLEETT_SESSION_TTL_SECS" => Some("0".into()),
+            _ => None,
+        })
+        .expect_err("zero ttl");
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "FLEETT_SESSION_TTL_SECS",
                 ..
             }
         ));

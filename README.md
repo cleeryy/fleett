@@ -14,6 +14,8 @@ was renamed from `hermes-fleet` in v0.2.0 — see [Upgrading from `hermes-fleet`
 - read logs, the generated Compose file and the runtime state
 - share a directory between instances (`rw` or `ro`) for findings and knowledge
 - agents keep running when the console is stopped, updated or deleted: Docker owns them
+- sign in with SSO (OIDC/Authentik) or a bearer token, with `admin`/`viewer` roles, CSRF
+  protection, named revocable API tokens and an audit log — see `docs/OIDC.md`
 
 ## Install
 

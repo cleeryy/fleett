@@ -1,14 +1,17 @@
 //! HTTP layer.
 
+pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod health;
 pub mod instances;
 pub mod shares;
 pub mod templates;
+pub mod tokens;
 
 pub use error::ApiError;
 
+use crate::auth::AuthService;
 use crate::config::Config;
 #[cfg(not(feature = "embed-web"))]
 use crate::config::VERSION;
@@ -35,6 +38,7 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub db: Db,
     pub driver: Arc<dyn Driver>,
+    pub auth: Arc<AuthService>,
     pub locks: Arc<InstanceLocks>,
     pub started_at: Instant,
 }
@@ -50,12 +54,25 @@ impl AppState {
     /// Same as [`AppState::bootstrap`] with an already open database, so the
     /// compose driver and the state share one connection pool.
     pub fn bootstrap_with_db(cfg: Config, driver: Arc<dyn Driver>, db: Db) -> anyhow::Result<Self> {
+        let auth = AuthService::from_config(&cfg);
+        Self::bootstrap_with_db_and_auth(cfg, driver, db, auth)
+    }
+
+    /// Bootstrap with an explicit [`AuthService`] (tests inject fake OIDC
+    /// verifiers this way).
+    pub fn bootstrap_with_db_and_auth(
+        cfg: Config,
+        driver: Arc<dyn Driver>,
+        db: Db,
+        auth: AuthService,
+    ) -> anyhow::Result<Self> {
         store::ensure_layout(&cfg)?;
         db::reconcile(&cfg, &db)?;
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
             driver,
+            auth: Arc::new(auth),
             locks: Arc::new(InstanceLocks::default()),
             started_at: Instant::now(),
         })
@@ -82,12 +99,29 @@ impl InstanceLocks {
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     let api = api_routes(state.clone());
-    finalize(api, state)
+    finalize(api, auth_pages(), state)
+}
+
+/// Browser-facing authentication routes (outside `/api` so a reverse proxy
+/// can forward them to the control plane without touching XHR calls).
+fn auth_pages() -> Router<AppState> {
+    Router::new()
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
+        .route("/auth/logout", post(auth::logout))
 }
 
 fn api_routes(state: AppState) -> Router<AppState> {
+    let public: Router<AppState> = Router::new()
+        .route("/health", get(health::health))
+        .route("/auth/config", get(auth::config));
+
     let protected: Router<AppState> = Router::new()
         .route("/auth/check", get(auth::check))
+        .route("/auth/me", get(auth::me))
+        .route("/audit", get(audit::list))
+        .route("/tokens", get(tokens::list).post(tokens::create))
+        .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
         .route("/instances", get(instances::list).post(instances::create))
         .route(
@@ -106,11 +140,11 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/shares/{name}/detach", post(shares::detach))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_token,
+            auth::require_auth,
         ));
 
     Router::new()
-        .route("/health", get(health::health))
+        .merge(public)
         .merge(protected)
         .fallback(api_not_found)
 }
@@ -120,7 +154,7 @@ async fn api_not_found() -> ApiError {
 }
 
 #[cfg(not(feature = "embed-web"))]
-fn finalize(api: Router<AppState>, state: AppState) -> Router {
+fn finalize(api: Router<AppState>, pages: Router<AppState>, state: AppState) -> Router {
     use tower_http::services::{ServeDir, ServeFile};
 
     let app: Router<AppState> = match state
@@ -133,9 +167,13 @@ fn finalize(api: Router<AppState>, state: AppState) -> Router {
             let index = dist.join("index.html");
             Router::new()
                 .nest("/api", api)
+                .merge(pages)
                 .fallback_service(ServeDir::new(dist).not_found_service(ServeFile::new(index)))
         }
-        None => Router::new().nest("/api", api).fallback(frontend_hint),
+        None => Router::new()
+            .nest("/api", api)
+            .merge(pages)
+            .fallback(frontend_hint),
     };
     app.with_state(state).layer(TraceLayer::new_for_http())
 }
@@ -152,9 +190,10 @@ async fn frontend_hint() -> Json<serde_json::Value> {
 }
 
 #[cfg(feature = "embed-web")]
-fn finalize(api: Router<AppState>, state: AppState) -> Router {
+fn finalize(api: Router<AppState>, pages: Router<AppState>, state: AppState) -> Router {
     Router::new()
         .nest("/api", api)
+        .merge(pages)
         .fallback(embedded_asset)
         .with_state(state)
         .layer(TraceLayer::new_for_http())

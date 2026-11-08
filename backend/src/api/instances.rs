@@ -1,7 +1,9 @@
 //! Instance endpoints.
 
+use crate::api::audit;
 use crate::api::error::ApiError;
 use crate::api::{up_and_record, AppState};
+use crate::auth::AuthContext;
 use crate::config::EgressMode;
 use crate::egress;
 use crate::models::{
@@ -13,7 +15,7 @@ use crate::models::{
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -89,6 +91,7 @@ pub async fn get(
 
 pub async fn create(
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
     Json(request): Json<CreateInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
     let prepared = prepare_create(&state, &request)?;
@@ -144,6 +147,17 @@ pub async fn create(
     };
     let mut stored = load(&state, &spec.id)?;
     record_health(&state, &mut stored, health);
+    audit::record(
+        &state,
+        &context,
+        "instance.create",
+        &stored.id,
+        Some(serde_json::json!({
+            "name": stored.name,
+            "template": stored.template,
+            "allow_lan": stored.allow_lan,
+        })),
+    );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
     Ok((
         StatusCode::CREATED,
@@ -156,6 +170,7 @@ pub async fn create(
 pub async fn patch(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
     Json(request): Json<PatchInstanceRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let lock = state.locks.for_id(&id);
@@ -194,6 +209,7 @@ pub async fn patch(
         Err(_) => (Status::Running, Health::Unknown, None),
     };
     record_health(&state, &mut spec, health);
+    audit::record(&state, &context, "instance.patch", &spec.id, None);
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
@@ -203,22 +219,25 @@ pub async fn patch(
 pub async fn start(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    lifecycle(state, id, Lifecycle::Start).await
+    lifecycle(state, id, Lifecycle::Start, context).await
 }
 
 pub async fn stop(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    lifecycle(state, id, Lifecycle::Stop).await
+    lifecycle(state, id, Lifecycle::Stop, context).await
 }
 
 pub async fn restart(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    lifecycle(state, id, Lifecycle::Restart).await
+    lifecycle(state, id, Lifecycle::Restart, context).await
 }
 
 pub async fn logs(
@@ -246,6 +265,7 @@ pub async fn delete(
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
     State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
 ) -> Result<StatusCode, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
@@ -260,6 +280,13 @@ pub async fn delete(
     state.db.delete_instance(&id).map_err(ApiError::from)?;
     store::remove_instance(&state.cfg, &id, purge)
         .map_err(|err| ApiError::internal(format!("failed to remove instance files: {err}")))?;
+    audit::record(
+        &state,
+        &context,
+        "instance.delete",
+        &id,
+        Some(serde_json::json!({ "purge": purge })),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -274,6 +301,7 @@ async fn lifecycle(
     state: AppState,
     id: String,
     operation: Lifecycle,
+    context: AuthContext,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
@@ -305,6 +333,12 @@ async fn lifecycle(
         .db
         .set_status(&id, status, None)
         .map_err(ApiError::from)?;
+    let action = match operation {
+        Lifecycle::Start => "instance.start",
+        Lifecycle::Stop => "instance.stop",
+        Lifecycle::Restart => "instance.restart",
+    };
+    audit::record(&state, &context, action, &id, None);
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),
     }))
