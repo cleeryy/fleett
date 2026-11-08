@@ -137,7 +137,5 @@ hermes-fleet is installed.
   open      : http://127.0.0.1:8090
 
 The bearer token is FLEET_TOKEN in ${envfile}.
-First run on a new machine: create the Docker network once.
-
-  docker network create hermes-fleet
+The hermes-fleet Docker network is created on first start if missing.
 EOF

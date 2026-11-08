@@ -16,7 +16,6 @@ Docker container. Your existing Hermes instance is never touched.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cleeryy/hermes-fleet/master/install.sh | bash
-docker network create hermes-fleet     # once per machine
 hermes-fleet                           # reads ~/.hermes-fleet/fleet.env
 # open http://127.0.0.1:8090
 ```

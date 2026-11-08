@@ -20,7 +20,7 @@ This is the central property of the design: the control plane is disposable.
 ## Prerequisites
 
 ```bash
-docker network create hermes-fleet          # once
+docker network create hermes-fleet          # optional: the app creates it
 docker image ls | grep hermes-agent         # image built from the fork
 ```
 

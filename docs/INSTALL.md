@@ -25,8 +25,8 @@ It is idempotent: re-running it replaces the binary and **keeps** data and secre
 ## First run
 
 ```bash
-docker network create hermes-fleet      # once per machine
 hermes-fleet                            # reads ~/.hermes-fleet/fleet.env
+# the hermes-fleet Docker network is created on first start if missing
 # open http://127.0.0.1:8090
 ```
 
