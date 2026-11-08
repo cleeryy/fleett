@@ -215,7 +215,7 @@ async fn health_is_public() {
     assert_eq!(status, StatusCode::OK);
     let health = parse(&body);
     assert_eq!(health["ok"], true);
-    assert_eq!(health["version"], "0.2.0");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(health["driver"], "mock");
     assert_eq!(health["docker"]["ok"], true);
 }
