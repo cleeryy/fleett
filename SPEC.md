@@ -1,77 +1,77 @@
-# hermes-fleet — spécification
+# hermes-fleet — specification
 
-Console web pour **créer, configurer, démarrer/arrêter et supprimer** des agents Hermes,
-chacun dans son conteneur Docker. L'instance Hermes existante n'est **jamais** touchée.
+Web console to **create, configure, start/stop and delete** Hermes agents, each in its own
+Docker container. The existing Hermes instance is **never** touched.
 
-## Décisions d'architecture
+## Architecture decisions
 
-### 1. Un projet Docker Compose par instance
-`instances/<id>/compose.yaml` est écrit sur disque et piloté par
+### 1. One Docker Compose project per instance
+`instances/<id>/compose.yaml` is written to disk and driven by
 `docker compose -f instances/<id>/compose.yaml -p hermes-<id> …`.
-Pas de conteneurs créés à la volée par l'API Docker : le fichier compose est la source de
-vérité, lisible et réparable à la main.
+Containers are not created on the fly through the Docker API: the compose file is the
+source of truth, readable and repairable by hand.
 
-### 2. Découplage total (exigence)
-`restart: unless-stopped` sur chaque service. Si la web app est arrêtée, mise à jour ou
-supprimée, **les agents continuent de tourner**. Si l'hôte redémarre, Docker les relance.
-La web app n'est qu'un plan de contrôle : elle ne supervise aucun process.
+### 2. Full decoupling (hard requirement)
+`restart: unless-stopped` on every service. If the web app is stopped, updated or deleted,
+**agents keep running**. If the host reboots, Docker brings them back.
+The web app is a control plane only: it supervises no process.
 
-### 3. Données et secrets par instance
+### 3. Per-instance data and secrets
 ```
 /opt/hermes-fleet/
-├── fleet.db                       # index SQLite (pas la source de vérité)
+├── fleet.db                       # SQLite index (not the source of truth)
 ├── instances/<id>/
 │   ├── compose.yaml
-│   ├── data/                      # monté sur /opt/data (HOME Hermes complet)
-│   └── secrets.env                # 0600, bot token + jeton de gate
-├── shares/<nom>/                  # répertoires partagés entre instances
-└── templates/<template>/          # config.yaml + SOUL.md modèles
+│   ├── data/                      # mounted at /opt/data (full Hermes home)
+│   └── secrets.env                # 0600, bot token + gate token
+├── shares/<name>/                 # directories shared across instances
+└── templates/<template>/          # config.yaml + SOUL.md templates
 ```
-UID/GID fixés à **10000** pour toutes les instances : nécessaire pour que les shares
-soient accessibles en écriture par plusieurs conteneurs. Conséquence assumée : l'isolation
-entre invités repose sur le conteneur et sur un montage par instance — jamais sur l'UID.
+UID/GID are fixed at **10000** for every instance: required so shares are writable by
+several containers. Trade-off accepted: isolation between guests rests on the container
+and on one mount per instance — never on the UID.
 
-### 4. Shares (montages partagés)
-Un share est un répertoire nommé, monté dans N instances :
-`shares/<nom>` → `/opt/data/shared/<nom>`, en `rw` ou `ro` selon le lien.
-Ajouter/retirer un share réécrit le compose et fait `docker compose up -d` (recréation du
-conteneur, données conservées).
+### 4. Shares (shared mounts)
+A share is a named directory mounted into N instances:
+`shares/<name>` → `/opt/data/shared/<name>`, `rw` or `ro` per link.
+Adding or removing a share rewrites the compose file and runs `docker compose up -d`
+(container recreated, data preserved).
 
 ### 5. Templates
-`templates/<id>/{config.yaml,SOUL.md}`. Le rendu remplace uniquement des variables
-explicites (`{{MODEL}}`, `{{BASE_URL}}`, `{{AGENT_NAME}}`). Le reste du fichier est du YAML
-Hermes valide, dérivé de `cli-config.yaml.example` (référence locale, hors git).
-Aucune génération de config à partir de zéro : un template est relu et versionné.
+`templates/<id>/{config.yaml,SOUL.md}`. Rendering substitutes only explicit variables
+(`{{MODEL}}`, `{{BASE_URL}}`, `{{AGENT_NAME}}`, `{{API_KEY_ENV}}`). The rest of the file is
+valid Hermes YAML, derived from `cli-config.yaml.example` (local reference, not in git).
+No config generation from scratch: a template is reviewable and versioned.
 
 ### 6. Driver
-`FLEET_DRIVER=compose` pilote Docker ; `FLEET_DRIVER=mock` (défaut dev/tests) simule les
-états sans toucher Docker. Les tests n'appellent jamais Docker.
+`FLEET_DRIVER=compose` drives Docker; `FLEET_DRIVER=mock` (default for dev/tests) simulates
+states without touching Docker. Tests never call Docker.
 
-## Isolation par défaut d'une instance
+## Default isolation for an instance
 
-- réseau bridge dédié `hermes-fleet` (jamais `network_mode: host`)
-- aucun montage du socket Docker
-- un seul montage de données : `./data:/opt/data`
+- dedicated bridge network `hermes-fleet` (never `network_mode: host`)
+- no Docker socket mount
+- a single data mount: `./data:/opt/data`
 - `security_opt: no-new-privileges`, `cap_drop: NET_RAW`, `tmpfs: /tmp`
-- `pids_limit: 256`, `mem_limit` configurable (défaut 1536m)
-- logs json-file plafonnés (10m × 3)
+- `pids_limit: 256`, configurable `mem_limit` (default 1536m)
+- capped json-file logs (10m × 3)
 
-## Cycle de vie
+## Lifecycle
 
-| Action | Effet | Conteneur |
+| Action | Effect | Container |
 |---|---|---|
-| create | écrit compose + data + secrets, `up -d` | running |
-| stop | `compose stop` | stopped (ne redémarre pas) |
+| create | writes compose + data + secrets, `up -d` | running |
+| stop | `compose stop` | stopped (does not restart) |
 | start | `compose start` | running |
 | restart | `compose restart` | running |
-| update | réécrit compose, `up -d` | recréé |
-| delete | `compose down` | supprimé, données conservées |
-| delete ?purge=true | `compose down` + `rm -rf data/` | supprimé, données effacées |
+| update | rewrite compose, `up -d` | recreated |
+| delete | `compose down` | removed, data preserved |
+| delete `?purge=true` | `compose down` + `rm -rf data/` | removed, data erased |
 
-## Hors périmètre v1
+## Out of scope for v1
 
-- multi-hôte (un seul démon Docker)
-- édition fine de la config Hermes (le dashboard Hermes le fait déjà)
-- conversations / chat dans la console
-- intégration automatique à `hermes-gate` (les champs existent, le jeton se colle à la main)
-- authentification SSO (un jeton bearer suffit pour la v1)
+- multi-host (single Docker daemon)
+- fine-grained Hermes config editing (the Hermes dashboard already does that)
+- chat / conversations in the console
+- automatic `hermes-gate` integration (fields exist, token is pasted manually)
+- SSO (a bearer token is enough for v1)

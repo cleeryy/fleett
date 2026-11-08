@@ -1,14 +1,26 @@
 # hermes-fleet
 
-Console web pour créer, configurer, démarrer/arrêter et supprimer des agents Hermes,
-chacun dans son propre conteneur Docker — sans jamais toucher à l'instance existante.
+Web console to create, configure, start/stop and delete Hermes agents, each in its own
+Docker container — without ever touching the existing Hermes instance.
 
-**Statut : en construction.** Voir `SPEC.md` (architecture) et `API.md` (contrat).
+**Status: under construction.** See `SPEC.md` (architecture) and `API.md` (HTTP contract).
+
+## Layout
+
+```
+backend/        Rust control plane (axum, SQLite, Compose driver)
+web/            React console (Vite + Tailwind), built into web/dist
+docs/DEPLOY.md  deployment runbook
+```
+
+## Development
 
 ```bash
-# backend
-cd backend && cargo run            # FLEET_DRIVER=mock par défaut
+# backend — mock driver by default, no Docker calls
+cd backend && cargo run
 
-# frontend
-cd web && pnpm dev                 # VITE_MOCK=1 par défaut
+# frontend — mock API by default
+cd web && pnpm install && pnpm dev
 ```
+
+The backend serves `web/dist` when it exists, so a production build is a single process.

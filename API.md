@@ -1,24 +1,24 @@
 # hermes-fleet — API v1
 
-Base : `http://127.0.0.1:8090`. Toutes les routes `/api/*` exigent
-`Authorization: Bearer <FLEET_TOKEN>`, sauf `GET /api/health`.
+Base: `http://127.0.0.1:8090`. Every `/api/*` route requires
+`Authorization: Bearer <FLEET_TOKEN>`, except `GET /api/health`.
 
-Erreurs : `{"error":{"code":"...","message":"..."}}` avec le statut HTTP correspondant
-(`400` entrée invalide, `401` jeton absent/faux, `404` inconnu, `409` conflit,
-`422` YAML/compose invalide, `502` échec Docker).
+Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
+(`400` invalid input, `401` missing/wrong token, `404` unknown, `409` conflict,
+`422` invalid YAML/compose, `502` Docker failure).
 
-## Santé et auth
+## Health and auth
 
-| Méthode | Route | Réponse |
+| Method | Route | Response |
 |---|---|---|
 | GET | `/api/health` | `{"ok":true,"version":"0.1.0","driver":"mock\|compose","docker":{"ok":true}}` |
-| GET | `/api/auth/check` | `204` si le jeton est valide |
+| GET | `/api/auth/check` | `204` when the token is valid |
 
 ## Templates
 
 `GET /api/templates`
 ```json
-[{"id":"guest","name":"Invité","description":"Web + mémoire, aucun accès infra",
+[{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
   "default_model":"deepseek-v4.1-flash","channel":"telegram"}]
 ```
 
@@ -41,8 +41,8 @@ Erreurs : `{"error":{"code":"...","message":"..."}}` avec le statut HTTP corresp
  "shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"notes":""}
 ```
-`id` : `[a-z0-9-]{2,32}`, unique. `channel.type` : `telegram`, `discord` ou `none`.
-Le token n'est **jamais** renvoyé par l'API.
+`id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
+The token is **never** returned by the API.
 
 `GET /api/instances/{id}` → `InstanceDetail`
 ```json
@@ -57,27 +57,27 @@ Le token n'est **jamais** renvoyé par l'API.
  "compose_yaml":"name: hermes-alice\n…"}
 ```
 
-`PATCH /api/instances/{id}` → `200 InstanceDetail`. Champs modifiables : `name`, `model`,
-`base_url`, `api_key_env`, `channel` (`token` optionnel = rotation), `shares`,
-`mem_limit_mb`, `notes`. Réécrit le compose et fait `up -d`.
+`PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
+`base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
+`mem_limit_mb`, `notes`. Rewrites the compose file and runs `up -d`.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
-`DELETE /api/instances/{id}` → `204` (données conservées) · `?purge=true` efface `data/`.
+`DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
 `GET /api/instances/{id}/logs?tail=200` → `text/plain`
 
 ## Shares
 
-| Méthode | Route | Corps | Réponse |
+| Method | Route | Body | Response |
 |---|---|---|---|
 | GET | `/api/shares` | — | `[{"name":"findings","path":"…","instances":[{"id":"alice","mode":"rw"}]}]` |
 | POST | `/api/shares` | `{"name":"findings"}` | `201` |
-| DELETE | `/api/shares/{name}` | — | `204` · `409` si encore attaché |
+| DELETE | `/api/shares/{name}` | — | `204` · `409` when still attached |
 | POST | `/api/shares/{name}/attach` | `{"instance":"alice","mode":"rw\|ro"}` | `204` |
 | POST | `/api/shares/{name}/detach` | `{"instance":"alice"}` | `204` |
 
-## Statuts
+## Statuses
 
 `created` · `running` · `stopped` · `error` · `unknown`
 
-`status` est un cache : la valeur fait foi est relue via `docker compose ps` à chaque
-`GET /api/instances` (driver `compose`). En driver `mock`, l'état est simulé.
+`status` is a cache: the authoritative value is read through `docker compose ps` on every
+`GET /api/instances` (driver `compose`). Under the `mock` driver the state is simulated.
