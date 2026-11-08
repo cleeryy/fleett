@@ -23,11 +23,11 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             asset_target: linux-aarch64
             cross: true
-          - runner: macos-14
+          - runner: macos-latest
             rust_target: aarch64-apple-darwin
             asset_target: darwin-aarch64
             cross: false
-          - runner: macos-14
+          - runner: macos-latest
             rust_target: x86_64-apple-darwin
             asset_target: darwin-x86_64
             cross: false
@@ -65,12 +65,13 @@ jobs:
           key: ${{ matrix.asset_target }}
 
       - name: Build binary
-        working-directory: backend
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --features embed-web --target "${{ matrix.rust_target }}"
+            cross build --manifest-path backend/Cargo.toml --release --locked \
+              --features embed-web --target "${{ matrix.rust_target }}"
           else
-            cargo build --release --locked --features embed-web --target "${{ matrix.rust_target }}"
+            cargo build --manifest-path backend/Cargo.toml --release --locked \
+              --features embed-web --target "${{ matrix.rust_target }}"
           fi
 
       - name: Package
