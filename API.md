@@ -40,7 +40,7 @@ Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"cpu_limit":1.0,"notes":""}
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"notes":""}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
 The token is **never** returned by the API.
@@ -63,7 +63,9 @@ The token is **never** returned by the API.
 `mem_limit_mb`, `cpu_limit`, `notes`. Rewrites the compose file and runs `up -d`.
 
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
-`memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
+`memswap_limit == mem_limit`. `allow_lan` is `false` by default: the instance only joins the
+restricted `fleett` network. Setting it to `true` also attaches `fleett-lan`, which bypasses
+the host egress firewall and gives the agent LAN access. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
 `FLEETT_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
