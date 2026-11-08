@@ -409,7 +409,7 @@ export function NewInstancePage() {
                   />
                   <p id="id-help" className="text-xs text-muted-foreground">
                     Names the compose project{" "}
-                    <span className="font-mono">hermes-{draft.id || "…"}</span> and the directory{" "}
+                    <span className="font-mono">fleett-{draft.id || "…"}</span> and the directory{" "}
                     <span className="font-mono">instances/{draft.id || "…"}</span>.
                   </p>
                   <FieldError id="id-error" message={serverIdError ?? (showErrors ? errors.id : undefined)} />

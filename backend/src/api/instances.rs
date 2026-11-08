@@ -289,9 +289,13 @@ fn render_for_update(
     state: &AppState,
     spec: &InstanceSpec,
 ) -> Result<render::RenderedInstance, ApiError> {
+    // Keep the project already declared on disk: an instance created by an
+    // older release stays on `hermes-<id>` until it is migrated explicitly.
+    let project = store::declared_project(&state.cfg, &spec.id);
     match render::load_template(&state.cfg, &spec.template) {
         Ok(template) => {
-            render::render_instance(&state.cfg, spec, &template).map_err(ApiError::from)
+            render::render_instance_with_project(&state.cfg, spec, &template, project.as_deref())
+                .map_err(ApiError::from)
         }
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
             let config_path = state.cfg.data_dir(&spec.id).join("config.yaml");
@@ -302,7 +306,12 @@ fn render_for_update(
                 ))
             })?;
             Ok(render::RenderedInstance {
-                compose_yaml: render::render_compose(&state.cfg, spec).map_err(ApiError::from)?,
+                compose_yaml: render::render_compose_with_project(
+                    &state.cfg,
+                    spec,
+                    project.as_deref(),
+                )
+                .map_err(ApiError::from)?,
                 config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
                 soul_md: None,
             })

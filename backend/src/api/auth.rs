@@ -29,7 +29,7 @@ pub async fn require_token(
         Some(expected) => provided
             .map(|token| constant_time_eq(expected.as_bytes(), token.as_bytes()))
             .unwrap_or(false),
-        // Only reachable with FLEET_ALLOW_NO_AUTH=1; the startup banner warns.
+        // Only reachable with FLEETT_ALLOW_NO_AUTH=1; the startup banner warns.
         None => state.cfg.allow_no_auth,
     };
 

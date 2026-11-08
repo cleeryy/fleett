@@ -1,9 +1,12 @@
 //! Runtime configuration.
 //!
 //! Configuration comes from the process environment, completed by an optional
-//! `fleet.env` file located in the fleet root. The file is a plain
-//! `KEY=VALUE` list: no shell expansion, no command substitution, and process
-//! environment variables always win over file entries.
+//! environment file located in the data root. The file is a plain `KEY=VALUE`
+//! list: no shell expansion, no command substitution, and process environment
+//! variables always win over file entries.
+//!
+//! Variables are read with the canonical `FLEETT_*` prefix first, then with the
+//! legacy `FLEET_*` prefix. The installer also accepts `HERMES_FLEET_*`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,15 +14,26 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const DEFAULT_ROOT: &str = "/opt/hermes-fleet";
+pub const DEFAULT_ROOT: &str = "/opt/fleett";
 pub const DEFAULT_BIND: &str = "127.0.0.1:8090";
 pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
-pub const DEFAULT_NETWORK: &str = "hermes-fleet";
+pub const DEFAULT_NETWORK: &str = "fleett";
 
-/// Name of the optional environment file inside `FLEET_ROOT`.
-pub const ENV_FILE_NAME: &str = "fleet.env";
+/// Name of the environment file inside `FLEETT_ROOT`.
+pub const ENV_FILE_NAME: &str = "fleett.env";
+/// Legacy name of the same file; read when `fleett.env` is absent.
+pub const LEGACY_ENV_FILE_NAME: &str = "fleet.env";
+/// Directory under `$HOME` used by the installer.
+pub const HOME_ROOT_NAME: &str = ".fleett";
+/// Legacy data root, adopted when `~/.fleett` does not exist yet.
+pub const LEGACY_HOME_ROOT_NAME: &str = ".hermes-fleet";
 
-/// Docker driver selected by `FLEET_DRIVER`.
+/// Canonical configuration prefix.
+pub const PREFIX: &str = "FLEETT_";
+/// Legacy configuration prefix, still accepted.
+pub const LEGACY_PREFIX: &str = "FLEET_";
+
+/// Docker driver selected by `FLEETT_DRIVER` (or `FLEET_DRIVER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
     Mock,
@@ -54,7 +68,7 @@ impl fmt::Display for DriverKind {
 pub struct Config {
     pub root: PathBuf,
     pub bind: SocketAddr,
-    /// `None` only when `FLEET_ALLOW_NO_AUTH=1`.
+    /// `None` only when `FLEETT_ALLOW_NO_AUTH=1`.
     pub token: Option<String>,
     pub allow_no_auth: bool,
     pub driver: DriverKind,
@@ -76,103 +90,135 @@ pub enum ConfigError {
         detail: String,
     },
     #[error(
-        "FLEET_TOKEN is required (set it in the environment or in $FLEET_ROOT/fleet.env, \
-         or set FLEET_ALLOW_NO_AUTH=1 to explicitly disable authentication)"
+        "FLEETT_TOKEN is required (set it in the environment or in $FLEETT_ROOT/fleett.env, \
+         or set FLEETT_ALLOW_NO_AUTH=1 to explicitly disable authentication)"
     )]
     MissingToken,
 }
 
 impl Config {
-    /// Load the configuration from the real process environment plus
-    /// `$FLEET_ROOT/fleet.env`.
+    /// Load the configuration from the real process environment plus the
+    /// environment file found in the data root.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_process_env(|key| std::env::var(key).ok())
     }
 
+    /// Same as [`Config::from_env`] without requiring a bearer token.
+    ///
+    /// Maintenance commands (`fleett migrate`) never serve HTTP, so they must
+    /// stay usable when the token lives in a file the caller did not load.
+    pub fn from_env_for_maintenance() -> Result<Self, ConfigError> {
+        Self::from_process_env_inner(|key| std::env::var(key).ok(), false)
+    }
+
     /// Same as [`Config::from_env`] with an injectable environment lookup.
     ///
-    /// `FLEET_ROOT` is resolved from the process environment first (or the
-    /// default root); `fleet.env` is then read from that root and fills in any
-    /// variable the process environment does not define.
+    /// `FLEETT_ROOT` is resolved from the process environment first (or the
+    /// home root); the environment file is then read from that root and fills
+    /// in any variable the process environment does not define.
     pub fn from_process_env(process: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let explicit_root = process("FLEET_ROOT")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
+        Self::from_process_env_inner(process, true)
+    }
+
+    fn from_process_env_inner(
+        process: impl Fn(&str) -> Option<String>,
+        require_token: bool,
+    ) -> Result<Self, ConfigError> {
+        let explicit_root = resolve_var(&process, "ROOT").map(PathBuf::from);
 
         let env_file = match explicit_root {
-            Some(ref root) => root.join(ENV_FILE_NAME),
-            None => {
-                // The installer writes `$HOME/.hermes-fleet/fleet.env`, while the
-                // system default root is `/opt/hermes-fleet`. Prefer the home file
-                // when it exists so a bare `hermes-fleet` starts with no env at all.
-                match process("HOME").map(|home| {
-                    PathBuf::from(home)
-                        .join(".hermes-fleet")
-                        .join(ENV_FILE_NAME)
-                }) {
-                    Some(path) if path.is_file() => path,
-                    _ => PathBuf::from(DEFAULT_ROOT).join(ENV_FILE_NAME),
-                }
-            }
+            Some(ref root) => env_file_in(root),
+            None => discover_env_file(&process),
         };
         let file_vars = load_env_file(&env_file);
-        Self::from_lookup(|key| process(key).or_else(|| file_vars.get(key).cloned()))
+        let file_lookup = |name: &str| file_vars.get(name).cloned();
+
+        // Precedence is by name first, then by source: a canonical `FLEETT_`
+        // in the file must beat a legacy `FLEET_` in the process environment.
+        //   1. process FLEETT_   2. file FLEETT_
+        //   3. process FLEET_    4. file FLEET_
+        let lookup = |suffix: &str| {
+            let canonical = format!("{PREFIX}{suffix}");
+            let legacy = format!("{LEGACY_PREFIX}{suffix}");
+            process(&canonical)
+                .or_else(|| file_lookup(&canonical))
+                .or_else(|| process(&legacy))
+                .or_else(|| file_lookup(&legacy))
+        };
+
+        let default_root = explicit_root
+            .or_else(|| home_root(&process))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+
+        Self::assemble(&lookup, default_root, require_token)
     }
 
     /// Resolve a configuration from a raw lookup function.
+    ///
+    /// The lookup receives full variable names, so a caller can inject
+    /// `FLEETT_TOKEN` or the legacy `FLEET_TOKEN` freely.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let get = |key: &str| {
-            lookup(key)
+        Self::assemble(
+            &|suffix| resolve_var(&lookup, suffix),
+            PathBuf::from(DEFAULT_ROOT),
+            true,
+        )
+    }
+
+    fn assemble(
+        get: &dyn Fn(&str) -> Option<String>,
+        default_root: PathBuf,
+        require_token: bool,
+    ) -> Result<Self, ConfigError> {
+        let get = |suffix: &str| {
+            get(suffix)
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         };
 
-        let root = get("FLEET_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+        let root = get("ROOT").map(PathBuf::from).unwrap_or(default_root);
 
-        let bind_raw = get("FLEET_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
+        let bind_raw = get("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
         let bind = bind_raw
             .parse::<SocketAddr>()
             .map_err(|err| ConfigError::Invalid {
-                var: "FLEET_BIND",
+                var: "FLEETT_BIND",
                 value: bind_raw.clone(),
                 detail: err.to_string(),
             })?;
 
         let allow_no_auth = matches!(
-            get("FLEET_ALLOW_NO_AUTH").as_deref(),
+            get("ALLOW_NO_AUTH").as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "on")
         );
-        let token = get("FLEET_TOKEN");
-        if token.is_none() && !allow_no_auth {
+        let token = get("TOKEN");
+        if token.is_none() && !allow_no_auth && require_token {
             return Err(ConfigError::MissingToken);
         }
 
-        let driver = match get("FLEET_DRIVER") {
+        let driver = match get("DRIVER") {
             None => DriverKind::Mock,
             Some(value) => DriverKind::parse(&value).ok_or_else(|| ConfigError::Invalid {
-                var: "FLEET_DRIVER",
+                var: "FLEETT_DRIVER",
                 value: value.clone(),
                 detail: "expected \"mock\" or \"compose\"".to_string(),
             })?,
         };
 
-        let image = get("FLEET_IMAGE").unwrap_or_else(|| DEFAULT_IMAGE.to_string());
-        let network = get("FLEET_NETWORK").unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+        let image = get("IMAGE").unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+        let network = get("NETWORK").unwrap_or_else(|| DEFAULT_NETWORK.to_string());
 
-        let max_total_cpu = match get("FLEET_MAX_TOTAL_CPU") {
+        let max_total_cpu = match get("MAX_TOTAL_CPU") {
             None => 0.0,
             Some(value) => {
                 let parsed = value.parse::<f64>().map_err(|err| ConfigError::Invalid {
-                    var: "FLEET_MAX_TOTAL_CPU",
+                    var: "FLEETT_MAX_TOTAL_CPU",
                     value: value.clone(),
                     detail: err.to_string(),
                 })?;
                 if !parsed.is_finite() || parsed < 0.0 {
                     return Err(ConfigError::Invalid {
-                        var: "FLEET_MAX_TOTAL_CPU",
+                        var: "FLEETT_MAX_TOTAL_CPU",
                         value,
                         detail: "expected a non-negative number of CPUs (0 disables the cap)"
                             .to_string(),
@@ -181,16 +227,16 @@ impl Config {
                 parsed
             }
         };
-        let max_total_mem_mb = match get("FLEET_MAX_TOTAL_MEM_MB") {
+        let max_total_mem_mb = match get("MAX_TOTAL_MEM_MB") {
             None => 0,
             Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
-                var: "FLEET_MAX_TOTAL_MEM_MB",
+                var: "FLEETT_MAX_TOTAL_MEM_MB",
                 value: value.clone(),
                 detail: err.to_string(),
             })?,
         };
 
-        let web_dist = get("FLEET_WEB_DIST").map(PathBuf::from).or_else(|| {
+        let web_dist = get("WEB_DIST").map(PathBuf::from).or_else(|| {
             ["web/dist", "../web/dist"]
                 .iter()
                 .map(PathBuf::from)
@@ -233,8 +279,9 @@ impl Config {
         self.root.join("fleet.db")
     }
 
+    /// Environment file in use: `fleett.env` first, then the legacy `fleet.env`.
     pub fn env_file_path(&self) -> PathBuf {
-        self.root.join(ENV_FILE_NAME)
+        env_file_in(&self.root)
     }
 
     pub fn instances_dir(&self) -> PathBuf {
@@ -278,6 +325,75 @@ impl Config {
     }
 }
 
+/// Resolve one configuration variable: `FLEETT_<suffix>` then `FLEET_<suffix>`.
+fn resolve_var(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<String> {
+    [
+        format!("{PREFIX}{suffix}"),
+        format!("{LEGACY_PREFIX}{suffix}"),
+    ]
+    .iter()
+    .find_map(|name| lookup(name))
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+/// Existing environment file in `root`: `fleett.env` wins over `fleet.env`.
+fn env_file_in(root: &Path) -> PathBuf {
+    let canonical = root.join(ENV_FILE_NAME);
+    if canonical.is_file() {
+        return canonical;
+    }
+    let legacy = root.join(LEGACY_ENV_FILE_NAME);
+    if legacy.is_file() {
+        return legacy;
+    }
+    canonical
+}
+
+/// Environment file to read when no root was given explicitly.
+///
+/// Mirrors [`home_root`]: the home root wins, the legacy home root is adopted
+/// only when `~/.fleett` is absent, and `/opt/fleett` is used without `HOME`.
+fn discover_env_file(process: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(home) = non_empty(process("HOME")) {
+        let home = PathBuf::from(home);
+        let canonical = home.join(HOME_ROOT_NAME);
+        if canonical.is_dir() {
+            return env_file_in(&canonical);
+        }
+        let legacy = home.join(LEGACY_HOME_ROOT_NAME);
+        if legacy.is_dir() {
+            return env_file_in(&legacy);
+        }
+        return canonical.join(ENV_FILE_NAME);
+    }
+    env_file_in(Path::new(DEFAULT_ROOT))
+}
+
+/// Data root used when neither the environment nor the file defines one.
+fn home_root(process: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let home = PathBuf::from(non_empty(process("HOME"))?);
+    let canonical = home.join(HOME_ROOT_NAME);
+    if canonical.is_dir() {
+        return Some(canonical);
+    }
+    let legacy = home.join(LEGACY_HOME_ROOT_NAME);
+    if legacy.is_dir() {
+        tracing::warn!(
+            root = %legacy.display(),
+            "using the legacy data root; rename it to ~/.fleett when convenient"
+        );
+        return Some(legacy);
+    }
+    Some(canonical)
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Parse a `KEY=VALUE` environment file.
 ///
 /// Blank lines and lines starting with `#` are ignored, keys must look like
@@ -303,7 +419,7 @@ pub fn parse_env_file(text: &str) -> BTreeMap<String, String> {
 }
 
 /// Read `path` as an environment file. Missing or unreadable files yield an
-/// empty map: the fleet must still start on a fresh host.
+/// empty map: the control plane must still start on a fresh host.
 pub fn load_env_file(path: &Path) -> BTreeMap<String, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => parse_env_file(&text),
@@ -364,47 +480,47 @@ mod tests {
     #[test]
     fn parses_env_file_and_ignores_comments() {
         let text = "\
-# fleet configuration
-FLEET_BIND=127.0.0.1:9999
+# configuration
+FLEETT_BIND=127.0.0.1:9999
 
-FLEET_IMAGE = \"example/agent:1.0\" 
+FLEETT_IMAGE = \"example/agent:1.0\"\x20
 not a variable
 9BAD=value
-FLEET_NETWORK='fleet-net'
+FLEETT_NETWORK='fleett-net'
 ";
         let vars = parse_env_file(text);
         assert_eq!(
-            vars.get("FLEET_BIND").map(String::as_str),
+            vars.get("FLEETT_BIND").map(String::as_str),
             Some("127.0.0.1:9999")
         );
         assert_eq!(
-            vars.get("FLEET_IMAGE").map(String::as_str),
+            vars.get("FLEETT_IMAGE").map(String::as_str),
             Some("example/agent:1.0")
         );
         assert_eq!(
-            vars.get("FLEET_NETWORK").map(String::as_str),
-            Some("fleet-net")
+            vars.get("FLEETT_NETWORK").map(String::as_str),
+            Some("fleett-net")
         );
         assert!(!vars.contains_key("9BAD"));
         assert_eq!(vars.len(), 3);
     }
 
     #[test]
-    fn fleet_env_file_fills_missing_variables() {
+    fn fleett_env_file_fills_missing_variables() {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(
             dir.path().join(ENV_FILE_NAME),
             "# generated by the installer\n\
-             FLEET_BIND=127.0.0.1:9999\n\
-             FLEET_IMAGE=from-file:1\n\
-             FLEET_TOKEN=file-token\n",
+             FLEETT_BIND=127.0.0.1:9999\n\
+             FLEETT_IMAGE=from-file:1\n\
+             FLEETT_TOKEN=file-token\n",
         )
-        .expect("write fleet.env");
+        .expect("write fleett.env");
 
         let root = dir.path().to_string_lossy().to_string();
         let cfg = Config::from_process_env(|key| match key {
-            "FLEET_ROOT" => Some(root.clone()),
-            "FLEET_TOKEN" => Some("process-token".to_string()),
+            "FLEETT_ROOT" => Some(root.clone()),
+            "FLEETT_TOKEN" => Some("process-token".to_string()),
             _ => None,
         })
         .expect("config resolves");
@@ -419,18 +535,71 @@ FLEET_NETWORK='fleet-net'
     }
 
     #[test]
-    fn home_fleet_env_is_used_without_fleet_root() {
+    fn legacy_fleet_prefix_is_still_accepted() {
+        let cfg = Config::from_process_env(|key| match key {
+            "FLEET_ROOT" => Some("/tmp/legacy-root".to_string()),
+            "FLEET_TOKEN" => Some("legacy-token".to_string()),
+            "FLEET_DRIVER" => Some("compose".to_string()),
+            _ => None,
+        })
+        .expect("legacy variables resolve");
+        assert_eq!(cfg.token.as_deref(), Some("legacy-token"));
+        assert_eq!(cfg.driver, DriverKind::Compose);
+        assert_eq!(cfg.root, PathBuf::from("/tmp/legacy-root"));
+    }
+
+    #[test]
+    fn fleett_prefix_wins_over_the_legacy_prefix() {
+        let cfg = Config::from_process_env(|key| match key {
+            "FLEETT_TOKEN" => Some("canonical".to_string()),
+            "FLEET_TOKEN" => Some("legacy".to_string()),
+            "FLEETT_BIND" => Some("127.0.0.1:1234".to_string()),
+            "FLEET_BIND" => Some("127.0.0.1:4321".to_string()),
+            _ => None,
+        })
+        .expect("config resolves");
+        assert_eq!(cfg.token.as_deref(), Some("canonical"));
+        assert_eq!(cfg.bind.port(), 1234);
+    }
+
+    #[test]
+    fn fleett_env_wins_over_the_legacy_env_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join(LEGACY_ENV_FILE_NAME),
+            "FLEETT_TOKEN=legacy-file\nFLEETT_IMAGE=legacy:1\n",
+        )
+        .expect("write fleet.env");
+        std::fs::write(
+            dir.path().join(ENV_FILE_NAME),
+            "FLEETT_TOKEN=canonical-file\n",
+        )
+        .expect("write fleett.env");
+
+        let root = dir.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "FLEETT_ROOT" => Some(root.clone()),
+            _ => None,
+        })
+        .expect("config resolves");
+        assert_eq!(cfg.token.as_deref(), Some("canonical-file"));
+        // `fleet.env` is not read at all when `fleett.env` exists.
+        assert_eq!(cfg.image, DEFAULT_IMAGE);
+    }
+
+    #[test]
+    fn home_fleett_env_is_used_without_fleett_root() {
         let home = tempfile::tempdir().expect("temp home");
-        let root = home.path().join(".hermes-fleet");
+        let root = home.path().join(HOME_ROOT_NAME);
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::write(
             root.join(ENV_FILE_NAME),
             format!(
-                "FLEET_ROOT={}\nFLEET_TOKEN=home-token\n",
+                "FLEETT_ROOT={}\nFLEETT_TOKEN=home-token\n",
                 root.to_string_lossy()
             ),
         )
-        .expect("write home fleet.env");
+        .expect("write home fleett.env");
 
         let home_str = home.path().to_string_lossy().to_string();
         let cfg = Config::from_process_env(|key| match key {
@@ -444,12 +613,110 @@ FLEET_NETWORK='fleet-net'
     }
 
     #[test]
+    fn the_legacy_home_root_is_adopted_when_fleett_is_absent() {
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().join(LEGACY_HOME_ROOT_NAME);
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join(LEGACY_ENV_FILE_NAME),
+            "FLEET_TOKEN=legacy-home-token\n",
+        )
+        .expect("write legacy fleet.env");
+
+        let home_str = home.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "HOME" => Some(home_str.clone()),
+            _ => None,
+        })
+        .expect("config resolves from the legacy home file");
+
+        assert_eq!(cfg.token.as_deref(), Some("legacy-home-token"));
+        assert_eq!(cfg.root, root);
+        assert_eq!(cfg.env_file_path(), root.join(LEGACY_ENV_FILE_NAME));
+    }
+
+    #[test]
+    fn an_existing_fleett_root_wins_over_the_legacy_one() {
+        let home = tempfile::tempdir().expect("temp home");
+        let canonical = home.path().join(HOME_ROOT_NAME);
+        let legacy = home.path().join(LEGACY_HOME_ROOT_NAME);
+        std::fs::create_dir_all(&canonical).expect("create root");
+        std::fs::create_dir_all(&legacy).expect("create legacy root");
+
+        let home_str = home.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "HOME" => Some(home_str.clone()),
+            "FLEETT_ALLOW_NO_AUTH" => Some("1".to_string()),
+            _ => None,
+        })
+        .expect("config resolves without a token");
+        assert_eq!(cfg.root, canonical);
+    }
+
+    #[test]
+    fn an_existing_fleett_root_hides_the_legacy_env_file() {
+        let home = tempfile::tempdir().expect("temp home");
+        let canonical = home.path().join(HOME_ROOT_NAME);
+        let legacy = home.path().join(LEGACY_HOME_ROOT_NAME);
+        std::fs::create_dir_all(&canonical).expect("create root");
+        std::fs::create_dir_all(&legacy).expect("create legacy root");
+        std::fs::write(legacy.join(LEGACY_ENV_FILE_NAME), "FLEETT_TOKEN=legacy\n")
+            .expect("write legacy env");
+
+        let home_str = home.path().to_string_lossy().to_string();
+        let env_file = discover_env_file(&|key: &str| (key == "HOME").then(|| home_str.clone()));
+        // The canonical root exists, so the legacy environment file is not read.
+        assert_eq!(env_file, canonical.join(ENV_FILE_NAME));
+    }
+
+    #[test]
+    fn canonical_name_in_file_beats_legacy_name_in_process() {
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().join(".fleett");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join(ENV_FILE_NAME),
+            "FLEETT_BIND=127.0.0.1:18095\nFLEETT_TOKEN=new-token\n",
+        )
+        .expect("write fleett.env");
+
+        let home_str = home.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "HOME" => Some(home_str.clone()),
+            "FLEET_BIND" => Some("127.0.0.1:18093".to_string()),
+            "FLEET_TOKEN" => Some("old-token".to_string()),
+            _ => None,
+        })
+        .expect("config resolves");
+
+        assert_eq!(cfg.bind.port(), 18095);
+        assert_eq!(cfg.token.as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn legacy_process_values_are_used_when_canonical_is_absent() {
+        let home = tempfile::tempdir().expect("temp home");
+        let home_str = home.path().to_string_lossy().to_string();
+        let cfg = Config::from_process_env(|key| match key {
+            "HOME" => Some(home_str.clone()),
+            "FLEET_BIND" => Some("127.0.0.1:18093".to_string()),
+            "FLEET_TOKEN" => Some("old-token".to_string()),
+            _ => None,
+        })
+        .expect("config resolves");
+
+        assert_eq!(cfg.bind.port(), 18093);
+        assert_eq!(cfg.token.as_deref(), Some("old-token"));
+    }
+
+    #[test]
     fn missing_token_is_rejected_unless_auth_is_disabled() {
         let err = Config::from_lookup(|_| None).expect_err("token required");
         assert!(matches!(err, ConfigError::MissingToken));
+        assert!(err.to_string().contains("FLEETT_TOKEN"));
 
         let cfg = Config::from_lookup(|key| match key {
-            "FLEET_ALLOW_NO_AUTH" => Some("1".to_string()),
+            "FLEETT_ALLOW_NO_AUTH" => Some("1".to_string()),
             _ => None,
         })
         .expect("no-auth mode resolves");
@@ -458,30 +725,44 @@ FLEET_NETWORK='fleet-net'
     }
 
     #[test]
+    fn the_maintenance_configuration_does_not_require_a_token() {
+        let lookup = |name: &str| (name == "FLEETT_ROOT").then(|| "/tmp/maintenance".to_string());
+        let cfg = Config::assemble(
+            &|suffix| resolve_var(&lookup, suffix),
+            PathBuf::from(DEFAULT_ROOT),
+            false,
+        )
+        .expect("maintenance config resolves without a token");
+        assert!(cfg.token.is_none());
+        assert!(!cfg.allow_no_auth);
+        assert_eq!(cfg.root, PathBuf::from("/tmp/maintenance"));
+    }
+
+    #[test]
     fn total_caps_are_optional_and_validated() {
         let cfg = Config::from_lookup(|key| match key {
-            "FLEET_TOKEN" => Some("t".to_string()),
-            "FLEET_MAX_TOTAL_CPU" => Some("4.5".to_string()),
-            "FLEET_MAX_TOTAL_MEM_MB" => Some("6144".to_string()),
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_MAX_TOTAL_CPU" => Some("4.5".to_string()),
+            "FLEETT_MAX_TOTAL_MEM_MB" => Some("6144".to_string()),
             _ => None,
         })
         .expect("caps resolve");
         assert_eq!(cfg.max_total_cpu, 4.5);
         assert_eq!(cfg.max_total_mem_mb, 6144);
 
-        let default = Config::from_lookup(|key| (key == "FLEET_TOKEN").then(|| "t".to_string()))
+        let default = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
             .expect("defaults resolve");
         assert_eq!(default.max_total_cpu, 0.0);
         assert_eq!(default.max_total_mem_mb, 0);
 
         for (var, value) in [
-            ("FLEET_MAX_TOTAL_CPU", "-1"),
-            ("FLEET_MAX_TOTAL_CPU", "lots"),
-            ("FLEET_MAX_TOTAL_MEM_MB", "-5"),
-            ("FLEET_MAX_TOTAL_MEM_MB", "1.5"),
+            ("FLEETT_MAX_TOTAL_CPU", "-1"),
+            ("FLEETT_MAX_TOTAL_CPU", "lots"),
+            ("FLEETT_MAX_TOTAL_MEM_MB", "-5"),
+            ("FLEETT_MAX_TOTAL_MEM_MB", "1.5"),
         ] {
             let err = Config::from_lookup(|key| match key {
-                "FLEET_TOKEN" => Some("t".to_string()),
+                "FLEETT_TOKEN" => Some("t".to_string()),
                 other if other == var => Some(value.to_string()),
                 _ => None,
             })
@@ -496,29 +777,29 @@ FLEET_NETWORK='fleet-net'
     #[test]
     fn rejects_invalid_driver_and_bind() {
         let err = Config::from_lookup(|key| match key {
-            "FLEET_TOKEN" => Some("t".to_string()),
-            "FLEET_DRIVER" => Some("swarm".to_string()),
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_DRIVER" => Some("swarm".to_string()),
             _ => None,
         })
         .expect_err("bad driver");
         assert!(matches!(
             err,
             ConfigError::Invalid {
-                var: "FLEET_DRIVER",
+                var: "FLEETT_DRIVER",
                 ..
             }
         ));
 
         let err = Config::from_lookup(|key| match key {
-            "FLEET_TOKEN" => Some("t".to_string()),
-            "FLEET_BIND" => Some("nope".to_string()),
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_BIND" => Some("nope".to_string()),
             _ => None,
         })
         .expect_err("bad bind");
         assert!(matches!(
             err,
             ConfigError::Invalid {
-                var: "FLEET_BIND",
+                var: "FLEETT_BIND",
                 ..
             }
         ));

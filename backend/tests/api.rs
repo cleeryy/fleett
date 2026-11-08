@@ -5,10 +5,10 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
-use hermes_fleet::api::{self, AppState};
-use hermes_fleet::config::Config;
-use hermes_fleet::driver::mock::MockDriver;
-use hermes_fleet::models::Health;
+use fleett::api::{self, AppState};
+use fleett::config::Config;
+use fleett::driver::mock::MockDriver;
+use fleett::models::Health;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::os::unix::fs::MetadataExt;
@@ -164,7 +164,7 @@ async fn health_is_public() {
     assert_eq!(status, StatusCode::OK);
     let health = parse(&body);
     assert_eq!(health["ok"], true);
-    assert_eq!(health["version"], "0.1.0");
+    assert_eq!(health["version"], "0.2.0");
     assert_eq!(health["driver"], "mock");
     assert_eq!(health["docker"]["ok"], true);
 }
@@ -266,7 +266,7 @@ async fn creates_instance_and_writes_files() {
 
     // compose.yaml parses and names the project.
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
-    assert_eq!(compose["name"], "hermes-alice");
+    assert_eq!(compose["name"], "fleett-alice");
 
     // secrets.env is 0600 and contains the expected keys.
     let secrets_path = harness.instance_dir("alice").join("secrets.env");
@@ -310,7 +310,7 @@ async fn creates_instance_and_writes_files() {
     assert!(detail["container"]["id"].is_string());
     assert!(detail["compose_yaml"]
         .as_str()
-        .is_some_and(|text| text.contains("hermes-alice")));
+        .is_some_and(|text| text.contains("fleett-alice")));
 
     let ups = harness
         .mock
@@ -508,6 +508,44 @@ async fn patch_rewrites_compose_and_keeps_data() {
     let secrets = std::fs::read_to_string(harness.instance_dir("alice").join("secrets.env"))
         .expect("secrets");
     assert!(secrets.contains("TELEGRAM_BOT_TOKEN=123:ABC"), "{secrets}");
+}
+
+#[tokio::test]
+async fn patch_keeps_a_legacy_compose_project_name() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    // Simulate a project created by the previous release: the compose file
+    // declares `hermes-<id>` and must keep it until an explicit migration.
+    let path = harness.instance_dir("alice").join("compose.yaml");
+    let legacy = std::fs::read_to_string(&path)
+        .expect("compose")
+        .replace("fleett-alice", "hermes-alice");
+    std::fs::write(&path, legacy).expect("legacy compose");
+
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"notes": "legacy project"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let compose = read_yaml(&path);
+    assert_eq!(compose["name"], "hermes-alice");
+    assert_eq!(
+        compose["services"]["agent"]["container_name"],
+        "hermes-alice"
+    );
+
+    // The driver is asked to operate on that declared project.
+    let started = harness
+        .mock
+        .calls()
+        .iter()
+        .any(|call| call.operation == "up" && call.instance == "alice");
+    assert!(started);
 }
 
 #[tokio::test]
@@ -862,9 +900,9 @@ async fn compose_file_is_restrictive() {
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
     let agent = &compose["services"]["agent"];
 
-    assert_eq!(compose["name"], "hermes-alice");
+    assert_eq!(compose["name"], "fleett-alice");
     assert_eq!(agent["image"], "hermes-agent:0.22.2-local");
-    assert_eq!(agent["container_name"], "hermes-alice");
+    assert_eq!(agent["container_name"], "fleett-alice");
     assert_eq!(agent["restart"], "unless-stopped");
     assert_eq!(agent["command"], json!(["gateway", "run"]));
     assert_eq!(agent["env_file"], json!(["secrets.env"]));
@@ -907,7 +945,7 @@ async fn compose_file_is_restrictive() {
         .any(|volume| { volume == "../../shares/archive:/opt/data/shared/archive:ro" }));
 
     assert_eq!(compose["networks"]["fleet"]["external"], true);
-    assert_eq!(compose["networks"]["fleet"]["name"], "hermes-fleet");
+    assert_eq!(compose["networks"]["fleet"]["name"], "fleett");
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +963,7 @@ async fn create_writes_the_healthcheck_and_exposes_health() {
     let metadata = std::fs::metadata(&script_path).expect("healthcheck metadata");
     assert_eq!(metadata.mode() & 0o777, 0o644);
     let script = std::fs::read_to_string(&script_path).expect("healthcheck");
-    assert_eq!(script, hermes_fleet::render::HEALTHCHECK_SCRIPT);
+    assert_eq!(script, fleett::render::HEALTHCHECK_SCRIPT);
     assert!(script.contains("/opt/data/gateway.sock"));
     assert!(script.contains("\"verb\": \"identify\""));
     assert!(script.contains("TIMEOUT_S = 3.0"));
@@ -942,7 +980,7 @@ async fn create_writes_the_healthcheck_and_exposes_health() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         std::fs::read_to_string(&script_path).expect("healthcheck"),
-        hermes_fleet::render::HEALTHCHECK_SCRIPT
+        fleett::render::HEALTHCHECK_SCRIPT
     );
 }
 

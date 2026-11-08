@@ -24,7 +24,7 @@ import { isValidSlug } from "@/lib/validation";
 
 const DEMO_TOKEN = "demo";
 const IMAGE = "hermes-agent:0.22.2-local";
-const FLEET_ROOT = "/opt/hermes-fleet";
+const FLEETT_ROOT = "/opt/fleett";
 const DOCKER_ERROR =
   "compose up failed (exit 1): Error response from daemon: pull access denied for hermes-agent:0.22.2-local, " +
   "repository does not exist or may require 'docker login': denied: requested access to the resource is denied";
@@ -111,8 +111,8 @@ function composeYaml(row: Stored): string {
       : `      HERMES_CHANNEL: ${row.channel}`;
 
   return [
-    "# Managed by hermes-fleet. Edit through the API: hand edits are overwritten.",
-    `name: hermes-${row.id}`,
+    "# Managed by fleett. Edit through the API: hand edits are overwritten.",
+    `name: fleett-${row.id}`,
     "",
     "services:",
     "  hermes:",
@@ -129,7 +129,7 @@ function composeYaml(row: Stored): string {
     "    volumes:",
     ...mounts,
     "    networks:",
-    "      - hermes-fleet",
+    "      - fleett",
     "    security_opt:",
     "      - no-new-privileges:true",
     "    cap_drop:",
@@ -145,7 +145,7 @@ function composeYaml(row: Stored): string {
     '        max-file: "3"',
     "",
     "networks:",
-    "  hermes-fleet:",
+    "  fleett:",
     "    external: true",
     "",
   ].join("\n");
@@ -172,7 +172,7 @@ function toDetail(row: Stored): InstanceDetail {
     created_at: row.created_at,
     updated_at: row.updated_at,
     last_error: row.last_error,
-    data_dir: `${FLEET_ROOT}/instances/${row.id}/data`,
+    data_dir: `${FLEETT_ROOT}/instances/${row.id}/data`,
     env_keys: envKeys(row),
     container: row.container_id
       ? { id: row.container_id, image: IMAGE, uptime_s: uptime }
@@ -266,7 +266,7 @@ function makeLogs(row: Stored): string[] {
 
   if (row.status === "error") {
     lines.push(
-      logLine(start + 420, "INFO", `creating container hermes-${row.id}`),
+      logLine(start + 420, "INFO", `creating container fleett-${row.id}`),
       logLine(start + 610, "ERROR", DOCKER_ERROR),
       logLine(start + 640, "ERROR", "rollback: container not created"),
     );
@@ -375,7 +375,7 @@ export function resetMock(): void {
   shares = [
     {
       name: "findings",
-      path: `${FLEET_ROOT}/shares/findings`,
+      path: `${FLEETT_ROOT}/shares/findings`,
       instances: [
         { id: "alice", mode: "rw" },
         { id: "ops", mode: "ro" },
@@ -383,12 +383,12 @@ export function resetMock(): void {
     },
     {
       name: "media",
-      path: `${FLEET_ROOT}/shares/media`,
+      path: `${FLEETT_ROOT}/shares/media`,
       instances: [{ id: "margaret", mode: "ro" }],
     },
     {
       name: "runbooks",
-      path: `${FLEET_ROOT}/shares/runbooks`,
+      path: `${FLEETT_ROOT}/shares/runbooks`,
       instances: [{ id: "ops", mode: "rw" }],
     },
   ];
@@ -481,7 +481,7 @@ function validateChannel(channel: { type: ChannelType; token?: string }, previou
 export const mockApi: FleetApi = {
   async health(): Promise<Health> {
     await delay(60);
-    return { ok: true, version: "0.1.0", driver: "mock", docker: { ok: true } };
+    return { ok: true, version: "0.2.0", driver: "mock", docker: { ok: true } };
   },
 
   async checkAuth(): Promise<void> {
@@ -669,7 +669,7 @@ export const mockApi: FleetApi = {
     if (shares.some((share) => share.name === name)) {
       fail(409, "conflict", `Share "${name}" already exists.`);
     }
-    shares.push({ name, path: `${FLEET_ROOT}/shares/${name}`, instances: [] });
+    shares.push({ name, path: `${FLEETT_ROOT}/shares/${name}`, instances: [] });
   },
 
   async deleteShare(name: string): Promise<void> {

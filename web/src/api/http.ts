@@ -43,7 +43,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       if (body?.error?.message) message = body.error.message;
     }
     if (response.status === 401) {
-      window.dispatchEvent(new CustomEvent("fleet:unauthorized"));
+      window.dispatchEvent(new CustomEvent("fleett:unauthorized"));
     }
     throw new ApiError(response.status, code, message);
   }

@@ -5,11 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>hermes-fleet</title>
+    <title>fleett</title>
     <script>
       // Apply the stored theme before first paint. Dark is the default.
       try {
-        if (localStorage.getItem("fleet.theme") === "light") {
+        var stored = localStorage.getItem("fleett.theme") || localStorage.getItem("fleet.theme");
+        if (stored === "light") {
           document.documentElement.classList.remove("dark");
           var meta = document.querySelector('meta[name="theme-color"]');
           if (meta) meta.setAttribute("content", "#ffffff");

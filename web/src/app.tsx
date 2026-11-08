@@ -17,7 +17,9 @@ import { TemplatesPage } from "@/pages/templates";
 
 type Theme = "dark" | "light";
 
-const THEME_KEY = "fleet.theme";
+const THEME_KEY = "fleett.theme";
+// Key written before the rename; still read so an open tab keeps its theme.
+const LEGACY_THEME_KEY = "fleet.theme";
 
 function titleFor(path: string): string {
   if (path === "/") return "Instances";
@@ -32,7 +34,8 @@ function titleFor(path: string): string {
 
 function readTheme(): Theme {
   try {
-    return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+    const stored = localStorage.getItem(THEME_KEY) ?? localStorage.getItem(LEGACY_THEME_KEY);
+    return stored === "light" ? "light" : "dark";
   } catch {
     return "dark";
   }
@@ -58,6 +61,7 @@ export default function App() {
     }
     try {
       localStorage.setItem(THEME_KEY, theme);
+      localStorage.removeItem(LEGACY_THEME_KEY);
     } catch {
       /* ignore storage failures */
     }
@@ -95,8 +99,8 @@ export default function App() {
       setToken(null);
       toast.error("Session expired. Sign in again.");
     }
-    window.addEventListener("fleet:unauthorized", onUnauthorized);
-    return () => window.removeEventListener("fleet:unauthorized", onUnauthorized);
+    window.addEventListener("fleett:unauthorized", onUnauthorized);
+    return () => window.removeEventListener("fleett:unauthorized", onUnauthorized);
   }, []);
 
   useEffect(() => {
@@ -108,7 +112,7 @@ export default function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-    document.title = `${titleFor(route.path)} · hermes-fleet`;
+    document.title = `${titleFor(route.path)} · fleett`;
   }, [route.path]);
 
   if (!token) {

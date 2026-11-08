@@ -58,7 +58,7 @@ function SideNav({
         <div className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
           <Boxes aria-hidden className="size-4" />
         </div>
-        <span className="text-sm font-semibold tracking-tight">hermes-fleet</span>
+        <span className="text-sm font-semibold tracking-tight">fleett</span>
       </div>
 
       <nav aria-label="Console sections" className="flex-1 space-y-1 p-2">

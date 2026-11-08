@@ -1,9 +1,10 @@
-//! hermes-fleet — control plane for fleet-managed Hermes agents.
+//! fleett — control plane for fleet-managed Hermes agents.
 
 pub mod api;
 pub mod config;
 pub mod db;
 pub mod driver;
+pub mod migrate;
 pub mod models;
 pub mod render;
 pub mod store;

@@ -137,10 +137,10 @@ fn finalize(api: Router<AppState>, state: AppState) -> Router {
 #[cfg(not(feature = "embed-web"))]
 async fn frontend_hint() -> Json<serde_json::Value> {
     Json(json!({
-        "name": "hermes-fleet",
+        "name": "fleett",
         "version": VERSION,
         "hint": "The web console is not built. Run `pnpm build` in web/ and restart, \
-                 or point FLEET_WEB_DIST at an existing build.",
+                 or point FLEETT_WEB_DIST at an existing build.",
         "api": "/api/health",
     }))
 }
@@ -214,7 +214,9 @@ pub(crate) async fn apply_compose(
     state: &AppState,
     spec: &mut InstanceSpec,
 ) -> Result<(), ApiError> {
-    let compose = crate::render::render_compose(&state.cfg, spec).map_err(ApiError::from)?;
+    let project = store::declared_project(&state.cfg, &spec.id);
+    let compose = crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref())
+        .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
         .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))?;
     up_and_record(state, spec).await

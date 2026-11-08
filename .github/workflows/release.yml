@@ -79,12 +79,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="hermes-fleet_${version}_${{ matrix.asset_target }}"
+          name="fleett_${version}_${{ matrix.asset_target }}"
           mkdir -p dist
-          cp "backend/target/${{ matrix.rust_target }}/release/hermes-fleet" dist/hermes-fleet
-          chmod 0755 dist/hermes-fleet
-          tar -C dist -czf "dist/${name}.tar.gz" hermes-fleet
-          rm dist/hermes-fleet
+          cp "backend/target/${{ matrix.rust_target }}/release/fleett" dist/fleett
+          chmod 0755 dist/fleett
+          tar -C dist -czf "dist/${name}.tar.gz" fleett
+          rm dist/fleett
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
           else

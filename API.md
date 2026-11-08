@@ -1,7 +1,7 @@
-# hermes-fleet — API v1
+# fleett — API v1
 
 Base: `http://127.0.0.1:8090`. Every `/api/*` route requires
-`Authorization: Bearer <FLEET_TOKEN>`, except `GET /api/health`.
+`Authorization: Bearer <FLEETT_TOKEN>`, except `GET /api/health`.
 
 Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 (`400` invalid input, `401` missing/wrong token, `404` unknown, `409` conflict,
@@ -11,7 +11,7 @@ Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 
 | Method | Route | Response |
 |---|---|---|
-| GET | `/api/health` | `{"ok":true,"version":"0.1.0","driver":"mock\|compose","docker":{"ok":true}}` |
+| GET | `/api/health` | `{"ok":true,"version":"0.2.0","driver":"mock\|compose","docker":{"ok":true}}` |
 | GET | `/api/auth/check` | `204` when the token is valid |
 
 ## Templates
@@ -52,10 +52,10 @@ The token is **never** returned by the API.
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"notes":"","created_at":"...","updated_at":"...",
- "last_error":null,"data_dir":"/opt/hermes-fleet/instances/alice/data",
+ "last_error":null,"data_dir":"/opt/fleett/instances/alice/data",
  "env_keys":["HERMES_GATE_PROFILE_TOKEN","TELEGRAM_BOT_TOKEN"],
  "container":{"id":"3f2a…","image":"hermes-agent:0.22.2-local","uptime_s":3600},
- "compose_yaml":"name: hermes-alice\n…"}
+ "compose_yaml":"name: fleett-alice\n…"}
 ```
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
@@ -63,8 +63,8 @@ The token is **never** returned by the API.
 `mem_limit_mb`, `cpu_limit`, `notes`. Rewrites the compose file and runs `up -d`.
 
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
-`memswap_limit == mem_limit`. Optional fleet caps (`FLEET_MAX_TOTAL_CPU`,
-`FLEET_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
+`memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
+`FLEETT_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.

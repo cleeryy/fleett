@@ -55,7 +55,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
           <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Boxes aria-hidden className="size-4" />
           </div>
-          <span className="font-semibold tracking-tight">hermes-fleet</span>
+          <span className="font-semibold tracking-tight">fleett</span>
         </div>
 
         <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
@@ -74,7 +74,7 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
                 autoComplete="off"
                 spellCheck={false}
                 className="pr-11 font-mono"
-                placeholder="FLEET_TOKEN"
+                placeholder="FLEETT_TOKEN"
                 aria-invalid={!!fieldError || !!error}
                 aria-describedby={fieldError ? "token-error" : undefined}
                 onChange={(event) => setToken(event.target.value)}

@@ -1,4 +1,4 @@
-//! In-memory driver used by the tests and by `FLEET_DRIVER=mock`.
+//! In-memory driver used by the tests and by `FLEETT_DRIVER=mock`.
 //!
 //! It records every call, keeps a per-instance state, and can be told to fail
 //! the next call of a given operation so error paths are testable without
@@ -157,10 +157,10 @@ impl MockDriver {
             None => (Status::Unknown, 0, self.image.clone()),
         };
         let lines = [
-            format!("[mock] hermes-{id}: image={image} status={status}"),
+            format!("[mock] fleett-{id}: image={image} status={status}"),
             format!("[mock] lifecycle calls: up={ups}"),
-            format!("[mock] instance {id} is simulated by FLEET_DRIVER=mock"),
-            "[mock] no container is running; start the control plane with FLEET_DRIVER=compose"
+            format!("[mock] instance {id} is simulated by FLEETT_DRIVER=mock"),
+            "[mock] no container is running; start the control plane with FLEETT_DRIVER=compose"
                 .to_string(),
         ];
         let start = lines.len().saturating_sub(tail as usize);

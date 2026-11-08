@@ -1,6 +1,6 @@
 //! Container drivers.
 //!
-//! `FLEET_DRIVER=compose` talks to Docker through `docker compose -f …`; the
+//! `FLEETT_DRIVER=compose` talks to Docker through `docker compose -f …`; the
 //! mock driver keeps every instance in memory and never touches Docker, which
 //! is what the test suite uses.
 

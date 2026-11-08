@@ -3,7 +3,7 @@
 Audited 2026-11-08 against the official guideline set. `file:line` refers to the state
 before the fixes. Priorities: **P0** blocking, **P1** should fix now, **P2** deferred.
 
-**Status in v0.1.0: all P0 and P1 fixed and verified. P2 untouched.**
+**Status in v0.2.0: all P0 and P1 fixed and verified. P2 untouched.**
 
 ## P0 — blocking
 

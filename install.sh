@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# hermes-fleet installer — Linux and macOS
+# fleett installer — Linux and macOS
 #
-#   curl -fsSL https://raw.githubusercontent.com/cleeryy/hermes-fleet/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cleeryy/fleett/master/install.sh | bash
 #
-# Environment overrides:
-#   HERMES_FLEET_VERSION      version to install (default: latest release)
-#   HERMES_FLEET_INSTALL_DIR  where to put the binary (default: /usr/local/bin or ~/.local/bin)
-#   HERMES_FLEET_ROOT         data root (default: ~/.hermes-fleet)
-#   HERMES_FLEET_BASE_URL     alternative download base (mirrors, tests)
+# Environment overrides (the legacy HERMES_FLEET_* names are still accepted):
+#   FLEETT_VERSION      version to install (default: latest release)
+#   FLEETT_INSTALL_DIR  where to put the binary (default: /usr/local/bin or ~/.local/bin)
+#   FLEETT_ROOT         data root (default: ~/.fleett, or the legacy ~/.hermes-fleet)
+#   FLEETT_BASE_URL     alternative download base (mirrors, tests)
+#   FLEETT_REPO         GitHub repository (default: cleeryy/fleett)
 #
 # The script is idempotent: it replaces the binary and keeps data and secrets.
 
 set -euo pipefail
 
-REPO="${HERMES_FLEET_REPO:-cleeryy/hermes-fleet}"
-BIN="hermes-fleet"
-ROOT="${HERMES_FLEET_ROOT:-$HOME/.hermes-fleet}"
-VERSION="${HERMES_FLEET_VERSION:-latest}"
+REPO="${FLEETT_REPO:-${HERMES_FLEET_REPO:-cleeryy/fleett}}"
+BIN="fleett"
+LEGACY_BIN="hermes-fleet"
+VERSION="${FLEETT_VERSION:-${HERMES_FLEET_VERSION:-latest}}"
+BASE_URL="${FLEETT_BASE_URL:-${HERMES_FLEET_BASE_URL:-}}"
+INSTALL_DIR="${FLEETT_INSTALL_DIR:-${HERMES_FLEET_INSTALL_DIR:-}}"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -24,6 +27,20 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
+
+# Adopt the legacy data root when the canonical one does not exist yet, so an
+# upgrade never starts from an empty directory.
+explicit_root="${FLEETT_ROOT:-${HERMES_FLEET_ROOT:-}}"
+if [ -n "$explicit_root" ]; then
+  ROOT="$explicit_root"
+elif [ -d "$HOME/.fleett" ]; then
+  ROOT="$HOME/.fleett"
+elif [ -d "$HOME/.hermes-fleet" ]; then
+  ROOT="$HOME/.hermes-fleet"
+  warn "using the legacy data root $ROOT (rename it to ~/.fleett when convenient)"
+else
+  ROOT="$HOME/.fleett"
+fi
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$os" in
@@ -51,13 +68,13 @@ if [ "$VERSION" = "latest" ]; then
       | sed 's|.*/tag/v\{0,1\}||' | tr -d '\r' | head -n1 || true)
   fi
 fi
-[ -n "${VERSION:-}" ] || die "could not resolve the latest release (set HERMES_FLEET_VERSION)"
+[ -n "${VERSION:-}" ] || die "could not resolve the latest release (set FLEETT_VERSION)"
 
 asset="${BIN}_${VERSION}_${target}.tar.gz"
-base="${HERMES_FLEET_BASE_URL:-https://github.com/${REPO}/releases/download/v${VERSION}}"
+base="${BASE_URL:-https://github.com/${REPO}/releases/download/v${VERSION}}"
 url="${base%/}/${asset}"
 
-tmp=$(mktemp -d 2>/dev/null || mktemp -d -t hermes-fleet)
+tmp=$(mktemp -d 2>/dev/null || mktemp -d -t fleett)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading ${asset}"
@@ -83,8 +100,8 @@ if [ ! -f "$src" ]; then
 fi
 [ -n "${src:-}" ] && [ -f "$src" ] || die "binary not found in ${asset}"
 
-if [ -n "${HERMES_FLEET_INSTALL_DIR:-}" ]; then
-  dir="$HERMES_FLEET_INSTALL_DIR"
+if [ -n "$INSTALL_DIR" ]; then
+  dir="$INSTALL_DIR"
 elif [ -w /usr/local/bin ] 2>/dev/null; then
   dir=/usr/local/bin
 else
@@ -98,10 +115,21 @@ else
 fi
 say "Installed ${BIN} ${VERSION} -> ${dir}/${BIN}"
 
-mkdir -p "$ROOT/instances" "$ROOT/shares"
-chmod 700 "$ROOT" 2>/dev/null || true
+# Compatibility: scripts and units written against the old name keep working.
+if ln -sf "$BIN" "$dir/$LEGACY_BIN" 2>/dev/null; then
+  say "Compatibility symlink: ${dir}/${LEGACY_BIN} -> ${BIN}"
+else
+  warn "could not create the ${LEGACY_BIN} compatibility symlink in ${dir}"
+fi
 
-envfile="$ROOT/fleet.env"
+mkdir -p "$ROOT/instances" "$ROOT/shares"
+chmod 700 "$ROOT" "$ROOT/instances" "$ROOT/shares" 2>/dev/null || true
+
+# `fleett.env` wins over the legacy `fleet.env`; keep an existing file as-is.
+envfile="$ROOT/fleett.env"
+if [ ! -f "$envfile" ] && [ -f "$ROOT/fleet.env" ]; then
+  envfile="$ROOT/fleet.env"
+fi
 if [ ! -f "$envfile" ]; then
   if command -v openssl >/dev/null 2>&1; then
     token=$(openssl rand -hex 32)
@@ -109,14 +137,16 @@ if [ ! -f "$envfile" ]; then
     token=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   fi
   ( umask 077; cat > "$envfile" <<EOF
-FLEET_ROOT=$ROOT
-FLEET_BIND=127.0.0.1:8090
-FLEET_DRIVER=compose
-FLEET_TOKEN=$token
+FLEETT_ROOT=$ROOT
+FLEETT_BIND=127.0.0.1:8090
+FLEETT_DRIVER=compose
+FLEETT_TOKEN=$token
 EOF
   )
   chmod 600 "$envfile"
   say "Wrote ${envfile} (bearer token inside)"
+elif [ "$envfile" = "$ROOT/fleet.env" ]; then
+  say "Kept existing ${envfile} (legacy name)"
 else
   say "Kept existing ${envfile}"
 fi
@@ -127,15 +157,20 @@ case ":${PATH}:" in
 esac
 command -v docker >/dev/null 2>&1 || warn "docker not found; compose driver needs it"
 
+if grep -rqs '^name: hermes-' "$ROOT/instances" 2>/dev/null; then
+  say "Legacy hermes-<id> compose projects detected: run \`fleett migrate --from hermes-fleet --apply\`."
+fi
+
 cat <<EOF
 
-hermes-fleet is installed.
+fleett is installed.
 
   data root : ${ROOT}
   env file  : ${envfile}
   start     : ${dir}/${BIN}
+  legacy    : ${dir}/${LEGACY_BIN} (symlink)
   open      : http://127.0.0.1:8090
 
-The bearer token is FLEET_TOKEN in ${envfile}.
-The hermes-fleet Docker network is created on first start if missing.
+The bearer token is FLEETT_TOKEN in ${envfile}.
+The fleett Docker network is created on first start if missing.
 EOF

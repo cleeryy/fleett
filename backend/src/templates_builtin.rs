@@ -16,7 +16,7 @@ pub struct BuiltinTemplate {
     pub soul_md: &'static str,
 }
 
-const GUEST_CONFIG: &str = r#"# hermes-fleet built-in template: guest (Telegram)
+const GUEST_CONFIG: &str = r#"# fleett built-in template: guest (Telegram)
 # Placeholders: {{MODEL}} {{BASE_URL}} {{AGENT_NAME}} {{API_KEY_ENV}}
 _config_version: 50
 
@@ -59,7 +59,7 @@ platforms:
 
 const GUEST_SOUL: &str = r#"# {{AGENT_NAME}}
 
-You are {{AGENT_NAME}}, a guest agent hosted on hermes-fleet.
+You are {{AGENT_NAME}}, a guest agent hosted on fleett.
 
 - You run inside your own container. The host, the Docker socket and the
   management network are out of reach; do not claim otherwise.
@@ -70,7 +70,7 @@ You are {{AGENT_NAME}}, a guest agent hosted on hermes-fleet.
 - Ask before doing anything destructive or expensive.
 "#;
 
-const DISCORD_CONFIG: &str = r#"# hermes-fleet built-in template: guest-discord
+const DISCORD_CONFIG: &str = r#"# fleett built-in template: guest-discord
 # Placeholders: {{MODEL}} {{BASE_URL}} {{AGENT_NAME}} {{API_KEY_ENV}}
 _config_version: 50
 
@@ -113,7 +113,7 @@ platforms:
 
 const DISCORD_SOUL: &str = r#"# {{AGENT_NAME}}
 
-You are {{AGENT_NAME}}, a guest agent hosted on hermes-fleet and reachable on
+You are {{AGENT_NAME}}, a guest agent hosted on fleett and reachable on
 Discord.
 
 - You run inside your own container. The host, the Docker socket and the
@@ -124,7 +124,7 @@ Discord.
 - Ask before doing anything destructive or expensive.
 "#;
 
-const SOLO_CONFIG: &str = r#"# hermes-fleet built-in template: solo (no messaging platform)
+const SOLO_CONFIG: &str = r#"# fleett built-in template: solo (no messaging platform)
 # Placeholders: {{MODEL}} {{BASE_URL}} {{AGENT_NAME}} {{API_KEY_ENV}}
 _config_version: 50
 
@@ -165,7 +165,7 @@ platforms:
 
 const SOLO_SOUL: &str = r#"# {{AGENT_NAME}}
 
-You are {{AGENT_NAME}}, a Hermes agent hosted on hermes-fleet without a
+You are {{AGENT_NAME}}, a Hermes agent hosted on fleett without a
 messaging platform. You are driven from the command line or from the Hermes
 API server.
 

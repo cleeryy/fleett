@@ -1,43 +1,43 @@
-# hermes-fleet — backend
+# fleett — backend
 
 Control plane for fleet-managed Hermes agents. One instance is one Docker
-Compose project (`hermes-<id>`); the compose file is written on disk and the
-control plane only drives it, so agents keep running when this process is down,
-restarts, or is deleted.
+Compose project (`fleett-<id>`, or the `name:` declared in the instance file);
+the compose file is written on disk and the control plane only drives it, so
+agents keep running when this process is down, restarts, or is deleted.
 
 The HTTP contract lives in `../API.md`, the architecture in `../SPEC.md`.
 
 ## Requirements
 
 - Rust 1.99 (`cargo`, `rustc`)
-- Docker Engine with the Compose v2 plugin (only for `FLEET_DRIVER=compose`)
+- Docker Engine with the Compose v2 plugin (only for `FLEETT_DRIVER=compose`)
 - Linux (the secret file is written with Unix mode `0600` and data directories
   are chowned to UID/GID 10000)
 
 ## Configuration
 
-Environment variables (a `fleet.env` file in `FLEET_ROOT` fills in whatever the
-process environment does not define):
+Environment variables (a `fleett.env` file in `FLEETT_ROOT`, or the legacy
+`fleet.env`, fills in whatever the process environment does not define):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLEET_ROOT` | `/opt/hermes-fleet` | Fleet directory: `fleet.db`, `instances/`, `shares/`, `templates/` |
-| `FLEET_BIND` | `127.0.0.1:8090` | Listen address |
-| `FLEET_TOKEN` | — | Bearer token for every `/api/*` route except `/api/health` |
-| `FLEET_ALLOW_NO_AUTH` | `0` | `1` disables authentication entirely (loud warning at startup) |
-| `FLEET_DRIVER` | `mock` | `mock` (in-memory, no Docker) or `compose` |
-| `FLEET_IMAGE` | `hermes-agent:0.22.2-local` | Image used for every agent container |
-| `FLEET_NETWORK` | `hermes-fleet` | Existing external Docker network all agents join |
-| `FLEET_MAX_TOTAL_CPU` | `0` | Optional fleet-wide CPU cap (sum of `cpu_limit`); `0` disables it |
-| `FLEET_MAX_TOTAL_MEM_MB` | `0` | Optional fleet-wide memory cap in MB; `0` disables it |
-| `FLEET_WEB_DIST` | auto-detect | Optional path to a built frontend (see “Serving the console”) |
+| `FLEETT_ROOT` | `~/.fleett` (or `/opt/fleett` without `HOME`) | Fleet directory: `fleet.db`, `instances/`, `shares/`, `templates/` |
+| `FLEETT_BIND` | `127.0.0.1:8090` | Listen address |
+| `FLEETT_TOKEN` | — | Bearer token for every `/api/*` route except `/api/health` |
+| `FLEETT_ALLOW_NO_AUTH` | `0` | `1` disables authentication entirely (loud warning at startup) |
+| `FLEETT_DRIVER` | `mock` | `mock` (in-memory, no Docker) or `compose` |
+| `FLEETT_IMAGE` | `hermes-agent:0.22.2-local` | Image used for every agent container |
+| `FLEETT_NETWORK` | `fleett` | Existing external Docker network all agents join |
+| `FLEETT_MAX_TOTAL_CPU` | `0` | Optional fleet-wide CPU cap (sum of `cpu_limit`); `0` disables it |
+| `FLEETT_MAX_TOTAL_MEM_MB` | `0` | Optional fleet-wide memory cap in MB; `0` disables it |
+| `FLEETT_WEB_DIST` | auto-detect | Optional path to a built frontend (see “Serving the console”) |
 
-`FLEET_TOKEN` is required unless `FLEET_ALLOW_NO_AUTH=1`. There is no default
+`FLEETT_TOKEN` is required unless `FLEETT_ALLOW_NO_AUTH=1`. There is no default
 token: the process refuses to start rather than run unauthenticated by accident.
 
-### `fleet.env`
+### `fleett.env`
 
-If `$FLEET_ROOT/fleet.env` exists, it is read at startup and any variable it
+If `$FLEETT_ROOT/fleett.env` exists, it is read at startup and any variable it
 defines is used **only when the process environment does not already define
 it**. Format: `KEY=VALUE`, one per line; blank lines and `#` comments are
 ignored; a matching pair of surrounding quotes is stripped; nothing is expanded
@@ -45,31 +45,36 @@ or executed (no `$VAR`, no backticks, no `source`). Process environment always
 wins.
 
 ```
-# /opt/hermes-fleet/fleet.env
-FLEET_TOKEN=change-me
-FLEET_DRIVER=compose
-FLEET_BIND=127.0.0.1:8090
+# /opt/fleett/fleett.env
+FLEETT_TOKEN=change-me
+FLEETT_DRIVER=compose
+FLEETT_BIND=127.0.0.1:8090
 ```
 
-`FLEET_ROOT` is resolved from the process environment first. When it is unset, the
-loader reads `$HOME/.hermes-fleet/fleet.env` if that file exists (the location used by
-`install.sh`), then falls back to `/opt/hermes-fleet/fleet.env`.
+`FLEETT_ROOT` is resolved from the process environment first. When it is unset, the
+loader looks for `fleett.env` then `fleet.env` in `$HOME/.fleett`; when that directory
+does not exist it adopts `$HOME/.hermes-fleet` (logged once); without `HOME` it falls
+back to `/opt/fleett`.
+
+The legacy `FLEET_*` prefix is still read, second to `FLEETT_*`, and a legacy env file
+named `fleet.env` is used when `fleett.env` is absent.
 
 ## Run
 
 ```bash
 cd backend
-cargo run                       # FLEET_DRIVER=mock, needs FLEET_TOKEN
-FLEET_TOKEN=dev cargo run       # same, with a token
-FLEET_DRIVER=compose FLEET_TOKEN=secret cargo run
-cargo run -- --version          # prints "hermes-fleet 0.1.0"
+cargo run                       # FLEETT_DRIVER=mock, needs FLEETT_TOKEN
+FLEETT_TOKEN=dev cargo run      # same, with a token
+FLEETT_DRIVER=compose FLEETT_TOKEN=secret cargo run
+cargo run -- --version          # prints "fleett 0.2.0"
+cargo run -- migrate --from hermes-fleet   # dry-run the project rename
 ```
 
 Release build:
 
 ```bash
 cargo build --release
-# binary: backend/target/release/hermes-fleet
+# binary: backend/target/release/fleett
 ```
 
 ### Serving the console
@@ -77,7 +82,7 @@ cargo build --release
 Two mutually exclusive modes:
 
 - **Default (no feature).** At startup the binary looks for a built frontend in
-  `$FLEET_WEB_DIST`, then `./web/dist`, then `../web/dist` (the last one matches
+  `$FLEETT_WEB_DIST`, then `./web/dist`, then `../web/dist` (the last one matches
   `cargo run` from `backend/`). If `index.html` is found it is served with
   `tower-http` `ServeDir` and an SPA fallback to `index.html`; otherwise `/`
   answers with a JSON hint. The directory is resolved once at startup.
@@ -97,9 +102,9 @@ Two mutually exclusive modes:
 ## Layout
 
 ```
-$FLEET_ROOT/
-├── fleet.db                  # SQLite index (cache, not the source of truth)
-├── fleet.env                 # optional defaults (see above)
+$FLEETT_ROOT/
+├── fleet.db                  # SQLite index (cache, not the source of truth); name unchanged
+├── fleett.env                # optional defaults (legacy: fleet.env)
 ├── instances/<id>/
 │   ├── compose.yaml          # generated, one compose project per agent
 │   ├── data/                 # mounted at /opt/data, still there after delete
@@ -153,12 +158,35 @@ migration (`MIGRATIONS` in `src/db.rs`):
   being touched (downgrades are not supported);
 - migrations are append-only: a released entry is never edited or reordered.
 
+## Legacy `hermes-<id>` projects
+
+The compose driver reads the project name from the instance `compose.yaml`
+instead of recomputing a prefix. A project created by an older release
+(declared as `hermes-<id>`) is therefore still started, stopped, restarted,
+logged and patched without recreating its container under another name; the DB
+row is keyed by instance id and does not change.
+
+Legacy projects are detected read-only at startup and reported with a single
+warning pointing at:
+
+```bash
+fleett migrate --from hermes-fleet            # print the plan
+fleett migrate --from hermes-fleet --apply    # down, rewrite, up
+```
+
+`--apply` records whether the project was running, runs
+`docker compose -p hermes-<id> down`, rewrites `name`, `container_name` and the
+legacy external network name through `serde_yaml` (never string replacement),
+writes the file back, then runs `up -d` only for instances that were running.
+The DB status is updated and the index reconciled. The planner and the rewrite
+are covered by Docker-free unit tests.
+
 ## Security notes
 
 - **Bearer token** on every route except `GET /api/health`. Comparison is
   constant time (`subtle`), no cookies, no sessions. The token is never logged
   and never returned by the API.
-- **`FLEET_ALLOW_NO_AUTH=1` is dangerous.** It disables authentication for
+- **`FLEETT_ALLOW_NO_AUTH=1` is dangerous.** It disables authentication for
   everyone who can reach the port; the process prints a multi-line warning.
   Bind it to localhost or put it behind an authenticating proxy.
 - **Secrets stay on the host.** `secrets.env` is `0600`, owned by the control
@@ -180,7 +208,7 @@ migration (`MIGRATIONS` in `src/db.rs`):
   reports `health` (`healthy|unhealthy|starting|none`); an unhealthy container
   keeps its `running` status and gets a short `last_error`, so a crashlooping
   or deadlocked gateway is visible without restarting it.
-- **Fleet caps**: optional `FLEET_MAX_TOTAL_CPU` / `FLEET_MAX_TOTAL_MEM_MB`
+- **Fleet caps**: optional `FLEETT_MAX_TOTAL_CPU` / `FLEETT_MAX_TOTAL_MEM_MB`
   bound the sum of every instance's limits. A create or update that would
   exceed one is refused with `409` and `error.details` `{used, requested,
   cap}`; an instance being patched is never counted twice.
@@ -205,7 +233,7 @@ migration (`MIGRATIONS` in `src/db.rs`):
 
 ## What is mocked
 
-`FLEET_DRIVER=mock` (the default) never calls Docker:
+`FLEETT_DRIVER=mock` (the default) never calls Docker:
 
 - instance state lives in memory (running/stopped/error/unknown), `up`, `stop`,
   `start`, `restart` and `down` only mutate that state;
@@ -222,12 +250,12 @@ The test suite uses `MockDriver` exclusively and never needs a Docker daemon.
 
 ```bash
 cargo fmt --all --check
-cargo test                  # 36 unit + 30 integration tests
+cargo test --locked         # 54 unit + 31 integration tests
 cargo clippy --all-targets  # must stay warning-free
 ```
 
 Integration tests (`tests/api.rs`) build the real router with a temporary
-`FLEET_ROOT` and a `MockDriver`, then call it through
+`FLEETT_ROOT` and a `MockDriver`, then call it through
 `tower::ServiceExt::oneshot`. They cover auth (401/204), health, templates,
 create (files on disk, YAML validity, `0600` secrets, generated
 `data/healthcheck.py`), duplicate ids, invalid ids and payloads (`mem_limit_mb`
@@ -240,8 +268,10 @@ purge, the generated compose shape (restart policy, external network, no host
 networking, no Docker socket, share mounts, `cpus`, `memswap_limit`,
 `healthcheck`) and driver failures (502 with truncated stderr). Unit tests also
 run the health probe against a fake Unix socket, parse both `docker compose ps`
-output shapes with `Health`, and migrate a v0 database (including a deliberately
-failing migration that must roll back).
+output shapes with `Health`, migrate a v0 database (including a deliberately
+failing migration that must roll back), resolve the compose project name from
+the instance file, and plan/rewrite the legacy `hermes-<id>` projects without
+Docker.
 
 ## API notes
 
@@ -253,7 +283,7 @@ contract):
   `GET /api/instances/{id}` returns the same `health`/`cpu_limit`.
 - `POST /api/instances` and `PATCH /api/instances/{id}` accept `cpu_limit`
   (default `1.0`, accepted range `0.1..=8.0`).
-- Exceeding `FLEET_MAX_TOTAL_CPU` or `FLEET_MAX_TOTAL_MEM_MB` returns `409`
+- Exceeding `FLEETT_MAX_TOTAL_CPU` or `FLEETT_MAX_TOTAL_MEM_MB` returns `409`
   (`cpu_cap_exceeded` / `mem_cap_exceeded`) with
   `error.details: {used, requested, cap}`.
 - `POST /api/instances` accepts `gate_token` (stored as

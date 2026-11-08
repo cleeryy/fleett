@@ -1,15 +1,15 @@
-# Deployment — hermes-fleet
+# Deployment — fleett
 
 Nothing here is applied yet. Target: a dedicated Docker host (CT/VM), not CT125.
 
 ## Why agents survive the app
 
 Every instance is a Compose project on disk with `restart: unless-stopped`.
-Docker (the daemon) supervises containers, not hermes-fleet. Therefore:
+Docker (the daemon) supervises containers, not fleett. Therefore:
 
 | Event | Agents |
 |---|---|
-| `systemctl stop hermes-fleet` | keep running |
+| `systemctl stop fleett` | keep running |
 | binary / UI update | keep running |
 | app crash | keep running |
 | host reboot | restarted by Docker |
@@ -20,7 +20,7 @@ This is the central property of the design: the control plane is disposable.
 ## Prerequisites
 
 ```bash
-docker network create hermes-fleet          # optional: the app creates it
+docker network create fleett                # optional: the app creates it
 docker image ls | grep hermes-agent         # image built from the fork
 ```
 
@@ -30,51 +30,53 @@ The image is not built by this app. Build once, tag per version:
 docker build -t hermes-agent:0.22.2-local /path/to/hermes-official-v0.22.2
 ```
 
+The image name, `/opt/data`, `HERMES_UID` and `HERMES_GID` are unchanged by the rename.
+
 ## Install
 
 The control plane and every agent container share **UID/GID 10000**, so bind-mounted
 data stays readable and writable by both without running the app as root.
 
 ```bash
-groupadd --system --gid 10000 hermes-fleet 2>/dev/null || true
+groupadd --system --gid 10000 fleett 2>/dev/null || true
 useradd --system --uid 10000 --gid 10000 \
-  --home /opt/hermes-fleet --shell /usr/sbin/nologin hermes-fleet 2>/dev/null || true
-usermod -aG docker hermes-fleet
+  --home /opt/fleett --shell /usr/sbin/nologin fleett 2>/dev/null || true
+usermod -aG docker fleett
 
-install -d -m 700 -o 10000 -g 10000 /opt/hermes-fleet
-install -d -m 700 -o 10000 -g 10000 /opt/hermes-fleet/instances /opt/hermes-fleet/shares
+install -d -m 700 -o 10000 -g 10000 /opt/fleett
+install -d -m 700 -o 10000 -g 10000 /opt/fleett/instances /opt/fleett/shares
 ```
 
 If you run the app as root instead, it still works (it can chown the instance data), but
 the UID 10000 model is the intended one.
 
-`/etc/hermes-fleet.env` (0600):
+`/etc/fleett.env` (0600):
 
 ```dotenv
-FLEET_ROOT=/opt/hermes-fleet
-FLEET_BIND=127.0.0.1:8090
-FLEET_DRIVER=compose
-FLEET_IMAGE=hermes-agent:0.22.2-local
-FLEET_NETWORK=hermes-fleet
-FLEET_TOKEN=<long token, generate with: openssl rand -hex 32>
+FLEETT_ROOT=/opt/fleett
+FLEETT_BIND=127.0.0.1:8090
+FLEETT_DRIVER=compose
+FLEETT_IMAGE=hermes-agent:0.22.2-local
+FLEETT_NETWORK=fleett
+FLEETT_TOKEN=<long token, generate with: openssl rand -hex 32>
 ```
 
-`/etc/systemd/system/hermes-fleet.service`:
+`/etc/systemd/system/fleett.service`:
 
 ```ini
 [Unit]
-Description=hermes-fleet control plane
+Description=fleett control plane
 After=docker.service network-online.target
 Requires=docker.service
 
 [Service]
-EnvironmentFile=/etc/hermes-fleet.env
-ExecStart=/usr/local/bin/hermes-fleet
+EnvironmentFile=/etc/fleett.env
+ExecStart=/usr/local/bin/fleett
 Restart=on-failure
 RestartSec=2
 # same UID as HERMES_UID/GID inside the containers; docker group for the socket
-User=hermes-fleet
-Group=hermes-fleet
+User=fleett
+Group=fleett
 SupplementaryGroups=docker
 
 [Install]
@@ -87,8 +89,32 @@ If the binary lives elsewhere, set `WorkingDirectory` so `web/dist` is found, or
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now hermes-fleet
+systemctl enable --now fleett
 curl -s http://127.0.0.1:8090/api/health
+```
+
+## Upgrading from `hermes-fleet`
+
+The old unit keeps working through the `hermes-fleet` compatibility symlink, but the canonical
+name is `fleett`:
+
+```bash
+systemctl disable --now hermes-fleet          # agents keep running
+install -m 755 fleett /usr/local/bin/fleett
+ln -sf fleett /usr/local/bin/hermes-fleet     # done by install.sh
+mv /etc/hermes-fleet.env /etc/fleett.env      # FLEET_* keys keep working
+systemctl enable --now fleett
+```
+
+Data compatibility: `FLEETT_ROOT` is read first, then `FLEET_ROOT`; the environment file
+`fleett.env` wins over `fleet.env`; an existing `~/.hermes-fleet` is adopted when `~/.fleett`
+does not exist. Compose projects declared as `hermes-<id>` keep working untouched and stay
+attached to the legacy `hermes-fleet` Docker network until they are migrated. To rename
+them:
+
+```bash
+fleett migrate --from hermes-fleet            # plan only
+fleett migrate --from hermes-fleet --apply    # down, rewrite, up when it was running
 ```
 
 ## Exposure
@@ -99,10 +125,10 @@ reverse proxy in front.
 
 ## Backup
 
-All state lives under `FLEET_ROOT`:
+All state lives under `FLEETT_ROOT`:
 
 ```bash
-tar czf fleet-$(date +%F).tgz -C /opt hermes-fleet
+tar czf fleett-$(date +%F).tgz -C /opt fleett
 ```
 
 Containers can be recreated from `instances/*/compose.yaml`; the data
@@ -111,9 +137,9 @@ Containers can be recreated from `instances/*/compose.yaml`; the data
 ## Update
 
 ```bash
-systemctl stop hermes-fleet          # agents keep running
-install -m 755 hermes-fleet /usr/local/bin/hermes-fleet
-systemctl start hermes-fleet
+systemctl stop fleett                # agents keep running
+install -m 755 fleett /usr/local/bin/fleett
+systemctl start fleett
 ```
 
 Rollback: restore the previous binary. The SQLite database is an index; on startup the app

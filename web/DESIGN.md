@@ -1,4 +1,4 @@
-# web — design note
+# fleett web — design note
 
 shadcn/ui defaults, neutral base, dark by default (`.dark` on `<html>`), light toggle in the sidebar.
 No custom palette, typefaces, illustrations or motion: the console stays out of the way.

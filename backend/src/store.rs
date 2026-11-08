@@ -112,6 +112,25 @@ pub fn read_compose(cfg: &Config, id: &str) -> String {
     fs::read_to_string(cfg.compose_path(id)).unwrap_or_default()
 }
 
+/// Compose project declared by the instance file, when one is declared.
+///
+/// Updates reuse it so a project created by an older release keeps its name
+/// (and its containers) instead of being duplicated under the new prefix.
+pub fn declared_project(cfg: &Config, id: &str) -> Option<String> {
+    let text = fs::read_to_string(cfg.compose_path(id)).ok()?;
+    compose_project_name(&text)
+}
+
+/// Read the `name:` field of a compose document.
+///
+/// Missing, blank or unparsable documents yield `None`; callers then fall back
+/// to the name used by this build.
+pub(crate) fn compose_project_name(text: &str) -> Option<String> {
+    let doc: Value = serde_yaml::from_str(text).ok()?;
+    let name = doc.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Write the compose file only (share changes do not touch the Hermes config).
 pub fn write_compose(cfg: &Config, id: &str, compose_yaml: &str) -> io::Result<()> {
     write_file(&cfg.compose_path(id), compose_yaml, 0o644)
@@ -365,6 +384,17 @@ mod tests {
             let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn compose_project_names_are_read_from_the_document() {
+        assert_eq!(
+            compose_project_name("name: fleett-alice\n"),
+            Some("fleett-alice".to_string())
+        );
+        assert_eq!(compose_project_name("services: {}\n"), None);
+        assert_eq!(compose_project_name("name: \" \"\n"), None);
+        assert_eq!(compose_project_name("name: [unclosed\n"), None);
     }
 
     #[test]

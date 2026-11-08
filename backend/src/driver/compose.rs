@@ -1,11 +1,16 @@
 //! Docker Compose driver.
 //!
-//! Every instance is a separate compose project (`hermes-<id>`) driven through
-//! `docker compose -f <root>/instances/<id>/compose.yaml -p hermes-<id>`.
+//! Every instance is a separate compose project driven through
+//! `docker compose -f <root>/instances/<id>/compose.yaml -p <project>`. The
+//! project name is read from the `name:` field of the instance compose file, so
+//! projects created by older releases (`hermes-<id>`) remain manageable without
+//! being recreated.
 
 use super::{Driver, DriverError, DriverFuture, PsResult};
 use crate::config::Config;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
+use crate::render;
+use crate::store::compose_project_name;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -44,21 +49,33 @@ impl ComposeDriver {
         self.root.join("instances").join(id).join("compose.yaml")
     }
 
+    /// Project name declared by the instance compose file.
+    ///
+    /// Reading it back (instead of computing a prefix) keeps projects created
+    /// by older releases, declared as `hermes-<id>`, fully manageable after an
+    /// upgrade: no container is ever recreated by a start, stop or logs call.
     fn project(&self, id: &str) -> String {
-        format!("hermes-{id}")
+        std::fs::read_to_string(self.compose_path(id))
+            .ok()
+            .and_then(|text| compose_project_name(&text))
+            .unwrap_or_else(|| render::project_name(id))
     }
 
-    fn command(&self, id: &str) -> Command {
+    fn command_for(&self, id: &str, project: &str) -> Command {
         let mut command = Command::new(&self.docker);
         command
             .arg("compose")
             .arg("-f")
             .arg(self.compose_path(id))
             .arg("-p")
-            .arg(self.project(id));
+            .arg(project);
         command.stdin(Stdio::null());
         command.kill_on_drop(true);
         command
+    }
+
+    fn command(&self, id: &str) -> Command {
+        self.command_for(id, &self.project(id))
     }
 
     async fn compose(
@@ -73,7 +90,64 @@ impl ComposeDriver {
         run_command(command, operation, timeout).await
     }
 
-    /// Make sure the external `fleet` network exists.
+    /// Run a compose operation against an explicit project name.
+    ///
+    /// The migration command uses it to talk to the legacy project before the
+    /// compose file is rewritten.
+    pub async fn project_operation(
+        &self,
+        id: &str,
+        project: &str,
+        args: &[&str],
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<String, DriverError> {
+        let mut command = self.command_for(id, project);
+        command.args(args);
+        run_command(command, operation, timeout).await
+    }
+
+    /// `docker compose ps` for an explicit project name.
+    pub async fn project_status(&self, id: &str, project: &str) -> Result<PsResult, DriverError> {
+        let stdout = self
+            .project_operation(
+                id,
+                project,
+                &["ps", "--all", "--format", "json"],
+                "ps",
+                PS_TIMEOUT,
+            )
+            .await?;
+        Ok(parse_ps(&stdout))
+    }
+
+    /// `docker compose down` for an explicit project name.
+    pub async fn project_down(&self, id: &str, project: &str) -> Result<(), DriverError> {
+        self.project_operation(
+            id,
+            project,
+            &["down", "--remove-orphans"],
+            "down",
+            DOWN_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `docker compose up -d` for an explicit project name.
+    pub async fn project_up(&self, id: &str, project: &str) -> Result<(), DriverError> {
+        self.project_operation(
+            id,
+            project,
+            &["up", "-d", "--remove-orphans"],
+            "up",
+            UP_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Make sure the external `fleett` network exists.
     ///
     /// Returns `true` when the network had to be created.
     pub async fn ensure_network(&self) -> Result<bool, DriverError> {
@@ -346,6 +420,64 @@ fn field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn driver_in(dir: &std::path::Path) -> ComposeDriver {
+        ComposeDriver::new(&Config::for_tests(dir.to_path_buf()))
+    }
+
+    #[test]
+    fn reads_the_project_name_from_the_compose_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let driver = driver_in(dir.path());
+        std::fs::create_dir_all(dir.path().join("instances/alice")).expect("instance dir");
+        std::fs::write(
+            dir.path().join("instances/alice/compose.yaml"),
+            "name: hermes-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+        assert_eq!(driver.project("alice"), "hermes-alice");
+    }
+
+    #[test]
+    fn project_name_falls_back_to_the_new_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let driver = driver_in(dir.path());
+        std::fs::create_dir_all(dir.path().join("instances/bob")).expect("instance dir");
+        for compose in ["services: {}\n", "name: \"  \"\n", "name: [unclosed\n"] {
+            std::fs::write(dir.path().join("instances/bob/compose.yaml"), compose)
+                .expect("compose file");
+            assert_eq!(driver.project("bob"), "fleett-bob", "{compose:?}");
+        }
+        std::fs::remove_file(dir.path().join("instances/bob/compose.yaml")).expect("remove");
+        assert_eq!(driver.project("bob"), "fleett-bob");
+    }
+
+    #[test]
+    fn docker_commands_use_the_declared_project_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let driver = driver_in(dir.path());
+        std::fs::create_dir_all(dir.path().join("instances/alice")).expect("instance dir");
+        std::fs::write(
+            dir.path().join("instances/alice/compose.yaml"),
+            "name: hermes-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+
+        let command = driver.command("alice");
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let project = args
+            .iter()
+            .position(|arg| arg == "-p")
+            .map(|index| args[index + 1].clone());
+        assert_eq!(project.as_deref(), Some("hermes-alice"));
+        assert!(args
+            .iter()
+            .any(|arg| arg.ends_with("instances/alice/compose.yaml")));
+    }
 
     #[test]
     fn parses_array_output() {

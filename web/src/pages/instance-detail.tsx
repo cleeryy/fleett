@@ -212,7 +212,7 @@ function OverviewTab({ detail, onConfigure }: { detail: InstanceDetail; onConfig
           <DataList
             items={[
               { label: "Data directory", value: <CopyValue value={detail.data_dir} label="data directory" /> },
-              { label: "Compose project", value: <Mono>hermes-{detail.id}</Mono> },
+              { label: "Compose project", value: <Mono>fleett-{detail.id}</Mono> },
             ]}
           />
         </Section>
