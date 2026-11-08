@@ -1,0 +1,570 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Boxes,
+  ExternalLink,
+  Loader2,
+  Minus,
+  MoreHorizontal,
+  MessageSquare,
+  Play,
+  Plus,
+  RefreshCw,
+  RotateCw,
+  Search,
+  Send,
+  Square,
+  Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
+import { api } from "@/api";
+import { toApiError, type ApiError } from "@/api/errors";
+import type { InstanceDetail, InstanceSummary } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
+import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
+import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
+import { PageHeader } from "@/components/page-header";
+import { StatusBadge } from "@/components/status-badge";
+import { formatClock, formatUptime, plural } from "@/lib/format";
+import { hrefFor, navigate } from "@/lib/router";
+import { useResource } from "@/lib/use-resource";
+
+const FILTERS = ["all", "running", "stopped", "created", "error", "unknown"] as const;
+type Filter = (typeof FILTERS)[number];
+
+/** Kept across navigation so returning from a detail page preserves the view. */
+const persisted = { q: "", status: "all" as Filter };
+
+function ChannelIcon({ channel }: { channel: string }) {
+  const Icon = channel === "telegram" ? Send : channel === "discord" ? MessageSquare : Minus;
+  return <Icon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />;
+}
+
+function RowMenu({
+  row,
+  pending,
+  onAction,
+  onDelete,
+}: {
+  row: InstanceSummary;
+  pending: boolean;
+  onAction: (action: "start" | "stop" | "restart") => void;
+  onDelete: () => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`Actions for ${row.name}`}
+          title={`Actions for ${row.name}`}
+          disabled={pending}
+        >
+          {pending ? <Loader2 aria-hidden className="animate-spin" /> : <MoreHorizontal aria-hidden />}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-44">
+        <DropdownMenuItem disabled={row.status === "running"} onSelect={() => onAction("start")}>
+          <Play aria-hidden />
+          Start
+        </DropdownMenuItem>
+        <DropdownMenuItem disabled={row.status !== "running"} onSelect={() => onAction("stop")}>
+          <Square aria-hidden />
+          Stop
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onAction("restart")}>
+          <RotateCw aria-hidden />
+          Restart
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem asChild>
+          <a href={hrefFor(`/instances/${row.id}`)}>
+            <ExternalLink aria-hidden />
+            Open
+          </a>
+        </DropdownMenuItem>
+        <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+          <Trash2 aria-hidden />
+          Delete…
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+export function FleetPage() {
+  const [q, setQ] = useState(persisted.q);
+  const [status, setStatus] = useState<Filter>(persisted.status);
+  const [nonce, setNonce] = useState(0);
+  const [details, setDetails] = useState<Record<string, InstanceDetail>>({});
+  const [refreshedAt, setRefreshedAt] = useState<Date | null>(null);
+  const [pendingId, setPendingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<ApiError | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<InstanceSummary | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const list = useResource(() => api.listInstances(), [nonce]);
+
+  useEffect(() => {
+    persisted.q = q;
+    persisted.status = status;
+  }, [q, status]);
+
+  // The list endpoint has no uptime or share modes; hydrate each row from the
+  // detail endpoint. Failures are non-fatal: the row keeps its summary values.
+  useEffect(() => {
+    if (!list.data) return;
+    let alive = true;
+    Promise.all(list.data.map((row) => api.getInstance(row.id).catch(() => null))).then((results) => {
+      if (!alive) return;
+      const next: Record<string, InstanceDetail> = {};
+      for (const detail of results) if (detail) next[detail.id] = detail;
+      setDetails(next);
+      setRefreshedAt(new Date());
+    });
+    return () => {
+      alive = false;
+    };
+  }, [list.data]);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable=true], [role=menu], [role=listbox], [role=dialog]")) {
+        return;
+      }
+      if (event.key === "/") {
+        event.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+      if (event.key === "c") {
+        event.preventDefault();
+        navigate("/instances/new");
+        return;
+      }
+      if (["j", "k", "ArrowDown", "ArrowUp"].includes(event.key)) {
+        const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("[data-row-link]")).filter(
+          (link) => link.getClientRects().length > 0,
+        );
+        if (links.length === 0) return;
+        event.preventDefault();
+        const index = links.indexOf(document.activeElement as HTMLAnchorElement);
+        const forward = event.key === "j" || event.key === "ArrowDown";
+        const next = index === -1 ? 0 : forward ? Math.min(index + 1, links.length - 1) : Math.max(index - 1, 0);
+        links[next]?.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const counts = useMemo(() => {
+    const result: Record<string, number> = { all: list.data?.length ?? 0 };
+    for (const row of list.data ?? []) {
+      result[row.status] = (result[row.status] ?? 0) + 1;
+    }
+    return result;
+  }, [list.data]);
+
+  const rows = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return [...(list.data ?? [])]
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .filter((row) => {
+        if (status !== "all" && row.status !== status) return false;
+        if (!needle) return true;
+        return [row.name, row.id, row.model, row.channel, row.template, ...row.shares].some((value) =>
+          value.toLowerCase().includes(needle),
+        );
+      });
+  }, [list.data, q, status]);
+
+  const errorCount = counts.error ?? 0;
+  const hasAny = (list.data?.length ?? 0) > 0;
+
+  async function runAction(id: string, action: "start" | "stop" | "restart") {
+    setPendingId(id);
+    setActionError(null);
+    try {
+      await api.action(id, action);
+      toast.success(`${id}: ${action === "stop" ? "stopped" : action === "start" ? "started" : "restarted"}.`);
+      setNonce((value) => value + 1);
+    } catch (cause) {
+      setActionError(toApiError(cause));
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  const emptyState = !hasAny ? (
+    <EmptyState
+      icon={Boxes}
+      title="No instances yet"
+      description="Create one to start a container. Each instance is its own compose project."
+      action={
+        <Button asChild>
+          <a href={hrefFor("/instances/new")}>
+            <Plus aria-hidden />
+            New instance
+          </a>
+        </Button>
+      }
+    />
+  ) : (
+    <EmptyState
+      icon={Search}
+      title="No instances match the filters"
+      description="Clear the search or pick another status."
+      action={
+        <Button
+          variant="outline"
+          onClick={() => {
+            setQ("");
+            setStatus("all");
+          }}
+        >
+          Clear filters
+        </Button>
+      }
+    />
+  );
+
+  return (
+    <>
+      <PageHeader
+        title="Instances"
+        description={
+          list.data
+            ? `${list.data.length} ${plural(list.data.length, "instance")}${
+                errorCount > 0 ? ` · ${errorCount} in error` : ""
+              }`
+            : "Loading instances."
+        }
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
+              <RefreshCw aria-hidden className={list.refreshing ? "animate-spin" : undefined} />
+              Refresh
+            </Button>
+            <Button asChild size="sm">
+              <a href={hrefFor("/instances/new")}>
+                <Plus aria-hidden />
+                New instance
+              </a>
+            </Button>
+          </>
+        }
+      />
+
+      {actionError ? <ErrorAlert error={actionError} /> : null}
+      {list.error ? <ErrorAlert error={list.error} onRetry={list.reload} /> : null}
+
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+        <div className="relative w-full sm:max-w-xs">
+          <Search aria-hidden className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            ref={searchRef}
+            value={q}
+            onChange={(event) => setQ(event.target.value)}
+            placeholder="Search name, id, model"
+            aria-label="Search instances"
+            className="pl-8"
+          />
+        </div>
+        <Select value={status} onValueChange={(value) => setStatus(value as Filter)} disabled={!list.data}>
+          <SelectTrigger className="w-full sm:w-44" aria-label="Filter by status">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {FILTERS.map((filter) => (
+              <SelectItem key={filter} value={filter}>
+                {filter === "all" ? "All" : filter} ({counts[filter] ?? 0})
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground sm:ml-auto" aria-live="polite">
+          {refreshedAt ? `Updated ${formatClock(refreshedAt)}` : "…"}
+        </p>
+      </div>
+
+      <div className="rounded-md border" aria-busy={list.loading || list.refreshing}>
+        {list.loading && !list.data ? (
+          <>
+            <div className="hidden md:block">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[120px]">Status</TableHead>
+                    <TableHead>Name</TableHead>
+                    <TableHead className="hidden lg:table-cell">Model</TableHead>
+                    <TableHead className="hidden md:table-cell">Channel</TableHead>
+                    <TableHead className="hidden lg:table-cell">Shares</TableHead>
+                    <TableHead className="w-[90px]">
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {Array.from({ length: 4 }).map((_, index) => (
+                    <TableRow key={index}>
+                      <TableCell>
+                        <Skeleton className="h-5 w-20" />
+                        <Skeleton className="mt-1.5 h-3 w-12" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="h-4 w-28" />
+                        <Skeleton className="mt-1.5 h-3 w-16" />
+                      </TableCell>
+                      <TableCell className="hidden lg:table-cell">
+                        <Skeleton className="h-4 w-40" />
+                      </TableCell>
+                      <TableCell className="hidden md:table-cell">
+                        <Skeleton className="h-4 w-16" />
+                      </TableCell>
+                      <TableCell className="hidden lg:table-cell">
+                        <Skeleton className="h-5 w-24" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="ml-auto size-7" />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            <div className="divide-y md:hidden">
+              {Array.from({ length: 4 }).map((_, index) => (
+                <div key={index} className="space-y-3 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1.5">
+                      <Skeleton className="h-4 w-28" />
+                      <Skeleton className="h-3 w-16" />
+                    </div>
+                    <Skeleton className="h-5 w-20" />
+                  </div>
+                  <Skeleton className="h-3 w-40" />
+                  <Skeleton className="h-7 w-full" />
+                </div>
+              ))}
+            </div>
+          </>
+        ) : rows.length === 0 ? (
+          emptyState
+        ) : (
+          <>
+            <div className="hidden md:block">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[120px]">Status</TableHead>
+                    <TableHead>Name</TableHead>
+                    <TableHead className="hidden lg:table-cell">Model</TableHead>
+                    <TableHead className="hidden md:table-cell">Channel</TableHead>
+                    <TableHead className="hidden lg:table-cell">Shares</TableHead>
+                    <TableHead className="w-[90px]">
+                      <span className="sr-only">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {rows.map((row) => {
+                    const detail = details[row.id];
+                    const uptime =
+                      row.status === "running" && detail?.container
+                        ? formatUptime(detail.container.uptime_s)
+                        : null;
+                    return (
+                      <TableRow key={row.id}>
+                        <TableCell>
+                          <div className="flex flex-col items-start gap-1">
+                            <StatusBadge status={row.status} />
+                            <span className="font-mono text-xs text-muted-foreground">{uptime ?? "—"}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <a
+                            data-row-link
+                            href={hrefFor(`/instances/${row.id}`)}
+                            className="block max-w-[260px] rounded-sm"
+                          >
+                            <span className="block truncate text-sm font-medium hover:underline">{row.name}</span>
+                            <span className="block truncate font-mono text-xs text-muted-foreground">
+                              {row.id}
+                              <span aria-hidden> · </span>
+                              {row.template}
+                            </span>
+                          </a>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          <span className="block max-w-[220px] truncate font-mono text-xs">{row.model}</span>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <span className="flex items-center gap-1.5 text-sm">
+                            <ChannelIcon channel={row.channel} />
+                            {row.channel}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          {row.shares.length ? (
+                            <div className="flex flex-wrap items-center gap-1">
+                              {row.shares.slice(0, 2).map((name) => {
+                                const mode = detail?.shares.find((share) => share.name === name)?.mode;
+                                return (
+                                  <Badge
+                                    key={name}
+                                    variant="outline"
+                                    className="gap-1 font-mono text-xs font-normal"
+                                  >
+                                    {name}
+                                    {mode ? <span className="text-muted-foreground">{mode}</span> : null}
+                                  </Badge>
+                                );
+                              })}
+                              {row.shares.length > 2 ? (
+                                <span className="text-xs text-muted-foreground">
+                                  +{row.shares.length - 2}
+                                </span>
+                              ) : null}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <RowMenu
+                            row={row}
+                            pending={pendingId === row.id}
+                            onAction={(action) => runAction(row.id, action)}
+                            onDelete={() => setDeleteTarget(row)}
+                          />
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+
+            <div className="divide-y md:hidden">
+              {rows.map((row) => {
+                const detail = details[row.id];
+                const uptime =
+                  row.status === "running" && detail?.container
+                    ? formatUptime(detail.container.uptime_s)
+                    : "—";
+                return (
+                  <div key={row.id} className="space-y-3 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <a
+                          data-row-link
+                          href={hrefFor(`/instances/${row.id}`)}
+                          className="block truncate text-sm font-medium"
+                        >
+                          {row.name}
+                        </a>
+                        <p className="truncate font-mono text-xs text-muted-foreground">
+                          {row.id}
+                          <span aria-hidden> · </span>
+                          {row.template}
+                        </p>
+                      </div>
+                      <StatusBadge status={row.status} />
+                    </div>
+                    <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                      <div className="min-w-0">
+                        <dt className="text-muted-foreground">Model</dt>
+                        <dd className="truncate font-mono">{row.model}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Channel</dt>
+                        <dd className="flex items-center gap-1.5">
+                          <ChannelIcon channel={row.channel} />
+                          {row.channel}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Uptime</dt>
+                        <dd className="font-mono">{uptime}</dd>
+                      </div>
+                      <div className="min-w-0">
+                        <dt className="text-muted-foreground">Shares</dt>
+                        <dd className="truncate font-mono">
+                          {row.shares.length ? row.shares.join(", ") : "—"}
+                        </dd>
+                      </div>
+                    </dl>
+                    <div className="flex items-center justify-end gap-2">
+                      <Button asChild variant="outline" size="sm">
+                        <a href={hrefFor(`/instances/${row.id}`)}>Open</a>
+                      </Button>
+                      <RowMenu
+                        row={row}
+                        pending={pendingId === row.id}
+                        onAction={(action) => runAction(row.id, action)}
+                        onDelete={() => setDeleteTarget(row)}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+
+      <p className="hidden text-xs text-muted-foreground md:block">
+        <span className="font-mono">j</span> <span className="font-mono">k</span> move · Enter open ·{" "}
+        <span className="font-mono">/</span> search · <span className="font-mono">c</span> create
+      </p>
+
+      <DeleteInstanceDialog
+        instance={
+          deleteTarget
+            ? { id: deleteTarget.id, name: deleteTarget.name }
+            : null
+        }
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        onDeleted={() => {
+          const id = deleteTarget?.id;
+          setDeleteTarget(null);
+          toast.success(id ? `Instance ${id} deleted.` : "Instance deleted.");
+          setNonce((value) => value + 1);
+        }}
+      />
+
+    </>
+  );
+}
