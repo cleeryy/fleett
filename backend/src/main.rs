@@ -828,6 +828,17 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!("watchdog disabled (FLEETT_WATCHDOG_INTERVAL_S=0)");
     }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(fleett::maintenance::TICK_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                fleett::maintenance::tick_scheduled(&state).await;
+            }
+        });
+    }
 
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;

@@ -356,6 +356,11 @@ pub struct Config {
     pub web_dist: Option<PathBuf>,
     /// Security posture of the rendered agent containers (`FLEETT_HARDENING`).
     pub hardening: Hardening,
+    /// Enforce `maintenance_windows` (`FLEETT_MAINTENANCE_ENFORCE`, default on).
+    ///
+    /// Enforcement only kicks in when at least one enabled window exists, so a
+    /// fresh install is never locked out.
+    pub maintenance_enforce: bool,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
     /// Sampling interval of the watchdog, in seconds (`FLEETT_WATCHDOG_INTERVAL_S`,
@@ -593,6 +598,17 @@ impl Config {
             })?,
         };
 
+        // `FLEETT_MAINTENANCE_ENFORCE=0` disables the upkeep windows entirely;
+        // any other value (or no value) keeps the default, which only blocks
+        // once an enabled window exists.
+        let maintenance_enforce = match get("MAINTENANCE_ENFORCE") {
+            None => true,
+            Some(value) => !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+        };
+
         Ok(Self {
             root,
             bind,
@@ -612,6 +628,7 @@ impl Config {
             secrets_autoimport,
             web_dist,
             hardening,
+            maintenance_enforce,
             metrics,
             watchdog_interval_s,
         })
@@ -648,6 +665,7 @@ impl Config {
             secrets_autoimport: false,
             web_dist: None,
             hardening: Hardening::Standard,
+            maintenance_enforce: true,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
             // Tests drive `watchdog::tick` explicitly; no background loop runs.

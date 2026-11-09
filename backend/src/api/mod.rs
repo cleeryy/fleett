@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bus;
+pub mod deployments;
 pub mod error;
 pub mod files;
 pub mod git;
@@ -10,6 +11,7 @@ pub mod health;
 pub mod incidents;
 pub mod instances;
 pub mod json;
+pub mod maintenance;
 pub mod memory;
 pub mod notifications;
 pub mod pipelines;
@@ -196,6 +198,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/upgrade", get(upgrade::status).post(upgrade::start))
         .route("/incidents", get(incidents::list))
         .route("/incidents/{id}/close", post(incidents::close))
+        .route("/deployments", get(deployments::list))
+        .route("/deployments/{id}", get(deployments::get))
+        .route(
+            "/maintenance-windows",
+            get(maintenance::list).post(maintenance::create),
+        )
+        .route("/maintenance-windows/status", get(maintenance::status))
+        .route(
+            "/maintenance-windows/{id}",
+            axum::routing::patch(maintenance::patch).delete(maintenance::delete),
+        )
         .route("/providers", get(providers::list).post(providers::create))
         .route(
             "/providers/{id}",

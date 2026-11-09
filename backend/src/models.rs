@@ -570,9 +570,13 @@ pub const UPGRADE_PARALLEL_MAX: usize = 16;
 pub const UPGRADE_TIMEOUT_DEFAULT_S: u64 = 180;
 /// Upper bound of the per-instance health timeout.
 pub const UPGRADE_TIMEOUT_MAX_S: u64 = 3600;
+/// Default canary soak time, in seconds (issue #39).
+pub const UPGRADE_SOAK_DEFAULT_S: u64 = 600;
+/// Upper bound of the canary soak time.
+pub const UPGRADE_SOAK_MAX_S: u64 = 3600;
 
 /// Body of `POST /api/upgrade`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UpgradeRequest {
     /// Image tag every instance is moved to (required).
     #[serde(default)]
@@ -586,6 +590,22 @@ pub struct UpgradeRequest {
     /// Per-instance health timeout, in seconds (default `180`).
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Instances moved to the new image first, watched during the soak
+    /// (default `0`: no canary). Capped at the fleet size.
+    #[serde(default)]
+    pub canary: Option<usize>,
+    /// Seconds the healthy canaries are watched before the rest moves
+    /// (default `600`, `0` skips the soak, max `3600`).
+    #[serde(default)]
+    pub soak_s: Option<u64>,
+    /// Start later: RFC 3339 or a `sun 04:00` day+time expression (UTC).
+    /// A scheduled deployment is journaled and fired by the server.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// Maintenance window that must contain the run (id or name), or `null`
+    /// for "any open window".
+    #[serde(default)]
+    pub window: Option<String>,
 }
 
 /// State of one instance inside an upgrade job.
@@ -650,6 +670,15 @@ pub struct UpgradeJob {
     pub dry_run: bool,
     pub parallel: usize,
     pub timeout_s: u64,
+    /// Number of canary instances moved first (`0`: no canary phase).
+    #[serde(default)]
+    pub canary: usize,
+    /// Seconds the healthy canaries were watched before the rest moved.
+    #[serde(default)]
+    pub soak_s: u64,
+    /// Journal row of the deployment (`GET /api/deployments/{id}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
     pub results: Vec<UpgradeResult>,
 }
 

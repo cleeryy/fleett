@@ -568,14 +568,15 @@ from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
 | Method | Route | Body | Response |
 |---|---|---|---|
 | GET | `/api/images` | — | `[{"tag":"hermes-agent:0.22.2-local","id":"sha256:…","size":"1.2GB","created":"…","instances":["alice"]}]` |
-| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180}` | `202 UpgradeJob` · `409 upgrade_in_progress` · `502 image_unavailable` |
+| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180,"canary":0,"soak_s":600,"at":"sun 04:00","window":"nightly"}` | `202 UpgradeJob` · `202 Deployment` when `at` is in the future · `400 invalid_*` · `403 maintenance_window` · `409 upgrade_in_progress` · `502 image_unavailable` |
 | GET | `/api/upgrade` | — | `200 UpgradeJob` (current or last) · `404` before the first job |
 
 `UpgradeJob`:
 ```json
 {"id":"2b6d…","image":"hermes-agent:0.23.0-local",
  "started_at":"2026-11-08T01:00:00Z","finished_at":"2026-11-08T01:04:12Z",
- "dry_run":false,"parallel":1,"timeout_s":180,
+ "dry_run":false,"parallel":1,"timeout_s":180,"canary":1,"soak_s":600,
+ "deployment_id":"2b6d…",
  "results":[{"id":"alice","from":"hermes-agent:0.22.2-local",
              "to":"hermes-agent:0.23.0-local","status":"healthy"},
             {"id":"bob","from":"hermes-agent:0.22.2-local",
@@ -585,14 +586,33 @@ from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
 
 `status` per instance: `pending`, `upgrading`, `healthy`, `rolled_back`, `failed`. `from` is
 `null` only when the instance had no image recorded yet. `finished_at` is absent while the job
-runs and on a dry run is equal to `started_at`.
+runs and on a dry run is equal to `started_at`. `canary` and `soak_s` are additive fields
+(`0`/`0` for a plain rolling upgrade); `deployment_id` is absent on a dry run.
 
 `POST /api/upgrade` pulls the image first (`docker image inspect`, then `docker pull`) and
 answers `502 image_unavailable` with the Docker detail when it cannot; nothing is written in
-that case. Requests are validated: `image` is required (`400 invalid_image`), `parallel` is
-`1..=16` (default `1`, i.e. sequential), `timeout_s` is `1..=3600` (default `180`). A second
-job while one runs answers `409 upgrade_in_progress`, whatever the body. Admin only: a viewer
-gets `403 forbidden` like every other mutation.
+that case, but the failed attempt is journaled as a `failed` deployment. Requests are
+validated: `image` is required (`400 invalid_image`), `parallel` is `1..=16` (default `1`,
+i.e. sequential), `timeout_s` is `1..=3600` (default `180`), `canary` is at most the fleet size
+(`400 invalid_canary`), `soak_s` is `0..=3600` (default `600`, `400 invalid_soak`) and `window`
+must name an enabled window (`400 invalid_window`). A second job while one runs answers
+`409 upgrade_in_progress`, whatever the body. Admin only: a viewer gets `403 forbidden` like
+every other mutation.
+
+Before the pull, the maintenance gate runs: when at least one enabled window exists and none is
+open, the request answers `403 maintenance_window` with `details.next_open` (see below). A past
+`at` is `400 invalid_at`.
+
+With `canary: N`, the first N instances move first and must stay healthy for `soak_s` seconds
+(probed every 10 s) before the rest moves; a canary that fails — during its own upgrade or
+during the soak — stops the deployment and the other instances stay untouched (`pending`, with
+`error: "not attempted: …"`). A canary that degrades during the soak is rolled back to its
+previous image. See `docs/DEPLOYMENTS.md`.
+
+With a future `at` (RFC 3339 or `sun 04:00`, UTC), nothing is pulled now: the response is
+`202` with the `Deployment` row (`status: "scheduled"`, `started_at` = planned time,
+`result.request` = the deferred body). The server fires it within 30 s of the due time; the
+window is re-evaluated then (a closed window `cancelled` the row).
 
 Per instance, the job:
 
@@ -611,4 +631,57 @@ file, pulls nothing and audits nothing.
 
 The compose file is the source of truth: the database `image` column is resynchronised from
 `services.agent.image` at startup, so a hand edit or a restore is picked up. See
-`docs/UPGRADE.md` for the operator procedure.
+`docs/UPGRADE.md` for the operator procedure and `docs/DEPLOYMENTS.md` for the windows, canary
+and journal details.
+
+## Maintenance windows
+
+Recurring UTC day/time ranges that gate destructive operations (`POST /api/upgrade` and
+`DELETE /api/instances/{id}`). Enforcement is inert while no enabled window exists;
+`FLEETT_MAINTENANCE_ENFORCE=0` disables it entirely. Admin only for mutations.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/maintenance-windows` | — | `[{"id":"…","name":"nightly","days":["mon","tue"],"start_minute":120,"end_minute":300,"enabled":true,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/maintenance-windows` | `{"name":"nightly","days":["mon","tue"],"start_minute":120,"end_minute":300,"enabled":true}` | `201` window · `400 invalid_window` |
+| PATCH | `/api/maintenance-windows/{id}` | any subset of the fields | `200` window · `400 invalid_window` · `404` |
+| DELETE | `/api/maintenance-windows/{id}` | — | `204` · `404` |
+| GET | `/api/maintenance-windows/status` | — | `{"open":false,"next_open":"2026-11-10T02:00:00Z","enforce":true}` |
+
+`days` accepts a JSON array or a `"mon,tue"` string. Minutes are UTC (`0..=1439`), `start` is
+inclusive and `end` exclusive; `end < start` is an overnight window owned by its start day and
+`start == end` covers the whole day. The status `open` field is `true` when a destructive
+operation would be allowed right now (`next_open` is then `null`). A refused operation is
+`403 maintenance_window` with `details.next_open`:
+
+```json
+{"error":{"code":"maintenance_window",
+          "message":"no maintenance window is open; the next opening is 2026-11-10T02:00:00Z",
+          "details":{"next_open":"2026-11-10T02:00:00Z"}}}
+```
+
+## Deployments
+
+Durable journal of every upgrade (immediate, canary or scheduled), newest first.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/deployments?limit=50&status=ok` | — | `[Deployment]` · `400 invalid_limit` · `400 invalid_status` |
+| GET | `/api/deployments/{id}` | — | `200 Deployment` · `404` |
+
+`Deployment`:
+```json
+{"id":"0b7e…","image":"hermes-agent:0.23.0-local","status":"ok",
+ "instances":["alice","bob"],"canary":1,"soak_s":600,
+ "started_at":"2026-11-09T03:00:00Z","finished_at":"2026-11-09T03:12:40Z",
+ "result":[{"id":"alice","from":"hermes-agent:0.22.2-local",
+            "to":"hermes-agent:0.23.0-local","status":"healthy"}],
+ "error":null,"rollback":false,"created_by":"cleeryy"}
+```
+
+`status`: `pending`, `canary`, `running`, `scheduled`, `ok`, `failed`, `rolled_back`,
+`cancelled`. `limit` is `1..=500` (default `50`). While a row is `scheduled`, `result` holds
+`{"request":{…}}` (the deferred `POST /api/upgrade` body) and `started_at` is the planned
+time; after firing it holds the per-instance results and `started_at` is the real start.
+`rollback` is `true` when at least one instance was restored to its previous image.
+

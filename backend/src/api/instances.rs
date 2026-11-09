@@ -1087,6 +1087,9 @@ pub async fn delete(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
 ) -> Result<StatusCode, ApiError> {
+    // Deleting an instance is destructive: respect the maintenance windows
+    // (issue #39) before stopping or removing anything.
+    crate::maintenance::enforce(&state)?;
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
 
