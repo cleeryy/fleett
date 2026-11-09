@@ -10,6 +10,7 @@ pub mod health;
 pub mod instances;
 pub mod json;
 pub mod memory;
+pub mod pipelines;
 pub mod providers;
 pub mod schedules;
 pub mod shares;
@@ -213,6 +214,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/schedules/{sid}/run", post(schedules::run))
         .route("/instances/{id}/errors", get(instances::errors))
+        .route("/pipelines", get(pipelines::list).post(pipelines::create))
+        .route(
+            "/pipelines/{id}",
+            get(pipelines::get)
+                .patch(pipelines::patch)
+                .delete(pipelines::delete),
+        )
+        .route("/pipelines/{id}/run", post(pipelines::run))
+        .route("/pipelines/{id}/runs", get(pipelines::runs))
+        .route("/pipelines/{id}/runs/{run}", get(pipelines::run_detail))
+        .route("/pipelines/{id}/runs/{run}/cancel", post(pipelines::cancel))
         .route("/shares", get(shares::list).post(shares::create))
         .route("/shares/{name}", delete(shares::delete))
         .route("/shares/{name}/attach", post(shares::attach))

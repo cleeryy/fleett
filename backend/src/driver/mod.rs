@@ -105,9 +105,9 @@ impl InspectInfo {
 /// Result of one command executed inside an instance container.
 ///
 /// A non-zero exit code is a *successful* driver call: the command ran and its
-/// code is part of the result (the scheduler records it). `timed_out` means the
-/// command was killed after the requested budget; `stdout`/`stderr` then hold
-/// whatever was captured, if anything.
+/// code is part of the result (the scheduler and the pipelines record it).
+/// `timed_out` means the command was killed after the requested budget;
+/// `stdout`/`stderr` then hold whatever was captured, if anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecResult {
     pub exit_code: Option<i32>,
@@ -115,6 +115,36 @@ pub struct ExecResult {
     pub stderr: String,
     pub timed_out: bool,
 }
+
+impl ExecResult {
+    /// `true` when the command exited cleanly before its timeout.
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out && self.exit_code == Some(0)
+    }
+
+    /// Operator-facing failure detail for a non-zero exit or a timeout.
+    pub fn failure_detail(&self) -> Option<String> {
+        if self.succeeded() {
+            return None;
+        }
+        if self.timed_out {
+            return Some("the command timed out".to_string());
+        }
+        let stderr = self.stderr.trim();
+        let stdout = self.stdout.trim();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        Some(match self.exit_code {
+            Some(code) if detail.is_empty() => format!("the command exited with code {code}"),
+            Some(code) => format!("exited with code {code}: {detail}"),
+            None if detail.is_empty() => "the command was terminated".to_string(),
+            None => detail.to_string(),
+        })
+    }
+}
+
+/// Historical name kept for the pipelines module (issue #31 merged after the
+/// scheduler); both names designate the same result type.
+pub type ExecOutput = ExecResult;
 
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -293,5 +323,39 @@ mod tests {
         let options = LogsOptions::default();
         assert_eq!(options.tail, 200);
         assert!(options.since.is_none());
+    }
+
+    #[test]
+    fn exec_outputs_distinguish_success_from_a_command_failure() {
+        let success = ExecOutput {
+            exit_code: Some(0),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(success.succeeded());
+        assert_eq!(success.failure_detail(), None);
+
+        let failed = ExecOutput {
+            exit_code: Some(2),
+            stdout: String::new(),
+            stderr: "boom".to_string(),
+            timed_out: false,
+        };
+        assert!(!failed.succeeded());
+        let detail = failed.failure_detail().expect("detail");
+        assert!(detail.contains("code 2"), "{detail}");
+        assert!(detail.contains("boom"), "{detail}");
+
+        let timed_out = ExecOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(!timed_out.succeeded());
+        assert!(timed_out
+            .failure_detail()
+            .is_some_and(|detail| detail.contains("timed out")));
     }
 }

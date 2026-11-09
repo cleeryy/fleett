@@ -251,6 +251,53 @@ CREATE INDEX IF NOT EXISTS idx_schedule_runs_instance
 CREATE INDEX IF NOT EXISTS idx_schedule_runs_status
     ON schedule_runs (status, started_at);
 "#,
+    // v12 — DAG pipelines (issue #31). The definition is stored as canonical
+    // JSON (validated before the write); every run is a new UUID and keeps its
+    // own step rows, so history is never overwritten.
+    r#"
+CREATE TABLE IF NOT EXISTS pipelines (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL UNIQUE,
+    definition  TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipelines_trigger ON pipelines (trigger, enabled);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    pipeline_id TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    context     TEXT,
+    started_at  TEXT,
+    finished_at TEXT,
+    error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline
+    ON pipeline_runs (pipeline_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs (status);
+
+CREATE TABLE IF NOT EXISTS pipeline_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    step_id     TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    attempt     INTEGER NOT NULL DEFAULT 0,
+    output      TEXT,
+    error       TEXT,
+    started_at  TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_steps_run
+    ON pipeline_steps (run_id, step_id);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
