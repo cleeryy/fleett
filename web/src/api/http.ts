@@ -8,17 +8,29 @@ import type {
   CreateTokenInput,
   CreatedToken,
   EnvInput,
+  FileContent,
+  FileEntry,
   FleetApi,
+  GitDiff,
+  GitDiffOptions,
+  GitLog,
+  GitLogOptions,
+  GitStatus,
   Health,
   Identity,
   InstanceDetail,
   InstanceSummary,
   LifecycleResult,
+  MkdirResult,
   PatchInstanceInput,
+  RevertInput,
+  RevertResult,
   Share,
   ShareMode,
   Template,
   TokenInfo,
+  WriteFileInput,
+  WriteFileResult,
 } from "./types";
 
 /** Empty base = same origin. Vite proxies /api and /auth to the controller in development. */
@@ -162,6 +174,70 @@ export const httpApi: FleetApi = {
     }),
 
   logs: (id, tail) => request<string>(`/api/instances/${encodeURIComponent(id)}/logs?tail=${tail}`),
+
+  listFiles: (id, path) =>
+    request<FileEntry[]>(`/api/instances/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`),
+
+  readFile: (id, path) =>
+    request<FileContent>(
+      `/api/instances/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(path)}`,
+    ),
+
+  writeFile: (id, input: WriteFileInput) => {
+    const query = input.restart ? "?restart=true" : "";
+    const headers: Record<string, string> = {};
+    if (input.force) {
+      // `*` means "the file must exist, any version": the documented override.
+      headers["If-Match"] = "*";
+    }
+    return request<WriteFileResult>(`/api/instances/${encodeURIComponent(id)}/files/content${query}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        path: input.path,
+        content: input.content,
+        etag: input.force ? undefined : (input.etag ?? undefined),
+      }),
+    });
+  },
+
+  deleteFile: (id, path) =>
+    request<void>(
+      `/api/instances/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(path)}`,
+      { method: "DELETE" },
+    ),
+
+  mkdir: (id, path) =>
+    request<MkdirResult>(`/api/instances/${encodeURIComponent(id)}/files/mkdir`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
+
+  gitLog: (id, options: GitLogOptions = {}) => {
+    const query = new URLSearchParams();
+    if (options.path) query.set("path", options.path);
+    if (options.limit) query.set("limit", String(options.limit));
+    const params = query.toString();
+    const suffix = params ? `?${params}` : "";
+    return request<GitLog>(`/api/instances/${encodeURIComponent(id)}/git/log${suffix}`);
+  },
+
+  gitDiff: (id, options: GitDiffOptions = {}) => {
+    const query = new URLSearchParams();
+    if (options.from) query.set("from", options.from);
+    if (options.to) query.set("to", options.to);
+    const params = query.toString();
+    const suffix = params ? `?${params}` : "";
+    return request<GitDiff>(`/api/instances/${encodeURIComponent(id)}/git/diff${suffix}`);
+  },
+
+  gitStatus: (id) => request<GitStatus>(`/api/instances/${encodeURIComponent(id)}/git/status`),
+
+  gitRevert: (id, input: RevertInput) =>
+    request<RevertResult>(`/api/instances/${encodeURIComponent(id)}/git/revert`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 
   listShares: () => request<Share[]>("/api/shares"),
 

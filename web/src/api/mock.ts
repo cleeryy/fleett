@@ -5,24 +5,38 @@ import type {
   AuthMode,
   ChannelType,
   CloneInstanceInput,
+  CommitInfo,
   CreateInstanceInput,
   CreateTokenInput,
   CreatedToken,
   EnvInput,
+  FileContent,
+  FileEntry,
   FleetApi,
+  GitDiff,
+  GitDiffOptions,
+  GitLog,
+  GitLogOptions,
+  GitStatus,
   Health,
   Identity,
   InstanceDetail,
   InstanceStatus,
   InstanceSummary,
   LifecycleResult,
+  MkdirResult,
   PatchInstanceInput,
+  RevertInput,
+  RevertResult,
   Role,
   Share,
   ShareMode,
   Template,
   TokenInfo,
+  WriteFileInput,
+  WriteFileResult,
 } from "./types";
+import { toPatch } from "@/lib/diff";
 import { tokenStore } from "@/lib/token";
 import { isValidSlug } from "@/lib/validation";
 
@@ -541,6 +555,555 @@ function seedRow(input: {
   return row;
 }
 
+// ---------------------------------------------------------------------------
+// instance files and history (docs/FILES.md, docs/GIT.md)
+//
+// A small in-memory tree per instance plus a one-commit-per-save history. It
+// mirrors the controller closely enough to exercise every screen state: etags,
+// rendered files, read-only extensions, drift and revert.
+
+const EDITABLE_EXTENSIONS = ["md", "yaml", "yml", "json", "txt", "toml"];
+const MAX_CONTENT_BYTES = 512 * 1024;
+const RENDERED_NOTE =
+  "this file is rendered by fleett from the instance configuration; a manual edit is overwritten on the next PATCH, so change the instance instead";
+
+interface MockFile {
+  content: string;
+  mtime: number;
+  rendered: boolean;
+}
+
+interface MockFs {
+  files: Map<string, MockFile>;
+  dirs: Set<string>;
+}
+
+interface MockCommit {
+  info: CommitInfo;
+  /** Repository relative path -> content, as of that commit. */
+  files: Record<string, string>;
+}
+
+interface MockRepo {
+  commits: MockCommit[];
+}
+
+interface MockAuthor {
+  name: string;
+  email: string;
+}
+
+const filesystems = new Map<string, MockFs>();
+const repositories = new Map<string, MockRepo>();
+
+let auditSeq = 1000;
+let commitSeq = 0;
+
+function recordAudit(
+  identity: Identity,
+  action: string,
+  target: string,
+  details?: unknown,
+): void {
+  auditSeq += 1;
+  audit.unshift({
+    id: auditSeq,
+    at: nowIso(),
+    actor: identity.actor,
+    role: identity.role,
+    method: identity.method,
+    action,
+    target,
+    ip: identity.method === "session" ? "10.1.20.5" : null,
+    details,
+  });
+}
+
+const textEncoder = new TextEncoder();
+
+function byteLength(text: string): number {
+  return textEncoder.encode(text).length;
+}
+
+function isoSecond(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** 64 lowercase hex characters, like the SHA-256 the controller returns. */
+function mockEtag(text: string): string {
+  const hash32 = (seed: number): number => {
+    let hash = 0x811c9dc5 ^ seed;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return hash >>> 0;
+  };
+  let out = "";
+  for (let seed = 0; seed < 8; seed += 1) {
+    out += hash32(seed * 0x9e3779b9).toString(16).padStart(8, "0");
+  }
+  return out;
+}
+
+function parentPath(path: string): string {
+  if (path === "/") return "/";
+  const index = path.lastIndexOf("/");
+  return index <= 0 ? "/" : path.slice(0, index);
+}
+
+function baseName(path: string): string {
+  if (path === "/") return "/";
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+function normalizeVirtual(raw: string | null | undefined): string {
+  const value = (raw ?? "/").trim();
+  if (!value) return "/";
+  if (!value.startsWith("/")) {
+    fail(400, "invalid_path", "paths are virtual and must start with \"/\"");
+  }
+  if (value.includes("\0")) {
+    fail(400, "invalid_path", "a path cannot contain a NUL byte");
+  }
+  if (value.split("/").some((segment) => segment === "..")) {
+    fail(400, "invalid_path", "\"..\" is not allowed in a virtual path");
+  }
+  const segments = value.split("/").filter((segment) => segment !== "" && segment !== ".");
+  return `/${segments.join("/")}`;
+}
+
+function repoPathFor(virtualPath: string): string {
+  return virtualPath === "/" ? "data" : `data${virtualPath}`;
+}
+
+function virtualForRepo(repoPath: string): string {
+  return repoPath.startsWith("data/") ? repoPath.slice(4) : "/";
+}
+
+function resolveRepoPath(raw: string): string {
+  const value = raw.trim();
+  if (value.startsWith("data/")) return value;
+  return repoPathFor(normalizeVirtual(value));
+}
+
+function isEditablePath(path: string): boolean {
+  const name = baseName(path);
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return false;
+  return EDITABLE_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase());
+}
+
+function isRenderedPath(path: string): boolean {
+  return path === "/config.yaml" || path === "/healthcheck.py";
+}
+
+/** Mirrors `history::is_tracked`: the editor allowlist minus runtime files. */
+function isTrackedRepoPath(repoPath: string): boolean {
+  if (!repoPath.startsWith("data/")) return false;
+  const relative = repoPath.slice(5);
+  const segments = relative.split("/");
+  if (segments.some((segment) => ["logs", "sessions", "node_modules", "__pycache__"].includes(segment))) {
+    return false;
+  }
+  const name = segments[segments.length - 1] ?? "";
+  if (name === "healthcheck.py" || name === "secrets.env") return false;
+  if (name.includes(".bak-")) return false;
+  const virtual = `/${relative}`;
+  if (virtual === "/SOUL.md" || virtual === "/config.yaml") return true;
+  return isEditablePath(virtual);
+}
+
+function createFs(): MockFs {
+  return { files: new Map(), dirs: new Set(["/"]) };
+}
+
+function ensureDir(fs: MockFs, path: string): void {
+  let current = path;
+  for (;;) {
+    fs.dirs.add(current);
+    if (current === "/") break;
+    current = parentPath(current);
+  }
+}
+
+function putFile(fs: MockFs, path: string, content: string, mtime: number, rendered = false): void {
+  ensureDir(fs, parentPath(path));
+  fs.files.set(path, { content, mtime, rendered });
+}
+
+function directoryMtime(fs: MockFs, path: string): number {
+  let newest = SEEDED_AT - 30 * DAY;
+  for (const [filePath, file] of fs.files) {
+    if (parentPath(filePath) === path) newest = Math.max(newest, file.mtime);
+  }
+  for (const dir of fs.dirs) {
+    if (dir !== path && parentPath(dir) === path) newest = Math.max(newest, directoryMtime(fs, dir));
+  }
+  return newest;
+}
+
+function listDirectory(fs: MockFs, directory: string): FileEntry[] {
+  const entries: FileEntry[] = [];
+  for (const candidate of fs.dirs) {
+    if (candidate === "/" || parentPath(candidate) !== directory) continue;
+    entries.push({
+      name: baseName(candidate),
+      path: candidate,
+      type: "dir",
+      size: 4096,
+      mtime: isoSecond(directoryMtime(fs, candidate)),
+      editable: false,
+      rendered: false,
+    });
+  }
+  for (const [filePath, file] of fs.files) {
+    if (parentPath(filePath) !== directory) continue;
+    entries.push({
+      name: baseName(filePath),
+      path: filePath,
+      type: "file",
+      size: byteLength(file.content),
+      mtime: isoSecond(file.mtime),
+      editable: isEditablePath(filePath) && !file.rendered,
+      rendered: file.rendered,
+    });
+  }
+  return entries.sort((left, right) => {
+    if (left.type !== right.type) return left.type === "dir" ? -1 : 1;
+    return left.name.toLowerCase().localeCompare(right.name.toLowerCase());
+  });
+}
+
+function trackedSnapshot(fs: MockFs): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  for (const [path, file] of fs.files) {
+    const repoPath = repoPathFor(path);
+    if (!isTrackedRepoPath(repoPath)) continue;
+    snapshot[repoPath] = file.content;
+  }
+  return snapshot;
+}
+
+function diffPaths(before: Record<string, string>, after: Record<string, string>): string[] {
+  const paths = new Set([...Object.keys(before), ...Object.keys(after)]);
+  return [...paths].filter((path) => before[path] !== after[path]).sort();
+}
+
+function authorFor(identity: Identity): MockAuthor {
+  const name = identity.user?.name?.trim();
+  const email = identity.user?.email?.trim();
+  if (name || email) {
+    return { name: name || email || identity.actor, email: email || `${identity.actor}@fleett.local` };
+  }
+  return { name: identity.actor, email: `${identity.actor}@fleett.local` };
+}
+
+function commitMessage(kind: "ui" | "sync", paths: string[]): string {
+  const head = paths[0] ?? "";
+  const extra = paths.length > 1 ? ` (+${paths.length - 1} more)` : "";
+  return `${kind}: ${head}${extra}`;
+}
+
+function commitId(seed: string): string {
+  commitSeq += 1;
+  return mockEtag(`${seed}:${commitSeq}`).slice(0, 40);
+}
+
+function repoFor(id: string): MockRepo {
+  const existing = repositories.get(id);
+  if (existing) return existing;
+  fsFor(id);
+  const created: MockRepo = { commits: [] };
+  repositories.set(id, created);
+  return created;
+}
+
+function recordCommit(
+  id: string,
+  fs: MockFs,
+  author: MockAuthor,
+  kind: "ui" | "sync",
+): CommitInfo | null {
+  const repo = repoFor(id);
+  const snapshot = trackedSnapshot(fs);
+  const head = repo.commits[0];
+  const changed = diffPaths(head?.files ?? {}, snapshot);
+  if (changed.length === 0) return null;
+
+  const message = commitMessage(kind, changed);
+  const at = isoSecond(Date.now());
+  const fullId = commitId(`${id}:${message}:${at}`);
+  const info: CommitInfo = {
+    id: fullId,
+    short: fullId.slice(0, 7),
+    author: author.name,
+    email: author.email,
+    at,
+    message,
+    paths: changed,
+  };
+  repo.commits.unshift({ info, files: snapshot });
+  return info;
+}
+
+/** Record one save/delete in the instance history, like `history::record_ui_write`. */
+function recordUiWrite(id: string, fs: MockFs, identity: Identity, virtualPath: string): void {
+  const repoPath = repoPathFor(virtualPath);
+  if (!isTrackedRepoPath(repoPath)) return;
+  recordCommit(id, fs, authorFor(identity), "ui");
+}
+
+function backupStamp(): string {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}` +
+    `-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`
+  );
+}
+
+function nextBackupPath(fs: MockFs, path: string): string {
+  const base = `${path}.bak-${backupStamp()}`;
+  let candidate = base;
+  let index = 1;
+  while (fs.files.has(candidate)) {
+    candidate = `${base}-${index}`;
+    index += 1;
+  }
+  return candidate;
+}
+
+function resolveCommit(commits: MockCommit[], revision: string | undefined): MockCommit | undefined {
+  if (!revision || !revision.trim()) return commits[0];
+  const value = revision.trim();
+  const head = /^HEAD(?:~(\d+))?$/.exec(value);
+  if (head) return commits[Number(head[1] ?? 0)];
+  return commits.find((commit) => commit.info.id === value || commit.info.id.startsWith(value));
+}
+
+function buildDiff(before: Record<string, string>, after: Record<string, string>): string {
+  const paths = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+  return paths.map((path) => toPatch(path, before[path] ?? "", after[path] ?? "")).join("");
+}
+
+function copyCommit(info: CommitInfo): CommitInfo {
+  return { ...info, paths: [...info.paths] };
+}
+
+// --- seeded content -------------------------------------------------------
+
+function templateLine(template: string): string {
+  if (template === "family") return "the family assistant";
+  if (template === "ops") return "an operations assistant";
+  if (template === "sandbox") return "a disposable sandbox assistant";
+  return "a patient research assistant";
+}
+
+function soulText(row: Stored, withBoundaries = true): string {
+  const lines = [
+    "# SOUL",
+    "",
+    `You are ${row.name}, ${templateLine(row.template)}.`,
+    "",
+    "## Voice",
+    "- Answer in the user's language, French or English.",
+    "- Short paragraphs. No filler, no flattery.",
+    '- Say "I do not know" before guessing.',
+    "",
+    "## Scope",
+    row.channel === "none"
+      ? "- Web search, memory and the files in this home. No shell, no Docker."
+      : `- Web search, memory and the ${row.channel} channel. No shell, no Docker.`,
+    "- Read shared folders read-only unless the share is mounted rw.",
+  ];
+  if (withBoundaries) {
+    lines.push(
+      "",
+      "## Boundaries",
+      "- Never echo a token, a key or a private URL.",
+      "- Ask before writing outside /opt/data.",
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function configText(row: Stored): string {
+  const channel =
+    row.channel === "none"
+      ? ["channel:", "  type: none"]
+      : [
+          "channel:",
+          `  type: ${row.channel}`,
+          `  token_env: ${row.channel === "telegram" ? "TELEGRAM_BOT_TOKEN" : "DISCORD_BOT_TOKEN"}`,
+        ];
+  return [
+    "# Rendered by fleett from the instance configuration.",
+    "# A manual edit is overwritten on the next PATCH: change the instance instead.",
+    `profile: ${row.id}`,
+    `model: ${row.model}`,
+    `base_url: ${row.base_url}`,
+    ...channel,
+    "memory:",
+    "  backend: sqlite",
+    "  path: /opt/data/state.db",
+    "tools:",
+    "  - web.search",
+    "  - memory.write",
+    "  - file.read",
+    "logging:",
+    "  level: info",
+    "",
+  ].join("\n");
+}
+
+const HEALTHCHECK_SCRIPT = [
+  "#!/usr/bin/env python3",
+  '"""Probe used by the container healthcheck. Rendered by fleett."""',
+  "import json",
+  "import socket",
+  "import sys",
+  "",
+  'SOCKET = "/opt/data/gateway.sock"',
+  "",
+  "def main() -> int:",
+  "    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+  "    client.settimeout(2)",
+  "    try:",
+  "        client.connect(SOCKET)",
+  '        client.sendall(b"identify\\n")',
+  '        reply = client.recv(256).decode("utf-8", "replace")',
+  "    except OSError as error:",
+  '        print(json.dumps({"ok": False, "error": str(error)}))',
+  "        return 1",
+  "    finally:",
+  "        client.close()",
+  '    print(json.dumps({"ok": reply.startswith("hermes")}))',
+  "    return 0",
+  "",
+  'if __name__ == "__main__":',
+  "    sys.exit(main())",
+  "",
+].join("\n");
+
+const NOTE_V1 = ["# Weekly summary", "", "Run every Friday at 17:00.", ""].join("\n");
+
+const NOTE_V2 = [
+  "# Weekly summary",
+  "",
+  "Run every Friday at 17:00.",
+  "",
+  "- Pull the week's sessions from memory.",
+  "- Group by project, not by day.",
+  "",
+].join("\n");
+
+const NOTE_V3 = [
+  "# Weekly summary",
+  "",
+  "Run every Friday at 17:00.",
+  "",
+  "- Pull the week's sessions from memory.",
+  "- Group by project, not by day.",
+  "- Send one message per project, with the links.",
+  "",
+].join("\n");
+
+function gatewayLog(row: Stored): string {
+  const base = SEEDED_AT - 20 * 60_000;
+  return (
+    [
+      logLine(base, "INFO", "hermes 0.22.2 starting"),
+      logLine(base + 180, "INFO", `profile=${row.id} model=${row.model}`),
+      logLine(base + 420, "INFO", "gateway listening on 127.0.0.1:9119"),
+      logLine(base + 900, "INFO", "scheduler started (cti every 15m)"),
+    ].join("\n") + "\n"
+  );
+}
+
+function pushSeedCommit(
+  repo: MockRepo,
+  row: Stored,
+  files: Record<string, string>,
+  kind: "ui" | "sync",
+  author: string,
+  email: string,
+  atMs: number,
+): void {
+  const changed = diffPaths(repo.commits[0]?.files ?? {}, files);
+  const message = commitMessage(kind, changed);
+  const fullId = commitId(`${row.id}:${message}:${atMs}`);
+  repo.commits.unshift({
+    info: {
+      id: fullId,
+      short: fullId.slice(0, 7),
+      author,
+      email,
+      at: isoSecond(atMs),
+      message,
+      paths: changed,
+    },
+    files,
+  });
+}
+
+function seedInstanceData(row: Stored, history: "demo" | "fresh"): void {
+  const fs = createFs();
+  const base = SEEDED_AT - 3 * DAY;
+  putFile(fs, "/SOUL.md", soulText(row), SEEDED_AT - 2 * DAY);
+  putFile(fs, "/config.yaml", configText(row), base, true);
+  putFile(fs, "/healthcheck.py", HEALTHCHECK_SCRIPT, base, true);
+  putFile(fs, "/skills/note.md", NOTE_V3, SEEDED_AT - 30 * 60_000);
+  putFile(fs, "/logs/gateway.log", gatewayLog(row), SEEDED_AT - 15 * 60_000);
+  filesystems.set(row.id, fs);
+
+  const repo: MockRepo = { commits: [] };
+  repositories.set(row.id, repo);
+
+  if (history === "demo") {
+    const first = {
+      ...trackedSnapshot(fs),
+      "data/SOUL.md": soulText(row, false),
+      "data/skills/note.md": NOTE_V1,
+    };
+    const second = { ...first, "data/SOUL.md": soulText(row) };
+    const third = { ...second, "data/skills/note.md": NOTE_V2 };
+    pushSeedCommit(repo, row, first, "sync", "fleett", "fleett@localhost", base);
+    pushSeedCommit(repo, row, second, "ui", "Cleeryy", "cleeryy@example.com", base + DAY);
+    pushSeedCommit(
+      repo,
+      row,
+      third,
+      "ui",
+      "Cleeryy",
+      "cleeryy@example.com",
+      SEEDED_AT - 40 * 60_000,
+    );
+    return;
+  }
+
+  const snapshot = trackedSnapshot(fs);
+  pushSeedCommit(repo, row, snapshot, "sync", "fleett", "fleett@localhost", base);
+}
+
+function fsFor(id: string): MockFs {
+  const existing = filesystems.get(id);
+  if (existing) return existing;
+  const row = findRow(id);
+  seedInstanceData(row, "fresh");
+  return filesystems.get(id) as MockFs;
+}
+
+function cloneInstanceData(sourceId: string, targetId: string): void {
+  const source = fsFor(sourceId);
+  const copy = createFs();
+  for (const dir of source.dirs) copy.dirs.add(dir);
+  for (const [path, file] of source.files) copy.files.set(path, { ...file });
+  filesystems.set(targetId, copy);
+  repositories.set(targetId, { commits: [] });
+  recordCommit(targetId, copy, { name: "fleett", email: "fleett@localhost" }, "sync");
+}
+
 export function resetMock(): void {
   const telegramEnv = [
     {
@@ -787,6 +1350,10 @@ export function resetMock(): void {
       target: "alice",
     },
   ];
+
+  filesystems.clear();
+  repositories.clear();
+  for (const row of rows) seedInstanceData(row, "demo");
 }
 
 resetMock();
@@ -1068,6 +1635,7 @@ export const mockApi: FleetApi = {
     row.logs = makeLogs(row);
     rows.unshift(row);
     for (const share of row.shares) attachToShare(share.name, id, share.mode);
+    seedInstanceData(row, "fresh");
     return toDetail(row);
   },
 
@@ -1163,6 +1731,11 @@ export const mockApi: FleetApi = {
     );
     rows.unshift(row);
     for (const share of row.shares) attachToShare(share.name, newId, share.mode);
+    if (copyData) {
+      cloneInstanceData(id, newId);
+    } else {
+      seedInstanceData(row, "fresh");
+    }
     return toDetail(row);
   },
 
@@ -1311,6 +1884,8 @@ export const mockApi: FleetApi = {
     const row = findRow(id);
     for (const share of row.shares) detachFromShare(share.name, id);
     rows = rows.filter((candidate) => candidate.id !== id);
+    filesystems.delete(id);
+    repositories.delete(id);
   },
 
   async logs(id, tail): Promise<string> {
@@ -1319,6 +1894,331 @@ export const mockApi: FleetApi = {
     const row = findRow(id);
     const count = Number.isFinite(tail) && tail > 0 ? Math.min(tail, 5000) : 200;
     return row.logs.slice(-count).join("\n");
+  },
+
+  async listFiles(id: string, path: string): Promise<FileEntry[]> {
+    requireAuth();
+    await delay(140);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(path);
+    if (fs.files.has(target)) {
+      fail(400, "not_a_directory", `"${target}" is a file`);
+    }
+    if (!fs.dirs.has(target)) {
+      fail(404, "not_found", `"${target}" does not exist`);
+    }
+    return listDirectory(fs, target);
+  },
+
+  async readFile(id: string, path: string): Promise<FileContent> {
+    requireAuth();
+    await delay(120);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(path);
+    const file = fs.files.get(target);
+    if (!file) {
+      if (fs.dirs.has(target)) {
+        fail(400, "not_a_file", `"${target}" is a directory`);
+      }
+      fail(404, "not_found", `"${target}" does not exist`);
+    }
+    return {
+      path: target,
+      content: file.content,
+      etag: mockEtag(file.content),
+      size: byteLength(file.content),
+      mtime: isoSecond(file.mtime),
+      editable: isEditablePath(target) && !file.rendered,
+      rendered: file.rendered,
+      ...(file.rendered ? { note: RENDERED_NOTE } : {}),
+    };
+  },
+
+  async writeFile(id: string, input: WriteFileInput): Promise<WriteFileResult> {
+    const identity = requireWrite();
+    await delay(260);
+    const row = findRow(id);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(input.path);
+
+    if (target === "/") {
+      fail(400, "not_a_file", "the data directory itself cannot be edited");
+    }
+    const existing = fs.files.get(target);
+    if (fs.dirs.has(target)) {
+      fail(400, "not_a_file", `"${target}" is a directory`);
+    }
+    if (existing?.rendered || isRenderedPath(target)) {
+      fail(409, "file_regenerated", `"${target}" is rendered by fleett and cannot be edited here`, {
+        file: target,
+        rendered: true,
+        hint: RENDERED_NOTE,
+      });
+    }
+    if (!isEditablePath(target)) {
+      fail(
+        409,
+        "file_not_editable",
+        `"${target}" is read-only: only ${EDITABLE_EXTENSIONS.map((ext) => `.${ext}`).join(", ")} files are editable`,
+        { file: target, extensions: EDITABLE_EXTENSIONS },
+      );
+    }
+    const size = byteLength(input.content);
+    if (size > MAX_CONTENT_BYTES) {
+      fail(413, "file_too_large", `the file is ${size} bytes, above the ${MAX_CONTENT_BYTES}-byte limit of the editor`, {
+        size,
+        limit: MAX_CONTENT_BYTES,
+      });
+    }
+    if (input.content.includes("\0")) {
+      fail(415, "binary_file", "the content must not contain a NUL byte");
+    }
+    const parent = parentPath(target);
+    if (!fs.dirs.has(parent)) {
+      fail(404, "not_found", `the folder "${parent}" does not exist`);
+    }
+
+    const current = existing ? mockEtag(existing.content) : null;
+    const expected = (input.etag ?? "").trim();
+    const matches = input.force
+      ? current !== null
+      : existing
+        ? expected === current
+        : expected === "";
+    if (!matches) {
+      fail(409, "etag_mismatch", "the file changed since it was loaded: reload it and retry", {
+        current,
+      });
+    }
+
+    let backup: string | undefined;
+    if (existing) {
+      backup = nextBackupPath(fs, target);
+      fs.files.set(backup, { content: existing.content, mtime: Date.now(), rendered: false });
+    }
+    const writtenAt = Date.now();
+    fs.files.set(target, { content: input.content, mtime: writtenAt, rendered: false });
+    recordUiWrite(id, fs, identity, target);
+    recordAudit(identity, "instance.file.write", row.id, {
+      path: target,
+      size,
+      backup: backup ?? null,
+      restart: input.restart === true,
+    });
+
+    const result: WriteFileResult = {
+      path: target,
+      etag: mockEtag(input.content),
+      size,
+      mtime: isoSecond(writtenAt),
+      editable: true,
+      rendered: false,
+      restarted: false,
+    };
+    if (backup) result.backup = backup;
+
+    if (input.restart) {
+      row.status = "running";
+      row.started_at = Date.now();
+      row.updated_at = nowIso();
+      row.last_error = null;
+      row.logs.push(logLine(Date.now(), "INFO", `restarted after ${target} edit`));
+      result.restarted = true;
+      result.status = row.status;
+    }
+    return result;
+  },
+
+  async deleteFile(id: string, path: string): Promise<void> {
+    const identity = requireWrite();
+    await delay(200);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(path);
+    if (target === "/") {
+      fail(400, "not_a_file", "the data directory itself cannot be deleted");
+    }
+
+    const file = fs.files.get(target);
+    if (file) {
+      if (file.rendered) {
+        fail(409, "file_regenerated", `"${target}" is rendered by fleett and cannot be deleted`, {
+          file: target,
+          rendered: true,
+          hint: RENDERED_NOTE,
+        });
+      }
+      fs.files.delete(target);
+      recordUiWrite(id, fs, identity, target);
+      recordAudit(identity, "instance.file.delete", id, { path: target });
+      return;
+    }
+
+    if (fs.dirs.has(target)) {
+      const occupied =
+        [...fs.files.keys()].some((candidate) => parentPath(candidate) === target) ||
+        [...fs.dirs].some((candidate) => candidate !== target && parentPath(candidate) === target);
+      if (occupied) {
+        fail(409, "directory_not_empty", `"${target}" still holds entries: delete them first`);
+      }
+      fs.dirs.delete(target);
+      recordAudit(identity, "instance.file.delete", id, { path: target });
+      return;
+    }
+
+    fail(404, "not_found", `"${target}" does not exist`);
+  },
+
+  async mkdir(id: string, path: string): Promise<MkdirResult> {
+    const identity = requireWrite();
+    await delay(180);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(path);
+    if (target === "/") {
+      fail(409, "already_exists", "the data directory already exists");
+    }
+    if (fs.dirs.has(target) || fs.files.has(target)) {
+      fail(409, "already_exists", `"${target}" already exists`);
+    }
+    const parent = parentPath(target);
+    if (!fs.dirs.has(parent)) {
+      fail(404, "not_found", `the folder "${parent}" does not exist`);
+    }
+    ensureDir(fs, target);
+    recordAudit(identity, "instance.file.mkdir", id, { path: target });
+    return { path: target, type: "dir" };
+  },
+
+  async gitLog(id: string, options: GitLogOptions = {}): Promise<GitLog> {
+    requireAuth();
+    await delay(140);
+    const repo = repoFor(id);
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      fail(400, "invalid_limit", "limit must be between 1 and 500");
+    }
+    let commits = repo.commits;
+    if (options.path && options.path.trim()) {
+      const wanted = resolveRepoPath(options.path);
+      if (!isTrackedRepoPath(wanted)) {
+        fail(400, "untracked_path", `"${options.path}" is not versioned`);
+      }
+      commits = commits.filter((commit) => commit.info.paths.includes(wanted));
+    }
+    return { commits: commits.slice(0, limit).map((commit) => copyCommit(commit.info)) };
+  },
+
+  async gitDiff(id: string, options: GitDiffOptions = {}): Promise<GitDiff> {
+    requireAuth();
+    await delay(160);
+    const repo = repoFor(id);
+    if (repo.commits.length === 0) {
+      return { from: "", to: "", diff: "" };
+    }
+    const to = resolveCommit(repo.commits, options.to);
+    if (!to) {
+      fail(404, "not_found", `commit "${options.to}" does not exist`);
+    }
+    let from: MockCommit | undefined;
+    if (options.from && options.from.trim()) {
+      from = resolveCommit(repo.commits, options.from);
+      if (!from) {
+        fail(404, "not_found", `commit "${options.from}" does not exist`);
+      }
+    } else {
+      from = repo.commits[repo.commits.indexOf(to) + 1];
+    }
+    return {
+      from: from?.info.id ?? "",
+      to: to.info.id,
+      diff: buildDiff(from?.files ?? {}, to.files),
+    };
+  },
+
+  async gitStatus(id: string): Promise<GitStatus> {
+    requireAuth();
+    await delay(140);
+    const repo = repoFor(id);
+    const fs = fsFor(id);
+    const head = repo.commits[0]?.files ?? {};
+    const current = trackedSnapshot(fs);
+    const modified = Object.keys(head)
+      .filter((path) => current[path] !== head[path])
+      .sort();
+    const untracked = Object.keys(current)
+      .filter((path) => !(path in head))
+      .sort();
+    return { modified, untracked };
+  },
+
+  async gitRevert(id: string, input: RevertInput): Promise<RevertResult> {
+    const identity = requireWrite();
+    await delay(320);
+    const row = findRow(id);
+    const repo = repoFor(id);
+    const fs = fsFor(id);
+    const target = resolveCommit(repo.commits, input.commit);
+    if (!target) {
+      fail(404, "not_found", `commit "${input.commit}" does not exist`);
+    }
+
+    const requested = (input.paths && input.paths.length > 0 ? input.paths : target.info.paths).map(
+      resolveRepoPath,
+    );
+    for (const repoPath of requested) {
+      if (!isTrackedRepoPath(repoPath)) {
+        fail(400, "untracked_path", `"${repoPath}" is not versioned`);
+      }
+    }
+
+    const restored: string[] = [];
+    const stamp = Date.now();
+    for (const repoPath of requested) {
+      const virtualPath = virtualForRepo(repoPath);
+      const desired = target.files[repoPath];
+      const current = fs.files.get(virtualPath);
+
+      if (desired === undefined) {
+        if (!current) continue;
+        fs.files.set(nextBackupPath(fs, virtualPath), { ...current, mtime: stamp });
+        fs.files.delete(virtualPath);
+        restored.push(repoPath);
+        continue;
+      }
+      if (current && current.content === desired) continue;
+      if (current) {
+        fs.files.set(nextBackupPath(fs, virtualPath), { ...current, mtime: stamp });
+      }
+      ensureDir(fs, parentPath(virtualPath));
+      fs.files.set(virtualPath, {
+        content: desired,
+        mtime: stamp,
+        rendered: isRenderedPath(virtualPath),
+      });
+      restored.push(repoPath);
+    }
+
+    const commit = recordCommit(id, fs, authorFor(identity), "ui");
+    let restarted = false;
+    if (input.restart) {
+      row.status = "running";
+      row.started_at = Date.now();
+      row.updated_at = nowIso();
+      row.last_error = null;
+      row.logs.push(logLine(Date.now(), "INFO", `restarted after restoring ${target.info.short}`));
+      restarted = true;
+    }
+    recordAudit(identity, "instance.git.revert", row.id, {
+      source: target.info.id,
+      paths: restored,
+      commit: commit?.id ?? null,
+    });
+    return {
+      source: target.info.id,
+      paths: restored,
+      commit,
+      restarted,
+      status: row.status,
+    };
   },
 
   async listShares(): Promise<Share[]> {

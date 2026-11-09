@@ -246,6 +246,141 @@ export interface LifecycleResult {
   status: InstanceStatus;
 }
 
+/* --------------------------------------------------------------------------
+ * Instance files (docs/FILES.md)
+ * -------------------------------------------------------------------------- */
+
+export type FileKind = "file" | "dir";
+
+/** One directory level of the agent home, paths rooted at the data directory. */
+export interface FileEntry {
+  name: string;
+  path: string;
+  type: FileKind;
+  /** Bytes on disk; a directory reports its own size and is never editable. */
+  size: number;
+  /** RFC 3339, second precision. */
+  mtime: string;
+  editable: boolean;
+  /** fleett rewrites this file on the next PATCH; a write is refused. */
+  rendered: boolean;
+}
+
+export interface FileContent {
+  path: string;
+  content: string;
+  /** Lowercase SHA-256 of the bytes on disk, 64 characters. */
+  etag: string;
+  size: number;
+  mtime: string;
+  editable: boolean;
+  rendered: boolean;
+  /** Present for rendered files: why a manual write would be lost. */
+  note?: string;
+}
+
+export interface WriteFileInput {
+  path: string;
+  content: string;
+  /**
+   * Version the editor loaded. Omit (or send an empty string) to create a new
+   * file; an existing file without an etag is a conflict.
+   */
+  etag?: string | null;
+  /** Write, then restart the instance. Defaults to false. */
+  restart?: boolean;
+  /**
+   * Admin override, sent as `If-Match: *`: overwrite whatever is on disk even
+   * though another version was loaded. The previous bytes go to a `.bak`.
+   */
+  force?: boolean;
+}
+
+export interface WriteFileResult {
+  path: string;
+  etag: string;
+  size: number;
+  mtime: string;
+  editable: boolean;
+  rendered: boolean;
+  /** Virtual path of the timestamped `.bak` copy, when one was written. */
+  backup?: string;
+  restarted: boolean;
+  status?: string;
+}
+
+export interface MkdirResult {
+  path: string;
+  type: "dir";
+}
+
+/* --------------------------------------------------------------------------
+ * Instance history (docs/GIT.md)
+ * -------------------------------------------------------------------------- */
+
+export interface CommitInfo {
+  id: string;
+  /** First seven characters of `id`. */
+  short: string;
+  author: string;
+  email: string;
+  /** RFC 3339 UTC, second precision. */
+  at: string;
+  message: string;
+  /** Paths changed against the first parent, repository relative. */
+  paths: string[];
+}
+
+export interface GitLog {
+  commits: CommitInfo[];
+}
+
+export interface GitDiff {
+  /** Empty when the range starts at the empty tree (root commit). */
+  from: string;
+  /** Empty when the instance has no history. */
+  to: string;
+  diff: string;
+}
+
+/** Work tree against `HEAD`, whitelist only. */
+export interface GitStatus {
+  modified: string[];
+  untracked: string[];
+}
+
+export interface GitLogOptions {
+  /** Repository (`data/SOUL.md`) or virtual (`/SOUL.md`) path. */
+  path?: string;
+  /** 1..500, defaults to 50. */
+  limit?: number;
+}
+
+export interface GitDiffOptions {
+  /** Defaults to the first parent of `to`. */
+  from?: string;
+  /** Defaults to `HEAD`. */
+  to?: string;
+}
+
+export interface RevertInput {
+  /** Full id, short id or any revision `HEAD~2` resolves. */
+  commit: string;
+  /** Paths to restore; omitted restores every path the commit changed. */
+  paths?: string[];
+  restart?: boolean;
+}
+
+export interface RevertResult {
+  source: string;
+  /** Repository relative paths actually restored or removed. */
+  paths: string[];
+  /** Commit recording the restore; `null` when nothing changed. */
+  commit: CommitInfo | null;
+  restarted: boolean;
+  status: string;
+}
+
 export interface FleetApi {
   health(): Promise<Health>;
   /** Public: which login methods the controller advertises. */
@@ -270,6 +405,16 @@ export interface FleetApi {
   action(id: string, action: "start" | "stop" | "restart"): Promise<LifecycleResult>;
   deleteInstance(id: string, purge: boolean): Promise<void>;
   logs(id: string, tail: number): Promise<string>;
+  listFiles(id: string, path: string): Promise<FileEntry[]>;
+  readFile(id: string, path: string): Promise<FileContent>;
+  /** Compare-and-swap write; `restart` restarts, `force` sends `If-Match: *`. */
+  writeFile(id: string, input: WriteFileInput): Promise<WriteFileResult>;
+  deleteFile(id: string, path: string): Promise<void>;
+  mkdir(id: string, path: string): Promise<MkdirResult>;
+  gitLog(id: string, options?: GitLogOptions): Promise<GitLog>;
+  gitDiff(id: string, options?: GitDiffOptions): Promise<GitDiff>;
+  gitStatus(id: string): Promise<GitStatus>;
+  gitRevert(id: string, input: RevertInput): Promise<RevertResult>;
   listShares(): Promise<Share[]>;
   createShare(name: string): Promise<void>;
   deleteShare(name: string): Promise<void>;

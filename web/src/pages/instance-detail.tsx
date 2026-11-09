@@ -44,6 +44,8 @@ import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { InstanceEnvironment } from "@/components/instance-env";
+import { InstanceFiles } from "@/components/instance-files";
+import { InstanceHistory } from "@/components/instance-history";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { SharePicker } from "@/components/share-picker";
@@ -811,6 +813,9 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [tab, setTab] = useState("overview");
+  // The Files tab is mounted on first visit and then kept alive (hidden), so an
+  // unsaved buffer survives a trip to Overview and back.
+  const [filesMounted, setFilesMounted] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ApiError | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -846,6 +851,10 @@ export function InstanceDetailPage({ id }: { id: string }) {
     envResetPending.current = false;
     envServerRef.current = data.env;
   }, [detail.data, envRows]);
+
+  useEffect(() => {
+    if (tab === "files") setFilesMounted(true);
+  }, [tab]);
 
   function handleSaved() {
     configResetPending.current = true;
@@ -997,6 +1006,8 @@ export function InstanceDetailPage({ id }: { id: string }) {
           <TabsList className="w-full justify-start sm:w-fit">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             {canEdit ? <TabsTrigger value="configuration">Configuration</TabsTrigger> : null}
+            <TabsTrigger value="files">Files</TabsTrigger>
+            <TabsTrigger value="history">History</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
             <TabsTrigger value="compose">Compose</TabsTrigger>
           </TabsList>
@@ -1024,10 +1035,30 @@ export function InstanceDetailPage({ id }: { id: string }) {
           </TabsContent>
         ) : null}
 
+        {/* `forceMount` keeps the editor mounted while another tab is shown;
+            the `hidden` class keeps an inactive panel out of the a11y tree. */}
+        <TabsContent
+          value="files"
+          forceMount
+          className={cn("mt-4", tab !== "files" && "hidden")}
+        >
+          {filesMounted ? (
+            <InstanceFiles
+              id={data.id}
+              canEdit={canEdit}
+              active={tab === "files"}
+              onRestarted={() => setNonce((value) => value + 1)}
+            />
+          ) : null}
+        </TabsContent>
+
+        <TabsContent value="history" className="mt-4">
+          <InstanceHistory id={data.id} canEdit={canEdit} />
+        </TabsContent>
+
         <TabsContent value="logs" className="mt-4">
           <LogsTab id={data.id} />
         </TabsContent>
-
         <TabsContent value="compose" className="mt-4 space-y-3">
           <p className="text-sm text-muted-foreground">
             <span className="font-mono">compose.yaml</span> is the source of truth. The controller rewrites it on

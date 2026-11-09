@@ -4,6 +4,18 @@ export function isValidSlug(value: string): boolean {
   return SLUG_RE.test(value);
 }
 
+/** Extensions the instance editor accepts, mirroring `docs/FILES.md`. */
+export const EDITABLE_EXTENSIONS = ["md", "yaml", "yml", "json", "txt", "toml"] as const;
+
+/** Human list for banners and hints. */
+export const EDITABLE_EXTENSIONS_LABEL = ".md, .yaml, .yml, .json, .txt, .toml";
+
+export function isEditableFileName(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return false;
+  return (EDITABLE_EXTENSIONS as readonly string[]).includes(name.slice(dot + 1).toLowerCase());
+}
+
 export function isHttpUrl(value: string): boolean {
   try {
     const url = new URL(value);
