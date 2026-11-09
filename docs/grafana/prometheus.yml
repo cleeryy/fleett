@@ -1,0 +1,27 @@
+# Prometheus configuration for the fleett demo bundle (issue #48).
+#
+# The compose file rewrites the fleett.invalid:8090 and __FLEETT_TOKEN__
+# placeholders into /tmp/prometheus.yml at startup, from ${FLEETT_METRICS_URL}
+# and ${FLEETT_METRICS_TOKEN}. Keeping the placeholders in this tracked file
+# means `promtool check config` can validate it without any environment.
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/fleett-alerts.yaml
+
+scrape_configs:
+  - job_name: fleett
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["fleett.invalid:8090"]
+        labels:
+          environment: demo
+    # Required as soon as the fleett metrics listener is not on loopback:
+    # FLEETT_METRICS_TOKEN must match. An empty value is harmless when the
+    # endpoint does not require a token.
+    authorization:
+      type: Bearer
+      credentials: "__FLEETT_TOKEN__"

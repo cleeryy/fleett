@@ -38,7 +38,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | **Backups** | Rotating host backups, portable instance export/import, restore into a fresh root. |
 | **Upgrades** | Move the whole fleet to a new image: one at a time, health-checked, automatic rollback to the previous tag. |
 | **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit log, named revocable tokens, encrypted secrets, LAN egress firewall, opt-in strict hardening. |
-| **Ops** | Real healthcheck, Prometheus `/metrics`, usage, `fleett doctor`, compose integration in CI. |
+| **Ops** | Real healthcheck, Prometheus `/metrics` with an importable Grafana dashboard and alert rules, usage, `fleett doctor`, compose integration in CI. |
 
 ## Quick start
 

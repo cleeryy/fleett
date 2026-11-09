@@ -17,6 +17,7 @@
 
 use crate::api::AppState;
 use crate::config::VERSION;
+use crate::db::Db;
 use crate::driver::UsageSample;
 use crate::models::{Health, InstanceSpec, Status, HEALTH_UNHEALTHY_MESSAGE};
 use axum::extract::{Request, State};
@@ -25,6 +26,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard};
@@ -117,7 +119,8 @@ impl Metrics {
             }
         };
         let samples = self.usage_samples(state, &specs).await;
-        render(&self.snapshot(&specs, samples.as_ref()))
+        let live = LiveState::read(&state.db);
+        render(&self.snapshot(&specs, samples.as_ref(), &live))
     }
 
     /// Utilisation of the whole fleet, from the cache when it is fresh.
@@ -159,6 +162,7 @@ impl Metrics {
         &self,
         specs: &[InstanceSpec],
         samples: Option<&BTreeMap<String, UsageSample>>,
+        live: &LiveState,
     ) -> Snapshot {
         let rows = specs
             .iter()
@@ -195,6 +199,10 @@ impl Metrics {
             api_requests: counters.api_requests.clone(),
             compose_actions: counters.compose_actions.clone(),
             upgrade_jobs: counters.upgrade_jobs.clone(),
+            restarts: live.restarts.clone(),
+            incidents_open: live.incidents_open,
+            secret_expiry_days: live.secret_expiry_days.clone(),
+            disk_quotas: live.disk_quotas.clone(),
         }
     }
 
@@ -208,6 +216,191 @@ impl Metrics {
         self.usage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Fleet state the control plane reads from the database for a scrape.
+///
+/// Every feature is detected at scrape time: a table or column that a newer
+/// build adds (incidents, disk quotas, secret expiry) never makes the endpoint
+/// fail on an older database. A missing feature yields an empty map, and the
+/// renderer exposes the stable fallback value instead.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LiveState {
+    /// Control-plane restarts per instance, from `audit_log`.
+    pub restarts: BTreeMap<String, u64>,
+    /// Incidents the registry still reports as open (`0` when the registry is
+    /// absent).
+    pub incidents_open: u64,
+    /// Days until the earliest secret expires, per instance. `-1` means the
+    /// expiry is unknown; an instance without secrets has no entry.
+    pub secret_expiry_days: BTreeMap<String, i64>,
+    /// Per-instance disk quota in bytes, when the quota feature is present.
+    pub disk_quotas: BTreeMap<String, u64>,
+}
+
+impl LiveState {
+    /// Read every optional feature from `db`, never failing on a missing one.
+    pub fn read(db: &Db) -> Self {
+        Self {
+            restarts: restart_counts(db),
+            incidents_open: open_incidents(db),
+            secret_expiry_days: secret_expiry_days(db),
+            disk_quotas: disk_quotas(db),
+        }
+    }
+}
+
+/// `PRAGMA table_info(<table>)` columns, empty when the table does not exist.
+fn columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect()
+}
+
+/// Restarts requested through the control plane, per instance.
+///
+/// The audit trail has recorded `instance.restart` since schema v5; a database
+/// created before that has no `audit_log` and simply reports no restarts.
+/// Docker-driven restarts (a crashloop) are not visible here.
+fn restart_counts(db: &Db) -> BTreeMap<String, u64> {
+    match db.with_conn(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT target, COUNT(*) FROM audit_log \
+             WHERE action = 'instance.restart' GROUP BY target",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            row.map(|(target, count)| (target, u64::try_from(count).unwrap_or_default()))
+        })
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+    }) {
+        Ok(counts) => counts,
+        Err(err) => {
+            tracing::debug!(%err, "no restart history available for the metrics scrape");
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Open incidents, when the watchdog's registry exists.
+fn open_incidents(db: &Db) -> u64 {
+    match db.with_conn(|conn| {
+        let columns = columns(conn, "incidents")?;
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        // The registry lands with issue #32; accept the shapes it may take
+        // instead of pinning the scrape to one unreleased schema.
+        let query = if columns.iter().any(|column| column == "resolved_at") {
+            "SELECT COUNT(*) FROM incidents WHERE resolved_at IS NULL"
+        } else if columns.iter().any(|column| column == "closed_at") {
+            "SELECT COUNT(*) FROM incidents WHERE closed_at IS NULL"
+        } else if columns.iter().any(|column| column == "status") {
+            "SELECT COUNT(*) FROM incidents WHERE lower(status) \
+             IN ('open', 'acknowledged', 'investigating')"
+        } else if columns.iter().any(|column| column == "open") {
+            "SELECT COUNT(*) FROM incidents WHERE open = 1"
+        } else {
+            return Ok(0);
+        };
+        conn.query_row(query, [], |row| row.get::<_, i64>(0))
+            .map(|count| u64::try_from(count).unwrap_or_default())
+    }) {
+        Ok(count) => count,
+        Err(err) => {
+            tracing::debug!(%err, "cannot count the open incidents for the metrics scrape");
+            0
+        }
+    }
+}
+
+/// Days until the earliest secret of each instance expires.
+///
+/// The current schema has no expiry column, so every instance holding at least
+/// one encrypted secret reports `-1` ("unknown"). When a later schema adds
+/// `instance_env.expires_at`, the nearest deadline wins. Instances without a
+/// secret are omitted: there is nothing to expire.
+fn secret_expiry_days(db: &Db) -> BTreeMap<String, i64> {
+    match db.with_conn(|conn| {
+        let columns = columns(conn, "instance_env")?;
+        if columns.is_empty() || !columns.iter().any(|column| column == "secret") {
+            return Ok(BTreeMap::new());
+        }
+        let mut ids =
+            conn.prepare("SELECT DISTINCT instance_id FROM instance_env WHERE secret = 1")?;
+        let ids = ids
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut expiries: BTreeMap<String, i64> = ids.into_iter().map(|id| (id, -1)).collect();
+        if columns.iter().any(|column| column == "expires_at") {
+            let mut statement = conn.prepare(
+                "SELECT instance_id, \
+                        MIN(CAST(julianday(expires_at) - julianday('now') AS INTEGER)) \
+                 FROM instance_env \
+                 WHERE secret = 1 AND julianday(expires_at) IS NOT NULL \
+                 GROUP BY instance_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            for row in rows {
+                let (id, days) = row?;
+                if let Some(days) = days {
+                    expiries.insert(id, days);
+                }
+            }
+        }
+        Ok(expiries)
+    }) {
+        Ok(expiries) => expiries,
+        Err(err) => {
+            tracing::debug!(%err, "cannot read the secret expiries for the metrics scrape");
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Per-instance disk quota in bytes, when the quota feature exists.
+///
+/// Issue #47 introduces `instances.disk_quota_mb`; accepting
+/// `disk_quota_bytes` too keeps the scrape working whichever unit lands.
+fn disk_quotas(db: &Db) -> BTreeMap<String, u64> {
+    match db.with_conn(|conn| {
+        let columns = columns(conn, "instances")?;
+        let (column, scale) = if columns.iter().any(|name| name == "disk_quota_mb") {
+            ("disk_quota_mb", 1024 * 1024)
+        } else if columns.iter().any(|name| name == "disk_quota_bytes") {
+            ("disk_quota_bytes", 1)
+        } else {
+            return Ok(BTreeMap::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT id, {column} FROM instances \
+             WHERE {column} IS NOT NULL AND {column} > 0"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            row.map(|(id, value)| {
+                (
+                    id,
+                    u64::try_from(value)
+                        .unwrap_or_default()
+                        .saturating_mul(scale),
+                )
+            })
+        })
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+    }) {
+        Ok(quotas) => quotas,
+        Err(err) => {
+            tracing::debug!(%err, "cannot read the disk quotas for the metrics scrape");
+            BTreeMap::new()
+        }
     }
 }
 
@@ -249,6 +442,14 @@ pub struct Snapshot {
     pub api_requests: BTreeMap<(String, String), u64>,
     pub compose_actions: BTreeMap<(String, String), u64>,
     pub upgrade_jobs: BTreeMap<String, u64>,
+    /// Control-plane restarts per instance (`audit_log`).
+    pub restarts: BTreeMap<String, u64>,
+    /// Incidents still open; `0` when the registry is unavailable.
+    pub incidents_open: u64,
+    /// Days until the earliest secret expires, per instance (`-1` unknown).
+    pub secret_expiry_days: BTreeMap<String, i64>,
+    /// Disk quota in bytes, per instance (empty when the feature is absent).
+    pub disk_quotas: BTreeMap<String, u64>,
 }
 
 /// Series that always exist, so a dashboard query never has to guess whether a
@@ -261,6 +462,9 @@ const SEEDED_SERIES: [(&str, &str); 6] = [
     ("error", "none"),
     ("unknown", "none"),
 ];
+
+/// Upgrade outcomes that always keep a series, even before the first job.
+const UPGRADE_STATUSES: [&str; 3] = ["success", "failed", "rolled_back"];
 
 /// Render the Prometheus text exposition (format version 0.0.4).
 pub fn render(snapshot: &Snapshot) -> String {
@@ -363,6 +567,99 @@ pub fn render(snapshot: &Snapshot) -> String {
 
     block(
         &mut out,
+        "fleett_instance_health",
+        "1 when the recorded container health of the instance is healthy, 0 otherwise.",
+        "gauge",
+    );
+    for row in &snapshot.rows {
+        let _ = writeln!(
+            out,
+            "fleett_instance_health{{instance=\"{}\"}} {}",
+            escape(&row.id),
+            u8::from(row.health == "healthy")
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_instance_restarts_total",
+        "Restarts requested through the control plane, per instance (audit log).",
+        "counter",
+    );
+    for row in &snapshot.rows {
+        let _ = writeln!(
+            out,
+            "fleett_instance_restarts_total{{instance=\"{}\"}} {}",
+            escape(&row.id),
+            snapshot.restarts.get(&row.id).copied().unwrap_or_default()
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_disk_quota_bytes",
+        "Disk quota of one instance, in bytes; 0 when no quota is configured.",
+        "gauge",
+    );
+    for row in &snapshot.rows {
+        let _ = writeln!(
+            out,
+            "fleett_disk_quota_bytes{{instance=\"{}\"}} {}",
+            escape(&row.id),
+            snapshot
+                .disk_quotas
+                .get(&row.id)
+                .copied()
+                .unwrap_or_default()
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_disk_used_bytes",
+        "Disk used against the quota of one instance, in bytes; 0 when no quota is configured.",
+        "gauge",
+    );
+    for row in &snapshot.rows {
+        let used = if snapshot.disk_quotas.contains_key(&row.id) {
+            row.disk_bytes
+        } else {
+            0
+        };
+        let _ = writeln!(
+            out,
+            "fleett_disk_used_bytes{{instance=\"{}\"}} {}",
+            escape(&row.id),
+            used
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_secrets_expiring_days",
+        "Days until the earliest secret of one instance expires; -1 when the expiry is unknown.",
+        "gauge",
+    );
+    for row in &snapshot.rows {
+        if let Some(days) = snapshot.secret_expiry_days.get(&row.id) {
+            let _ = writeln!(
+                out,
+                "fleett_secrets_expiring_days{{instance=\"{}\"}} {days}",
+                escape(&row.id)
+            );
+        }
+    }
+
+    block(
+        &mut out,
+        "fleett_incidents_open",
+        "Incidents currently open; 0 when the incident registry is unavailable.",
+        "gauge",
+    );
+    let _ = writeln!(out, "fleett_incidents_open {}", snapshot.incidents_open);
+
+    block(
+        &mut out,
         "fleett_api_requests_total",
         "HTTP requests served by the API, per method and status.",
         "counter",
@@ -404,6 +701,40 @@ pub fn render(snapshot: &Snapshot) -> String {
             escape(result)
         );
     }
+
+    block(
+        &mut out,
+        "fleett_upgrades_total",
+        "Rolling upgrade jobs, per final status (same counter as fleett_upgrade_jobs_total).",
+        "counter",
+    );
+    for status in UPGRADE_STATUSES {
+        let _ = writeln!(
+            out,
+            "fleett_upgrades_total{{status=\"{status}\"}} {}",
+            snapshot
+                .upgrade_jobs
+                .get(status)
+                .copied()
+                .unwrap_or_default()
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_rollbacks_total",
+        "Rolling upgrade jobs that rolled at least one instance back.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "fleett_rollbacks_total {}",
+        snapshot
+            .upgrade_jobs
+            .get("rolled_back")
+            .copied()
+            .unwrap_or_default()
+    );
 
     block(
         &mut out,
@@ -542,6 +873,7 @@ mod tests {
                     disk_bytes: 4096,
                 },
             )])),
+            &LiveState::default(),
         );
         snapshot.rows = vec![row("alice", "running", "healthy")];
         snapshot
@@ -576,9 +908,17 @@ mod tests {
             ("fleett_instance_mem_used_bytes", "gauge"),
             ("fleett_instance_mem_limit_bytes", "gauge"),
             ("fleett_instance_disk_bytes", "gauge"),
+            ("fleett_instance_health", "gauge"),
+            ("fleett_instance_restarts_total", "counter"),
+            ("fleett_disk_quota_bytes", "gauge"),
+            ("fleett_disk_used_bytes", "gauge"),
+            ("fleett_secrets_expiring_days", "gauge"),
+            ("fleett_incidents_open", "gauge"),
             ("fleett_api_requests_total", "counter"),
             ("fleett_compose_actions_total", "counter"),
             ("fleett_upgrade_jobs_total", "counter"),
+            ("fleett_upgrades_total", "counter"),
+            ("fleett_rollbacks_total", "counter"),
             ("fleett_usage_ok", "gauge"),
         ] {
             assert!(
@@ -603,9 +943,11 @@ mod tests {
                 .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
                 .count()
         );
-        // 6 instance series + 4 per-instance series + 2 API + 1 action +
-        // 1 upgrade job + build_info + up + usage_ok.
-        assert_eq!(lines.len(), 6 + 4 + 2 + 1 + 1 + 3);
+        // 6 instance series + 4 legacy per-instance series + 4 new
+        // per-instance series + 2 API + 1 action + 1 upgrade job +
+        // 3 seeded upgrade statuses + 1 rollback total + 1 incidents +
+        // build_info + up + usage_ok.
+        assert_eq!(lines.len(), 6 + 4 + 4 + 2 + 1 + 1 + 3 + 1 + 1 + 3);
     }
 
     #[test]
@@ -653,7 +995,7 @@ mod tests {
     #[test]
     fn counters_start_empty_and_increment() {
         let metrics = Metrics::new();
-        let empty = metrics.snapshot(&[], None);
+        let empty = metrics.snapshot(&[], None, &LiveState::default());
         assert!(empty.api_requests.is_empty());
         assert!(empty.compose_actions.is_empty());
         assert!(empty.upgrade_jobs.is_empty());
@@ -666,7 +1008,7 @@ mod tests {
         metrics.record_compose_action("start", RESULT_ERROR);
         metrics.record_upgrade_job("rolled_back");
 
-        let counters = metrics.snapshot(&[], None);
+        let counters = metrics.snapshot(&[], None, &LiveState::default());
         assert_eq!(
             counters.api_requests.get(&("GET".into(), "200".into())),
             Some(&2)
@@ -726,6 +1068,151 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("fleett_usage_ok 1"));
+    }
+
+    #[test]
+    fn health_restarts_quotas_and_secrets_are_rendered_per_instance() {
+        let mut snapshot = snapshot();
+        snapshot.rows = vec![
+            row("alice", "running", "healthy"),
+            row("bob", "running", "unhealthy"),
+            row("carol", "stopped", "none"),
+        ];
+        snapshot.restarts = BTreeMap::from([("alice".to_string(), 2)]);
+        snapshot.disk_quotas = BTreeMap::from([("alice".to_string(), 10 * 1024 * 1024)]);
+        snapshot.secret_expiry_days =
+            BTreeMap::from([("alice".to_string(), 12), ("bob".to_string(), -1)]);
+
+        let text = render(&snapshot);
+        assert!(
+            text.contains("fleett_instance_health{instance=\"alice\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_instance_health{instance=\"bob\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_instance_health{instance=\"carol\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_instance_restarts_total{instance=\"alice\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_instance_restarts_total{instance=\"bob\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_disk_quota_bytes{instance=\"alice\"} 10485760"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_disk_quota_bytes{instance=\"bob\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_disk_used_bytes{instance=\"alice\"} 4096"),
+            "the used series mirrors the measured data directory:\n{text}"
+        );
+        assert!(
+            text.contains("fleett_disk_used_bytes{instance=\"bob\"} 0"),
+            "without a quota the used series falls back to 0:\n{text}"
+        );
+        assert!(
+            text.contains("fleett_secrets_expiring_days{instance=\"alice\"} 12"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_secrets_expiring_days{instance=\"bob\"} -1"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("fleett_secrets_expiring_days{instance=\"carol\"}"),
+            "an instance without secrets is omitted:\n{text}"
+        );
+    }
+
+    #[test]
+    fn upgrades_rollbacks_and_incidents_are_counted() {
+        let metrics = Metrics::new();
+        metrics.record_upgrade_job("success");
+        metrics.record_upgrade_job("success");
+        metrics.record_upgrade_job("rolled_back");
+        let snapshot = metrics.snapshot(
+            &[],
+            None,
+            &LiveState {
+                incidents_open: 4,
+                ..LiveState::default()
+            },
+        );
+        let text = render(&snapshot);
+        assert!(
+            text.contains("fleett_upgrades_total{status=\"success\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_upgrades_total{status=\"failed\"} 0"),
+            "unseen statuses keep their series:\n{text}"
+        );
+        assert!(
+            text.contains("fleett_upgrades_total{status=\"rolled_back\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("fleett_rollbacks_total 1"), "{text}");
+        assert!(text.contains("fleett_incidents_open 4"), "{text}");
+    }
+
+    #[test]
+    fn optional_features_do_not_break_a_scrape_on_a_current_schema() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        assert_eq!(LiveState::read(&db), LiveState::default());
+    }
+
+    #[test]
+    fn future_feature_tables_and_columns_are_detected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        // No expiry column yet: a secret reports an unknown (-1) deadline.
+        db.with_transaction(|conn| {
+            conn.execute(
+                "INSERT INTO instance_env (instance_id, key, secret, value, updated_at) \
+                 VALUES ('alice', 'TOKEN', 1, NULL, 'now')",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("insert a secret");
+        assert_eq!(
+            secret_expiry_days(&db).get("alice"),
+            Some(&-1),
+            "without an expiry column the deadline is unknown"
+        );
+
+        db.with_transaction(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE instance_env ADD COLUMN expires_at TEXT;
+                 ALTER TABLE instances ADD COLUMN disk_quota_mb INTEGER;
+                 CREATE TABLE incidents (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+                 UPDATE instance_env SET expires_at = datetime('now', '+30 days');
+                 INSERT INTO instances (id, name, template, model, base_url, api_key_env, \
+                     channel, status, mem_limit_mb, created_at, updated_at, disk_quota_mb) \
+                 VALUES ('alice', 'Alice', 'guest', 'm', 'https://example.test/v1', \
+                     'OPENAI_API_KEY', 'none', 'running', 512, 'now', 'now', 100);
+                 INSERT INTO incidents (status) VALUES ('open'), ('acknowledged'), ('resolved');",
+            )
+        })
+        .expect("create the optional feature columns");
+
+        let days = secret_expiry_days(&db);
+        let days = days.get("alice").copied().expect("alice has a secret");
+        assert!((28..=30).contains(&days), "unexpected deadline: {days}");
+        assert_eq!(disk_quotas(&db).get("alice"), Some(&(100 * 1024 * 1024)));
+        assert_eq!(open_incidents(&db), 2);
     }
 
     #[test]
