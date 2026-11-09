@@ -15,6 +15,7 @@ pub mod health;
 pub mod incidents;
 pub mod instances;
 pub mod json;
+pub mod logcenter;
 pub mod maintenance;
 pub mod memory;
 pub mod notifications;
@@ -70,6 +71,8 @@ pub struct AppState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Watchdog sampling state (streaks, heal attempts, backoff).
     pub watchdog: Arc<crate::watchdog::WatchdogState>,
+    /// Persistent searchable log center (`GET /api/logs`).
+    pub logstore: Arc<crate::logstore::LogStore>,
     /// Effective command policy of `POST /api/instances/{id}/exec`.
     pub exec_policy: Arc<crate::exec::ExecPolicy>,
     /// Shared HTTP client of the outbound notifications (and nothing else):
@@ -112,6 +115,7 @@ impl AppState {
         // Drop expired restore points before serving (idempotent, best effort).
         crate::snapshots::startup(&cfg, &db);
         let exec_policy = crate::exec::ExecPolicy::from_config(cfg.exec_allowlist.as_deref());
+        let logstore = Arc::new(crate::logstore::LogStore::from_config(&cfg));
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
@@ -122,6 +126,7 @@ impl AppState {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             watchdog: Arc::new(crate::watchdog::WatchdogState::default()),
             exec_policy: Arc::new(exec_policy),
+            logstore,
             http: reqwest::Client::builder()
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()
@@ -201,6 +206,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/webhooks/{id}/test", post(webhooks::test))
         .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
         .route("/audit", get(audit::list))
+        .route("/logs", get(logcenter::search))
+        .route("/logs/stream", get(logcenter::stream))
+        .route("/logs/export", get(logcenter::export))
+        .route("/logs/instances/{id}", get(logcenter::instance_logs))
         .route("/messages", get(bus::list))
         .route("/messages/expired", delete(bus::purge))
         .route("/memory", get(memory::list).post(memory::write))

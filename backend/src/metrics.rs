@@ -1197,6 +1197,7 @@ mod tests {
             conn.execute_batch(
                 "ALTER TABLE instance_env ADD COLUMN expires_at TEXT;
                  ALTER TABLE instances ADD COLUMN disk_quota_mb INTEGER;
+                 DROP TABLE IF EXISTS incidents;
                  CREATE TABLE incidents (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
                  UPDATE instance_env SET expires_at = datetime('now', '+30 days');
                  INSERT INTO instances (id, name, template, model, base_url, api_key_env, \

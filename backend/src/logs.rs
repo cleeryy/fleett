@@ -255,7 +255,7 @@ pub fn split_timestamp(line: &str) -> Option<(String, String)> {
     Some((candidate.to_string(), message))
 }
 
-fn strip_compose_prefix(line: &str) -> &str {
+pub(crate) fn strip_compose_prefix(line: &str) -> &str {
     match line.find("| ") {
         Some(index) if index <= 64 => line[index + 2..].trim_start(),
         _ => line,

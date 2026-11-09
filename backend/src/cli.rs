@@ -4,13 +4,13 @@
 //! the host; the commands below are a thin HTTP client so the fleet is
 //! scriptable from cron, CI or a runbook. See `docs/CLI.md`.
 
+use crate::logstore::LogEntry;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
 /// Client configuration, relative to `$HOME`.
 pub const CONFIG_RELATIVE_PATH: &str = ".config/fleett/config.toml";
 /// Overrides the `[server] url` of the configuration file.
@@ -304,6 +304,9 @@ pub enum Command {
     Ls,
     Ps { all: bool },
     Logs(LogsArgs),
+    LogsSearch(LogSearchArgs),
+    LogsTail(LogTailArgs),
+    LogsExport(LogExportArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
@@ -482,6 +485,48 @@ pub struct LogsArgs {
     pub level: Option<String>,
 }
 
+/// Filters shared by `fleett logs search` and `fleett logs export`.
+#[derive(Debug, Clone)]
+pub struct LogSearchArgs {
+    pub q: Option<String>,
+    /// One id, or a comma-separated list.
+    pub instance: Option<String>,
+    pub level: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: u32,
+}
+
+impl Default for LogSearchArgs {
+    fn default() -> Self {
+        Self {
+            q: None,
+            instance: None,
+            level: None,
+            since: None,
+            until: None,
+            limit: 100,
+        }
+    }
+}
+
+/// Arguments of `fleett logs tail`.
+#[derive(Debug, Clone, Default)]
+pub struct LogTailArgs {
+    pub instance: Option<String>,
+    pub q: Option<String>,
+    pub level: Option<String>,
+    pub since: Option<String>,
+}
+
+/// Arguments of `fleett logs export`.
+#[derive(Debug, Clone)]
+pub struct LogExportArgs {
+    pub format: String,
+    pub out: PathBuf,
+    pub filters: LogSearchArgs,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CreateArgs {
     pub id: String,
@@ -517,6 +562,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Ls => ls(&client, json).await,
         Command::Ps { all } => ps(&client, json, all).await,
         Command::Logs(args) => logs(&client, json, &args).await,
+        Command::LogsSearch(args) => logs_search(&client, json, &args).await,
+        Command::LogsTail(args) => logs_tail(&client, json, &args).await,
+        Command::LogsExport(args) => logs_export(&client, json, &args).await,
         Command::Create(args) => create(&client, json, &args).await,
         Command::Start(id) => lifecycle(&client, json, &id, "start").await,
         Command::Stop(id) => lifecycle(&client, json, &id, "stop").await,
@@ -938,6 +986,181 @@ async fn logs(client: &Client, json: bool, args: &LogsArgs) -> Result<(), CliErr
         if !text.is_empty() && !text.ends_with('\n') {
             println!();
         }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct LogSearchResponse {
+    entries: Vec<LogEntry>,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    limit: usize,
+}
+
+fn log_filter_pairs(args: &LogSearchArgs) -> Vec<(&'static str, String)> {
+    let mut query: Vec<(&'static str, String)> = vec![("limit", args.limit.to_string())];
+    if let Some(q) = args
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("q", q.to_string()));
+    }
+    if let Some(instance) = args
+        .instance
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("instances", instance.to_string()));
+    }
+    if let Some(level) = args
+        .level
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("level", level.to_string()));
+    }
+    if let Some(since) = args
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("since", since.to_string()));
+    }
+    if let Some(until) = args
+        .until
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("until", until.to_string()));
+    }
+    query
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+async fn logs_search(client: &Client, json: bool, args: &LogSearchArgs) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/logs", &log_filter_pairs(args), None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let response: LogSearchResponse = decode(value)?;
+    if response.entries.is_empty() {
+        println!("no matching log lines");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = response
+        .entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.at.clone(),
+                entry.instance.clone(),
+                entry.level.as_str().to_string(),
+                truncate_chars(&entry.message, 160),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["AT", "INSTANCE", "LEVEL", "MESSAGE"], &rows)
+    );
+    eprintln!(
+        "{} line(s) shown (limit {})",
+        response.count, response.limit
+    );
+    Ok(())
+}
+
+async fn logs_tail(client: &Client, json: bool, args: &LogTailArgs) -> Result<(), CliError> {
+    let mut search = LogSearchArgs {
+        q: args.q.clone(),
+        instance: args.instance.clone(),
+        level: args.level.clone(),
+        since: args.since.clone(),
+        until: None,
+        limit: 200,
+    };
+    let mut last_id = 0i64;
+    let mut first = true;
+    loop {
+        if !first {
+            // Poll the window since the newest line we printed. The id cursor
+            // drops lines that share the same timestamp.
+            search.since = Some("30s".to_string());
+        }
+        let value = client
+            .value(Method::GET, "/api/logs", &log_filter_pairs(&search), None)
+            .await?;
+        let response: LogSearchResponse = decode(value)?;
+        let mut entries = response.entries;
+        entries.sort_by_key(|entry| entry.id);
+        for entry in entries {
+            if entry.id <= last_id {
+                continue;
+            }
+            last_id = entry.id;
+            if json {
+                let line = serde_json::to_string(&entry)
+                    .map_err(|err| CliError::Decode(err.to_string()))?;
+                println!("{line}");
+            } else {
+                println!(
+                    "{} {} {:<5} {}",
+                    entry.at,
+                    entry.instance,
+                    entry.level.as_str(),
+                    entry.message
+                );
+            }
+        }
+        first = false;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn logs_export(client: &Client, json: bool, args: &LogExportArgs) -> Result<(), CliError> {
+    let format = args.format.trim().to_ascii_lowercase();
+    if !matches!(format.as_str(), "json" | "csv") {
+        return Err(CliError::Config(
+            "format must be \"json\" or \"csv\"".to_string(),
+        ));
+    }
+    let mut query = log_filter_pairs(&args.filters);
+    query.push(("format", format.clone()));
+    let text = client
+        .text(Method::GET, "/api/logs/export", &query, None)
+        .await?;
+    std::fs::write(&args.out, &text)
+        .map_err(|err| CliError::Config(format!("cannot write {}: {err}", args.out.display())))?;
+    if json {
+        print_json(&json!({
+            "path": args.out.display().to_string(),
+            "format": format,
+            "bytes": text.len(),
+        }))?;
+    } else {
+        println!(
+            "wrote {} ({} bytes, {format})",
+            args.out.display(),
+            text.len()
+        );
     }
     Ok(())
 }

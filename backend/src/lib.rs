@@ -21,6 +21,7 @@ pub mod gitops;
 pub mod history;
 pub mod instance_archive;
 pub mod logs;
+pub mod logstore;
 pub mod maintenance;
 pub mod mcp;
 pub mod memory;

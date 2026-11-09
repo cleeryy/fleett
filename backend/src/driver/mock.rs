@@ -81,6 +81,8 @@ pub struct MockDriver {
     exec_calls: Mutex<Vec<MockExecCall>>,
     /// Canned results consumed by the next `exec` calls, per instance.
     exec_results: Mutex<HashMap<String, VecDeque<ExecOutput>>>,
+    /// Persistent canned result (`force_exec`), consumed by every call.
+    exec_sticky: Mutex<HashMap<String, ExecOutput>>,
     /// `exec` sleeps this long, so pipeline tests can observe concurrency.
     exec_delay: Mutex<Option<Duration>>,
     in_flight_execs: AtomicUsize,
@@ -123,6 +125,7 @@ impl MockDriver {
             max_in_flight_ups: AtomicUsize::new(0),
             exec_calls: Mutex::new(Vec::new()),
             exec_results: Mutex::new(HashMap::new()),
+            exec_sticky: Mutex::new(HashMap::new()),
             exec_delay: Mutex::new(None),
             in_flight_execs: AtomicUsize::new(0),
             max_in_flight_execs: AtomicUsize::new(0),
@@ -183,7 +186,7 @@ impl MockDriver {
     /// Compatibility helper from the scheduler branch: it queues exactly one
     /// result, like [`MockDriver::push_exec_result`].
     pub fn force_exec(&self, id: &str, result: ExecOutput) {
-        self.push_exec_result(id, result);
+        lock(&self.exec_sticky).insert(id.to_string(), result);
     }
 
     /// Compatibility helper of the exec API tests: queue one result.
@@ -194,6 +197,7 @@ impl MockDriver {
     /// Drop every queued `exec` result of one instance.
     pub fn clear_exec(&self, id: &str) {
         lock(&self.exec_results).remove(id);
+        lock(&self.exec_sticky).remove(id);
     }
 
     /// Queue one simulated `exec` result for the next call on `id`.
@@ -654,6 +658,9 @@ impl Driver for MockDriver {
                     .fetch_max(running, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
                 self.in_flight_execs.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let Some(result) = lock(&self.exec_sticky).get(&spec.id) {
+                return Ok(result.clone());
             }
             let queued = lock(&self.exec_results)
                 .get_mut(&spec.id)
