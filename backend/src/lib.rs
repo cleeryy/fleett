@@ -12,6 +12,7 @@ pub mod driver;
 pub mod egress;
 pub mod envs;
 pub mod files;
+pub mod gitops;
 pub mod history;
 pub mod instance_archive;
 pub mod logs;

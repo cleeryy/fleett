@@ -164,6 +164,18 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — last applied declarative document (issue #34). A single row keeps
+    // the raw `fleet.yaml` text that produced the current fleet; drift is the
+    // plan recomputed from it against the live index. The document never holds
+    // a secret value, only `secret_ref` references.
+    r#"
+CREATE TABLE IF NOT EXISTS desired_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    document   TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    source     TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -246,6 +258,16 @@ pub struct ProviderRecord {
     /// AES-GCM nonce of the stored secret.
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
+}
+
+/// The last applied declarative document (`desired_state`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredStateRecord {
+    /// Raw `fleet.yaml` text, as submitted (secret references only).
+    pub document: String,
+    pub applied_at: String,
+    /// Where the apply came from (`api`, `cli`, …).
+    pub source: String,
 }
 
 /// A named API token. The secret is never stored, only its digest.
@@ -1072,6 +1094,41 @@ impl Db {
             .is_some())
     }
 
+    /// The last applied declarative document, when one has been applied.
+    pub fn desired_state(&self) -> Result<Option<DesiredStateRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT document, applied_at, source FROM desired_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok(DesiredStateRecord {
+                        document: row.get(0)?,
+                        applied_at: row.get(1)?,
+                        source: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Record the document an apply just converged the fleet to.
+    pub fn put_desired_state(
+        &self,
+        document: &str,
+        applied_at: &str,
+        source: &str,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO desired_state (id, document, applied_at, source) VALUES (1, ?1, ?2, ?3) \
+             ON CONFLICT (id) DO UPDATE SET document = excluded.document, \
+             applied_at = excluded.applied_at, source = excluded.source",
+            params![document, applied_at, source],
+        )?;
+        Ok(())
+    }
+
     /// Active (non-revoked) token matching a digest.
     pub fn active_token_by_hash(&self, hash: &str) -> Result<Option<ApiTokenRecord>, DbError> {
         let conn = self.lock();
@@ -1412,6 +1469,8 @@ mod tests {
             "audit_log",
             "api_tokens",
             "providers",
+            "messages",
+            "desired_state",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }

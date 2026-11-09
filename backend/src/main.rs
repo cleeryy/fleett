@@ -229,6 +229,45 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// Compare a declarative `fleet.yaml` with the running fleet, without
+    /// writing anything (client mode). See docs/GITOPS.md.
+    Plan {
+        /// Declarative fleet document.
+        #[arg(short = 'f', long = "file", default_value = "fleet.yaml")]
+        file: PathBuf,
+        /// Report the deletions an apply with --allow-delete would run.
+        #[arg(long)]
+        allow_delete: bool,
+    },
+    /// Converge the fleet to a declarative `fleet.yaml` (client mode).
+    Apply {
+        /// Declarative fleet document.
+        #[arg(short = 'f', long = "file", default_value = "fleet.yaml")]
+        file: PathBuf,
+        /// Execute the deletions the document implies.
+        #[arg(long)]
+        allow_delete: bool,
+        /// Print the plan and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the last applied document and the drift against it (client mode).
+    DesiredState,
+    /// Re-apply a declarative document on a timer (client mode).
+    Reconcile {
+        /// Declarative fleet document.
+        #[arg(short = 'f', long = "file", default_value = "fleet.yaml")]
+        file: PathBuf,
+        /// Keep running until SIGINT, re-applying every `--interval` seconds.
+        #[arg(long)]
+        watch: bool,
+        /// Seconds between two applies (default 60, minimum 5).
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+        /// Execute the deletions the document implies.
+        #[arg(long)]
+        allow_delete: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +505,46 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Plan { file, allow_delete } => {
+            cli::run(
+                cli::Command::Plan(cli::PlanArgs { file, allow_delete }),
+                json,
+            )
+            .await
+        }
+        Commands::Apply {
+            file,
+            allow_delete,
+            dry_run,
+        } => {
+            cli::run(
+                cli::Command::Apply(cli::ApplyArgs {
+                    file,
+                    allow_delete,
+                    dry_run,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::DesiredState => cli::run(cli::Command::DesiredState, json).await,
+        Commands::Reconcile {
+            file,
+            watch,
+            interval,
+            allow_delete,
+        } => {
+            cli::run(
+                cli::Command::Reconcile(cli::ReconcileArgs {
+                    file,
+                    watch,
+                    interval,
+                    allow_delete,
+                }),
+                json,
+            )
+            .await
         }
     };
 

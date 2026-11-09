@@ -70,6 +70,27 @@ request wins. `secret` on `PATCH` rotates the credential and restarts every
 attached instance sequentially (one `restarted` entry each). Instances without
 a provider keep their own `gate_token`/`api_key_env`.
 
+## Declarative state (GitOps)
+
+One document describes the whole fleet; see `docs/GITOPS.md`. The document is
+the raw `fleet.yaml` text (or a JSON object) and never contains a secret value,
+only `secret_ref` references resolved by the control plane at apply time.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/desired-state` | — | `{"applied_at":"…","source":"cli","document_text":"…","document":{…},"in_sync":false,"drift":{…}}`; `document`/`applied_at` are absent before the first apply |
+| GET | `/api/desired-state/drift` | — | `{"found":true,"applied_at":"…","source":"api","in_sync":false,"drift":{…}}` |
+| POST | `/api/desired-state/plan` | `{"document":"<yaml>"}` or the raw document | `Plan`, no write |
+| POST | `/api/desired-state/apply[?allow_delete=true]` | `{"document":"<yaml>","allow_delete":false,"source":"api"}` | `{"plan":{…},"applied":[…],"applied_at":"…","source":"api"}`, admin only |
+
+`Plan` has four arrays of `{"action":"create|update|delete","resource":
+"provider|instance","id":"alice","name":"Alice","fields":[{"field":"model",
+"from":"…","to":"…"}]}`: `create`, `update`, `delete` (executed) and `refused`
+(deletions blocked because `allow_delete` was not set). Applying an equivalent
+document returns an empty plan. Every apply is audited as `gitops.apply`;
+deletions require `allow_delete` (query or body). `409 gitops_conflict` is
+returned when a provider deletion would orphan an instance.
+
 ## Instances
 
 `GET /api/instances` → `InstanceSummary[]`

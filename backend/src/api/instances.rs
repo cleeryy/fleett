@@ -1172,7 +1172,7 @@ async fn lifecycle(
 /// Instances adopted from disk have the template `custom`: their config was
 /// written by hand (or by an older control plane), so the on-disk file is used
 /// as the template instead of a built-in.
-fn render_for_update(
+pub(crate) fn render_for_update(
     state: &AppState,
     spec: &InstanceSpec,
     env_keys: &[String],
@@ -1276,7 +1276,10 @@ pub(crate) fn record_health(state: &AppState, spec: &mut InstanceSpec, health: H
 /// request is refused with `409 egress_not_enforced`.
 ///
 /// Lifecycle calls (start/stop/restart) never go through this check.
-async fn check_egress_policy(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+pub(crate) async fn check_egress_policy(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
     if spec.allow_lan || state.cfg.egress == EgressMode::Off {
         return Ok(());
     }
@@ -1313,7 +1316,10 @@ fn egress_conflict(detail: String, marker_path: &std::path::Path) -> ApiError {
 }
 
 /// Create the unrestricted LAN network before an `allow_lan` instance joins it.
-async fn ensure_lan_network(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+pub(crate) async fn ensure_lan_network(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
     if !spec.allow_lan {
         return Ok(());
     }
@@ -1330,7 +1336,7 @@ async fn ensure_lan_network(state: &AppState, spec: &InstanceSpec) -> Result<(),
 ///
 /// `replacing` is the instance being patched: its stored row is excluded from
 /// the sum so an unchanged or shrinking value never trips the cap.
-fn enforce_caps(
+pub(crate) fn enforce_caps(
     state: &AppState,
     replacing: Option<&str>,
     spec: &InstanceSpec,

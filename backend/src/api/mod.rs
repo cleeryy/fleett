@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bus;
+pub mod desired_state;
 pub mod error;
 pub mod files;
 pub mod git;
@@ -157,6 +158,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .delete(providers::delete),
         )
         .route("/providers/{id}/test", post(providers::test))
+        .route("/desired-state", get(desired_state::get))
+        .route("/desired-state/drift", get(desired_state::drift))
+        .route("/desired-state/plan", post(desired_state::plan))
+        .route("/desired-state/apply", post(desired_state::apply))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(

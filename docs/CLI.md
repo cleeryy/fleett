@@ -57,6 +57,10 @@ fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
 fleett doctor
+fleett plan -f fleet.yaml [--allow-delete]
+fleett apply -f fleet.yaml [--allow-delete] [--dry-run]
+fleett desired-state
+fleett reconcile --watch -f fleet.yaml [--interval 60] [--allow-delete]
 ```
 
 Every command accepts the global `--json` flag (before or after the subcommand). Human
@@ -184,6 +188,38 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `plan` / `apply` / `desired-state` / `reconcile`
+
+Declarative GitOps: one versioned `fleet.yaml` describes providers and
+instances, and the control plane converges to it. See `docs/GITOPS.md` for the
+schema, the secret references and the deletion semantics.
+
+```bash
+# Read-only diff against the running fleet.
+fleett plan -f fleet.yaml
+fleett --json plan -f fleet.yaml | jq '.update[].fields'
+
+# Create/update; deletions stay refused until --allow-delete.
+fleett apply -f fleet.yaml
+fleett apply -f fleet.yaml --allow-delete
+
+# Same as plan, writes nothing.
+fleett apply -f fleet.yaml --dry-run
+
+# Last applied document plus the drift measured against it.
+fleett desired-state
+
+# Re-apply every 60 seconds until SIGINT.
+fleett reconcile --watch -f fleet.yaml --interval 60
+```
+
+Secret values never appear in the file: `secret_ref: env:NAME` or
+`secret_ref: file:/path` is resolved by the control plane at apply time, so
+`plan` output is safe to share. `apply` and `reconcile` talk to the same HTTP
+API as the other client commands; `--allow-delete` is required to remove an
+instance or provider that the document no longer declares. `--interval` must
+be at least 5 seconds.
 
 ### `doctor`
 

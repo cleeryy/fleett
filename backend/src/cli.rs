@@ -4,6 +4,7 @@
 //! the host; the commands below are a thin HTTP client so the fleet is
 //! scriptable from cron, CI or a runbook. See `docs/CLI.md`.
 
+use crate::gitops::{ApplyReport, DesiredStateView, Plan};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -301,20 +302,60 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
+    /// Compare a `fleet.yaml` with the running fleet (read-only).
+    Plan(PlanArgs),
+    /// Converge the fleet to a `fleet.yaml`.
+    Apply(ApplyArgs),
+    /// Print the last applied document and its drift.
+    DesiredState,
+    /// Re-apply a `fleet.yaml`, optionally forever.
+    Reconcile(ReconcileArgs),
+}
+
+/// Arguments of `fleett plan`.
+#[derive(Debug, Clone)]
+pub struct PlanArgs {
+    pub file: PathBuf,
+    pub allow_delete: bool,
+}
+
+/// Arguments of `fleett apply`.
+#[derive(Debug, Clone)]
+pub struct ApplyArgs {
+    pub file: PathBuf,
+    pub allow_delete: bool,
+    pub dry_run: bool,
+}
+
+/// Arguments of `fleett reconcile`.
+#[derive(Debug, Clone)]
+pub struct ReconcileArgs {
+    pub file: PathBuf,
+    pub watch: bool,
+    pub interval: u64,
+    pub allow_delete: bool,
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +454,10 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Plan(args) => plan(&client, json, &args).await,
+        Command::Apply(args) => apply(&client, json, &args).await,
+        Command::DesiredState => desired_state(&client, json).await,
+        Command::Reconcile(args) => reconcile(&client, json, &args).await,
     }
 }
 
@@ -1302,6 +1347,178 @@ async fn run_doctor(client: &Client) -> Vec<Check> {
     }
 
     checks
+}
+
+// ---------------------------------------------------------------------------
+// GitOps commands (issue #34)
+// ---------------------------------------------------------------------------
+
+/// Minimum period accepted by `fleett reconcile --watch`.
+pub const MIN_RECONCILE_INTERVAL: u64 = 5;
+
+fn read_document(path: &Path) -> Result<String, CliError> {
+    std::fs::read_to_string(path)
+        .map_err(|err| CliError::Config(format!("cannot read {}: {err}", path.display())))
+}
+
+async fn plan(client: &Client, json: bool, args: &PlanArgs) -> Result<(), CliError> {
+    let text = read_document(&args.file)?;
+    let body = json!({
+        "document": text,
+        "allow_delete": args.allow_delete,
+        "source": "cli",
+    });
+    let value = client
+        .value(Method::POST, "/api/desired-state/plan", &[], Some(body))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let plan: Plan = decode(value)?;
+    print!("{}", plan.render_text());
+    Ok(())
+}
+
+async fn apply(client: &Client, json: bool, args: &ApplyArgs) -> Result<(), CliError> {
+    if args.dry_run {
+        return run_plan(client, json, &args.file, args.allow_delete).await;
+    }
+    let report = apply_document(client, &args.file, args.allow_delete, "cli").await?;
+    if json {
+        return print_json(&report);
+    }
+    print!("{}", apply_report_text(&report));
+    Ok(())
+}
+
+async fn run_plan(
+    client: &Client,
+    json: bool,
+    file: &Path,
+    allow_delete: bool,
+) -> Result<(), CliError> {
+    plan(
+        client,
+        json,
+        &PlanArgs {
+            file: file.to_path_buf(),
+            allow_delete,
+        },
+    )
+    .await
+}
+
+async fn apply_document(
+    client: &Client,
+    file: &Path,
+    allow_delete: bool,
+    source: &str,
+) -> Result<ApplyReport, CliError> {
+    let text = read_document(file)?;
+    let body = json!({
+        "document": text,
+        "allow_delete": allow_delete,
+        "source": source,
+    });
+    let value = client
+        .value(Method::POST, "/api/desired-state/apply", &[], Some(body))
+        .await?;
+    decode(value)
+}
+
+fn apply_report_text(report: &ApplyReport) -> String {
+    if report.applied.is_empty() {
+        return format!(
+            "no changes (applied at {}, source {})\n",
+            report.applied_at, report.source
+        );
+    }
+    let mut out = format!(
+        "applied {} change(s) at {} (source {}):\n",
+        report.applied.len(),
+        report.applied_at,
+        report.source
+    );
+    for entry in &report.applied {
+        let marker = match entry.action.as_str() {
+            "create" => "+",
+            "delete" => "-",
+            _ => "~",
+        };
+        out.push_str(&format!("  {marker} {} {}\n", entry.resource, entry.id));
+    }
+    if !report.plan.refused.is_empty() {
+        out.push_str(&format!(
+            "{} deletion(s) refused: re-run with --allow-delete\n",
+            report.plan.refused.len()
+        ));
+    }
+    out
+}
+
+async fn desired_state(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/desired-state", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: DesiredStateView = decode(value)?;
+    let Some(applied_at) = &view.applied_at else {
+        println!("no desired state recorded yet: run `fleett apply -f fleet.yaml`");
+        return Ok(());
+    };
+    println!(
+        "applied at {applied_at} (source {})",
+        view.source.as_deref().unwrap_or("-")
+    );
+    if let Some(text) = &view.document_text {
+        println!();
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+    println!();
+    if view.in_sync {
+        println!("no drift: the fleet matches the document");
+    } else {
+        print!("{}", view.drift.render_text());
+    }
+    Ok(())
+}
+
+async fn reconcile(client: &Client, json: bool, args: &ReconcileArgs) -> Result<(), CliError> {
+    if args.watch && args.interval < MIN_RECONCILE_INTERVAL {
+        return Err(CliError::Config(format!(
+            "--interval must be at least {MIN_RECONCILE_INTERVAL} seconds"
+        )));
+    }
+    loop {
+        match apply_document(client, &args.file, args.allow_delete, "reconcile").await {
+            Ok(report) => {
+                if json {
+                    print_json(&report)?;
+                } else {
+                    print!("{}", apply_report_text(&report));
+                }
+            }
+            Err(err) if args.watch => print_error(&err, json),
+            Err(err) => return Err(err),
+        }
+        if !args.watch {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                if !json {
+                    eprintln!("fleett: reconciler stopped");
+                }
+                return Ok(());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
