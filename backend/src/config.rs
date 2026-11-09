@@ -308,6 +308,73 @@ impl fmt::Debug for OidcConfig {
 /// Default bind of the dedicated Prometheus listener (`GET /metrics`).
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9100";
 
+/// Requests per minute allowed on `/api/*`, per client and credential
+/// (`FLEETT_RATE_LIMIT_PER_MIN`); `0` disables the limiter.
+pub const DEFAULT_RATE_LIMIT_PER_MIN: u32 = 120;
+/// Requests per minute allowed on the browser authentication pages
+/// (`FLEETT_RATE_LIMIT_AUTH_PER_MIN`); `0` disables the bucket.
+pub const DEFAULT_RATE_LIMIT_AUTH_PER_MIN: u32 = 10;
+/// Requests per minute allowed on the heavy instance routes — `/exec`, `/logs`,
+/// `/files`, `/export` (`FLEETT_RATE_LIMIT_HEAVY_PER_MIN`); `0` disables the
+/// bucket.
+pub const DEFAULT_RATE_LIMIT_HEAVY_PER_MIN: u32 = 30;
+/// Failed authentications tolerated from one IP and credential shape before the
+/// progressive lockout engages (`FLEETT_AUTH_LOCKOUT_FAILURES`); `0` disables
+/// the lockout.
+pub const DEFAULT_AUTH_LOCKOUT_FAILURES: u32 = 10;
+/// Sliding window of the failure counter (`FLEETT_AUTH_LOCKOUT_WINDOW_S`).
+pub const DEFAULT_AUTH_LOCKOUT_WINDOW_S: u64 = 600;
+/// How long the lockout refuses new attempts (`FLEETT_AUTH_LOCKOUT_S`).
+pub const DEFAULT_AUTH_LOCKOUT_S: u64 = 900;
+
+/// API hardening: rate limits, progressive lockout and header posture.
+///
+/// A rate limit of `0` disables that bucket; `FLEETT_AUTH_LOCKOUT_FAILURES=0`
+/// disables the lockout entirely, so the window and duration are only used
+/// when at least one failure is tolerated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityConfig {
+    /// `FLEETT_RATE_LIMIT_PER_MIN`, `0` = disabled.
+    pub rate_limit_per_min: u32,
+    /// `FLEETT_RATE_LIMIT_AUTH_PER_MIN`, `0` = disabled.
+    pub rate_limit_auth_per_min: u32,
+    /// `FLEETT_RATE_LIMIT_HEAVY_PER_MIN`, `0` = disabled.
+    pub rate_limit_heavy_per_min: u32,
+    /// `FLEETT_AUTH_LOCKOUT_FAILURES`, `0` = disabled.
+    pub lockout_failures: u32,
+    /// `FLEETT_AUTH_LOCKOUT_WINDOW_S`.
+    pub lockout_window_s: u64,
+    /// `FLEETT_AUTH_LOCKOUT_S`.
+    pub lockout_s: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_min: DEFAULT_RATE_LIMIT_PER_MIN,
+            rate_limit_auth_per_min: DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
+            rate_limit_heavy_per_min: DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
+            lockout_failures: DEFAULT_AUTH_LOCKOUT_FAILURES,
+            lockout_window_s: DEFAULT_AUTH_LOCKOUT_WINDOW_S,
+            lockout_s: DEFAULT_AUTH_LOCKOUT_S,
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Whether at least one rate-limit bucket is active.
+    pub fn limiting_enabled(&self) -> bool {
+        self.rate_limit_per_min > 0
+            || self.rate_limit_auth_per_min > 0
+            || self.rate_limit_heavy_per_min > 0
+    }
+
+    /// Whether the progressive authentication lockout is active.
+    pub fn lockout_enabled(&self) -> bool {
+        self.lockout_failures > 0
+    }
+}
+
 pub const DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:8090";
 pub const DEFAULT_OIDC_SCOPES: &str = "openid profile email";
 pub const DEFAULT_OIDC_ADMIN_GROUP: &str = "fleett-admins";
@@ -333,6 +400,8 @@ pub const DEFAULT_LOG_MAX_ROWS: u64 = 500_000;
 pub struct Config {
     pub root: PathBuf,
     pub bind: SocketAddr,
+    /// Public base URL (`FLEETT_PUBLIC_URL`); used by HSTS and notification links.
+    pub public_url: String,
     /// `None` only when `FLEETT_ALLOW_NO_AUTH=1` or OIDC is the only mode.
     pub token: Option<String>,
     pub allow_no_auth: bool,
@@ -381,6 +450,9 @@ pub struct Config {
     pub log_retention: std::time::Duration,
     /// Row cap of the log center; `0` disables the cap (`FLEETT_LOG_MAX_ROWS`).
     pub log_max_rows: u64,
+    /// API hardening: rate limits and auth lockout (`FLEETT_RATE_LIMIT_*`,
+    /// `FLEETT_AUTH_LOCKOUT_*`). See docs/HARDENING.md.
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -602,6 +674,8 @@ impl Config {
         };
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
+        let security = resolve_security(&get)?;
+        let public_url = get("PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
         let exec_allowlist = get("EXEC_ALLOWLIST");
 
         let cost_scan_interval_s = match get("COST_SCAN_INTERVAL_S") {
@@ -653,6 +727,7 @@ impl Config {
         Ok(Self {
             root,
             bind,
+            public_url,
             token,
             allow_no_auth,
             auth,
@@ -676,6 +751,7 @@ impl Config {
             exec_allowlist,
             log_retention,
             log_max_rows,
+            security,
         })
     }
 
@@ -694,6 +770,7 @@ impl Config {
             bind: "127.0.0.1:0"
                 .parse()
                 .expect("literal socket address is valid"),
+            public_url: DEFAULT_PUBLIC_URL.to_string(),
             token: Some("test-token".to_string()),
             allow_no_auth: false,
             auth: AuthMode::Bearer,
@@ -720,12 +797,28 @@ impl Config {
             exec_allowlist: None,
             log_retention: parse_log_retention(DEFAULT_LOG_RETENTION).expect("valid default"),
             log_max_rows: DEFAULT_LOG_MAX_ROWS,
+            // Tests exercise the limiter explicitly; by default they are never
+            // rate-limited.
+            security: SecurityConfig {
+                rate_limit_per_min: 0,
+                rate_limit_auth_per_min: 0,
+                rate_limit_heavy_per_min: 0,
+                lockout_failures: 0,
+                ..SecurityConfig::default()
+            },
         }
     }
 
     /// Name of the unrestricted network attached to `allow_lan` instances.
     pub fn lan_network(&self) -> String {
         format!("{}-lan", self.network)
+    }
+
+    pub fn hsts_enabled(&self) -> bool {
+        self.public_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("https://")
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -1881,4 +1974,97 @@ FLEETT_NETWORK='fleett-net'
         assert!(!debug.contains("scrape-me"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
     }
+}
+
+fn resolve_security(get: &dyn Fn(&str) -> Option<String>) -> Result<SecurityConfig, ConfigError> {
+    fn env_u32(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u32,
+    ) -> Result<u32, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u32>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    fn env_u64(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u64,
+    ) -> Result<u64, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    let rate_limit_per_min = env_u32(
+        get,
+        "RATE_LIMIT_PER_MIN",
+        "FLEETT_RATE_LIMIT_PER_MIN",
+        DEFAULT_RATE_LIMIT_PER_MIN,
+    )?;
+    let rate_limit_auth_per_min = env_u32(
+        get,
+        "RATE_LIMIT_AUTH_PER_MIN",
+        "FLEETT_RATE_LIMIT_AUTH_PER_MIN",
+        DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
+    )?;
+    let rate_limit_heavy_per_min = env_u32(
+        get,
+        "RATE_LIMIT_HEAVY_PER_MIN",
+        "FLEETT_RATE_LIMIT_HEAVY_PER_MIN",
+        DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
+    )?;
+    let lockout_failures = env_u32(
+        get,
+        "AUTH_LOCKOUT_FAILURES",
+        "FLEETT_AUTH_LOCKOUT_FAILURES",
+        DEFAULT_AUTH_LOCKOUT_FAILURES,
+    )?;
+    let lockout_window_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_WINDOW_S",
+        "FLEETT_AUTH_LOCKOUT_WINDOW_S",
+        DEFAULT_AUTH_LOCKOUT_WINDOW_S,
+    )?;
+    let lockout_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_S",
+        "FLEETT_AUTH_LOCKOUT_S",
+        DEFAULT_AUTH_LOCKOUT_S,
+    )?;
+
+    for (var, value) in [
+        ("FLEETT_AUTH_LOCKOUT_WINDOW_S", lockout_window_s),
+        ("FLEETT_AUTH_LOCKOUT_S", lockout_s),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::Invalid {
+                var,
+                value: "0".to_string(),
+                detail: "expected a positive number of seconds".to_string(),
+            });
+        }
+    }
+
+    Ok(SecurityConfig {
+        rate_limit_per_min,
+        rate_limit_auth_per_min,
+        rate_limit_heavy_per_min,
+        lockout_failures,
+        lockout_window_s,
+        lockout_s,
+    })
 }

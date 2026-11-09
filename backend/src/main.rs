@@ -1008,9 +1008,12 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         "fleett listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())

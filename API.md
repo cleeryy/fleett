@@ -8,8 +8,10 @@ Base: `http://127.0.0.1:8090`. Every `/api/*` route requires a bearer token
 Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 (`400` invalid input, `401` missing/wrong credential, `403` role or CSRF
 refusal, `404` unknown, `409` conflict, `422` invalid YAML/compose,
-`502` Docker or provider failure). Unauthenticated API calls never redirect:
-`401` JSON, always.
+`429` rate limit or authentication lockout, `502` Docker or provider failure).
+A `429` always carries `Retry-After` (whole seconds) and
+`details.retry_after_s`. Unauthenticated API calls never redirect: `401` JSON,
+always.
 
 Credentials are resolved in this order: session cookie, then bearer token
 (`FLEETT_TOKEN` = admin, then named tokens). Authorization is granted per
@@ -67,6 +69,39 @@ The level is read from SQLite on every request: a grant, a role change or a
 removal applies to the next call. Changes are audited as
 `instance.acl.update` / `instance.acl.delete` with the affected `subject` in
 `details`.
+
+## Security
+
+Every `/api/*` request is rate-limited per `(client IP, credential, route class)`
+and every failed authentication feeds a progressive lockout; see
+[HARDENING.md](docs/HARDENING.md#api-and-control-plane-hardening) for the
+implementation and the environment variables. The limits apply before the route
+handler, so an invalid credential is always a constant `401`, never a `404` that
+would reveal whether an instance exists.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/security/status` | — | `{"rate_limit":{"enabled":true,"limits":{"per_min":120,"auth_per_min":10,"heavy_per_min":30}},"lockout":{"failures":10,"window_s":600,"lockout_s":900,"locked_ips":0},"headers":{"csp":"…","x_frame_options":"DENY","referrer_policy":"no-referrer","permissions_policy":"camera=(), microphone=(), geolocation=()","x_content_type_options":"nosniff","hsts":true},"tokens":{"expired_or_revoked":0,"active":2},"auth_mode":"bearer"}`, admin only |
+
+`429` bodies name the bucket that refused the request:
+
+```json
+{"error":{"code":"rate_limited","message":"too many requests: retry in 42 second(s)",
+  "details":{"retry_after_s":42,"class":"api"}}}
+```
+
+`details.class` is `api`, `auth` or `heavy` for a rate limit;
+`details.reason = "lockout"` identifies a progressive authentication lockout
+(the lock is audited as `auth.lockout`). A `0` limit disables the bucket;
+setting every limit to `0` disables rate limiting.
+
+`/api/health` and `/api/auth/config` are exempt. `/auth/login` and
+`/auth/callback` use the `auth` bucket; routes containing an `exec`, `logs`,
+`files` or `export` segment use the `heavy` bucket. Every response — console,
+API, errors — also carries the security headers (`Content-Security-Policy`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
+`X-Content-Type-Options: nosniff`, and `Strict-Transport-Security` only when
+`FLEETT_PUBLIC_URL` is https).
 
 ## Templates
 

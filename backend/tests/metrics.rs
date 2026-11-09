@@ -204,6 +204,7 @@ async fn the_scrape_exposes_the_fleet_in_the_prometheus_text_format() {
         "fleett_api_requests_total",
         "fleett_compose_actions_total",
         "fleett_upgrade_jobs_total",
+        "fleett_rate_limited_total",
         "fleett_usage_ok",
     ] {
         assert!(

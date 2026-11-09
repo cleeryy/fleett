@@ -129,6 +129,8 @@ it — the agents keep running. The SQLite database is a rebuildable index; `ins
   `${KEY}`, and no endpoint returns a secret value.
 - **Humans**: OIDC/Authentik, signed session cookies, `admin`/`viewer`, CSRF double-submit,
   named tokens stored as digests, every mutation in the audit log.
+- **API**: sliding-window rate limits per IP and credential, a progressive lockout after
+  failed logins, and CSP/HSTS/framing headers on every response (`fleett security`).
 
 ## CLI
 
@@ -140,6 +142,7 @@ fleett usage
 fleett upgrade --image hermes-agent:0.23.0-local
 fleett backup --keep 7
 fleett doctor
+fleett security
 ```
 
 Every command accepts `--json`; the server URL and token come from

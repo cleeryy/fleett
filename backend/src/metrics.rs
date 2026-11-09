@@ -53,6 +53,7 @@ struct Counters {
     api_requests: BTreeMap<(String, String), u64>,
     compose_actions: BTreeMap<(String, String), u64>,
     upgrade_jobs: BTreeMap<String, u64>,
+    rate_limited: BTreeMap<String, u64>,
 }
 
 /// Last utilisation sample, with the instant it was taken.
@@ -102,6 +103,12 @@ impl Metrics {
     pub fn record_upgrade_job(&self, result: &str) {
         let mut counters = self.counters();
         *counters.upgrade_jobs.entry(result.to_string()).or_default() += 1;
+    }
+
+    /// Count one request refused by a rate limit or the auth lockout.
+    pub fn record_rate_limited(&self, class: &str) {
+        let mut counters = self.counters();
+        *counters.rate_limited.entry(class.to_string()).or_default() += 1;
     }
 
     /// Drop the cached utilisation sample.
@@ -199,6 +206,7 @@ impl Metrics {
             api_requests: counters.api_requests.clone(),
             compose_actions: counters.compose_actions.clone(),
             upgrade_jobs: counters.upgrade_jobs.clone(),
+            rate_limited: counters.rate_limited.clone(),
             restarts: live.restarts.clone(),
             incidents_open: live.incidents_open,
             secret_expiry_days: live.secret_expiry_days.clone(),
@@ -442,6 +450,8 @@ pub struct Snapshot {
     pub api_requests: BTreeMap<(String, String), u64>,
     pub compose_actions: BTreeMap<(String, String), u64>,
     pub upgrade_jobs: BTreeMap<String, u64>,
+    /// Refused requests, per rate-limit class.
+    pub rate_limited: BTreeMap<String, u64>,
     /// Control-plane restarts per instance (`audit_log`).
     pub restarts: BTreeMap<String, u64>,
     /// Incidents still open; `0` when the registry is unavailable.
@@ -743,6 +753,20 @@ pub fn render(snapshot: &Snapshot) -> String {
         "gauge",
     );
     let _ = writeln!(out, "fleett_usage_ok {}", u8::from(snapshot.usage_ok));
+
+    block(
+        &mut out,
+        "fleett_rate_limited_total",
+        "Requests refused by the rate limiter or the authentication lockout, per class.",
+        "counter",
+    );
+    for (class, count) in &snapshot.rate_limited {
+        let _ = writeln!(
+            out,
+            "fleett_rate_limited_total{{class=\"{}\"}} {count}",
+            escape(class)
+        );
+    }
 
     out
 }

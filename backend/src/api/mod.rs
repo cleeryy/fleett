@@ -23,6 +23,7 @@ pub mod openapi;
 pub mod pipelines;
 pub mod providers;
 pub mod schedules;
+pub mod security;
 pub mod shares;
 pub mod snapshots;
 pub mod templates;
@@ -75,6 +76,8 @@ pub struct AppState {
     pub logstore: Arc<crate::logstore::LogStore>,
     /// Effective command policy of `POST /api/instances/{id}/exec`.
     pub exec_policy: Arc<crate::exec::ExecPolicy>,
+    /// Rate limiter and progressive authentication lockout.
+    pub security: Arc<crate::security::Security>,
     /// Shared HTTP client of the outbound notifications (and nothing else):
     /// one connection pool, one timeout, no per-alert client.
     pub http: reqwest::Client,
@@ -116,6 +119,8 @@ impl AppState {
         crate::snapshots::startup(&cfg, &db);
         let exec_policy = crate::exec::ExecPolicy::from_config(cfg.exec_allowlist.as_deref());
         let logstore = Arc::new(crate::logstore::LogStore::from_config(&cfg));
+        // Build the limiter before `cfg` is moved into the state.
+        let security = crate::security::Security::new(cfg.security.clone());
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
@@ -127,6 +132,7 @@ impl AppState {
             watchdog: Arc::new(crate::watchdog::WatchdogState::default()),
             exec_policy: Arc::new(exec_policy),
             logstore,
+            security: Arc::new(security),
             http: reqwest::Client::builder()
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()
@@ -156,10 +162,21 @@ impl InstanceLocks {
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
     let api = api_routes(state.clone());
-    finalize(api, auth_pages(), state.clone()).layer(middleware::from_fn_with_state(
-        state,
-        crate::metrics::track_request,
-    ))
+    finalize(api, auth_pages(), state.clone())
+        // Innermost first: the limiter sees every request, the request counter
+        // sees the 429 the limiter produces, the headers close every response.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::security::guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::metrics::track_request,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state,
+            crate::security::headers,
+        ))
 }
 
 /// Browser-facing authentication routes (outside `/api` so a reverse proxy
@@ -225,6 +242,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/memory/{id}/promote", post(memory::promote))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
+        .route("/security/status", get(security::status))
         .route("/templates", get(templates::list))
         .route("/usage/ingest", post(cost::ingest))
         .route("/cost", get(cost::report))
