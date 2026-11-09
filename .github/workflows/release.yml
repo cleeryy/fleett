@@ -178,6 +178,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          # Never fetch the transient buildx `.dockerbuild` cache artifact: it is
+          # not a release asset and a flaky blob download used to fail the job.
+          pattern: "{linux-*,darwin-*,deb-amd64}"
           path: dist
           merge-multiple: true
 
