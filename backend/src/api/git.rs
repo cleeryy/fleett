@@ -144,6 +144,9 @@ pub async fn revert(
     let _guard = lock.lock().await;
 
     let mut spec = instances::load(&state, &id)?;
+    // A revert rewrites files in the data directory: keep a restore point so
+    // an unwanted revert can itself be undone.
+    crate::snapshots::auto_before(&state, &id, "git-revert").await;
     let author = history::author_for(&context);
     let outcome = history::revert(&state.cfg, &id, &commit, request.paths.as_deref(), &author)
         .map_err(map_error)?;

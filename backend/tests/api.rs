@@ -3958,3 +3958,191 @@ async fn a_message_loop_is_stopped_by_hops() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(parse(&body)["error"]["code"], "message_loop");
 }
+
+// ---------------------------------------------------------------------------
+// Snapshots (issue #38)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn snapshots_round_trip_through_the_api() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let soul = harness.instance_dir("alice").join("data").join("SOUL.md");
+    let original_soul = std::fs::read_to_string(&soul).expect("rendered SOUL.md");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/snapshots",
+            Some(json!({"label": "before change", "ttl_s": 3600})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created = parse(&body);
+    let first = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["label"], "before change");
+    assert_eq!(created["status"], "ok");
+    assert!(created["size_bytes"].as_u64().expect("size") > 0);
+    assert!(Path::new(created["path"].as_str().expect("path")).is_file());
+
+    // Change the data, take a second snapshot, compare them.
+    std::fs::write(&soul, "SOUL broken\n").expect("soul write");
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/snapshots",
+            Some(json!({"label": "after change"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second = parse(&body)["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/snapshots", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 2);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/snapshots/compare",
+            Some(json!({"a": first, "b": second})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let diff = parse(&body);
+    assert!(
+        diff["changed"]
+            .as_array()
+            .expect("changed")
+            .iter()
+            .any(|file| file["path"] == "data/SOUL.md"),
+        "{diff}"
+    );
+
+    // Restore the first snapshot: SOUL.md and the env rows come back.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/snapshots/{first}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let report = parse(&body);
+    assert_eq!(report["instance_id"], "alice");
+    assert_eq!(report["status"], "running");
+    assert!(report["files"].as_u64().expect("files") >= 1);
+    assert_eq!(
+        std::fs::read_to_string(&soul).expect("restored soul"),
+        original_soul
+    );
+
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/snapshots/{first}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["status"], "ok");
+
+    let (status, _) = harness
+        .request(Method::DELETE, &format!("/api/snapshots/{second}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = harness
+        .request(Method::GET, &format!("/api/snapshots/{second}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Every mutation is in the audit trail.
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=100", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let actions: Vec<String> = parse(&body)
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|entry| entry["action"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        actions.contains(&"instance.snapshot.create".to_string()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"instance.snapshot.restore".to_string()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"instance.snapshot.delete".to_string()),
+        "{actions:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_environment_change_takes_an_automatic_snapshot() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "42", "secret": false}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/snapshots", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let snapshots = parse(&body);
+    let snapshots = snapshots.as_array().expect("array");
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0]["label"], "auto: env");
+    assert_eq!(snapshots[0]["status"], "ok");
+}
+
+#[tokio::test]
+async fn snapshot_errors_are_explicit() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/snapshots",
+            Some(json!({"ttl_s": 0})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "invalid_snapshot");
+
+    let (status, _) = harness
+        .request(Method::GET, "/api/snapshots/ghost", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = harness
+        .request(Method::POST, "/api/snapshots/ghost/restore", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/snapshots/compare",
+            Some(json!({"a": "", "b": "x"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/snapshots/expired", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["removed"], 0);
+}

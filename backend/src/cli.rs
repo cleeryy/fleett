@@ -301,20 +301,47 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
+    Snapshots {
+        id: String,
+    },
+    SnapshotCreate {
+        id: String,
+        label: Option<String>,
+        ttl_s: Option<u64>,
+    },
+    SnapshotRestore {
+        snapshot: String,
+        yes: bool,
+    },
+    SnapshotDelete {
+        snapshot: String,
+    },
+    SnapshotDiff {
+        a: String,
+        b: String,
+    },
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +440,15 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Snapshots { id } => snapshots(&client, json, &id).await,
+        Command::SnapshotCreate { id, label, ttl_s } => {
+            snapshot_create(&client, json, &id, label.as_deref(), ttl_s).await
+        }
+        Command::SnapshotRestore { snapshot, yes } => {
+            snapshot_restore(&client, json, &snapshot, yes).await
+        }
+        Command::SnapshotDelete { snapshot } => snapshot_delete(&client, json, &snapshot).await,
+        Command::SnapshotDiff { a, b } => snapshot_diff(&client, json, &a, &b).await,
     }
 }
 
@@ -605,6 +641,66 @@ struct Me {
     role: String,
     #[serde(default)]
     method: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SnapshotView {
+    id: String,
+    instance_id: String,
+    path: String,
+    #[serde(default)]
+    label: String,
+    created_at: String,
+    expires_at: String,
+    size_bytes: u64,
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotRestoreView {
+    snapshot: SnapshotView,
+    instance_id: String,
+    files: usize,
+    status: String,
+    #[serde(default)]
+    env_restored: bool,
+    #[serde(default)]
+    compose_restored: bool,
+    #[serde(default)]
+    previous_data_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DiffFileView {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ChangedFileView {
+    path: String,
+    size_a: u64,
+    size_b: u64,
+    sha256_a: String,
+    sha256_b: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SnapshotDiffView {
+    instance_id: String,
+    a: String,
+    b: String,
+    #[serde(default)]
+    added: Vec<DiffFileView>,
+    #[serde(default)]
+    removed: Vec<DiffFileView>,
+    #[serde(default)]
+    changed: Vec<ChangedFileView>,
+    #[serde(default)]
+    unchanged: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +947,210 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
     }
     println!("message {message_id} marked as read");
     Ok(())
+}
+
+async fn fetch_snapshot(client: &Client, snapshot: &str) -> Result<SnapshotView, CliError> {
+    let path = format!("/api/snapshots/{}", encode_path_segment(snapshot));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    decode(value)
+}
+
+async fn snapshots(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/snapshots", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let snapshots: Vec<SnapshotView> = decode(value)?;
+    if snapshots.is_empty() {
+        println!("no restore point for {id}");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = snapshots
+        .iter()
+        .map(|snapshot| {
+            vec![
+                snapshot.id.clone(),
+                snapshot.created_at.clone(),
+                snapshot.expires_at.clone(),
+                human_bytes(snapshot.size_bytes),
+                snapshot.status.clone(),
+                if snapshot.label.is_empty() {
+                    "-".to_string()
+                } else {
+                    snapshot.label.clone()
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "CREATED", "EXPIRES", "SIZE", "STATUS", "LABEL"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn snapshot_create(
+    client: &Client,
+    json: bool,
+    id: &str,
+    label: Option<&str>,
+    ttl_s: Option<u64>,
+) -> Result<(), CliError> {
+    let mut body = Value::Object(serde_json::Map::new());
+    if let Some(label) = label {
+        body["label"] = json!(label);
+    }
+    if let Some(ttl_s) = ttl_s {
+        body["ttl_s"] = json!(ttl_s);
+    }
+    let path = format!("/api/instances/{}/snapshots", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let snapshot: SnapshotView = decode(value)?;
+    println!(
+        "snapshot {} of {} ({}), expires {}",
+        snapshot.id,
+        snapshot.instance_id,
+        human_bytes(snapshot.size_bytes),
+        snapshot.expires_at
+    );
+    if !snapshot.label.is_empty() {
+        println!("  label: {}", snapshot.label);
+    }
+    println!(
+        "  restore with `fleett snapshot restore {} --yes`",
+        snapshot.id
+    );
+    Ok(())
+}
+
+async fn snapshot_restore(
+    client: &Client,
+    json: bool,
+    snapshot_id: &str,
+    yes: bool,
+) -> Result<(), CliError> {
+    let snapshot = fetch_snapshot(client, snapshot_id).await?;
+    if !yes {
+        use std::io::Write as _;
+        eprintln!(
+            "restore snapshot {} of {} (created {})? The instance is stopped and restarted. [y/N]",
+            snapshot.id, snapshot.instance_id, snapshot.created_at
+        );
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|err| CliError::Config(format!("cannot read the confirmation: {err}")))?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Err(CliError::Config(
+                "restore aborted; pass --yes to confirm non-interactively".to_string(),
+            ));
+        }
+    }
+    let path = format!(
+        "/api/snapshots/{}/restore",
+        encode_path_segment(snapshot_id)
+    );
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let report: SnapshotRestoreView = decode(value)?;
+    println!(
+        "restored snapshot {} of {} ({} file(s)); instance {}",
+        report.snapshot.id, report.instance_id, report.files, report.status
+    );
+    if report.compose_restored {
+        println!("  compose file restored");
+    }
+    if report.env_restored {
+        println!("  environment rows restored (secrets stay encrypted)");
+    }
+    if let Some(path) = report.previous_data_dir {
+        println!("  previous data kept at {path}");
+    }
+    Ok(())
+}
+
+async fn snapshot_delete(client: &Client, json: bool, snapshot: &str) -> Result<(), CliError> {
+    let path = format!("/api/snapshots/{}", encode_path_segment(snapshot));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "snapshot": snapshot, "deleted": true }));
+    }
+    println!("deleted snapshot {snapshot}");
+    Ok(())
+}
+
+async fn snapshot_diff(client: &Client, json: bool, a: &str, b: &str) -> Result<(), CliError> {
+    let left = fetch_snapshot(client, a).await?;
+    let right = fetch_snapshot(client, b).await?;
+    if left.instance_id != right.instance_id {
+        return Err(CliError::Config(format!(
+            "snapshot {a} belongs to {} and snapshot {b} to {}: compare two snapshots of the same instance",
+            left.instance_id, right.instance_id
+        )));
+    }
+    let path = format!(
+        "/api/instances/{}/snapshots/compare",
+        encode_path_segment(&left.instance_id)
+    );
+    let value = client
+        .value(Method::POST, &path, &[], Some(json!({ "a": a, "b": b })))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let diff: SnapshotDiffView = decode(value)?;
+    println!("{} -> {} (instance {})", diff.a, diff.b, diff.instance_id);
+    if !diff.removed.is_empty() {
+        println!("removed ({}):", diff.removed.len());
+        for file in &diff.removed {
+            println!(
+                "  {:<48} {:>10}  {}",
+                file.path,
+                human_bytes(file.size),
+                short_hash(&file.sha256)
+            );
+        }
+    }
+    if !diff.added.is_empty() {
+        println!("added ({}):", diff.added.len());
+        for file in &diff.added {
+            println!(
+                "  {:<48} {:>10}  {}",
+                file.path,
+                human_bytes(file.size),
+                short_hash(&file.sha256)
+            );
+        }
+    }
+    if !diff.changed.is_empty() {
+        println!("changed ({}):", diff.changed.len());
+        for file in &diff.changed {
+            println!(
+                "  {:<48} {:>10} -> {:<10}  {} -> {}",
+                file.path,
+                human_bytes(file.size_a),
+                human_bytes(file.size_b),
+                short_hash(&file.sha256_a),
+                short_hash(&file.sha256_b)
+            );
+        }
+    }
+    println!("unchanged: {} file(s)", diff.unchanged);
+    Ok(())
+}
+
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 async fn create(client: &Client, json: bool, args: &CreateArgs) -> Result<(), CliError> {

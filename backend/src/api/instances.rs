@@ -787,6 +787,11 @@ pub async fn patch(
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
     let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
+    // A PATCH that may rewrite the environment gets a restore point first:
+    // an applied env is exactly what an operator wants to roll back.
+    if request.env.is_some() || gate_token.is_some() || channel_token.is_some() {
+        crate::snapshots::auto_before(&state, &id, "patch").await;
+    }
     enforce_caps(&state, Some(&id), &spec)?;
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
@@ -858,6 +863,8 @@ pub async fn put_env(
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
+    // A full environment replacement is a risky operation: snapshot first.
+    crate::snapshots::auto_before(&state, &id, "env").await;
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     let entries = resolve_full_env(&existing, &vars)?;
 
@@ -889,6 +896,8 @@ pub async fn delete_env(
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
+    // Removing a variable rewrites the environment: snapshot before it.
+    crate::snapshots::auto_before(&state, &id, "env-delete").await;
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     if !existing.iter().any(|entry| entry.key == key) {
         return Err(ApiError::not_found(format!(

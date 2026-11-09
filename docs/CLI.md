@@ -56,6 +56,11 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett snapshots <id>
+fleett snapshot create <id> [--label L] [--ttl S]
+fleett snapshot restore <snapshot-id> [--yes]
+fleett snapshot rm <snapshot-id>
+fleett snapshot diff <a> <b>
 fleett doctor
 ```
 
@@ -184,6 +189,27 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `snapshots` / `snapshot`
+
+Restore points of one instance ([docs/SNAPSHOTS.md](SNAPSHOTS.md)):
+
+```bash
+fleett snapshots alice
+fleett snapshot create alice --label "before model change" --ttl 2592000
+fleett snapshot restore 0f0e… --yes
+fleett snapshot diff 0f0e… 1a2b…
+fleett snapshot rm 1a2b…
+```
+
+`snapshots` lists `ID`, `CREATED`, `EXPIRES`, `SIZE`, `STATUS` and `LABEL`.
+`snapshot create` prints the new id and how to restore it; `--ttl` is in
+seconds (default 7 days, maximum 90). `snapshot restore` asks for confirmation
+unless `--yes` is given and stops/restarts the instance; a failed restore is
+reported as `409 restore_failed` after the previous state was put back.
+`snapshot diff` compares two snapshots of the **same** instance and prints the
+added, removed and changed files with their sizes and SHA-256 prefixes.
+`--json` returns the raw `Snapshot`, `RestoreReport` or `SnapshotDiff` objects.
 
 ### `doctor`
 

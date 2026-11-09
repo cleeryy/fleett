@@ -229,6 +229,51 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// List the restore points of one instance (client mode).
+    Snapshots {
+        /// Instance id.
+        id: String,
+    },
+    /// Create, restore, compare or delete a restore point (client mode).
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCommands,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum SnapshotCommands {
+    /// Snapshot one instance before a risky change.
+    Create {
+        /// Instance id.
+        id: String,
+        /// Free-form label (at most 128 characters).
+        #[arg(long)]
+        label: Option<String>,
+        /// Retention in seconds (default 7 days, maximum 90).
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Restore one snapshot: stop, replace, start, wait for health.
+    Restore {
+        /// Snapshot id.
+        snapshot: String,
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete one snapshot and its archive.
+    Rm {
+        /// Snapshot id.
+        snapshot: String,
+    },
+    /// Compare two snapshots of the same instance (no extraction).
+    Diff {
+        /// First snapshot id.
+        a: String,
+        /// Second snapshot id.
+        b: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +511,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Snapshots { id } => cli::run(cli::Command::Snapshots { id }, json).await,
+        Commands::Snapshot { action } => {
+            let command = match action {
+                SnapshotCommands::Create { id, label, ttl } => cli::Command::SnapshotCreate {
+                    id,
+                    label,
+                    ttl_s: ttl,
+                },
+                SnapshotCommands::Restore { snapshot, yes } => {
+                    cli::Command::SnapshotRestore { snapshot, yes }
+                }
+                SnapshotCommands::Rm { snapshot } => cli::Command::SnapshotDelete { snapshot },
+                SnapshotCommands::Diff { a, b } => cli::Command::SnapshotDiff { a, b },
+            };
+            cli::run(command, json).await
         }
     };
 

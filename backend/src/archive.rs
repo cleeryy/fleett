@@ -71,23 +71,39 @@ pub fn append_tree<W: Write>(
     root: &Path,
     prefix: &Path,
 ) -> io::Result<usize> {
+    append_tree_excluding(builder, root, prefix, |_| false)
+}
+
+/// Same as [`append_tree`] with an extra name filter.
+///
+/// `skip` receives the file name of every entry (file or directory) and
+/// returns `true` to leave it out. Snapshots use it to drop runtime caches that
+/// are regenerated on the next start; backups (`fleett backup`) keep the whole
+/// tree and call [`append_tree`].
+pub fn append_tree_excluding<W: Write, F: Fn(&OsStr) -> bool>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    prefix: &Path,
+    skip: F,
+) -> io::Result<usize> {
     let mut count = 0;
-    append_children(builder, root, prefix, &mut count)?;
+    append_children(builder, root, prefix, &mut count, &skip)?;
     Ok(count)
 }
 
-fn append_children<W: Write>(
+fn append_children<W: Write, F: Fn(&OsStr) -> bool>(
     builder: &mut tar::Builder<W>,
     root: &Path,
     prefix: &Path,
     count: &mut usize,
+    skip: &F,
 ) -> io::Result<()> {
     let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
         let name = entry.file_name();
-        if is_secret_name(&name) {
+        if is_secret_name(&name) || skip(&name) {
             continue;
         }
         let path = entry.path();
@@ -97,7 +113,7 @@ fn append_children<W: Write>(
 
         if file_type.is_dir() {
             append_dir(builder, &relative, 0o700)?;
-            append_children(builder, &path, &relative, count)?;
+            append_children(builder, &path, &relative, count, skip)?;
             continue;
         }
         if file_type.is_symlink() {
@@ -328,6 +344,47 @@ mod tests {
                 "data/sessions",
                 "data/sessions/one.json",
             ]
+        );
+    }
+
+    #[test]
+    fn a_name_filter_skips_files_and_whole_directories() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("data");
+        fs::create_dir_all(root.join("cache")).expect("cache dir");
+        fs::create_dir_all(root.join("skills")).expect("skills dir");
+        fs::write(root.join("cache/blob.bin"), "cache").expect("cache file");
+        fs::write(root.join("skills/note.md"), "note\n").expect("skill");
+        fs::write(root.join("SOUL.md"), "soul\n").expect("soul");
+
+        let mut builder = tar::Builder::new(gzip_writer());
+        let count = append_tree_excluding(&mut builder, &root, Path::new("data"), |name| {
+            name == "cache"
+        })
+        .expect("tree");
+        assert_eq!(count, 2, "SOUL and the skill, no cache file");
+        let bytes = builder.into_inner().expect("tar").finish().expect("gzip");
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(bytes)));
+        let mut names = Vec::new();
+        for entry in archive.entries().expect("entries") {
+            names.push(
+                entry
+                    .expect("entry")
+                    .path()
+                    .expect("path")
+                    .display()
+                    .to_string(),
+            );
+        }
+        assert!(names.contains(&"data/SOUL.md".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"data/skills/note.md".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("cache")),
+            "{names:?}"
         );
     }
 }
