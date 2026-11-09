@@ -8,7 +8,7 @@ use axum::Router;
 use fleett::api::{self, AppState};
 use fleett::config::{Config, EgressMode};
 use fleett::driver::mock::MockDriver;
-use fleett::driver::InspectInfo;
+use fleett::driver::{ExecOutput, InspectInfo};
 use fleett::models::{Health, Status};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -3875,6 +3875,310 @@ async fn file_mutations_are_audited() {
     assert_eq!(mkdir["details"]["path"], "/notes");
     let delete = find("instance.file.delete");
     assert_eq!(delete["details"]["path"], "/notes");
+}
+
+// ---------------------------------------------------------------------------
+// Exec (#36)
+// ---------------------------------------------------------------------------
+
+async fn audit_entries(harness: &Harness, action: &str) -> Vec<Value> {
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=50", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)
+        .as_array()
+        .expect("audit array")
+        .iter()
+        .filter(|entry| entry["action"] == action)
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn exec_runs_an_allowlisted_command_and_audits_it() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["ls", "/opt/data"], "timeout_s": 5})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let exec = parse(&body);
+    assert_eq!(exec["exit_code"], 0);
+    assert!(
+        exec["stdout"]
+            .as_str()
+            .is_some_and(|text| text.contains("ls /opt/data")),
+        "{body}"
+    );
+    assert_eq!(exec["stderr"], "");
+    assert_eq!(exec["timed_out"], false);
+    assert_eq!(exec["truncated"], false);
+    assert!(exec["duration_ms"].as_u64().is_some());
+
+    let calls = harness.mock.exec_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].instance, "alice");
+    assert_eq!(calls[0].argv, vec!["ls", "/opt/data"]);
+    assert_eq!(calls[0].timeout_s, 5);
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["target"], "alice");
+    assert_eq!(entry["details"]["result"], "ok");
+    assert_eq!(entry["details"]["argv"], json!(["ls", "/opt/data"]));
+    assert_eq!(entry["details"]["exit_code"], 0);
+    assert_eq!(entry["details"]["truncated"], false);
+    assert_eq!(entry["details"]["wildcard"], false);
+}
+
+#[tokio::test]
+async fn exec_refuses_rm_and_audits_the_refusal() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["rm", "-rf", "/"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "exec_refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("denylist")),
+        "{body}"
+    );
+    assert_eq!(error["details"]["reason"], "denied_command");
+    assert_eq!(error["details"]["argv"], json!(["rm", "-rf", "/"]));
+    let allowlist = error["details"]["allowlist"]
+        .as_array()
+        .expect("allowlist array");
+    assert!(allowlist.iter().any(|value| value == "ls"), "{body}");
+    assert!(
+        error["details"]["denylist"]
+            .as_array()
+            .expect("denylist array")
+            .iter()
+            .any(|value| value == "rm"),
+        "{body}"
+    );
+    assert!(
+        harness.mock.exec_calls().is_empty(),
+        "a refused command never reaches the driver"
+    );
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["details"]["result"], "refused");
+    assert_eq!(entries[0]["details"]["reason"], "denied_command");
+}
+
+#[tokio::test]
+async fn exec_reports_a_timeout_with_a_null_exit_code() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_exec_result(
+        "alice",
+        ExecOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            duration_ms: 1000,
+            truncated: false,
+        },
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["cat", "/dev/zero"], "timeout_s": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let exec = parse(&body);
+    assert_eq!(exec["timed_out"], true);
+    assert_eq!(exec["exit_code"], Value::Null);
+    assert_eq!(exec["stdout"], "");
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["details"]["result"], "timeout");
+}
+
+#[tokio::test]
+async fn exec_reports_a_truncated_stream() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_exec_result(
+        "alice",
+        ExecOutput {
+            exit_code: Some(0),
+            stdout: format!("data{}", fleett::exec::TRUNCATION_MARKER),
+            stderr: String::new(),
+            timed_out: false,
+            duration_ms: 3,
+            truncated: true,
+        },
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"cmd": "cat /dev/zero"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["truncated"], true);
+    assert_eq!(
+        audit_entries(&harness, "instance.exec").await[0]["details"]["truncated"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn exec_rejects_malformed_requests_before_touching_the_driver() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    for (body, code) in [
+        (json!({"cmd": "ls", "argv": ["ls"]}), "invalid_exec"),
+        (json!({}), "invalid_exec"),
+        (json!({"cmd": "ls; rm -rf /"}), "invalid_exec"),
+        (json!({"argv": ["ls"], "timeout_s": 0}), "invalid_timeout"),
+        (json!({"argv": ["ls"], "timeout_s": 301}), "invalid_timeout"),
+    ] {
+        let (status, response) = harness
+            .request(
+                Method::POST,
+                "/api/instances/alice/exec",
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(parse(&response)["error"]["code"], code, "{body}");
+    }
+    assert!(harness.mock.exec_calls().is_empty());
+
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/ghost/exec",
+            Some(json!({"argv": ["ls"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn exec_policy_lists_the_effective_lists_and_is_admin_only() {
+    let harness = Harness::new();
+    let (status, body) = harness.request(Method::GET, "/api/exec/policy", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = parse(&body);
+    assert_eq!(policy["source"], "default");
+    assert_eq!(policy["wildcard"], false);
+    assert!(policy["allowlist"]
+        .as_array()
+        .expect("allowlist")
+        .iter()
+        .any(|value| value == "ls"));
+    assert!(policy["denylist"]
+        .as_array()
+        .expect("denylist")
+        .iter()
+        .any(|value| value == "rm"));
+    assert_eq!(policy["max_output_bytes"], 256 * 1024);
+    assert_eq!(policy["timeout_s"]["default"], 30);
+
+    // A viewer may run nothing and read no policy.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/exec/policy", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["ls"]})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // The SSE route is a GET, so the method policy alone would let a viewer
+    // through: the handler itself must require admin.
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=ls",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn exec_stream_is_a_one_shot_sse() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=ls%20%2Fopt%2Fdata&timeout_s=5",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(body.contains("event: stdout"), "{body}");
+    assert!(
+        body.contains("\"line\":\"[mock] exec in alice: ls /opt/data\""),
+        "{body}"
+    );
+    assert!(body.contains("event: exit"), "{body}");
+    assert!(body.contains("\"exit_code\":0"), "{body}");
+
+    // A refusal is a JSON 403 before any SSE byte is sent.
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=rm%20-rf%20%2F",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "exec_refused");
 }
 
 // ---------------------------------------------------------------------------

@@ -356,6 +356,8 @@ pub struct Config {
     pub hardening: Hardening,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Raw `FLEETT_EXEC_ALLOWLIST` (`None` keeps the built-in allowlist).
+    pub exec_allowlist: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -577,6 +579,7 @@ impl Config {
         };
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
+        let exec_allowlist = get("EXEC_ALLOWLIST");
 
         Ok(Self {
             root,
@@ -598,6 +601,7 @@ impl Config {
             web_dist,
             hardening,
             metrics,
+            exec_allowlist,
         })
     }
 
@@ -634,6 +638,7 @@ impl Config {
             hardening: Hardening::Standard,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            exec_allowlist: None,
         }
     }
 
@@ -1316,6 +1321,21 @@ FLEETT_NETWORK='fleett-net'
                 "unexpected error for {var}={value}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn the_exec_allowlist_is_read_from_the_environment() {
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("t".to_string()),
+            "FLEETT_EXEC_ALLOWLIST" => Some("ls, cat".to_string()),
+            _ => None,
+        })
+        .expect("config resolves");
+        assert_eq!(cfg.exec_allowlist.as_deref(), Some("ls, cat"));
+
+        let default = Config::from_lookup(|key| (key == "FLEETT_TOKEN").then(|| "t".to_string()))
+            .expect("defaults resolve");
+        assert!(default.exec_allowlist.is_none());
     }
 
     #[test]

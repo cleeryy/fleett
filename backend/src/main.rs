@@ -168,6 +168,21 @@ enum Commands {
     },
     /// Show the CPU, memory and disk usage of the fleet (client mode).
     Usage,
+    /// Run one allowlisted command inside an instance container (client mode).
+    ///
+    /// Argv based: no shell is involved. See docs/EXEC.md.
+    Exec {
+        /// Instance id.
+        id: String,
+        /// Seconds before the command is killed (1..=300).
+        #[arg(long, default_value_t = cli::DEFAULT_EXEC_TIMEOUT)]
+        timeout: u64,
+        /// Command and its arguments, after `--`.
+        #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Show the effective exec allowlist and denylist (client mode).
+    ExecPolicy,
     /// List the container images present on the host and their instances
     /// (client mode).
     Images,
@@ -407,6 +422,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
         Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
         Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Exec { id, timeout, argv } => {
+            cli::run(
+                cli::Command::Exec(cli::ExecArgs {
+                    id,
+                    argv,
+                    timeout_s: timeout,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::ExecPolicy => cli::run(cli::Command::ExecPolicy, json).await,
         Commands::Images => cli::run(cli::Command::Images, json).await,
         Commands::Upgrade {
             image,

@@ -5,7 +5,8 @@
 //! Docker.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecOutput, ImageRecord, InspectInfo, LogsOptions, PsResult,
+    UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -26,6 +27,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct MockCall {
     pub operation: &'static str,
     pub instance: String,
+}
+
+/// One recorded `exec` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockExecCall {
+    pub instance: String,
+    pub argv: Vec<String>,
+    pub timeout_s: u64,
 }
 
 #[derive(Debug)]
@@ -55,6 +64,10 @@ pub struct MockDriver {
     inspect: Mutex<HashMap<String, InspectInfo>>,
     /// Canned usage samples, per instance (`force_usage`).
     usage: Mutex<HashMap<String, UsageSample>>,
+    /// Canned `exec` results, per instance (`set_exec_result`).
+    exec_results: Mutex<HashMap<String, ExecOutput>>,
+    /// Every `exec` call with its argv and timeout, oldest first.
+    exec_calls: Mutex<Vec<MockExecCall>>,
     /// Health reported once an instance runs the given image (`set_image_health`).
     image_health: Mutex<HashMap<String, Health>>,
     /// Images whose pull must fail (`fail_image_pull`).
@@ -96,6 +109,8 @@ impl MockDriver {
             logs_options: Mutex::new(Vec::new()),
             inspect: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
+            exec_results: Mutex::new(HashMap::new()),
+            exec_calls: Mutex::new(Vec::new()),
             image_health: Mutex::new(HashMap::new()),
             pull_failures: Mutex::new(HashMap::new()),
             known_images: Mutex::new(known),
@@ -194,6 +209,24 @@ impl MockDriver {
     /// Drop the canned usage sample of one instance.
     pub fn clear_usage(&self, id: &str) {
         lock(&self.usage).remove(id);
+    }
+
+    /// Report a canned result for the next `exec` calls on one instance.
+    ///
+    /// The same payload is returned until it is cleared, which is enough to
+    /// exercise the API: a timeout, a non-zero exit code or a truncated stream.
+    pub fn set_exec_result(&self, id: &str, output: ExecOutput) {
+        lock(&self.exec_results).insert(id.to_string(), output);
+    }
+
+    /// Drop the canned `exec` result of one instance.
+    pub fn clear_exec_result(&self, id: &str) {
+        lock(&self.exec_results).remove(id);
+    }
+
+    /// Every `exec` call, oldest first (argv and timeout included).
+    pub fn exec_calls(&self) -> Vec<MockExecCall> {
+        lock(&self.exec_calls).clone()
     }
 
     /// Make the next call of `operation` fail with `stderr`.
@@ -479,6 +512,34 @@ impl Driver for MockDriver {
         })
     }
 
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
+        Box::pin(async move {
+            self.record("exec", &spec.id);
+            lock(&self.exec_calls).push(MockExecCall {
+                instance: spec.id.clone(),
+                argv: argv.to_vec(),
+                timeout_s,
+            });
+            self.fail_if_requested("exec")?;
+            if let Some(output) = lock(&self.exec_results).get(&spec.id) {
+                return Ok(output.clone());
+            }
+            Ok(ExecOutput {
+                exit_code: Some(0),
+                stdout: format!("[mock] exec in {}: {}\n", spec.id, argv.join(" ")),
+                stderr: String::new(),
+                timed_out: false,
+                duration_ms: 1,
+                truncated: false,
+            })
+        })
+    }
+
     fn usage<'a>(
         &'a self,
         specs: &'a [InstanceSpec],
@@ -697,6 +758,49 @@ mod tests {
             .await
             .expect_err("injected failure");
         assert!(err.detail.contains("Docker daemon"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exec_records_the_argv_and_returns_a_canned_result() {
+        let driver = MockDriver::new();
+        let instance = spec("alice");
+        let argv = vec!["ls".to_string(), "/opt/data".to_string()];
+
+        let output = driver.exec(&instance, &argv, 5).await.expect("exec");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.stdout.contains("[mock] exec in alice: ls /opt/data"));
+        assert_eq!(
+            driver.exec_calls(),
+            vec![MockExecCall {
+                instance: "alice".to_string(),
+                argv: argv.clone(),
+                timeout_s: 5,
+            }]
+        );
+
+        driver.set_exec_result(
+            "alice",
+            ExecOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: true,
+                duration_ms: 1000,
+                truncated: false,
+            },
+        );
+        let output = driver.exec(&instance, &argv, 1).await.expect("exec");
+        assert!(output.timed_out);
+        assert_eq!(output.exit_code, None);
+
+        driver.fail_next("exec", "the container is not running");
+        let err = driver.exec(&instance, &argv, 1).await.expect_err("failure");
+        assert!(err.detail.contains("not running"), "{err}");
+        assert_eq!(
+            driver.exec_calls().len(),
+            3,
+            "a failed call is recorded too"
+        );
     }
 
     #[tokio::test]

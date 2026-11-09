@@ -240,6 +240,29 @@ with a timestamp, and `[{"line":"…"}]` otherwise. Invalid values answer `400` 
 the error/warn lines of a bounded window (at most 2000 lines) without returning the log.
 `last_at` is the parsed timestamp of the last matching line (`null` when it has none).
 
+## Exec
+
+One-shot command execution inside an instance container, **admin only** (including the SSE
+route, which is a `GET`). Full security model in [docs/EXEC.md](docs/EXEC.md): argv only
+(no shell), allowlist of basenames, hard denylist, basename-only names, 1..=300 s timeout,
+256 KiB per stream and an `instance.exec` audit row for every attempt.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/exec` | `{"argv":["ls","/opt/data"],"timeout_s":5}` or `{"cmd":"df -h","timeout_s":5}` | `{"exit_code":0,"stdout":"…","stderr":"","timed_out":false,"duration_ms":12,"truncated":false}`; `403 exec_refused` (details: `reason`, `argv`, `allowlist`, `denylist`, `wildcard`); `400 invalid_exec`/`invalid_timeout`; `404`; `502 driver_error` |
+| GET | `/api/instances/{id}/exec/stream?cmd=ls%20%2Fopt%2Fdata&timeout_s=5` | — | `text/event-stream`: `event: stdout` / `event: stderr` with `data: {"line":"…"}`, then `event: exit` with `{"exit_code","timed_out","duration_ms","truncated"}`; a refusal is a JSON `403 exec_refused` before any event |
+| GET | `/api/exec/policy` | — | `{"wildcard":false,"source":"default","allowlist":[…],"denylist":[…],"max_args":32,"max_arg_bytes":4096,"max_output_bytes":262144,"timeout_s":{"default":30,"min":1,"max":300}}`, admin only |
+
+`cmd` is split on whitespace and never given to a shell; it refuses `; | & $ ` < > ( ) \ " '`
+and newlines (`400 invalid_exec`). Send `argv` for an argument containing a space or a quote.
+Default allowlist: `ls cat tail head grep env ps df du date which pwd id uname uptime free echo`
+(`FLEETT_EXEC_ALLOWLIST` replaces it, `*` disables it while the denylist stays in force).
+`env` accepts no argument in allowlist mode. A timeout answers `200` with
+`"timed_out":true` and `"exit_code":null` (the streams are empty); it is not an HTTP error.
+The SSE route is **one-shot**: the command runs to completion, then the captured output is
+emitted and the stream closes — there is no stdin, PTY or session, and `EventSource` cannot
+send a bearer header (use `fetch`). See `docs/EXEC.md`.
+
 `GET /api/instances/{id}/export` → `application/gzip`, `Content-Disposition: attachment;
 filename="<id>.tgz"`. A gzipped tar with `manifest.json` (format/version, `created_at` and the
 instance metadata: id, name, template, model, base_url, api_key_env, channel, mem_limit_mb,

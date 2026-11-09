@@ -19,6 +19,8 @@ pub const URL_ENV: &str = "FLEETT_URL";
 pub const TOKEN_ENV: &str = "FLEETT_TOKEN";
 /// Default `--tail` of `fleett logs`, like the HTTP API.
 pub const DEFAULT_LOG_TAIL: u32 = 200;
+/// Default `--timeout` of `fleett exec`, like the HTTP API.
+pub const DEFAULT_EXEC_TIMEOUT: u64 = 30;
 /// Default provider base URL, the same one the web console pre-fills.
 pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/inference/go/openai/v1";
 /// Interval between two `GET /api/upgrade` polls of `fleett upgrade`.
@@ -153,6 +155,10 @@ pub enum CliError {
     /// `fleett upgrade` already printed the per-instance results.
     #[error("one or more instances were not upgraded")]
     UpgradeIncomplete,
+    /// `fleett exec` ran, but the remote command did not exit with `0`; the
+    /// process exit code mirrors it (124 on a timeout).
+    #[error("the remote command exited with code {code}")]
+    RemoteExit { code: i32 },
 }
 
 impl CliError {
@@ -165,6 +171,7 @@ impl CliError {
             Self::Decode(_) => "decode_error",
             Self::ChecksFailed => "checks_failed",
             Self::UpgradeIncomplete => "upgrade_incomplete",
+            Self::RemoteExit { .. } => "exec_failed",
         }
     }
 
@@ -250,7 +257,21 @@ impl Client {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Value, CliError> {
-        let text = self.text(method, path, query, body).await?;
+        self.value_with_timeout(method, path, query, body, HTTP_TIMEOUT)
+            .await
+    }
+
+    async fn value_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, CliError> {
+        let text = self
+            .text_with_timeout(method, path, query, body, timeout)
+            .await?;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(Value::Null);
@@ -265,8 +286,20 @@ impl Client {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<String, CliError> {
+        self.text_with_timeout(method, path, query, body, HTTP_TIMEOUT)
+            .await
+    }
+
+    async fn text_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<String, CliError> {
         let url = format!("{}{}", self.base, path);
-        let mut request = self.http.request(method, &url);
+        let mut request = self.http.request(method, &url).timeout(timeout);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
@@ -310,6 +343,8 @@ pub enum Command {
     Delete { id: String, purge: bool },
     Usage,
     Images,
+    Exec(ExecArgs),
+    ExecPolicy,
     Upgrade(UpgradeArgs),
     Doctor,
     Say(SayArgs),
@@ -335,6 +370,15 @@ pub struct MessagesArgs {
     pub view: String,
     pub status: Option<String>,
     pub limit: usize,
+}
+
+/// Arguments of `fleett exec`.
+#[derive(Debug, Clone)]
+pub struct ExecArgs {
+    pub id: String,
+    /// Command and arguments, already separated by the shell.
+    pub argv: Vec<String>,
+    pub timeout_s: u64,
 }
 
 /// Arguments of `fleett upgrade`.
@@ -387,6 +431,9 @@ pub struct CreateArgs {
 pub async fn run(command: Command, json: bool) -> i32 {
     match execute(command, json).await {
         Ok(()) => 0,
+        // `fleett exec` mirrors the remote exit code, like `docker exec`; the
+        // remote stderr was already written to our stderr.
+        Err(CliError::RemoteExit { code }) => code.clamp(1, 255),
         Err(err) => {
             print_error(&err, json);
             1
@@ -408,6 +455,8 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Delete { id, purge } => delete(&client, json, &id, purge).await,
         Command::Usage => usage(&client, json).await,
         Command::Images => images(&client, json).await,
+        Command::Exec(args) => exec(&client, json, &args).await,
+        Command::ExecPolicy => exec_policy(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
         Command::Say(args) => say(&client, json, &args).await,
@@ -525,6 +574,20 @@ struct ImageView {
     created: String,
     #[serde(default)]
     instances: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExecView {
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1005,6 +1068,104 @@ async fn images(client: &Client, json: bool) -> Result<(), CliError> {
     print!(
         "{}",
         render_table(&["TAG", "ID", "SIZE", "CREATED", "INSTANCES"], &rows)
+    );
+    Ok(())
+}
+
+async fn exec(client: &Client, json: bool, args: &ExecArgs) -> Result<(), CliError> {
+    // The remote timeout is the authoritative one; give the HTTP round trip a
+    // margin so the control plane answers instead of reqwest giving up first.
+    let timeout = Duration::from_secs(args.timeout_s.saturating_add(10));
+    let body = json!({
+        "argv": args.argv,
+        "timeout_s": args.timeout_s,
+    });
+    let path = format!("/api/instances/{}/exec", encode_path_segment(&args.id));
+    let value = client
+        .value_with_timeout(Method::POST, &path, &[], Some(body), timeout)
+        .await?;
+    let view: ExecView = decode(value.clone())?;
+
+    if json {
+        print_json(&value)?;
+    } else {
+        print!("{}", view.stdout);
+        if !view.stdout.is_empty() && !view.stdout.ends_with('\n') {
+            println!();
+        }
+        eprint!("{}", view.stderr);
+        if !view.stderr.is_empty() && !view.stderr.ends_with('\n') {
+            eprintln!();
+        }
+        if view.truncated {
+            eprintln!(
+                "fleett: output truncated at {} KiB",
+                crate::exec::MAX_OUTPUT_BYTES / 1024
+            );
+        }
+        if view.timed_out {
+            eprintln!("fleett: the command was killed after {}s", args.timeout_s);
+        }
+    }
+
+    exit_status(&view)
+}
+
+/// Mirror the remote exit code (124 for a timeout, like `timeout(1)`).
+fn exit_status(view: &ExecView) -> Result<(), CliError> {
+    if view.timed_out {
+        return Err(CliError::RemoteExit { code: 124 });
+    }
+    match view.exit_code {
+        Some(0) | None => Ok(()),
+        Some(code) => Err(CliError::RemoteExit { code }),
+    }
+}
+
+async fn exec_policy(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/exec/policy", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let text = |key: &str| -> String {
+        value[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    println!(
+        "source:    {}",
+        value["source"].as_str().unwrap_or("default")
+    );
+    println!(
+        "wildcard:  {}",
+        if value["wildcard"].as_bool().unwrap_or(false) {
+            "yes (FLEETT_EXEC_ALLOWLIST=*)"
+        } else {
+            "no"
+        }
+    );
+    println!("allowlist: {}", text("allowlist"));
+    println!("denylist:  {}", text("denylist"));
+    println!(
+        "timeout:   {}s ({}..={}s)",
+        value["timeout_s"]["default"].as_u64().unwrap_or(30),
+        value["timeout_s"]["min"].as_u64().unwrap_or(1),
+        value["timeout_s"]["max"].as_u64().unwrap_or(300)
+    );
+    println!(
+        "limits:    {} args, {} bytes per arg, {} KiB per stream",
+        value["max_args"].as_u64().unwrap_or(32),
+        value["max_arg_bytes"].as_u64().unwrap_or(4096),
+        value["max_output_bytes"].as_u64().unwrap_or(262_144) / 1024
     );
     Ok(())
 }
@@ -1549,5 +1710,26 @@ mod tests {
     fn path_segments_are_escaped() {
         assert_eq!(encode_path_segment("alice-2"), "alice-2");
         assert_eq!(encode_path_segment("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn exec_mirrors_the_remote_exit_code() {
+        let view = |exit_code, timed_out| ExecView {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out,
+            truncated: false,
+        };
+        assert!(exit_status(&view(Some(0), false)).is_ok());
+        assert!(exit_status(&view(None, false)).is_ok());
+        assert!(matches!(
+            exit_status(&view(Some(2), false)),
+            Err(CliError::RemoteExit { code: 2 })
+        ));
+        assert!(matches!(
+            exit_status(&view(None, true)),
+            Err(CliError::RemoteExit { code: 124 })
+        ));
     }
 }

@@ -11,6 +11,7 @@ pub mod db;
 pub mod driver;
 pub mod egress;
 pub mod envs;
+pub mod exec;
 pub mod files;
 pub mod history;
 pub mod instance_archive;

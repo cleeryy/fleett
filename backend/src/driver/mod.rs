@@ -102,6 +102,21 @@ impl InspectInfo {
     }
 }
 
+/// Result of one one-shot command executed inside the instance container.
+///
+/// `stdout` and `stderr` are captured separately and each capped at
+/// [`crate::exec::MAX_OUTPUT_BYTES`]; `truncated` is set when either stream hit
+/// the cap. A killed command reports `timed_out = true` with no exit code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub duration_ms: u64,
+    pub truncated: bool,
+}
+
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("docker compose {operation} failed: {detail}")]
@@ -173,6 +188,20 @@ pub trait Driver: Send + Sync {
         &'a self,
         spec: &'a InstanceSpec,
     ) -> DriverFuture<'a, Result<InspectInfo, DriverError>>;
+
+    /// Run one argv vector inside the instance container, without a shell.
+    ///
+    /// Container-side redirection and metacharacters are inert: the driver runs
+    /// `docker compose exec -T agent <argv…>` directly. The command is killed
+    /// after `timeout_s` seconds and the partial streams are discarded (a
+    /// killed `exec` cannot drain them); the output of both streams is capped
+    /// at [`crate::exec::MAX_OUTPUT_BYTES`].
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>>;
 
     /// Runtime usage of the given instances, in the same order.
     ///

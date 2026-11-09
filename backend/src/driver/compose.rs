@@ -7,10 +7,12 @@
 //! being recreated.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecOutput, ImageRecord, InspectInfo, LogsOptions, PsResult,
+    UsageSample,
 };
 use crate::config::Config;
 use crate::db::Db;
+use crate::exec::truncate_output;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use crate::render;
 use crate::store::compose_project_name;
@@ -18,7 +20,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 const UP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -244,6 +246,11 @@ impl ComposeDriver {
     }
 }
 
+/// Milliseconds elapsed since `started`, saturating at `u64::MAX`.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn run_command(
     mut command: Command,
     operation: &str,
@@ -405,6 +412,52 @@ impl Driver for ComposeDriver {
             let stdout = run_command(command, "inspect", INSPECT_TIMEOUT).await?;
             parse_inspect(&stdout)
                 .ok_or_else(|| DriverError::new("inspect", "unparsable docker inspect output"))
+        })
+    }
+
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
+        Box::pin(async move {
+            let mut command = self.command(&spec.id)?;
+            command
+                .arg("exec")
+                .arg("-T")
+                .arg("agent")
+                .args(argv)
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+
+            let started = Instant::now();
+            match tokio::time::timeout(Duration::from_secs(timeout_s), command.output()).await {
+                Err(_) => Ok(ExecOutput {
+                    exit_code: None,
+                    timed_out: true,
+                    duration_ms: elapsed_ms(started),
+                    ..ExecOutput::default()
+                }),
+                Ok(Err(err)) => Err(DriverError::new(
+                    "exec",
+                    format!("could not run docker: {err}"),
+                )),
+                Ok(Ok(output)) => {
+                    let (stdout, stdout_truncated) =
+                        truncate_output(&String::from_utf8_lossy(&output.stdout));
+                    let (stderr, stderr_truncated) =
+                        truncate_output(&String::from_utf8_lossy(&output.stderr));
+                    Ok(ExecOutput {
+                        exit_code: output.status.code(),
+                        stdout,
+                        stderr,
+                        timed_out: false,
+                        duration_ms: elapsed_ms(started),
+                        truncated: stdout_truncated || stderr_truncated,
+                    })
+                }
+            }
         })
     }
 
@@ -1410,5 +1463,86 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].tag, "agent:2");
         assert_eq!(images[0].size, "9MB");
+    }
+
+    #[tokio::test]
+    async fn exec_runs_the_argv_through_compose_exec_without_a_shell() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let calls = dir.path().join("calls");
+        let docker = fake_docker(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\necho hello\necho boom >&2\nexit 3\n",
+                calls = calls.display()
+            ),
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let argv = vec!["ls".to_string(), "-la".to_string(), "/opt/data".to_string()];
+
+        let output = driver
+            .exec(&usage_spec("alice"), &argv, 10)
+            .await
+            .expect("exec");
+        assert_eq!(output.exit_code, Some(3));
+        assert_eq!(output.stdout.trim(), "hello");
+        assert_eq!(output.stderr.trim(), "boom");
+        assert!(!output.timed_out);
+        assert!(!output.truncated);
+
+        let recorded = std::fs::read_to_string(&calls).expect("calls");
+        assert_eq!(
+            recorded.trim(),
+            format!(
+                "compose -f {} -p fleett-alice exec -T agent ls -la /opt/data",
+                dir.path().join("instances/alice/compose.yaml").display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_kills_a_command_that_exceeds_its_timeout() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let docker = fake_docker(dir.path(), "#!/bin/sh\nsleep 5\necho too late\n");
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let started = std::time::Instant::now();
+
+        let output = driver
+            .exec(
+                &usage_spec("alice"),
+                &["cat".to_string(), "/dev/zero".to_string()],
+                1,
+            )
+            .await
+            .expect("exec");
+        assert!(output.timed_out, "the command must be killed");
+        assert_eq!(output.exit_code, None);
+        assert!(output.stdout.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the timeout must not wait for the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_truncates_a_stream_at_the_cap() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let docker = fake_docker(
+            dir.path(),
+            "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' 'a'\nexit 0\n",
+        );
+        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+
+        let output = driver
+            .exec(&usage_spec("alice"), &["cat".to_string()], 10)
+            .await
+            .expect("exec");
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.truncated, "300 KB must be cut at 256 KiB");
+        assert!(output.stdout.ends_with(crate::exec::TRUNCATION_MARKER));
+        assert_eq!(
+            output.stdout.len(),
+            crate::exec::MAX_OUTPUT_BYTES + crate::exec::TRUNCATION_MARKER.len()
+        );
+        assert!(output.stderr.is_empty(), "stderr is capped separately");
     }
 }
