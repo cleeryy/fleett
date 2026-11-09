@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: fleett
+    orgId: 1
+    folder: fleett
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

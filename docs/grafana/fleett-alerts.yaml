@@ -1,0 +1,90 @@
+groups:
+  - name: fleett
+    interval: 30s
+    rules:
+      - alert: InstanceDown
+        expr: 'up{job="fleett"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+          component: fleett
+        annotations:
+          summary: 'fleett: the scrape target {{ $labels.instance }} is down'
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for more than
+            two minutes. The control plane is stopped, the metrics listener is
+            closed, or the network path is broken. Check
+            `systemctl status fleett` (or the container) and
+            `FLEETT_METRICS_BIND`.
+
+      - alert: InstanceUnhealthy
+        expr: 'fleett_instance_health{instance=~".+"} == 0'
+        for: 5m
+        labels:
+          severity: warning
+          component: fleett
+        annotations:
+          summary: 'fleett: instance {{ $labels.instance }} is not healthy'
+          description: >-
+            The recorded container health of {{ $labels.instance }} has been
+            non-healthy for five minutes. This covers a failing health probe and
+            a container that is not running; check the instance logs and
+            `last_error` before restarting it.
+
+      - alert: InstanceRestarting
+        expr: 'increase(fleett_instance_restarts_total{instance=~".+"}[15m]) > 0'
+        for: 0m
+        labels:
+          severity: warning
+          component: fleett
+        annotations:
+          summary: 'fleett: instance {{ $labels.instance }} is restarting'
+          description: >-
+            {{ $labels.instance }} was restarted
+            {{ $value | printf "%.0f" }} time(s) through the control plane in the
+            last fifteen minutes. A restart loop burns the agent budget and
+            usually hides a configuration or image problem.
+
+      - alert: DiskQuotaHigh
+        expr: >-
+          100 * fleett_disk_used_bytes
+          / on(instance) (fleett_disk_quota_bytes > 0) > 90
+        for: 10m
+        labels:
+          severity: warning
+          component: fleett
+        annotations:
+          summary: 'fleett: instance {{ $labels.instance }} is above 90% of its disk quota'
+          description: >-
+            {{ $labels.instance }} uses {{ $value | printf "%.1f" }}% of its disk
+            quota for more than ten minutes. Free the instance logs or raise its
+            quota before the data directory fills the host. This rule stays
+            silent while no quota is configured (the series is 0).
+
+      - alert: FleettScrapeFailing
+        expr: '(fleett_usage_ok == 0) or (up{job="fleett"} == 0)'
+        for: 5m
+        labels:
+          severity: critical
+          component: fleett
+        annotations:
+          summary: 'fleett: metrics are incomplete or the scrape is failing'
+          description: >-
+            Either Prometheus cannot scrape fleett at all, or
+            `fleett_usage_ok` has been 0 for five minutes: the endpoint answers
+            but the docker stats / du sample cannot be read, so the per-instance
+            CPU, memory and disk series are stale.
+
+      - alert: UpgradeRolledBack
+        expr: 'increase(fleett_rollbacks_total[1h]) > 0'
+        for: 0m
+        labels:
+          severity: warning
+          component: fleett
+        annotations:
+          summary: 'fleett: an upgrade was rolled back'
+          description: >-
+            {{ $value | printf "%.0f" }} rolling upgrade job(s) rolled at least
+            one instance back in the last hour. The fleet runs the previous
+            image; inspect `GET /api/upgrade` and the instance logs before
+            retrying the target image.
