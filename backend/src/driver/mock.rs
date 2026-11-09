@@ -45,6 +45,7 @@ struct MockInstance {
     image: String,
     started_at: Option<SystemTime>,
     ups: u32,
+    restart_count: u32,
 }
 
 /// Deterministic, Docker-free driver.
@@ -281,6 +282,7 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: Some(SystemTime::now()),
             ups: 0,
+            restart_count: 0,
         });
         entry.status = status;
         if status != Status::Running {
@@ -298,8 +300,22 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: Some(SystemTime::now()),
             ups: 0,
+            restart_count: 0,
         });
         entry.health = health;
+    }
+
+    /// Force the `docker inspect` restart count of one instance.
+    pub fn force_restart_count(&self, id: &str, count: u32) {
+        let mut state = self.ensure_instance(id);
+        if let Some(entry) = state.get_mut(id) {
+            entry.restart_count = count;
+        }
+    }
+
+    /// Current simulated status of one instance.
+    pub fn status_of(&self, id: &str) -> Option<Status> {
+        lock(&self.state).get(id).map(|entry| entry.status)
     }
 
     fn record(&self, operation: &'static str, id: &str) {
@@ -326,6 +342,7 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: None,
             ups: 0,
+            restart_count: 0,
         });
         state
     }
@@ -379,6 +396,7 @@ impl MockDriver {
                 state: entry.status.as_str().to_string(),
                 exit_code: Some(0),
                 oom_killed: false,
+                restart_count: entry.restart_count,
                 error: None,
                 started_at: entry.started_at.map(|started| {
                     chrono::DateTime::<chrono::Utc>::from(started)
@@ -690,6 +708,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: crate::models::HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -730,6 +752,7 @@ mod tests {
                 state: "exited".to_string(),
                 exit_code: Some(137),
                 oom_killed: true,
+                restart_count: 0,
                 error: None,
                 started_at: None,
             },

@@ -63,6 +63,10 @@ fleett schedule add <id> --name NAME --cron EXPR --prompt TEXT
 fleett schedule rm <schedule-id>
 fleett schedule run <schedule-id>
 fleett runs <id> [--limit N]
+fleett incidents [--status open|closed] [--instance ID] [--limit N]
+fleett heal <id> --policy off|restart|recreate
+              [--unhealthy-after N] [--max-restarts N] [--backoff SECONDS]
+fleett incident close <incident-id>
 fleett doctor
 ```
 
@@ -229,6 +233,24 @@ fleett memory promote 12 --namespace global
 
 Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
 the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+### `incidents` / `heal` / `incident close`
+
+Read the watchdog incident registry and change the self-healing policy
+([docs/WATCHDOG.md](WATCHDOG.md)):
+
+```bash
+fleett incidents
+fleett incidents --status open --instance alice
+fleett heal alice --policy restart --unhealthy-after 2 --max-restarts 3 --backoff 15
+fleett heal alice --policy off
+fleett incident close 3f2a…
+```
+
+`incidents` prints `OPENED`, `INSTANCE`, `CAUSE`, `STATUS`, `RESTARTS` and
+`DETAIL`, newest first. `--json` prints the raw incident array. `heal` prints the
+resulting policy (`id: heal=restart unhealthy_after=2 max_restarts=3 backoff=15s`);
+`incident close` prints the closed incident. Both mutations require an admin
+token and are written to the audit log.
 
 ### `doctor`
 

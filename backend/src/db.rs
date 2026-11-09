@@ -12,7 +12,7 @@
 
 use crate::config::Config;
 use crate::models::{
-    now_iso, ChannelKind, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
+    now_iso, ChannelKind, HealPolicy, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
 };
 use crate::store;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -298,6 +298,31 @@ CREATE TABLE IF NOT EXISTS pipeline_steps (
 CREATE INDEX IF NOT EXISTS idx_pipeline_steps_run
     ON pipeline_steps (run_id, step_id);
 "#,
+    // v13 — watchdog: self-healing policy per instance and the incident
+    // registry (issue #32). Existing rows keep healing disabled, so an upgrade
+    // never starts touching containers on its own.
+    r#"
+CREATE TABLE IF NOT EXISTS incidents (
+    id            TEXT PRIMARY KEY NOT NULL,
+    instance_id   TEXT NOT NULL,
+    cause         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    opened_at     TEXT NOT NULL,
+    closed_at     TEXT,
+    detail        TEXT NOT NULL DEFAULT '',
+    actions       TEXT NOT NULL DEFAULT '[]',
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    last_seen_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_instance_status
+    ON incidents (instance_id, status);
+
+ALTER TABLE instances ADD COLUMN heal TEXT NOT NULL DEFAULT 'off';
+ALTER TABLE instances ADD COLUMN unhealthy_after INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE instances ADD COLUMN max_restarts INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE instances ADD COLUMN heal_backoff_s INTEGER NOT NULL DEFAULT 30;
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -477,8 +502,8 @@ impl Db {
         let stored = conn
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, provider, channel, \
-                 status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
-                 updated_at \
+                 status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
+                 unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -495,8 +520,8 @@ impl Db {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, provider, channel, status, \
-             last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
-             updated_at \
+             last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, unhealthy_after, \
+             max_restarts, heal_backoff_s, notes, created_at, updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -541,9 +566,10 @@ impl Db {
         }
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, provider, \
-             channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, \
-             created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
+             unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                     ?17, ?18, ?19, ?20, ?21)",
             params![
                 spec.id,
                 spec.name,
@@ -559,6 +585,10 @@ impl Db {
                 spec.cpu_limit,
                 spec.image,
                 spec.allow_lan,
+                spec.heal.as_str(),
+                spec.unhealthy_after,
+                spec.max_restarts,
+                spec.heal_backoff_s as i64,
                 spec.notes,
                 spec.created_at,
                 spec.updated_at,
@@ -577,8 +607,9 @@ impl Db {
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, provider = ?7, channel = ?8, status = ?9, last_error = ?10, \
-             mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, notes = ?15, \
-             updated_at = ?16 \
+             mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, heal = ?15, \
+             unhealthy_after = ?16, max_restarts = ?17, heal_backoff_s = ?18, notes = ?19, \
+             updated_at = ?20 \
              WHERE id = ?1",
             params![
                 spec.id,
@@ -595,6 +626,10 @@ impl Db {
                 spec.cpu_limit,
                 spec.image,
                 spec.allow_lan,
+                spec.heal.as_str(),
+                spec.unhealthy_after,
+                spec.max_restarts,
+                spec.heal_backoff_s as i64,
                 spec.notes,
                 spec.updated_at,
             ],
@@ -647,6 +682,33 @@ impl Db {
         Ok(())
     }
 
+    /// Record the watchdog policy of one instance.
+    ///
+    /// Only the policy columns (and `updated_at`) move: a policy change must
+    /// never rewrite the notes, the limits or the share links of the instance.
+    pub fn set_heal_policy(
+        &self,
+        id: &str,
+        heal: HealPolicy,
+        unhealthy_after: u32,
+        max_restarts: u32,
+        heal_backoff_s: u64,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE instances SET heal = ?2, unhealthy_after = ?3, max_restarts = ?4, \
+             heal_backoff_s = ?5, updated_at = ?6 WHERE id = ?1",
+            params![
+                id,
+                heal.as_str(),
+                unhealthy_after,
+                max_restarts,
+                heal_backoff_s as i64,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_instance(&self, id: &str) -> Result<(), DbError> {
         let mut conn = self.lock();
         let transaction = conn.transaction()?;
@@ -670,6 +732,7 @@ impl Db {
             params![id],
         )?;
         transaction.execute("DELETE FROM schedules WHERE instance_id = ?1", params![id])?;
+        transaction.execute("DELETE FROM incidents WHERE instance_id = ?1", params![id])?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
         transaction.commit()?;
         Ok(())
@@ -1285,6 +1348,10 @@ struct StoredRow {
     cpu_limit: f64,
     image: String,
     allow_lan: bool,
+    heal: String,
+    unhealthy_after: i64,
+    max_restarts: i64,
+    heal_backoff_s: i64,
     notes: String,
     created_at: String,
     updated_at: String,
@@ -1313,6 +1380,10 @@ impl StoredRow {
             // reads it back when the instance is rendered.
             previous_image: None,
             allow_lan: self.allow_lan,
+            heal: HealPolicy::parse(&self.heal).unwrap_or(HealPolicy::Off),
+            unhealthy_after: self.unhealthy_after.clamp(0, u32::MAX as i64) as u32,
+            max_restarts: self.max_restarts.clamp(0, u32::MAX as i64) as u32,
+            heal_backoff_s: self.heal_backoff_s.clamp(0, i64::MAX) as u64,
             notes: self.notes,
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
             last_error: self.last_error,
@@ -1338,6 +1409,10 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         cpu_limit: row.get("cpu_limit")?,
         image: row.get("image")?,
         allow_lan: row.get("allow_lan")?,
+        heal: row.get("heal")?,
+        unhealthy_after: row.get("unhealthy_after")?,
+        max_restarts: row.get("max_restarts")?,
+        heal_backoff_s: row.get("heal_backoff_s")?,
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -1464,6 +1539,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -1554,6 +1633,7 @@ mod tests {
             "audit_log",
             "api_tokens",
             "providers",
+            "incidents",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -1568,6 +1648,12 @@ mod tests {
         assert!(columns.iter().any(|column| column == "allow_lan"));
         assert!(columns.iter().any(|column| column == "image"));
         assert!(columns.iter().any(|column| column == "provider"));
+        for column in ["heal", "unhealthy_after", "max_restarts", "heal_backoff_s"] {
+            assert!(
+                columns.iter().any(|c| c == column),
+                "missing column {column}"
+            );
+        }
     }
 
     #[test]

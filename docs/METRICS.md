@@ -62,7 +62,7 @@ port must not go unnoticed.
 | `fleett_secrets_expiring_days` | gauge | `instance` | Days until the earliest secret of the instance expires. `-1` means the expiry is unknown (the current schema has no expiry column); instances without secrets are omitted. |
 | `fleett_incidents_open` | gauge | — | Incidents the watchdog registry still reports as open; `0` when the registry (issue #32) is not installed. |
 | `fleett_api_requests_total` | counter | `method`, `status` | HTTP requests served by the API, per method and status code. |
-| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `upgrade`, `rollback`) and result (`ok`, `error`). |
+| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `recreate`, `upgrade`, `rollback`) and result (`ok`, `error`). |
 | `fleett_upgrade_jobs_total` | counter | `result` | Finished rolling upgrade jobs, per final result (`success`, `rolled_back`, `failed`). |
 | `fleett_upgrades_total` | counter | `status` | Same counter as `fleett_upgrade_jobs_total`, with the `status` label the alert rules use; the three statuses keep a `0` series before the first job. |
 | `fleett_rollbacks_total` | counter | — | Rolling upgrade jobs that rolled at least one instance back. |

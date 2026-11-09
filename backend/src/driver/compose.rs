@@ -762,6 +762,14 @@ fn parse_inspect(stdout: &str) -> Option<InspectInfo> {
             .find(|(key, _)| key.eq_ignore_ascii_case("oomkilled"))
             .and_then(|(_, value)| value.as_bool())
             .unwrap_or(false),
+        // `RestartCount` is a sibling of `State` in `docker inspect`, not a
+        // member of it.
+        restart_count: object
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("restartcount"))
+            .and_then(|(_, value)| value.as_u64())
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .unwrap_or(0),
         error: text(&["error"]).filter(|error| !error.trim().is_empty()),
         started_at,
     })
@@ -1156,6 +1164,7 @@ mod tests {
         let stdout = r#"[{
             "Id": "abc",
             "Name": "/fleett-alice",
+            "RestartCount": 4,
             "State": {
                 "Status": "running",
                 "Running": true,
@@ -1170,6 +1179,7 @@ mod tests {
         assert_eq!(info.state, "running");
         assert_eq!(info.exit_code, Some(0));
         assert!(!info.oom_killed);
+        assert_eq!(info.restart_count, 4);
         assert_eq!(info.error, None);
         assert_eq!(
             info.started_at.as_deref(),
@@ -1288,6 +1298,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: crate::models::HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,

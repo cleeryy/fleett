@@ -312,6 +312,9 @@ pub enum Command {
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
+    Incidents(IncidentsArgs),
+    Heal(HealArgs),
+    IncidentClose(String),
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
@@ -375,6 +378,25 @@ pub enum MemoryCommand {
         namespace: String,
     },
 }
+
+/// Arguments of `fleett incidents`.
+#[derive(Debug, Clone)]
+pub struct IncidentsArgs {
+    pub status: Option<String>,
+    pub instance: Option<String>,
+    pub limit: usize,
+}
+
+/// Arguments of `fleett heal`.
+#[derive(Debug, Clone)]
+pub struct HealArgs {
+    pub id: String,
+    pub policy: String,
+    pub unhealthy_after: Option<u32>,
+    pub max_restarts: Option<u32>,
+    pub backoff_s: Option<u64>,
+}
+
 /// Arguments of `fleett say`.
 #[derive(Debug, Clone)]
 pub struct SayArgs {
@@ -468,6 +490,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
+        Command::Incidents(args) => incidents(&client, json, &args).await,
+        Command::Heal(args) => heal(&client, json, &args).await,
+        Command::IncidentClose(id) => incident_close(&client, json, &id).await,
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
@@ -1617,6 +1642,117 @@ fn short_id(id: &str) -> String {
     // `sha256:` plus the first 12 hex characters, like `docker ps`.
     let digest = id.strip_prefix("sha256:").unwrap_or(id);
     digest.chars().take(12).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog: incidents and heal policy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct IncidentView {
+    id: String,
+    instance_id: String,
+    cause: String,
+    status: String,
+    opened_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    restart_count: u32,
+    #[serde(default)]
+    actions: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HealView {
+    id: String,
+    heal: String,
+    unhealthy_after: u32,
+    max_restarts: u32,
+    heal_backoff_s: u64,
+}
+
+async fn incidents(client: &Client, json: bool, args: &IncidentsArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
+    if let Some(status) = args.status.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("status", status.to_string()));
+    }
+    if let Some(instance) = args.instance.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("instance", instance.to_string()));
+    }
+    let value = client
+        .value(Method::GET, "/api/incidents", &query, None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let incidents: Vec<IncidentView> = decode(value)?;
+    if incidents.is_empty() {
+        println!("no incidents");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = incidents
+        .iter()
+        .map(|incident| {
+            vec![
+                incident.opened_at.clone(),
+                incident.instance_id.clone(),
+                incident.cause.clone(),
+                incident.status.clone(),
+                incident.restart_count.to_string(),
+                incident.detail.replace('\n', " "),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["OPENED", "INSTANCE", "CAUSE", "STATUS", "RESTARTS", "DETAIL"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn heal(client: &Client, json: bool, args: &HealArgs) -> Result<(), CliError> {
+    let mut body = json!({ "heal": args.policy });
+    let object = body.as_object_mut().expect("object");
+    if let Some(unhealthy_after) = args.unhealthy_after {
+        object.insert("unhealthy_after".to_string(), json!(unhealthy_after));
+    }
+    if let Some(max_restarts) = args.max_restarts {
+        object.insert("max_restarts".to_string(), json!(max_restarts));
+    }
+    if let Some(backoff_s) = args.backoff_s {
+        object.insert("heal_backoff_s".to_string(), json!(backoff_s));
+    }
+    let path = format!("/api/instances/{}/heal", encode_path_segment(&args.id));
+    let value = client.value(Method::PATCH, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: HealView = decode(value)?;
+    println!(
+        "{}: heal={} unhealthy_after={} max_restarts={} backoff={}s",
+        view.id, view.heal, view.unhealthy_after, view.max_restarts, view.heal_backoff_s
+    );
+    Ok(())
+}
+
+async fn incident_close(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/incidents/{}/close", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let incident: IncidentView = decode(value)?;
+    println!(
+        "closed incident {} ({} on {})",
+        incident.id, incident.cause, incident.instance_id
+    );
+    Ok(())
 }
 
 async fn doctor(client: &Client, json: bool, url: &str) -> Result<(), CliError> {

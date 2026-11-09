@@ -189,6 +189,42 @@ enum Commands {
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
+    /// List the incidents recorded by the watchdog (client mode).
+    Incidents {
+        /// `open` or `closed`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Only the incidents of this instance.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Change the self-healing policy of an instance (client mode).
+    ///
+    /// See docs/WATCHDOG.md.
+    Heal {
+        /// Instance id.
+        id: String,
+        /// `off` (observe only), `restart` or `recreate`.
+        #[arg(long)]
+        policy: String,
+        /// Consecutive unhealthy samples before the watchdog acts.
+        #[arg(long)]
+        unhealthy_after: Option<u32>,
+        /// Heal attempts allowed before the watchdog gives up.
+        #[arg(long)]
+        max_restarts: Option<u32>,
+        /// Base delay between two heal attempts, in seconds.
+        #[arg(long)]
+        backoff: Option<u64>,
+    },
+    /// Manage incidents (client mode).
+    Incident {
+        #[command(subcommand)]
+        action: IncidentCommands,
+    },
     /// Send a message to another instance over the fleet bus (client mode).
     Say {
         /// Recipient instance id.
@@ -343,6 +379,15 @@ enum ScheduleCommands {
     Run {
         /// Schedule id.
         schedule_id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum IncidentCommands {
+    /// Close one incident by hand (`fleett incident close <id>`).
+    Close {
+        /// Incident id.
+        id: String,
     },
 }
 
@@ -541,6 +586,43 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+        Commands::Incidents {
+            status,
+            instance,
+            limit,
+        } => {
+            cli::run(
+                cli::Command::Incidents(cli::IncidentsArgs {
+                    status,
+                    instance,
+                    limit,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Heal {
+            id,
+            policy,
+            unhealthy_after,
+            max_restarts,
+            backoff,
+        } => {
+            cli::run(
+                cli::Command::Heal(cli::HealArgs {
+                    id,
+                    policy,
+                    unhealthy_after,
+                    max_restarts,
+                    backoff_s: backoff,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Incident { action } => match action {
+            IncidentCommands::Close { id } => cli::run(cli::Command::IncidentClose(id), json).await,
+        },
         Commands::Say {
             to,
             body,
@@ -741,6 +823,11 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         Err(err) => tracing::warn!(%err, "could not recover scheduled runs"),
     }
     spawn_scheduler(state.clone());
+    if cfg.watchdog_interval_s > 0 {
+        tokio::spawn(fleett::watchdog::run(state.clone()));
+    } else {
+        tracing::info!("watchdog disabled (FLEETT_WATCHDOG_INTERVAL_S=0)");
+    }
 
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;

@@ -7,6 +7,7 @@ pub mod error;
 pub mod files;
 pub mod git;
 pub mod health;
+pub mod incidents;
 pub mod instances;
 pub mod json;
 pub mod memory;
@@ -30,7 +31,7 @@ use crate::driver::Driver;
 use crate::models::{Health, InstanceSpec, Status, HEALTH_UNHEALTHY_MESSAGE};
 use crate::store;
 use axum::middleware;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 #[cfg(not(feature = "embed-web"))]
 use axum::Json;
 use axum::Router;
@@ -54,6 +55,8 @@ pub struct AppState {
     pub upgrade: Arc<upgrade::UpgradeManager>,
     /// Prometheus counters and the cached utilisation sample (`GET /metrics`).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Watchdog sampling state (streaks, heal attempts, backoff).
+    pub watchdog: Arc<crate::watchdog::WatchdogState>,
     pub started_at: Instant,
 }
 
@@ -96,6 +99,7 @@ impl AppState {
             locks: Arc::new(InstanceLocks::default()),
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            watchdog: Arc::new(crate::watchdog::WatchdogState::default()),
             started_at: Instant::now(),
         })
     }
@@ -164,6 +168,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/usage", get(usage::usage))
         .route("/images", get(upgrade::images))
         .route("/upgrade", get(upgrade::status).post(upgrade::start))
+        .route("/incidents", get(incidents::list))
+        .route("/incidents/{id}/close", post(incidents::close))
         .route("/providers", get(providers::list).post(providers::create))
         .route(
             "/providers/{id}",
@@ -182,6 +188,11 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
+        .route(
+            "/instances/{id}/incidents",
+            get(incidents::instance_incidents),
+        )
+        .route("/instances/{id}/heal", patch(incidents::patch_heal))
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",
