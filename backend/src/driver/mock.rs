@@ -9,6 +9,7 @@ use super::{
     LogsOptions, PsResult, UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
+use crate::hosts::HostCapacity;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +28,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct MockCall {
     pub operation: &'static str,
     pub instance: String,
+    /// Host recorded through `InstanceSpec::host` at call time.
+    pub host: String,
 }
 
 /// One recorded `exec` call (pipelines, issue #31).
@@ -71,8 +74,18 @@ pub struct MockDriver {
     pull_failures: Mutex<HashMap<String, String>>,
     /// Images present in the simulated local store.
     known_images: Mutex<Vec<String>>,
-    /// Every `ensure_image` target, oldest first.
+    /// Every `ensure_image` target, oldest first (without its host).
     image_calls: Mutex<Vec<String>>,
+    /// Every `(host, image)` pair passed to `ensure_image`.
+    image_hosts: Mutex<Vec<(String, String)>>,
+    /// Canned capacity of each host (`probe_host`).
+    host_capacity: Mutex<HashMap<String, HostCapacity>>,
+    /// Host ids whose probe must fail.
+    host_failures: Mutex<HashMap<String, String>>,
+    /// Every host id probed, oldest first.
+    host_probes: Mutex<Vec<String>>,
+    /// Host ids whose `usage` call must fail (unreachable daemon).
+    usage_failures: Mutex<HashMap<String, String>>,
     /// `up` sleeps this long, so the upgrade tests can observe concurrency.
     up_delay: Mutex<Option<Duration>>,
     in_flight_ups: AtomicUsize,
@@ -120,6 +133,11 @@ impl MockDriver {
             pull_failures: Mutex::new(HashMap::new()),
             known_images: Mutex::new(known),
             image_calls: Mutex::new(Vec::new()),
+            image_hosts: Mutex::new(Vec::new()),
+            host_capacity: Mutex::new(HashMap::new()),
+            host_failures: Mutex::new(HashMap::new()),
+            host_probes: Mutex::new(Vec::new()),
+            usage_failures: Mutex::new(HashMap::new()),
             up_delay: Mutex::new(None),
             in_flight_ups: AtomicUsize::new(0),
             max_in_flight_ups: AtomicUsize::new(0),
@@ -231,6 +249,40 @@ impl MockDriver {
         self.max_in_flight_execs.load(Ordering::SeqCst)
     }
 
+    /// Every `(host, image)` pair passed to `ensure_image`.
+    pub fn image_hosts(&self) -> Vec<(String, String)> {
+        lock(&self.image_hosts).clone()
+    }
+
+    /// Canned capacity reported by `probe_host` for one host.
+    pub fn set_host_capacity(&self, host: &str, capacity: HostCapacity) {
+        lock(&self.host_capacity).insert(host.to_string(), capacity);
+    }
+
+    /// Make `probe_host` fail for one host, as an unreachable daemon would.
+    pub fn fail_host_test(&self, host: &str, detail: impl Into<String>) {
+        lock(&self.host_failures).insert(host.to_string(), detail.into());
+    }
+
+    /// Make `usage` fail for one host, as an unreachable daemon would.
+    pub fn fail_usage_host(&self, host: &str, detail: impl Into<String>) {
+        lock(&self.usage_failures).insert(host.to_string(), detail.into());
+    }
+
+    /// Every host id probed, oldest first.
+    pub fn host_probes(&self) -> Vec<String> {
+        lock(&self.host_probes).clone()
+    }
+
+    /// Host recorded for the latest call of one operation on one instance.
+    pub fn host_of(&self, operation: &str, id: &str) -> Option<String> {
+        lock(&self.calls)
+            .iter()
+            .rev()
+            .find(|call| call.operation == operation && call.instance == id)
+            .map(|call| call.host.clone())
+    }
+
     /// Image the simulated container of `id` currently runs.
     pub fn image_of(&self, id: &str) -> Option<String> {
         lock(&self.state).get(id).map(|entry| entry.image.clone())
@@ -338,10 +390,11 @@ impl MockDriver {
         lock(&self.state).get(id).map(|entry| entry.status)
     }
 
-    fn record(&self, operation: &'static str, id: &str) {
+    fn record_for(&self, operation: &'static str, id: &str, host: &str) {
         lock(&self.calls).push(MockCall {
             operation,
             instance: id.to_string(),
+            host: host.to_string(),
         });
     }
 
@@ -440,20 +493,45 @@ impl Driver for MockDriver {
         Box::pin(async move { true })
     }
 
-    fn ensure_network<'a>(&'a self, _name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>> {
+    fn ensure_network<'a>(
+        &'a self,
+        _host: &'a str,
+        _name: &'a str,
+    ) -> DriverFuture<'a, Result<bool, DriverError>> {
         Box::pin(async move { Ok(false) })
     }
 
     fn network_subnet<'a>(
         &'a self,
+        _host: &'a str,
         _name: &'a str,
     ) -> DriverFuture<'a, Result<Option<String>, DriverError>> {
         Box::pin(async move { Ok(lock(&self.network_subnet).clone()) })
     }
 
+    fn probe_host<'a>(
+        &'a self,
+        host: &'a crate::hosts::HostSpec,
+    ) -> DriverFuture<'a, Result<HostCapacity, DriverError>> {
+        Box::pin(async move {
+            lock(&self.host_probes).push(host.id.clone());
+            if let Some(detail) = lock(&self.host_failures).get(&host.id).cloned() {
+                return Err(DriverError::new("info", detail));
+            }
+            Ok(lock(&self.host_capacity)
+                .get(&host.id)
+                .cloned()
+                .unwrap_or_else(|| HostCapacity {
+                    ncpu: 8,
+                    mem_total_bytes: 16 * 1024 * 1024 * 1024,
+                    docker_version: Some("mock".to_string()),
+                }))
+        })
+    }
+
     fn up<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.record("up", &spec.id);
+            self.record_for("up", &spec.id, &spec.host);
             self.fail_if_requested("up")?;
             let delay = *lock(&self.up_delay);
             if let Some(delay) = delay {
@@ -483,7 +561,7 @@ impl Driver for MockDriver {
 
     fn stop<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.record("stop", &spec.id);
+            self.record_for("stop", &spec.id, &spec.host);
             self.fail_if_requested("stop")?;
             let mut state = self.ensure_instance(&spec.id);
             if let Some(entry) = state.get_mut(&spec.id) {
@@ -497,7 +575,7 @@ impl Driver for MockDriver {
 
     fn start<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.record("start", &spec.id);
+            self.record_for("start", &spec.id, &spec.host);
             self.fail_if_requested("start")?;
             self.set_running(&spec.id);
             Ok(())
@@ -506,7 +584,7 @@ impl Driver for MockDriver {
 
     fn restart<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.record("restart", &spec.id);
+            self.record_for("restart", &spec.id, &spec.host);
             self.fail_if_requested("restart")?;
             self.set_running(&spec.id);
             Ok(())
@@ -515,7 +593,7 @@ impl Driver for MockDriver {
 
     fn down<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.record("down", &spec.id);
+            self.record_for("down", &spec.id, &spec.host);
             self.fail_if_requested("down")?;
             lock(&self.state).remove(&spec.id);
             Ok(())
@@ -524,7 +602,7 @@ impl Driver for MockDriver {
 
     fn ps<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<PsResult, DriverError>> {
         Box::pin(async move {
-            self.record("ps", &spec.id);
+            self.record_for("ps", &spec.id, &spec.host);
             self.fail_if_requested("ps")?;
             let state = lock(&self.state);
             let Some(entry) = state.get(&spec.id) else {
@@ -559,7 +637,7 @@ impl Driver for MockDriver {
         options: &'a LogsOptions,
     ) -> DriverFuture<'a, Result<String, DriverError>> {
         Box::pin(async move {
-            self.record("logs", &spec.id);
+            self.record_for("logs", &spec.id, &spec.host);
             lock(&self.logs_options).push((spec.id.clone(), options.clone()));
             self.fail_if_requested("logs")?;
             let text = match lock(&self.logs).get(&spec.id) {
@@ -577,7 +655,7 @@ impl Driver for MockDriver {
         spec: &'a InstanceSpec,
     ) -> DriverFuture<'a, Result<InspectInfo, DriverError>> {
         Box::pin(async move {
-            self.record("inspect", &spec.id);
+            self.record_for("inspect", &spec.id, &spec.host);
             self.fail_if_requested("inspect")?;
             Ok(self.simulate_inspect(&spec.id))
         })
@@ -589,7 +667,10 @@ impl Driver for MockDriver {
     ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>> {
         Box::pin(async move {
             for spec in specs {
-                self.record("usage", &spec.id);
+                self.record_for("usage", &spec.id, &spec.host);
+                if let Some(detail) = lock(&self.usage_failures).get(&spec.host).cloned() {
+                    return Err(DriverError::new("usage", detail));
+                }
             }
             self.fail_if_requested("usage")?;
             let forced = lock(&self.usage);
@@ -610,9 +691,14 @@ impl Driver for MockDriver {
         })
     }
 
-    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>> {
+    fn ensure_image<'a>(
+        &'a self,
+        host: &'a str,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
             lock(&self.image_calls).push(image.to_string());
+            lock(&self.image_hosts).push((host.to_string(), image.to_string()));
             if let Some(detail) = lock(&self.pull_failures).get(image).cloned() {
                 return Err(DriverError::new("image pull", detail));
             }
@@ -621,7 +707,10 @@ impl Driver for MockDriver {
         })
     }
 
-    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>> {
+    fn list_images<'a>(
+        &'a self,
+        _host: &'a str,
+    ) -> DriverFuture<'a, Result<Vec<ImageRecord>, DriverError>> {
         Box::pin(async move {
             self.fail_if_requested("images")?;
             let known = lock(&self.known_images);
@@ -644,7 +733,7 @@ impl Driver for MockDriver {
         timeout_s: u64,
     ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
         Box::pin(async move {
-            self.record("exec", &spec.id);
+            self.record_for("exec", &spec.id, &spec.host);
             lock(&self.exec_calls).push(MockExecCall {
                 instance: spec.id.clone(),
                 argv: argv.to_vec(),
@@ -737,6 +826,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,
             last_error: None,
             created_at: crate::models::now_iso(),
@@ -882,17 +972,23 @@ mod tests {
     #[tokio::test]
     async fn ensure_image_records_calls_and_can_fail() {
         let driver = MockDriver::new();
-        driver.ensure_image("agent:1").await.expect("ensure");
+        driver
+            .ensure_image(crate::hosts::LOCAL_HOST, "agent:1")
+            .await
+            .expect("ensure");
         assert_eq!(driver.image_calls(), vec!["agent:1".to_string()]);
 
         driver.fail_image_pull("agent:9", "manifest unknown");
         let err = driver
-            .ensure_image("agent:9")
+            .ensure_image(crate::hosts::LOCAL_HOST, "agent:9")
             .await
             .expect_err("pull failure");
         assert!(err.detail.contains("manifest unknown"), "{err}");
 
-        let images = driver.list_images().await.expect("images");
+        let images = driver
+            .list_images(crate::hosts::LOCAL_HOST)
+            .await
+            .expect("images");
         let tags: Vec<&str> = images.iter().map(|image| image.tag.as_str()).collect();
         assert!(tags.contains(&"agent:1"), "{tags:?}");
         assert!(!tags.contains(&"agent:9"), "a failed pull is not local");

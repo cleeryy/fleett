@@ -273,6 +273,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,
             last_error: None,
             created_at: now.clone(),

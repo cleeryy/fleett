@@ -143,6 +143,10 @@ enum Commands {
         /// Free-form operator note.
         #[arg(long)]
         note: Option<String>,
+        /// Docker host id, or `auto` to place on the host with the most free
+        /// capacity (default `local`). See docs/HOSTS.md.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Start an instance (client mode).
     Start {
@@ -198,6 +202,18 @@ enum Commands {
     /// List the container images present on the host and their instances
     /// (client mode).
     Images,
+    /// List the Docker hosts of the fleet with their capacity (client mode).
+    Hosts,
+    /// Register and test Docker hosts (client mode). See docs/HOSTS.md.
+    Host {
+        #[command(subcommand)]
+        action: HostCommands,
+    },
+    /// Instance-wide operations (client mode).
+    Instances {
+        #[command(subcommand)]
+        action: InstanceCommands,
+    },
     /// Move every agent to another container image, rolling back the ones
     /// that never become healthy (client mode). See docs/UPGRADE.md.
     Upgrade {
@@ -530,6 +546,65 @@ enum IncidentCommands {
 }
 
 #[derive(Subcommand, Clone)]
+enum HostCommands {
+    /// Register a Docker host and test it immediately.
+    Add {
+        /// Display name (also used to derive the id when --id is omitted).
+        #[arg(long)]
+        name: String,
+        /// Host id (`[a-z0-9][a-z0-9-]{0,31}`).
+        #[arg(long)]
+        id: Option<String>,
+        /// `local` or `ssh` (default `local`).
+        #[arg(long)]
+        transport: Option<String>,
+        /// `user@host` or `ssh://user@host` (required for `ssh`).
+        #[arg(long)]
+        address: Option<String>,
+        /// Docker context name.
+        #[arg(long)]
+        docker_context: Option<String>,
+    },
+    /// Test the connection to one host and print its capacity.
+    Test {
+        /// Host id.
+        id: String,
+    },
+    /// Remove a host (refused while instances still run on it).
+    Rm {
+        /// Host id.
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum InstanceCommands {
+    /// Move an instance to another Docker host.
+    ///
+    /// A remote target receives its data with scp/ssh using the operator's SSH
+    /// configuration; the bind-mount path is preserved.
+    Move {
+        /// Instance id.
+        id: String,
+        /// Target host id (or name).
+        #[arg(long)]
+        to: String,
+        /// Do not copy the data: the target already sees the same path.
+        #[arg(long)]
+        skip_transfer: bool,
+        /// Leave the instance stopped on the target.
+        #[arg(long)]
+        no_start: bool,
+        /// Override the instance directory on the target host.
+        #[arg(long)]
+        remote_instance_dir: Option<String>,
+        /// Keep the archive copied to the target.
+        #[arg(long)]
+        keep_archive: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum BackupCommands {
     /// List the archives of the backup directory, newest first.
     List {
@@ -702,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
             cpu,
             mem,
             note,
+            host,
         } => {
             cli::run(
                 cli::Command::Create(cli::CreateArgs {
@@ -718,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
                     cpu,
                     mem,
                     note,
+                    host,
                 }),
                 json,
             )
@@ -758,6 +835,47 @@ async fn main() -> anyhow::Result<()> {
             cli::run(cli::Command::Budget(cli::BudgetArgs { id, set }), json).await
         }
         Commands::Images => cli::run(cli::Command::Images, json).await,
+        Commands::Hosts => cli::run(cli::Command::Hosts, json).await,
+        Commands::Host { action } => {
+            let action = match action {
+                HostCommands::Add {
+                    name,
+                    id,
+                    transport,
+                    address,
+                    docker_context,
+                } => cli::HostAction::Add(cli::HostAddArgs {
+                    name,
+                    id,
+                    transport,
+                    address,
+                    docker_context,
+                }),
+                HostCommands::Test { id } => cli::HostAction::Test(id),
+                HostCommands::Rm { id } => cli::HostAction::Rm(id),
+            };
+            cli::run(cli::Command::Host(action), json).await
+        }
+        Commands::Instances { action } => {
+            let action = match action {
+                InstanceCommands::Move {
+                    id,
+                    to,
+                    skip_transfer,
+                    no_start,
+                    remote_instance_dir,
+                    keep_archive,
+                } => cli::InstancesAction::Move(cli::MoveArgs {
+                    id,
+                    to,
+                    skip_transfer,
+                    no_start,
+                    remote_instance_dir,
+                    keep_archive,
+                }),
+            };
+            cli::run(cli::Command::Instances(action), json).await
+        }
         Commands::Upgrade {
             image,
             parallel,
@@ -1047,7 +1165,10 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         }
         DriverKind::Compose => {
             let compose = ComposeDriver::new(&cfg).with_secrets(db.clone());
-            match compose.ensure_network_named(&cfg.network).await {
+            match compose
+                .ensure_network_named(fleett::hosts::LOCAL_HOST, &cfg.network)
+                .await
+            {
                 Ok(true) => tracing::info!(network = %cfg.network, "created the docker network"),
                 Ok(false) => {}
                 Err(err) => {
@@ -1193,7 +1314,11 @@ async fn warn_about_egress(cfg: &Config, driver: Arc<dyn Driver>) {
         }
         EgressMode::Restrict => {
             let marker = egress::read_marker(&cfg.egress_marker);
-            let subnet = driver.network_subnet(&cfg.network).await.ok().flatten();
+            let subnet = driver
+                .network_subnet(fleett::hosts::LOCAL_HOST, &cfg.network)
+                .await
+                .ok()
+                .flatten();
             if let Err(detail) = egress::check_marker(&marker, subnet.as_deref()) {
                 tracing::warn!(
                     marker = %cfg.egress_marker.display(),

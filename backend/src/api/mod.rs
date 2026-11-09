@@ -13,6 +13,7 @@ pub mod exec;
 pub mod files;
 pub mod git;
 pub mod health;
+pub mod hosts;
 pub mod incidents;
 pub mod instances;
 pub mod json;
@@ -292,6 +293,12 @@ fn api_routes(state: AppState) -> Router<AppState> {
             "/maintenance-windows/{id}",
             axum::routing::patch(maintenance::patch).delete(maintenance::delete),
         )
+        .route("/hosts", get(hosts::list).post(hosts::create))
+        .route(
+            "/hosts/{id}",
+            get(hosts::get).patch(hosts::patch).delete(hosts::delete),
+        )
+        .route("/hosts/{id}/test", post(hosts::test))
         .route("/providers", get(providers::list).post(providers::create))
         .route(
             "/providers/{id}",
@@ -350,6 +357,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/instances/{id}/stop", post(instances::stop))
         .route("/instances/{id}/restart", post(instances::restart))
         .route("/instances/{id}/clone", post(instances::clone))
+        .route("/instances/{id}/move", post(instances::move_instance))
         .route("/instances/{id}/logs", get(instances::logs))
         .route("/exec/policy", get(exec::policy))
         .route("/instances/{id}/exec", post(exec::run))

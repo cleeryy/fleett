@@ -53,6 +53,12 @@ behaviour is unchanged.
 | POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin","scope"?}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
 | DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
 
+`GET /api/audit` filters: `limit` (default 200, max 1000), `offset`, `actor`,
+`action`, `target`, `from`, `to`, `result` (`ok|failed|refused`). `actor`,
+`action`, `target` and `result` are exact matches; `from`/`to` accept RFC 3339
+or `YYYY-MM-DD` (a date-only `to` covers the whole day). The legacy `?limit=`
+behaviour is unchanged.
+
 `role` defaults to `viewer`. `scope` is optional: `{"instances":["probe"],
 "actions":["read","write","exec"]}` restricts the token to those instance ids
 and actions. Every instance must exist, `actions` is a non-empty subset of
@@ -60,7 +66,7 @@ and actions. Every instance must exist, `actions` is a non-empty subset of
 keeps the legacy global role, and `scope` is absent from `GET /api/tokens` for
 such rows. A scope always intersects the ACL, even for an `admin` token. See
 `docs/RBAC.md`. Revoking is idempotent. Tokens are stored as a SHA-256 digest
-only.
+only. Full audit documentation: [docs/AUDIT.md](docs/AUDIT.md).
 
 ## Instance ACL
 
@@ -242,13 +248,49 @@ document returns an empty plan. Every apply is audited as `gitops.apply`;
 deletions require `allow_delete` (query or body). `409 gitops_conflict` is
 returned when a provider deletion would orphan an instance.
 
+## Docker hosts
+
+A host is a Docker endpoint. `local` always exists; `ssh` hosts are reached with
+`DOCKER_HOST=ssh://…` (Docker's own SSH transport). See `docs/HOSTS.md` for the
+bind-mount requirement: paths are resolved on the target, not on the controller.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/hosts` | — | `[{"id":"local","name":"local","transport":"local","address":"","status":"ok","last_check_at":"…","last_error":null,"instances":2,"capacity":{"ncpu":8,"mem_total_bytes":17179869184,"docker_version":"27.3.1"},"free_mem_bytes":16106127360,"free_cpu":6.0}]` |
+| POST | `/api/hosts` | `{"id"?,"name":"pve3","transport":"local\|ssh","address"?,"docker_context"?}` | `201 HostSummary`, admin only; the connection is tested immediately and `status`/`last_error` are recorded |
+| GET | `/api/hosts/{id}` | — | `200 HostSummary`, probed now |
+| PATCH | `/api/hosts/{id}` | `{"name"?,"transport"?,"address"?,"docker_context"?}` | `200 HostSummary`, re-tested; the local host cannot be renamed or moved, admin only |
+| DELETE | `/api/hosts/{id}` | — | `204` · `409 host_protected` (local) · `409 host_in_use` with `details.instances`, admin only |
+| POST | `/api/hosts/{id}/test` | — | `{"ok":true,"status":"ok","checked_at":"…","latency_ms":42,"capacity":{…}}`, admin only |
+
+`status`: `unknown`, `ok` or `unreachable`. `capacity` is best-effort (`docker info`
+`NCPU`/`MemTotal`/`ServerVersion`) and `free_mem_bytes`/`free_cpu` subtract the declared
+limits of the instances already placed on the host. A failed probe never fails the list:
+the host is reported `unreachable` with `last_error`.
+
+Instances carry a `host` field. `POST /api/instances` accepts `"host":"<id>|auto"`
+(default `local`): an explicit host must be registered (`400 unknown_host`), while `auto`
+probes every host and picks the reachable one with the most free memory, then CPU, then the
+fewest instances. Lifecycle, logs, exec/files (`docker cp`) and upgrades all target the
+instance host.
+
+`POST /api/instances/{id}/move` → `200 InstanceDetail`
+```json
+{"to":"pve3","start":true}
+```
+Stops the instance, relabels it, starts it on the target and rolls the label back (restarting
+the source) if the start fails. **The data directory is not copied by the API**: the target
+must expose the same absolute bind-mount path (shared storage), or the operator transfers it
+first with `fleett instances move` (scp/ssh) and then calls `--skip-transfer`. See
+`docs/HOSTS.md`.
+
 ## Instances
 
 `GET /api/instances` → `InstanceSummary[]`
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
- "health":"healthy","cpu_limit":1.0,"allow_lan":false,"provider":"9e2c…",
+ "health":"healthy","cpu_limit":1.0,"allow_lan":false,"host":"local","provider":"9e2c…",
  "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z",
  "role":"owner"}
 ```
@@ -266,11 +308,12 @@ may read (ACL or token scope), and `role` is the caller's level on that row
  "provider":"9e2c…",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"notes":"",
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local","notes":"",
  "env":[{"key":"DISCORD_ALLOWED_USERS","value":"123","secret":false}]}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
-The token is **never** returned by the API. `env` is a list of `{key, value, secret}`; the
+The token is **never** returned by the API. `host` defaults to `local`; `auto` applies
+placement (`docs/HOSTS.md`). `env` is a list of `{key, value, secret}`; the
 deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every entry as a secret
 (see [Environment variables](#environment-variables)).
 
@@ -282,7 +325,7 @@ deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every en
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
  "provider":"9e2c…",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local",
  "warnings":[],"notes":"","created_at":"...","updated_at":"...",
  "last_error":null,"data_dir":"/opt/fleett/instances/alice/data",
  "env":[{"key":"HERMES_GATE_PROFILE_TOKEN","secret":true,"updated_at":"..."},
@@ -850,17 +893,22 @@ The generated compose probes `/opt/data/gateway.sock` with the gateway's `identi
                "disk_bytes":12582912}],
  "totals":{"cpu_pct":1.5,"mem_used_bytes":134742016,
            "mem_limit_bytes":1610612736,"disk_bytes":12582912},
- "caps":{"max_cpu":8.0,"max_mem_mb":16384}}
+ "caps":{"max_cpu":8.0,"max_mem_mb":16384},
+ "warnings":[]}
 ```
 
+Instances are grouped by `host` and each daemon is sampled once. An unreachable host yields
+an entry in `warnings` (`host "pve3" is unreachable: …`) and zeroed numbers for its instances
+instead of failing the whole report; `200` is returned as long as at least one host answered.
+
 With `FLEETT_DRIVER=compose`, `cpu_pct`/`mem_used_bytes` come from one
-`docker stats --no-stream --format json` call (containers are matched by name), `disk_bytes`
-from `du -sb` on `instances/<id>/data`, and `mem_limit_bytes` from the container limit (or the
-configured limit when the container is absent). Stopped instances report zero CPU and memory.
+`docker stats --no-stream --format json` call per host (containers are matched by name),
+`disk_bytes` from `du -sb` on `instances/<id>/data` (the controller-side path the target must
+share), and `mem_limit_bytes` from the container limit (or the configured limit when the
+container is absent). Stopped instances report zero CPU and memory.
 `totals` sums every instance; `caps` echoes `FLEETT_MAX_TOTAL_CPU` and
-`FLEETT_MAX_TOTAL_MEM_MB` (`0` = unlimited). The endpoint answers `502 usage_unavailable`
-when Docker fails, and an empty fleet answers zeros without touching Docker. Under
-`FLEETT_DRIVER=mock` the numbers are stable simulations.
+`FLEETT_MAX_TOTAL_MEM_MB` (`0` = unlimited). An empty fleet answers zeros without touching
+Docker. Under `FLEETT_DRIVER=mock` the numbers are stable simulations.
 
 The fleet is also checked by `fleett doctor`, which reads `docker`, `secrets` and `egress`
 from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
@@ -914,8 +962,8 @@ every write is admin-only.
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/images` | — | `[{"tag":"hermes-agent:0.22.2-local","id":"sha256:…","size":"1.2GB","created":"…","instances":["alice"]}]` |
-| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180,"canary":0,"soak_s":600,"at":"sun 04:00","window":"nightly"}` | `202 UpgradeJob` · `202 Deployment` when `at` is in the future · `400 invalid_*` · `403 maintenance_window` · `409 upgrade_in_progress` · `502 image_unavailable` |
+| GET | `/api/images` | — | `[{"tag":"hermes-agent:0.22.2-local","id":"sha256:…","size":"1.2GB","created":"…","instances":["alice"]}]` — the union of every instance host; an unreachable host is skipped |
+| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180,"canary":0,"soak_s":600,"at":"sun 04:00","window":"nightly"}` | `202 UpgradeJob` · `202 Deployment` when `at` is in the future · `400 invalid_*` · `403 maintenance_window` · `409 upgrade_in_progress` · `502 image_unavailable` (the tag is ensured on every instance host before the job starts) |
 | GET | `/api/upgrade` | — | `200 UpgradeJob` (current or last) · `404` before the first job |
 
 `UpgradeJob`:

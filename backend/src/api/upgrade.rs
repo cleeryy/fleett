@@ -507,21 +507,26 @@ async fn launch(
     }
 
     // The image is pulled before the job starts: a bad tag is a `502` with the
-    // Docker detail instead of a job in which every instance fails.
-    if let Err(err) = state.driver.ensure_image(&prepared.image).await {
-        let message = format!(
-            "cannot pull image {}: {}",
-            prepared.image,
-            err.detail.trim()
-        );
-        if let Some(id) = &deployment_id {
-            let _ = deployments::fail(&state.db, id, &message);
+    // Docker detail instead of a job in which every instance fails. Every host
+    // that runs an instance must have the tag.
+    let hosts: std::collections::BTreeSet<String> =
+        specs.iter().map(|spec| spec.host.clone()).collect();
+    for host in hosts {
+        if let Err(err) = state.driver.ensure_image(&host, &prepared.image).await {
+            let message = format!(
+                "cannot pull image {} on host \"{host}\": {}",
+                prepared.image,
+                err.detail.trim()
+            );
+            if let Some(id) = &deployment_id {
+                let _ = deployments::fail(&state.db, id, &message);
+            }
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "image_unavailable",
+                message,
+            ));
         }
-        return Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "image_unavailable",
-            message,
-        ));
     }
 
     let job = state.upgrade.begin(job)?;
@@ -541,24 +546,43 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<UpgradeJob>, A
         .ok_or_else(|| ApiError::not_found("no upgrade job has run yet"))
 }
 
-/// `GET /api/images` — local images and the instances that use each tag.
+/// `GET /api/images` — images of every host and the instances that use each
+/// tag.
+///
+/// An unreachable host is skipped (and logged): the catalogue of the remaining
+/// daemons stays usable. Every host is queried because a tag may only exist on
+/// the host that runs the instance.
 pub async fn images(State(state): State<AppState>) -> Result<Json<Vec<ImageInfo>>, ApiError> {
-    let local = state.driver.list_images().await.map_err(|err| {
-        let detail = err.detail.trim();
-        ApiError::new(
+    let specs = state.db.list().map_err(ApiError::from)?;
+    let mut hosts: std::collections::BTreeSet<String> =
+        specs.iter().map(|spec| spec.host.clone()).collect();
+    hosts.insert(crate::hosts::LOCAL_HOST.to_string());
+
+    let mut records: std::collections::BTreeMap<String, crate::driver::ImageRecord> =
+        std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    for host in hosts {
+        match state.driver.list_images(&host).await {
+            Ok(images) => {
+                for record in images {
+                    records.entry(record.tag.clone()).or_insert(record);
+                }
+            }
+            Err(err) => {
+                errors.push(format!("host \"{host}\": {}", err.detail.trim()));
+            }
+        }
+    }
+    if records.is_empty() && !errors.is_empty() {
+        return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "images_unavailable",
-            if detail.is_empty() {
-                format!("cannot list the local docker images: {}", err.operation)
-            } else {
-                format!("cannot list the local docker images: {detail}")
-            },
-        )
-    })?;
-    let specs = state.db.list().map_err(ApiError::from)?;
+            format!("cannot list the docker images: {}", errors.join("; ")),
+        ));
+    }
 
-    let images = local
-        .into_iter()
+    let images = records
+        .into_values()
         .map(|record| {
             let instances = specs
                 .iter()
@@ -921,7 +945,7 @@ async fn upgrade_one(
     // The image is made available before anything is written: a failed pull
     // leaves the instance untouched and is reported as a failure, not a
     // rollback (there is nothing to roll back).
-    if let Err(err) = state.driver.ensure_image(&image).await {
+    if let Err(err) = state.driver.ensure_image(&spec.host, &image).await {
         let message = format!("cannot use image {image}: {}", err.detail.trim());
         let _ = state.db.set_last_error(&id, Some(&message));
         state.upgrade.update_result(&job_id, &id, |result| {

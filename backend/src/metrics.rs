@@ -145,17 +145,17 @@ impl Metrics {
             }
         }
 
-        let samples = match state.driver.usage(specs).await {
-            Ok(samples) => samples,
-            Err(err) => {
-                tracing::debug!(%err, "the metrics scrape cannot read the container usage");
-                return None;
+        let usage = crate::driver::usage_by_host(&*state.driver, specs).await;
+        if !usage.warnings.is_empty() {
+            for warning in &usage.warnings {
+                tracing::debug!(%warning, "the metrics scrape cannot read one host");
             }
-        };
+            return None;
+        }
         let by_id = specs
             .iter()
             .map(|spec| spec.id.clone())
-            .zip(samples)
+            .zip(usage.samples)
             .collect::<BTreeMap<_, _>>();
         *self.usage() = Some(CachedUsage {
             taken_at: Instant::now(),
@@ -1284,6 +1284,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Running,
             last_error: None,
             created_at: crate::models::now_iso(),

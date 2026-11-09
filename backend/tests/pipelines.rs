@@ -63,6 +63,7 @@ impl Harness {
                 image: "agent:1".to_string(),
                 previous_image: None,
                 allow_lan: false,
+                host: "local".to_string(),
                 notes: String::new(),
                 heal: fleett::models::HealPolicy::Off,
                 unhealthy_after: fleett::models::DEFAULT_UNHEALTHY_AFTER,

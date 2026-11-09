@@ -204,7 +204,7 @@ pub async fn create(
     // Creating an instance is fleet-level: only an admin may do it in v1
     // (a per-instance ACL cannot grant an instance that does not exist yet).
     audit::require_admin(&context)?;
-    let prepared = prepare_create(&state, &request)?;
+    let prepared = prepare_create(&state, &request).await?;
     let mut spec = prepared.spec;
 
     let lock = state.locks.for_id(&spec.id);
@@ -272,6 +272,7 @@ pub async fn create(
             "name": stored.name,
             "template": stored.template,
             "allow_lan": stored.allow_lan,
+            "host": stored.host,
         })),
     );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
@@ -718,6 +719,9 @@ async fn import_archive(
 
     let mut spec = crate::instance_archive::spec_from_manifest(&extraction.manifest.instance, id)
         .map_err(import_error)?;
+    // An archive never dictates placement: an imported instance starts on the
+    // local host of the control plane that receives it.
+    spec.host = crate::hosts::LOCAL_HOST.to_string();
     spec.template = crate::instance_archive::settle_template(&state.cfg, &spec.template);
     // Keep the image the archived instance ran; an archive without one falls
     // back to this build's `FLEETT_IMAGE`.
@@ -840,6 +844,136 @@ async fn import_archive(
         StatusCode::CREATED,
         to_detail(state, &stored, status, health, container, warnings),
     ))
+}
+
+/// Body of `POST /api/instances/{id}/move`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MoveInstanceRequest {
+    /// Target host id or name (required).
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Start the instance on the target once the label is written (default
+    /// `true`). `false` lets an operator transfer the data directory between
+    /// the stop and the start.
+    #[serde(default)]
+    pub start: Option<bool>,
+}
+
+/// `POST /api/instances/{id}/move` — move an instance to another Docker host.
+///
+/// The compose file and the data directory are *not* copied: they stay on the
+/// control plane, and the target host must expose the same absolute bind-mount
+/// paths (shared storage, NFS, or a prior `fleett instances move` transfer).
+/// The operation stops the container, relabels the instance, then starts it on
+/// the target and rolls the label back if the start fails.
+pub async fn move_instance(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    Json(request): Json<MoveInstanceRequest>,
+) -> Result<Json<InstanceDetail>, ApiError> {
+    let target = request.to.as_deref().unwrap_or_default().trim();
+    if target.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_host",
+            "to is required: send {\"to\": \"<host-id>\"}",
+        ));
+    }
+    let lock = state.locks.for_id(&id);
+    let _guard = lock.lock().await;
+
+    let mut spec = load(&state, &id)?;
+    let target_host = state
+        .db
+        .host_by_ref(target)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_host",
+                format!("host \"{target}\" is not registered"),
+            )
+        })?;
+    if target_host.id == spec.host {
+        return Err(ApiError::conflict(
+            "already_on_host",
+            format!("instance \"{id}\" already runs on host \"{}\"", spec.host),
+        ));
+    }
+    let source_host = spec.host.clone();
+    let start = request.start.unwrap_or(true);
+
+    // Always stop: the data directory must be quiescent before it is either
+    // shared by the new daemon or transferred by the operator.
+    if let Err(err) = state.driver.stop(&spec).await {
+        return Err(ApiError::driver(err));
+    }
+
+    spec.host = target_host.id.clone();
+    state
+        .db
+        .set_host(&id, &target_host.id)
+        .map_err(ApiError::from)?;
+
+    if start {
+        match up_and_record(&state, &mut spec).await {
+            Ok(()) => {}
+            Err(err) => {
+                // The instance never started on the target: put the routing
+                // back and restart the source so the move is a no-op.
+                spec.host = source_host.clone();
+                let _ = state.db.set_host(&id, &source_host);
+                let _ = state.driver.start(&spec).await;
+                let _ = state.db.set_status(&id, Status::Running, None);
+                return Err(ApiError::new(
+                    err.status,
+                    "move_failed",
+                    format!(
+                        "cannot start instance \"{id}\" on host \"{}\": {} (the instance was \
+                         moved back to \"{source_host}\")",
+                        target_host.id, err.message
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "from": source_host,
+                    "to": target_host.id,
+                })));
+            }
+        }
+    } else {
+        state
+            .db
+            .set_status(&id, Status::Stopped, None)
+            .map_err(ApiError::from)?;
+        spec.status = Status::Stopped;
+    }
+
+    audit::record(
+        &state,
+        &context,
+        "instance.move",
+        &id,
+        Some(serde_json::json!({
+            "from": source_host,
+            "to": target_host.id,
+            "started": start,
+        })),
+    );
+    let (status, health, container) = match state.driver.ps(&spec).await {
+        Ok(result) => (result.status, result.health, result.container),
+        Err(_) => (
+            if start {
+                Status::Running
+            } else {
+                Status::Stopped
+            },
+            Health::Unknown,
+            None,
+        ),
+    };
+    let warnings = egress::warnings(&state.cfg, spec.allow_lan);
+    Ok(Json(to_detail(
+        &state, &spec, status, health, container, warnings,
+    )))
 }
 
 fn import_error(err: ArchiveError) -> ApiError {
@@ -1438,7 +1572,11 @@ pub(crate) async fn check_egress_policy(
 
     let marker_path = &state.cfg.egress_marker;
     let marker = egress::read_marker(marker_path);
-    let current_subnet = match state.driver.network_subnet(&state.cfg.network).await {
+    let current_subnet = match state
+        .driver
+        .network_subnet(&spec.host, &state.cfg.network)
+        .await
+    {
         Ok(subnet) => subnet,
         Err(err) => {
             return Err(egress_conflict(
@@ -1476,7 +1614,7 @@ pub(crate) async fn ensure_lan_network(
         return Ok(());
     }
     let name = state.cfg.lan_network();
-    match state.driver.ensure_network(&name).await {
+    match state.driver.ensure_network(&spec.host, &name).await {
         Ok(true) => tracing::info!(network = %name, "created the docker network"),
         Ok(false) => {}
         Err(err) => return Err(ApiError::driver(err)),
@@ -1597,6 +1735,7 @@ fn to_summary(
         health: health.as_str().to_string(),
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
+        host: spec.host.clone(),
         provider: spec.provider.clone(),
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
@@ -1648,6 +1787,7 @@ fn to_detail(
         mem_limit_mb: spec.mem_limit_mb,
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
+        host: spec.host.clone(),
         warnings,
         notes: spec.notes.clone(),
         created_at: spec.created_at.clone(),
@@ -1660,7 +1800,10 @@ fn to_detail(
     }
 }
 
-fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<Prepared, ApiError> {
+async fn prepare_create(
+    state: &AppState,
+    request: &CreateInstanceRequest,
+) -> Result<Prepared, ApiError> {
     let id = request.id.as_deref().unwrap_or_default().trim().to_string();
     validate_instance_id(&id).map_err(|message| ApiError::bad_request("invalid_id", message))?;
 
@@ -1806,6 +1949,17 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     validate_cpu_limit(cpu_limit)
         .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
 
+    // Explicit host wins; `auto` places on the reachable host with the most
+    // free RAM/CPU and the fewest instances. Unknown host is a 400 before any
+    // file is written.
+    let host = crate::api::hosts::resolve_placement(
+        state,
+        request.host.as_deref(),
+        mem_limit_mb,
+        cpu_limit,
+    )
+    .await?;
+
     let allow_lan = request
         .allow_lan
         .or(template.defaults.allow_lan)
@@ -1889,6 +2043,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             max_restarts: DEFAULT_MAX_RESTARTS,
             heal_backoff_s: DEFAULT_HEAL_BACKOFF_S,
             notes,
+            host,
             status: Status::Created,
             last_error: None,
             created_at: now.clone(),

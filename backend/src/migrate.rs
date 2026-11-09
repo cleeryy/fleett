@@ -250,7 +250,7 @@ pub async fn run(cfg: &Config, source: &str, apply: bool) -> anyhow::Result<()> 
 
     let driver = ComposeDriver::new(cfg).with_secrets(db.clone());
     driver
-        .ensure_network_named(&cfg.network)
+        .ensure_network_named(crate::hosts::LOCAL_HOST, &cfg.network)
         .await
         .map_err(|err| anyhow::anyhow!("could not ensure the {} network: {err}", cfg.network))?;
 

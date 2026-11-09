@@ -266,6 +266,34 @@ impl Client {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<String, CliError> {
+        let response = self.send(method, path, query, body).await?;
+        response.text().await.map_err(|err| CliError::Transport {
+            url: format!("{}{}", self.base, path),
+            detail: err.to_string(),
+        })
+    }
+
+    async fn bytes(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<u8>, CliError> {
+        let response = self.send(method, path, query, None).await?;
+        let bytes = response.bytes().await.map_err(|err| CliError::Transport {
+            url: format!("{}{}", self.base, path),
+            detail: err.to_string(),
+        })?;
+        Ok(bytes.to_vec())
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<reqwest::Response, CliError> {
         let url = format!("{}{}", self.base, path);
         let mut request = self.http.request(method, &url);
         if let Some(token) = &self.token {
@@ -282,15 +310,11 @@ impl Client {
             detail: err.to_string(),
         })?;
         let status = response.status().as_u16();
-        let text = response.text().await.map_err(|err| CliError::Transport {
-            url: url.clone(),
-            detail: err.to_string(),
-        })?;
         if (200..300).contains(&status) {
-            Ok(text)
-        } else {
-            Err(parse_api_error(status, &text))
+            return Ok(response);
         }
+        let text = response.text().await.unwrap_or_default();
+        Err(parse_api_error(status, &text))
     }
 }
 
@@ -323,6 +347,9 @@ pub enum Command {
     Budget(BudgetArgs),
     Images,
     Upgrade(UpgradeArgs),
+    Hosts,
+    Host(HostAction),
+    Instances(InstancesAction),
     Doctor,
     Incidents(IncidentsArgs),
     Heal(HealArgs),
@@ -473,6 +500,45 @@ pub struct HealArgs {
     pub backoff_s: Option<u64>,
 }
 
+/// `fleett host …`.
+#[derive(Debug, Clone)]
+pub enum HostAction {
+    Add(HostAddArgs),
+    Test(String),
+    Rm(String),
+}
+
+/// `fleett instances …`.
+#[derive(Debug, Clone)]
+pub enum InstancesAction {
+    Move(MoveArgs),
+}
+
+/// Arguments of `fleett host add`.
+#[derive(Debug, Clone, Default)]
+pub struct HostAddArgs {
+    pub name: String,
+    pub id: Option<String>,
+    pub transport: Option<String>,
+    pub address: Option<String>,
+    pub docker_context: Option<String>,
+}
+
+/// Arguments of `fleett instances move`.
+#[derive(Debug, Clone)]
+pub struct MoveArgs {
+    pub id: String,
+    pub to: String,
+    /// Do not copy the data: the target already sees the same bind-mount path.
+    pub skip_transfer: bool,
+    /// Leave the instance stopped on the target.
+    pub no_start: bool,
+    /// Override the instance directory on the target host.
+    pub remote_instance_dir: Option<String>,
+    /// Keep the temporary archive copied to the target.
+    pub keep_archive: bool,
+}
+
 /// Arguments of `fleett say`.
 #[derive(Debug, Clone)]
 pub struct SayArgs {
@@ -611,6 +677,8 @@ pub struct CreateArgs {
     pub cpu: Option<f64>,
     pub mem: Option<u32>,
     pub note: Option<String>,
+    /// Docker host id, or `auto` for placement.
+    pub host: Option<String>,
 }
 
 /// Run one client command, returning the process exit code.
@@ -645,6 +713,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Budget(args) => budget(&client, json, &args).await,
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
+        Command::Hosts => hosts(&client, json).await,
+        Command::Host(action) => host(&client, json, &action).await,
+        Command::Instances(action) => instances(&client, json, &action).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
         Command::Incidents(args) => incidents(&client, json, &args).await,
         Command::Heal(args) => heal(&client, json, &args).await,
@@ -723,6 +794,10 @@ struct InstanceDetail {
     status: String,
     health: String,
     #[serde(default)]
+    host: String,
+    #[serde(default)]
+    data_dir: String,
+    #[serde(default)]
     warnings: Vec<String>,
     #[serde(default)]
     container: Option<ContainerInfo>,
@@ -762,6 +837,47 @@ struct UsageReport {
     instances: Vec<UsageEntry>,
     totals: UsageTotals,
     caps: UsageCaps,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HostCapacityView {
+    #[serde(default)]
+    ncpu: u32,
+    #[serde(default)]
+    mem_total_bytes: u64,
+    #[serde(default)]
+    docker_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HostView {
+    id: String,
+    name: String,
+    transport: String,
+    #[serde(default)]
+    address: String,
+    status: String,
+    #[serde(default)]
+    instances: usize,
+    #[serde(default)]
+    capacity: Option<HostCapacityView>,
+    #[serde(default)]
+    free_mem_bytes: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HostTestView {
+    ok: bool,
+    status: String,
+    latency_ms: u64,
+    #[serde(default)]
+    capacity: Option<HostCapacityView>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1906,6 +2022,7 @@ async fn create(client: &Client, json: bool, args: &CreateArgs) -> Result<(), Cl
         ("api_key_env", &args.api_key_env),
         ("gate_token", &args.gate_token),
         ("notes", &args.note),
+        ("host", &args.host),
     ] {
         if let Some(value) = value {
             object.insert(key.to_string(), json!(value));
@@ -2013,6 +2130,9 @@ async fn usage(client: &Client, json: bool) -> Result<(), CliError> {
         "{}",
         render_table(&["ID", "STATUS", "CPU", "MEMORY", "DISK"], &rows)
     );
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
     println!("{}", caps_line(&report.caps));
     Ok(())
 }
@@ -2240,6 +2360,409 @@ async fn images(client: &Client, json: bool) -> Result<(), CliError> {
         render_table(&["TAG", "ID", "SIZE", "CREATED", "INSTANCES"], &rows)
     );
     Ok(())
+}
+
+async fn hosts(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client.value(Method::GET, "/api/hosts", &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let hosts: Vec<HostView> = decode(value)?;
+    let rows: Vec<Vec<String>> = hosts
+        .iter()
+        .map(|host| {
+            vec![
+                host.id.clone(),
+                host.name.clone(),
+                host.transport.clone(),
+                if host.address.is_empty() {
+                    "-".to_string()
+                } else {
+                    host.address.clone()
+                },
+                host.status.clone(),
+                host.instances.to_string(),
+                host.capacity
+                    .as_ref()
+                    .map(|capacity| {
+                        format!(
+                            "{} CPU / {}",
+                            capacity.ncpu,
+                            human_bytes(capacity.mem_total_bytes)
+                        )
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                host.free_mem_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "ID",
+                "NAME",
+                "TRANSPORT",
+                "ADDRESS",
+                "STATUS",
+                "INSTANCES",
+                "CAPACITY",
+                "FREE MEM"
+            ],
+            &rows
+        )
+    );
+    for host in &hosts {
+        if let Some(error) = &host.last_error {
+            println!("  {}: {error}", host.id);
+        }
+    }
+    Ok(())
+}
+
+async fn host(client: &Client, json: bool, action: &HostAction) -> Result<(), CliError> {
+    match action {
+        HostAction::Add(args) => {
+            let mut body = json!({ "name": args.name });
+            if let Some(id) = &args.id {
+                body["id"] = json!(id);
+            }
+            if let Some(transport) = &args.transport {
+                body["transport"] = json!(transport);
+            }
+            if let Some(address) = &args.address {
+                body["address"] = json!(address);
+            }
+            if let Some(context) = &args.docker_context {
+                body["docker_context"] = json!(context);
+            }
+            let value = client
+                .value(Method::POST, "/api/hosts", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let host: HostView = decode(value)?;
+            println!(
+                "added host {} ({} {}) status={}",
+                host.id,
+                host.transport,
+                if host.address.is_empty() {
+                    "-"
+                } else {
+                    &host.address
+                },
+                host.status
+            );
+            if let Some(error) = &host.last_error {
+                println!("warning: {error}");
+            }
+            Ok(())
+        }
+        HostAction::Test(id) => {
+            let path = format!("/api/hosts/{}/test", encode_path_segment(id));
+            let value = client.value(Method::POST, &path, &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            let test: HostTestView = decode(value)?;
+            print!("host {id}: {} ({} ms)", test.status, test.latency_ms);
+            if let Some(capacity) = &test.capacity {
+                print!(
+                    ", {} CPU / {}",
+                    capacity.ncpu,
+                    human_bytes(capacity.mem_total_bytes)
+                );
+                if let Some(version) = &capacity.docker_version {
+                    print!(", docker {version}");
+                }
+            }
+            println!();
+            if let Some(error) = &test.error {
+                println!("error: {error}");
+            }
+            if !test.ok {
+                return Err(CliError::Config(format!("host \"{id}\" is not reachable")));
+            }
+            Ok(())
+        }
+        HostAction::Rm(id) => {
+            let path = format!("/api/hosts/{}", encode_path_segment(id));
+            client.text(Method::DELETE, &path, &[], None).await?;
+            if json {
+                return print_json(&json!({ "id": id, "deleted": true }));
+            }
+            println!("removed host {id}");
+            Ok(())
+        }
+    }
+}
+
+async fn instances(client: &Client, json: bool, action: &InstancesAction) -> Result<(), CliError> {
+    match action {
+        InstancesAction::Move(args) => move_instance(client, json, args).await,
+    }
+}
+
+async fn move_instance(client: &Client, json: bool, args: &MoveArgs) -> Result<(), CliError> {
+    let detail_path = format!("/api/instances/{}", encode_path_segment(&args.id));
+    let detail: InstanceDetail = client.json(Method::GET, &detail_path, &[], None).await?;
+    let hosts: Vec<HostView> = client.json(Method::GET, "/api/hosts", &[], None).await?;
+    let target = hosts
+        .iter()
+        .find(|host| host.id == args.to || host.name == args.to)
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "host \"{}\" is not registered; run `fleett hosts`",
+                args.to
+            ))
+        })?;
+    if target.id == detail.host {
+        return Err(CliError::Config(format!(
+            "instance \"{}\" already runs on host \"{}\"",
+            args.id, target.id
+        )));
+    }
+
+    let transport = target.transport.as_str();
+    let transfer = transport != "local" && !args.skip_transfer;
+    let mut archive_path: Option<PathBuf> = None;
+    let remote_archive = format!("/tmp/fleett-move-{}-{}.tgz", args.id, std::process::id());
+
+    if transfer {
+        let (remote, port) = split_ssh_target(&target.address);
+        if remote.is_empty() {
+            return Err(CliError::Config(format!(
+                "host \"{}\" has no SSH address",
+                target.id
+            )));
+        }
+        let instance_dir = match &args.remote_instance_dir {
+            Some(path) => path.clone(),
+            None => instance_directory(&detail.data_dir)?,
+        };
+        validate_remote_instance_dir(&instance_dir)?;
+        if !tool_available("scp") || !tool_available("ssh") {
+            print_manual_move(&args.id, &target.id, &remote, &instance_dir);
+            return Err(CliError::Config(
+                "scp and ssh are required to move an instance to a remote host".to_string(),
+            ));
+        }
+
+        // Stop before exporting so the archive is a consistent snapshot.
+        stop_instance(client, &args.id).await?;
+        let archive = std::env::temp_dir().join(format!(
+            "fleett-move-{}-{}.tgz",
+            args.id,
+            std::process::id()
+        ));
+        let bytes = match client
+            .bytes(Method::GET, &format!("{detail_path}/export"), &[])
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = start_instance(client, &args.id).await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = std::fs::write(&archive, &bytes) {
+            let _ = start_instance(client, &args.id).await;
+            return Err(CliError::Config(format!(
+                "cannot write the export archive: {err}"
+            )));
+        }
+        archive_path = Some(archive.clone());
+
+        if let Err(detail) = copy_to_host(
+            &remote,
+            port.as_deref(),
+            &archive,
+            &remote_archive,
+            &instance_dir,
+            args.keep_archive,
+        ) {
+            let _ = start_instance(client, &args.id).await;
+            let _ = std::fs::remove_file(&archive);
+            print_manual_move(&args.id, &target.id, &remote, &instance_dir);
+            return Err(CliError::Config(format!(
+                "cannot copy the instance data to {remote}: {detail}"
+            )));
+        }
+    }
+
+    let path = format!("{detail_path}/move");
+    let body = json!({ "to": target.id, "start": !args.no_start });
+    let moved = client.value(Method::POST, &path, &[], Some(body)).await;
+    if let Some(archive) = &archive_path {
+        if !args.keep_archive {
+            let _ = std::fs::remove_file(archive);
+        }
+    }
+    let value = match moved {
+        Ok(value) => value,
+        Err(err) => {
+            // The server rolls the authorisation back on its own; the copied
+            // data stays on the target and can be reused after a retry.
+            return Err(err);
+        }
+    };
+    if json {
+        return print_json(&value);
+    }
+    println!(
+        "moved instance {} from {} to {}{}",
+        args.id,
+        detail.host,
+        target.id,
+        if args.no_start { " (left stopped)" } else { "" }
+    );
+    if args.keep_archive && archive_path.is_some() {
+        println!("archive kept at {remote_archive} (also in the local temp folder)");
+    }
+    Ok(())
+}
+
+async fn stop_instance(client: &Client, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/stop", encode_path_segment(id));
+    client
+        .json::<StatusResponse>(Method::POST, &path, &[], None)
+        .await
+        .map(|_| ())
+}
+
+async fn start_instance(client: &Client, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/start", encode_path_segment(id));
+    client
+        .json::<StatusResponse>(Method::POST, &path, &[], None)
+        .await
+        .map(|_| ())
+}
+
+/// Copy the export archive to the target and extract its `data/` tree at the
+/// exact instance directory the compose bind mounts reference.
+fn copy_to_host(
+    remote: &str,
+    port: Option<&str>,
+    archive: &Path,
+    remote_archive: &str,
+    instance_dir: &str,
+    keep: bool,
+) -> Result<(), String> {
+    let mut scp = std::process::Command::new("scp");
+    scp.arg("-q");
+    if let Some(port) = port {
+        scp.arg("-P").arg(port);
+    }
+    let scp = scp
+        .arg(archive)
+        .arg(format!("{remote}:{remote_archive}"))
+        .status()
+        .map_err(|err| format!("cannot run scp: {err}"))?;
+    if !scp.success() {
+        return Err(format!("scp exited with {scp}"));
+    }
+
+    let cleanup = if keep {
+        String::new()
+    } else {
+        format!(" && rm -f {}", shell_quote(remote_archive))
+    };
+    let command = format!(
+        "mkdir -p {dir} && rm -rf {dir}/data && tar -xzf {archive} -C {dir} data && \
+         (chown -R 10000:10000 {dir}/data 2>/dev/null || true){cleanup}",
+        dir = shell_quote(instance_dir),
+        archive = shell_quote(remote_archive),
+    );
+    let mut ssh = std::process::Command::new("ssh");
+    if let Some(port) = port {
+        ssh.arg("-p").arg(port);
+    }
+    let ssh = ssh
+        .arg(remote)
+        .arg(command)
+        .status()
+        .map_err(|err| format!("cannot run ssh: {err}"))?;
+    if !ssh.success() {
+        return Err(format!("ssh exited with {ssh}"));
+    }
+    Ok(())
+}
+
+/// Split an SSH address into its `user@host` part and an optional port.
+fn split_ssh_target(address: &str) -> (String, Option<String>) {
+    let address = address
+        .trim()
+        .strip_prefix("ssh://")
+        .unwrap_or(address.trim());
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) {
+            return (host.to_string(), Some(port.to_string()));
+        }
+    }
+    (address.to_string(), None)
+}
+
+/// Parent directory of `<root>/instances/<id>/data`.
+fn instance_directory(data_dir: &str) -> Result<String, CliError> {
+    let path = Path::new(data_dir);
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Config(format!(
+            "cannot derive the instance directory from \"{data_dir}\"; pass \
+             --remote-instance-dir"
+        ))
+    })?;
+    Ok(parent.display().to_string())
+}
+
+/// Refuse a target directory that the remote `rm -rf` must never touch.
+fn validate_remote_instance_dir(path: &str) -> Result<(), CliError> {
+    let path = path.trim();
+    if !path.starts_with('/') || path == "/" || path.split('/').any(|part| part == "..") {
+        return Err(CliError::Config(format!(
+            "refusing the remote instance directory \"{path}\": expected an absolute path \
+             below /"
+        )));
+    }
+    Ok(())
+}
+
+fn tool_available(name: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// POSIX single-quote a value embedded in a remote shell command.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn print_manual_move(id: &str, host: &str, remote: &str, instance_dir: &str) {
+    println!(
+        "The target host \"{host}\" is remote: its Docker daemon resolves bind mounts on its \
+         own filesystem."
+    );
+    println!("Transfer the data yourself, then run this move again with --skip-transfer:");
+    println!("  1. fleett stop {id}");
+    println!(
+        "  2. curl -fsS -H \"Authorization: Bearer $FLEETT_TOKEN\" \
+         \"$FLEETT_URL/api/instances/{id}/export\" -o /tmp/{id}.tgz"
+    );
+    println!("  3. scp /tmp/{id}.tgz {remote}:/tmp/{id}.tgz");
+    println!(
+        "  4. ssh {remote} 'mkdir -p {dir} && tar -xzf /tmp/{id}.tgz -C {dir} data && \
+         chown -R 10000:10000 {dir}/data'",
+        dir = shell_quote(instance_dir)
+    );
+    println!("  5. fleett instances move {id} --to {host} --skip-transfer");
 }
 
 async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), CliError> {
@@ -3265,5 +3788,35 @@ mod tests {
     fn path_segments_are_escaped() {
         assert_eq!(encode_path_segment("alice-2"), "alice-2");
         assert_eq!(encode_path_segment("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn ssh_targets_are_split_without_losing_the_port() {
+        assert_eq!(
+            split_ssh_target("cle@10.1.20.5"),
+            ("cle@10.1.20.5".to_string(), None)
+        );
+        assert_eq!(
+            split_ssh_target("ssh://cle@10.1.20.5:2222"),
+            ("cle@10.1.20.5".to_string(), Some("2222".to_string()))
+        );
+        assert_eq!(
+            split_ssh_target(" ssh://cle@host "),
+            ("cle@host".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn remote_shell_paths_are_single_quoted() {
+        assert_eq!(shell_quote("/opt/fleett"), "'/opt/fleett'");
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn a_remote_instance_directory_can_never_be_root() {
+        assert!(validate_remote_instance_dir("/opt/fleett/instances/alice").is_ok());
+        for bad in ["", "/", "relative/path", "/opt/../etc"] {
+            assert!(validate_remote_instance_dir(bad).is_err(), "{bad}");
+        }
     }
 }

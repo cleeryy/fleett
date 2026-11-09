@@ -377,7 +377,7 @@ async fn enforcement(
             let marker = firewall::read_marker(&state.cfg.egress_marker);
             let subnet = state
                 .driver
-                .network_subnet(&state.cfg.network)
+                .network_subnet(&spec.host, &state.cfg.network)
                 .await
                 .ok()
                 .flatten();

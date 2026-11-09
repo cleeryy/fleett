@@ -861,6 +861,7 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan,
+            host: crate::hosts::LOCAL_HOST.to_string(),
             heal: crate::models::HealPolicy::Off,
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
