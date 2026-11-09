@@ -28,6 +28,17 @@ jobs:
         working-directory: backend
         run: cargo test --locked
 
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: |
+          bash -n docker/fetch-s6-overlay.sh
+          bash -n tests/image/test-fetch-s6-overlay.sh
+      - name: s6-overlay download helper (local mock, no GitHub)
+        run: bash tests/image/test-fetch-s6-overlay.sh
+
   web:
     runs-on: ubuntu-24.04
     steps:
