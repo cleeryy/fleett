@@ -138,6 +138,8 @@ fleett create --template guest-discord --id tchouniz
 fleett logs tchouniz --since 30m --grep error --level error
 fleett usage
 fleett upgrade --image hermes-agent:0.23.0-local
+fleett upgrade --image hermes-agent:0.23.0-local --canary 1 --soak 10m
+fleett deployments
 fleett backup --keep 7
 fleett doctor
 ```
@@ -152,7 +154,7 @@ Every command accepts `--json`; the server URL and token come from
 | [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | how to run it, as a binary, a `.deb` or a container |
 | [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
 | [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) | the per-agent surface |
-| [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
+| [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [deployments](docs/DEPLOYMENTS.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
 
 ## Development
 

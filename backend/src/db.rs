@@ -164,6 +164,41 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — maintenance windows and the deployment journal (issue #39).
+    // A window restricts destructive operations to a day/time range; a
+    // deployment row keeps the trace of one upgrade (immediate or scheduled)
+    // after the in-memory job is gone. `days` is a comma-separated subset of
+    // `mon..sun`; minutes are UTC minutes since midnight (0..1439).
+    r#"
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id            TEXT PRIMARY KEY NOT NULL,
+    name          TEXT NOT NULL,
+    days          TEXT NOT NULL,
+    start_minute  INTEGER NOT NULL,
+    end_minute    INTEGER NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deployments (
+    id          TEXT PRIMARY KEY NOT NULL,
+    image       TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    instances   TEXT NOT NULL,
+    canary      INTEGER NOT NULL DEFAULT 0,
+    soak_s      INTEGER NOT NULL DEFAULT 0,
+    started_at  TEXT,
+    finished_at TEXT,
+    result      TEXT,
+    error       TEXT,
+    rollback    INTEGER NOT NULL DEFAULT 0,
+    created_by  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_started ON deployments (started_at);
+CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments (status);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -1412,6 +1447,9 @@ mod tests {
             "audit_log",
             "api_tokens",
             "providers",
+            "messages",
+            "maintenance_windows",
+            "deployments",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }

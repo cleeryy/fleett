@@ -5,7 +5,9 @@ time** and puts an instance back on its previous tag when the new one never beco
 The operation is driven by the control plane: nothing has to be done container by container.
 
 Related: `docs/CLI.md` (client commands), `API.md` (HTTP contract), `docs/DEPLOY.md`
-(deployment), `docs/BACKUP.md` (take a backup before a big jump).
+(deployment), `docs/BACKUP.md` (take a backup before a big jump),
+`docs/DEPLOYMENTS.md` (maintenance windows, canary phase, scheduled runs and the deployment
+journal).
 
 ## What the job does
 
@@ -73,7 +75,17 @@ fleett upgrade --image hermes-agent:0.23.0-local
 
 # 3. two instances at once on a large fleet, with a longer timeout
 fleett upgrade --image hermes-agent:0.23.0-local --parallel 2 --timeout 300
+
+# 4. one instance first, watched for 10 minutes, then the rest
+fleett upgrade --image hermes-agent:0.23.0-local --canary 1 --soak 10m
 ```
+
+When at least one maintenance window is enabled, the same command is refused outside the
+window with `403 maintenance_window` and the next opening (`docs/DEPLOYMENTS.md`). With
+`--canary N`, the first N instances are moved first and must stay healthy for `--soak`
+seconds; a canary that fails rolls back on its own and stops the deployment, leaving the
+other instances on their current tag. Every run — immediate or scheduled with `--at` — is
+recorded in the deployment journal (`fleett deployments`).
 
 The command polls the job every 2 s, prints one line per state change, then the final table:
 
@@ -125,7 +137,9 @@ entry carries `from`, `to`, `status` and the reason).
 The job is in memory: restarting the control plane loses the last job but never changes a
 container. A job that was running when the control plane stopped is simply gone — run
 `fleett ps` and re-run the upgrade; instances already on the new tag are upgraded again (a
-no-op `up -d` on the same image) and stay healthy.
+no-op `up -d` on the same image) and stay healthy. The deployment journal
+(`GET /api/deployments`) keeps the durable trace of the run; scheduled deployments survive a
+restart and fire on the next tick once due.
 
 ## Parallelism
 
@@ -164,6 +178,9 @@ records the label.
 - **`409 upgrade_in_progress`** — a job is still running (`GET /api/upgrade` shows it). Wait,
   or restart the control plane to clear a job left behind by a crash.
 - **`403 forbidden`** — the token is a `viewer`; upgrading is an admin mutation.
+- **`403 maintenance_window`** — an enabled maintenance window is closed at the moment; the
+  message and `error.details.next_open` carry the next opening (`fleett windows`,
+  `docs/DEPLOYMENTS.md`). Nothing was pulled or restarted.
 - **Health never turns healthy** — the healthcheck has a 60 s `start_period` and 3 retries at
   30 s; a heavy first start can exceed the default 180 s timeout. Re-run with `--timeout 300`.
 
@@ -173,4 +190,6 @@ The suite covers the whole path without Docker: the mock driver tracks the image
 simulated container, can declare a tag unhealthy and can delay `up` (parallelism). The
 integration tests assert the healthy move (image + label), the rollback and its `last_error`,
 the dry run writing nothing, the parallel limit, the `409` of a concurrent job, the audit rows
-and the `403` of a viewer. See `backend/tests/upgrade.rs`.
+and the `403` of a viewer. See `backend/tests/upgrade.rs`. The windows, canary/soak phase,
+scheduled deployments and the journal are covered by `backend/tests/deployments.rs` (see
+`docs/DEPLOYMENTS.md`).

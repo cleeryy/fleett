@@ -186,6 +186,35 @@ enum Commands {
         /// Seconds to wait for an instance to become healthy (default 180).
         #[arg(long, default_value_t = fleett::models::UPGRADE_TIMEOUT_DEFAULT_S)]
         timeout: u64,
+        /// Instances moved first and watched during the soak (0: no canary).
+        #[arg(long)]
+        canary: Option<usize>,
+        /// Soak duration: seconds, 30s, 10m or 1h (default 600).
+        #[arg(long)]
+        soak: Option<String>,
+        /// Start later: RFC 3339 or a "sun 04:00" day+time expression (UTC).
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// List, add or remove the maintenance windows that gate destructive
+    /// operations (client mode). See docs/DEPLOYMENTS.md.
+    Windows {
+        #[command(subcommand)]
+        action: Option<WindowsCommands>,
+    },
+    /// List the deployment journal (client mode). See docs/DEPLOYMENTS.md.
+    Deployments {
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter by status (ok, failed, rolled_back, scheduled, ...).
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Show one deployment of the journal (client mode).
+    Deployment {
+        #[command(subcommand)]
+        action: DeploymentCommands,
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
@@ -276,6 +305,44 @@ enum EgressCommands {
     Status,
     /// Print the exact iptables commands without running them.
     Print,
+}
+
+#[derive(Subcommand, Clone)]
+enum WindowsCommands {
+    /// List the windows (the default).
+    List,
+    /// Create a window.
+    Add {
+        /// Display name.
+        #[arg(long)]
+        name: String,
+        /// Comma-separated days, `mon..sun` (`sat,sun`).
+        #[arg(long)]
+        days: String,
+        /// UTC start, `HH:MM`.
+        #[arg(long)]
+        start: String,
+        /// UTC end, `HH:MM` (an end before the start means overnight).
+        #[arg(long)]
+        end: String,
+        /// Create it disabled.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Delete a window by id.
+    Rm {
+        /// Window id.
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DeploymentCommands {
+    /// Show one journal row with its per-instance results.
+    Get {
+        /// Deployment id.
+        id: String,
+    },
 }
 
 impl From<EgressCommands> for egress::Action {
@@ -413,6 +480,9 @@ async fn main() -> anyhow::Result<()> {
             parallel,
             dry_run,
             timeout,
+            canary,
+            soak,
+            at,
         } => {
             cli::run(
                 cli::Command::Upgrade(cli::UpgradeArgs {
@@ -420,11 +490,44 @@ async fn main() -> anyhow::Result<()> {
                     parallel,
                     dry_run,
                     timeout_s: timeout,
+                    canary,
+                    soak,
+                    at,
                 }),
                 json,
             )
             .await
         }
+        Commands::Windows { action } => {
+            let action = match action {
+                None | Some(WindowsCommands::List) => cli::WindowsAction::List,
+                Some(WindowsCommands::Add {
+                    name,
+                    days,
+                    start,
+                    end,
+                    disabled,
+                }) => cli::WindowsAction::Add(cli::WindowAddArgs {
+                    name,
+                    days,
+                    start,
+                    end,
+                    disabled,
+                }),
+                Some(WindowsCommands::Rm { id }) => cli::WindowsAction::Remove(id),
+            };
+            cli::run(cli::Command::Windows(action), json).await
+        }
+        Commands::Deployments { limit, status } => {
+            cli::run(
+                cli::Command::Deployments(cli::DeploymentsArgs { limit, status }),
+                json,
+            )
+            .await
+        }
+        Commands::Deployment { action } => match action {
+            DeploymentCommands::Get { id } => cli::run(cli::Command::DeploymentGet(id), json).await,
+        },
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
         Commands::Say {
             to,
@@ -540,6 +643,8 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state.clone());
 
+    spawn_maintenance_ticker(state.clone());
+
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
     }
@@ -561,6 +666,22 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())
+}
+
+/// Start the loop that fires scheduled deployments (`at`, issue #39).
+///
+/// A row due while a job runs stays `scheduled` and is retried at the next
+/// tick. A restart loses the in-memory job but never the journal row, which
+/// remains `scheduled` until its time comes.
+fn spawn_maintenance_ticker(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(fleett::maintenance::TICK_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            fleett::maintenance::tick_scheduled(&state).await;
+        }
+    });
 }
 
 /// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).

@@ -115,6 +115,17 @@ impl MockDriver {
         lock(&self.image_health).insert(image.to_string(), health);
     }
 
+    /// Change the health of one *existing* simulated container.
+    ///
+    /// Unlike [`MockDriver::set_image_health`], which applies at the next
+    /// `up`, this models a container that was healthy and degrades later (the
+    /// canary soak of issue #39).
+    pub fn set_instance_health(&self, id: &str, health: Health) {
+        if let Some(entry) = lock(&self.state).get_mut(id) {
+            entry.health = health;
+        }
+    }
+
     /// Make `ensure_image` fail for one tag, as a registry would.
     pub fn fail_image_pull(&self, image: &str, detail: impl Into<String>) {
         lock(&self.pull_failures).insert(image.to_string(), detail.into());

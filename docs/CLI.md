@@ -52,7 +52,13 @@ fleett restart <id>
 fleett delete <id> [--purge]
 fleett usage
 fleett images
-fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
+fleett upgrade --image TAG [--parallel N] [--canary N] [--soak 10m|600]
+               [--at "sun 04:00"] [--dry-run] [--timeout N]
+fleett windows [list]
+fleett windows add --name NAME --days mon,tue --start HH:MM --end HH:MM [--disabled]
+fleett windows rm <id>
+fleett deployments [--limit N] [--status STATUS]
+fleett deployment get <id>
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
@@ -154,15 +160,26 @@ are omitted. A Docker failure answers `502 images_unavailable` with the Docker e
 ### `upgrade`
 
 Moves every agent to another image, one instance at a time by default, and rolls back the
-instances that never become healthy. See `docs/UPGRADE.md` for the procedure and the rollback
-semantics.
+instances that never become healthy. A canary phase and a maintenance window can gate the run;
+see `docs/UPGRADE.md` (rollback semantics) and `docs/DEPLOYMENTS.md` (windows, canary, journal).
 
 ```bash
 fleett upgrade --image hermes-agent:0.23.0-local --dry-run
 fleett upgrade --image hermes-agent:0.23.0-local
 fleett upgrade --image hermes-agent:0.23.0-local --parallel 2 --timeout 300
-fleett --json upgrade --image hermes-agent:0.23.0-local | jq '.results[] | {id, status}'
+
+# one instance first, watched for 10 minutes, then the rest
+fleett upgrade --image hermes-agent:0.23.0-local --canary 1 --soak 10m
+
+# schedule the same run for the next Sunday 04:00 UTC
+fleett upgrade --image hermes-agent:0.23.0-local --canary 1 --soak 10m --at "sun 04:00"
 ```
+
+`--soak` accepts a bare number of seconds (`600`), `30s`, `10m` or `1h` (0..3600).
+`--at` accepts an RFC 3339 timestamp or a `<day> HH:MM` expression, always UTC; the next
+occurrence strictly in the future is used. A scheduled run prints
+`scheduled deployment <id>: image …, at <time>` and exits `0` immediately — nothing is
+pulled or restarted now.
 
 The command posts the job, polls `GET /api/upgrade` every 2 s and prints a line whenever an
 instance changes state, then a final table (`ID`, `FROM`, `TO`, `STATUS`) with the error of
@@ -170,6 +187,50 @@ each instance that did not keep the new image. `--dry-run` only prints the plan
 (`id  from -> to`), the server writes nothing. Exit code `1` when at least one instance ends
 `rolled_back` or `failed`; the table is still printed. `--json` prints the final job and
 nothing intermediate.
+
+Outside a maintenance window the server refuses with `403 maintenance_window` and the next
+opening; nothing is pulled. With a canary policy, a failing canary stops the run: the canary
+instances are rolled back, the others are left untouched and reported `pending` with
+`not attempted: …`.
+
+### `windows`
+
+Manages the recurring maintenance windows that gate destructive operations
+([docs/DEPLOYMENTS.md](DEPLOYMENTS.md)). Without a subcommand, lists them.
+
+```bash
+fleett windows add --name nightly --days mon,tue,wed,thu,fri --start 02:00 --end 05:00
+fleett windows add --name weekend --days sat,sun --start 00:00 --end 00:00   # all weekend
+fleett windows add --name frozen --days mon --start 00:00 --end 00:00 --disabled
+fleett windows
+fleett windows rm 6a1c…
+fleett --json windows | jq '.[] | select(.enabled)'
+```
+
+Times are UTC `HH:MM`; an end before the start is an overnight window that belongs to its
+start day, and `start == end` covers the whole day. Days are `mon`..`sun` (full names are
+accepted). Mutations require an admin token.
+
+### `deployments`
+
+Lists the deployment journal, newest first: short id, image, status, canary size, instance
+count, start and finish. `--limit` is `1..=500` (default 50), `--status` filters on `pending`,
+`canary`, `running`, `scheduled`, `ok`, `failed`, `rolled_back` or `cancelled`.
+
+```bash
+fleett deployments
+fleett deployments --limit 20 --status rolled_back
+fleett --json deployments | jq '.[] | select(.rollback)'
+```
+
+`fleett deployment get <id>` prints one row with its per-instance results (and the deferred
+request while it is `scheduled`); `--json` returns the raw row.
+
+```bash
+fleett deployment get 0b7e…
+fleett --json deployment get 0b7e… | jq '.result[] | select(.status != "healthy")'
+```
+
 
 ### `say` / `messages` / `ack`
 

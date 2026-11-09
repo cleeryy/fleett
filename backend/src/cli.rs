@@ -311,6 +311,9 @@ pub enum Command {
     Usage,
     Images,
     Upgrade(UpgradeArgs),
+    Windows(WindowsAction),
+    Deployments(DeploymentsArgs),
+    DeploymentGet(String),
     Doctor,
     Say(SayArgs),
     Messages(MessagesArgs),
@@ -344,6 +347,12 @@ pub struct UpgradeArgs {
     pub parallel: usize,
     pub dry_run: bool,
     pub timeout_s: u64,
+    /// Instances moved first and watched during the soak (`None`: no canary).
+    pub canary: Option<usize>,
+    /// Soak duration as written on the command line (`10m`, `600`).
+    pub soak: Option<String>,
+    /// Future start (`sun 04:00` or RFC 3339).
+    pub at: Option<String>,
 }
 
 impl Default for UpgradeArgs {
@@ -353,8 +362,36 @@ impl Default for UpgradeArgs {
             parallel: 1,
             dry_run: false,
             timeout_s: 180,
+            canary: None,
+            soak: None,
+            at: None,
         }
     }
+}
+
+/// Arguments of `fleett deployments`.
+#[derive(Debug, Clone)]
+pub struct DeploymentsArgs {
+    pub limit: usize,
+    pub status: Option<String>,
+}
+
+/// Arguments of `fleett windows`.
+#[derive(Debug, Clone)]
+pub enum WindowsAction {
+    List,
+    Add(WindowAddArgs),
+    Remove(String),
+}
+
+/// Arguments of `fleett windows add`.
+#[derive(Debug, Clone)]
+pub struct WindowAddArgs {
+    pub name: String,
+    pub days: String,
+    pub start: String,
+    pub end: String,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +446,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Usage => usage(&client, json).await,
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
+        Command::Windows(action) => windows(&client, json, &action).await,
+        Command::Deployments(args) => deployments(&client, json, &args).await,
+        Command::DeploymentGet(id) => deployment_get(&client, json, &id).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
@@ -548,6 +588,10 @@ struct UpgradeJobView {
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
+    canary: usize,
+    #[serde(default)]
+    soak_s: u64,
+    #[serde(default)]
     results: Vec<UpgradeResultView>,
 }
 
@@ -562,6 +606,61 @@ impl UpgradeJobView {
             .iter()
             .any(|result| matches!(result.status.as_str(), "rolled_back" | "failed"))
     }
+}
+
+/// One maintenance window, as returned by `GET /api/maintenance-windows`.
+#[derive(Debug, Clone, Deserialize)]
+struct WindowView {
+    id: String,
+    name: String,
+    #[serde(default)]
+    days: Vec<String>,
+    #[serde(rename = "start_minute", default)]
+    start_minute: u32,
+    #[serde(rename = "end_minute", default)]
+    end_minute: u32,
+    #[serde(default)]
+    enabled: bool,
+}
+
+impl WindowView {
+    fn start(&self) -> String {
+        format!(
+            "{:02}:{:02}",
+            self.start_minute / 60,
+            self.start_minute % 60
+        )
+    }
+
+    fn end(&self) -> String {
+        format!("{:02}:{:02}", self.end_minute / 60, self.end_minute % 60)
+    }
+}
+
+/// One deployment journal row, as returned by `GET /api/deployments`.
+#[derive(Debug, Clone, Deserialize)]
+struct DeploymentView {
+    id: String,
+    image: String,
+    status: String,
+    #[serde(default)]
+    instances: Vec<String>,
+    #[serde(default)]
+    canary: usize,
+    #[serde(default)]
+    soak_s: u64,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    rollback: bool,
+    #[serde(default)]
+    created_by: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1010,15 +1109,45 @@ async fn images(client: &Client, json: bool) -> Result<(), CliError> {
 }
 
 async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), CliError> {
-    let body = json!({
+    let mut body = json!({
         "image": args.image,
         "parallel": args.parallel,
         "dry_run": args.dry_run,
         "timeout_s": args.timeout_s,
     });
+    if let Some(canary) = args.canary {
+        body["canary"] = json!(canary);
+    }
+    if let Some(soak) = &args.soak {
+        let seconds = parse_duration(soak)
+            .map_err(|message| CliError::Config(format!("invalid --soak: {message}")))?;
+        body["soak_s"] = json!(seconds);
+    }
+    if let Some(at) = &args.at {
+        body["at"] = json!(at);
+    }
     let value = client
         .value(Method::POST, "/api/upgrade", &[], Some(body))
         .await?;
+
+    // A future `at` is journaled as a scheduled deployment: nothing runs now.
+    if value.get("status").and_then(Value::as_str) == Some("scheduled") {
+        if json {
+            return print_json(&value);
+        }
+        println!(
+            "scheduled deployment {}: image {}, at {}",
+            value.get("id").and_then(Value::as_str).unwrap_or("-"),
+            value.get("image").and_then(Value::as_str).unwrap_or("-"),
+            value
+                .get("started_at")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+        );
+        println!("journal: fleett deployment get <id>");
+        return Ok(());
+    }
+
     let mut job: UpgradeJobView = decode(value)?;
 
     if json {
@@ -1032,10 +1161,15 @@ async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), 
     }
 
     println!(
-        "upgrade {}: {} instance(s) to {}{}",
+        "upgrade {}: {} instance(s) to {}{}{}",
         job.id,
         job.results.len(),
         job.image,
+        if job.canary > 0 {
+            format!(", canary {}", job.canary)
+        } else {
+            String::new()
+        },
         if job.dry_run { " (dry run)" } else { "" }
     );
     if job.dry_run {
@@ -1075,6 +1209,195 @@ async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), 
     println!();
     print_upgrade_table(&job);
     upgrade_status(&job)
+}
+
+async fn windows(client: &Client, json: bool, action: &WindowsAction) -> Result<(), CliError> {
+    match action {
+        WindowsAction::List => {
+            let value = client
+                .value(Method::GET, "/api/maintenance-windows", &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let windows: Vec<WindowView> = decode(value)?;
+            if windows.is_empty() {
+                println!("no maintenance window: destructive operations are allowed");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = windows
+                .iter()
+                .map(|window| {
+                    vec![
+                        window.id.clone(),
+                        window.name.clone(),
+                        window.days.join(","),
+                        window.start(),
+                        window.end(),
+                        if window.enabled { "yes" } else { "no" }.to_string(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "NAME", "DAYS", "START", "END", "ENABLED"], &rows)
+            );
+            Ok(())
+        }
+        WindowsAction::Add(args) => {
+            let start = crate::maintenance::parse_hhmm(&args.start)
+                .map_err(|message| CliError::Config(format!("invalid --start: {message}")))?;
+            let end = crate::maintenance::parse_hhmm(&args.end)
+                .map_err(|message| CliError::Config(format!("invalid --end: {message}")))?;
+            let body = json!({
+                "name": args.name,
+                "days": args.days.split(',').map(str::trim).filter(|day| !day.is_empty()).collect::<Vec<_>>(),
+                "start_minute": start,
+                "end_minute": end,
+                "enabled": !args.disabled,
+            });
+            let value = client
+                .value(Method::POST, "/api/maintenance-windows", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let window: WindowView = decode(value)?;
+            println!(
+                "created window {} ({} {}..{}, {})",
+                window.id,
+                window.days.join(","),
+                window.start(),
+                window.end(),
+                if window.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            Ok(())
+        }
+        WindowsAction::Remove(id) => {
+            let path = format!("/api/maintenance-windows/{}", encode_path_segment(id));
+            client.text(Method::DELETE, &path, &[], None).await?;
+            if json {
+                return print_json(&json!({ "id": id, "deleted": true }));
+            }
+            println!("deleted maintenance window {id}");
+            Ok(())
+        }
+    }
+}
+
+async fn deployments(client: &Client, json: bool, args: &DeploymentsArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
+    if let Some(status) = &args.status {
+        query.push(("status", status.clone()));
+    }
+    let value = client
+        .value(Method::GET, "/api/deployments", &query, None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let deployments: Vec<DeploymentView> = decode(value)?;
+    if deployments.is_empty() {
+        println!("no deployment");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = deployments
+        .iter()
+        .map(|deployment| {
+            vec![
+                deployment.id.chars().take(8).collect(),
+                deployment.image.clone(),
+                deployment.status.clone(),
+                if deployment.canary > 0 {
+                    deployment.canary.to_string()
+                } else {
+                    "-".to_string()
+                },
+                deployment.instances.len().to_string(),
+                deployment
+                    .started_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                deployment
+                    .finished_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "ID",
+                "IMAGE",
+                "STATUS",
+                "CANARY",
+                "INSTANCES",
+                "STARTED",
+                "FINISHED"
+            ],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn deployment_get(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/deployments/{}", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let deployment: DeploymentView = decode(value)?;
+    println!(
+        "deployment {}: {} → {} ({} instance(s), canary {}, soak {}s)",
+        deployment.id,
+        deployment.status,
+        deployment.image,
+        deployment.instances.len(),
+        deployment.canary,
+        deployment.soak_s
+    );
+    if let Some(at) = &deployment.started_at {
+        println!("started: {at}");
+    }
+    if let Some(at) = &deployment.finished_at {
+        println!("finished: {at}");
+    }
+    if deployment.rollback {
+        println!("rollback: at least one instance was restored");
+    }
+    if !deployment.created_by.is_empty() {
+        println!("created by: {}", deployment.created_by);
+    }
+    if let Some(error) = &deployment.error {
+        println!("error: {error}");
+    }
+    if let Some(results) = deployment.result.as_ref().and_then(Value::as_array) {
+        let rows: Vec<Vec<String>> = results
+            .iter()
+            .map(|result| {
+                vec![
+                    result["id"].as_str().unwrap_or("-").to_string(),
+                    result["from"].as_str().unwrap_or("-").to_string(),
+                    result["to"].as_str().unwrap_or("-").to_string(),
+                    result["status"].as_str().unwrap_or("-").to_string(),
+                ]
+            })
+            .collect();
+        print!("{}", render_table(&["ID", "FROM", "TO", "STATUS"], &rows));
+        for result in results {
+            if let Some(error) = result["error"].as_str() {
+                println!("  {}: {error}", result["id"].as_str().unwrap_or("-"));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_upgrade(client: &Client) -> Result<UpgradeJobView, CliError> {
@@ -1343,6 +1666,34 @@ fn table_line(widths: &[usize], cells: &[String]) -> String {
     line
 }
 
+/// Parse a duration: bare seconds (`600`), or `30s`, `10m`, `1h`.
+///
+/// The control plane speaks seconds; this only makes the CLI friendlier.
+pub fn parse_duration(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let (digits, factor) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3600),
+        _ => (value, 1),
+    };
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid duration \"{value}\": expected seconds, 30s, 10m or 1h"
+        ));
+    }
+    let amount: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid duration \"{value}\": number too large"))?;
+    amount
+        .checked_mul(factor)
+        .ok_or_else(|| format!("invalid duration \"{value}\": number too large"))
+}
+
 /// `1536` → `1.5 KiB` (binary units, like `docker stats`).
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -1504,6 +1855,20 @@ mod tests {
 
         let err = parse_api_error(500, "");
         assert!(err.to_string().contains("HTTP 500"), "{err}");
+    }
+
+    #[test]
+    fn durations_accept_seconds_minutes_and_hours() {
+        assert_eq!(parse_duration("600"), Ok(600));
+        assert_eq!(parse_duration("30s"), Ok(30));
+        assert_eq!(parse_duration("10m"), Ok(600));
+        assert_eq!(parse_duration("1h"), Ok(3600));
+        assert_eq!(parse_duration(" 2m "), Ok(120));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("m").is_err());
+        assert!(parse_duration("10mm").is_err());
+        assert!(parse_duration("1d").is_err());
+        assert!(parse_duration("99999999999999999999").is_err());
     }
 
     #[test]
