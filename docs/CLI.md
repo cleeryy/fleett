@@ -56,14 +56,13 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
-fleett memory set <namespace> <key> <value> [--tag T]… [--ttl S]
-fleett memory get <namespace> <key>
-fleett memory list [--namespace NS] [--limit N]
-fleett memory search <query> [--namespace NS] [--limit N]
-fleett memory history <id>
-fleett memory restore <id> <version>
-fleett memory delete <id>
-fleett memory promote <id> [--namespace global]
+fleett schedules <id>
+fleett schedule add <id> --name NAME --cron EXPR --prompt TEXT
+                [--enabled|--disabled] [--overlap skip|queue] [--timeout S]
+                [--timezone TZ] [--catchup]
+fleett schedule rm <schedule-id>
+fleett schedule run <schedule-id>
+fleett runs <id> [--limit N]
 fleett doctor
 ```
 
@@ -192,6 +191,29 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `schedules` / `schedule` / `runs`
+
+Manage the cron schedules of an instance ([docs/SCHEDULES.md](SCHEDULES.md)):
+
+```bash
+fleett schedule add alice --name every-five --cron '*/5 * * * *' \
+  --prompt 'summarize the incidents' --timeout 120
+fleett schedules alice
+fleett schedule run <schedule-id>
+fleett schedule rm <schedule-id>
+fleett runs alice --limit 20
+```
+
+`schedules` prints one row per schedule: `NAME`, `CRON`, `ENABLED`, `NEXT`,
+`LAST`, `OVERLAP`, `TIMEOUT`. `schedule add` accepts `--name`, `--cron` and
+`--prompt` (required), plus `--enabled` (the default), `--disabled`,
+`--overlap skip|queue`, `--timeout` (1..=3600 s), `--timezone` (stored, UTC
+evaluation for now) and `--catchup`. `schedule run` executes the schedule
+immediately and prints `run <id>: <status> (<duration> ms), exit <code>`; a
+non-`ok` run prints its output indented. `runs` prints `STARTED`, `STATUS`,
+`EXIT`, `DURATION` and the first 80 characters of `OUTPUT`. Every command
+accepts `--json` and prints the raw `Schedule` / `ScheduleRun` objects.
 
 ### `memory`
 

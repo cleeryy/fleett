@@ -11,6 +11,7 @@ pub mod instances;
 pub mod json;
 pub mod memory;
 pub mod providers;
+pub mod schedules;
 pub mod shares;
 pub mod templates;
 pub mod tokens;
@@ -200,6 +201,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/instances/{id}/logs", get(instances::logs))
         .route("/instances/{id}/messages", get(bus::inbox).post(bus::send))
         .route("/instances/{id}/messages/{message_id}/ack", post(bus::ack))
+        .route(
+            "/instances/{id}/schedules",
+            get(schedules::list_for_instance).post(schedules::create),
+        )
+        .route("/instances/{id}/runs", get(schedules::list_runs))
+        .route("/schedules", get(schedules::list_all))
+        .route(
+            "/schedules/{sid}",
+            axum::routing::patch(schedules::patch).delete(schedules::delete),
+        )
+        .route("/schedules/{sid}/run", post(schedules::run))
         .route("/instances/{id}/errors", get(instances::errors))
         .route("/shares", get(shares::list).post(shares::create))
         .route("/shares/{name}", delete(shares::delete))

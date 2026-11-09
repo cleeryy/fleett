@@ -234,6 +234,24 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// List the cron schedules of an instance (client mode).
+    Schedules {
+        /// Instance id.
+        id: String,
+    },
+    /// Create, delete or trigger a cron schedule (client mode).
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleCommands,
+    },
+    /// Show the run history of an instance (client mode).
+    Runs {
+        /// Instance id.
+        id: String,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -279,6 +297,52 @@ enum MemoryCommands {
         id: i64,
         #[arg(long, default_value = "global")]
         namespace: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum ScheduleCommands {
+    /// Create a schedule for an instance.
+    Add {
+        /// Instance id.
+        id: String,
+        /// Operator-facing name, unique per instance.
+        #[arg(long)]
+        name: String,
+        /// Five-field cron expression, evaluated in UTC (`*/5 * * * *`).
+        #[arg(long)]
+        cron: String,
+        /// Prompt sent to the gateway on every run.
+        #[arg(long)]
+        prompt: String,
+        /// Enable the schedule (the default).
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Create the schedule disabled.
+        #[arg(long, conflicts_with = "enabled")]
+        disabled: bool,
+        /// `skip` (default) or `queue` when the previous run is still going.
+        #[arg(long)]
+        overlap: Option<String>,
+        /// Execution budget in seconds (1..=3600, default 300).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Timezone label (stored, evaluated in UTC for now).
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Replay one missed occurrence at startup.
+        #[arg(long)]
+        catchup: bool,
+    },
+    /// Delete a schedule and its run history.
+    Rm {
+        /// Schedule id.
+        schedule_id: String,
+    },
+    /// Trigger a schedule immediately and print the run.
+    Run {
+        /// Schedule id.
+        schedule_id: String,
     },
 }
 
@@ -559,6 +623,43 @@ async fn main() -> anyhow::Result<()> {
             };
             cli::run(cli::Command::Memory(command), json).await
         }
+        Commands::Schedules { id } => cli::run(cli::Command::Schedules { id }, json).await,
+        Commands::Schedule { action } => {
+            let command = match action {
+                ScheduleCommands::Add {
+                    id,
+                    name,
+                    cron,
+                    prompt,
+                    enabled,
+                    disabled,
+                    overlap,
+                    timeout,
+                    timezone,
+                    catchup,
+                } => cli::Command::ScheduleAdd(cli::ScheduleAddArgs {
+                    id,
+                    name,
+                    cron,
+                    prompt,
+                    enabled: if enabled {
+                        Some(true)
+                    } else if disabled {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                    overlap,
+                    timeout_s: timeout,
+                    timezone,
+                    catchup,
+                }),
+                ScheduleCommands::Rm { schedule_id } => cli::Command::ScheduleRm { schedule_id },
+                ScheduleCommands::Run { schedule_id } => cli::Command::ScheduleRun { schedule_id },
+            };
+            cli::run(command, json).await
+        }
+        Commands::Runs { id, limit } => cli::run(cli::Command::Runs { id, limit }, json).await,
     };
 
     if code != 0 {
@@ -632,6 +733,15 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state.clone());
 
+    // A `running` row belongs to a process that died; catchup=false schedules
+    // whose slot is long past are moved to their next future occurrence here.
+    match fleett::scheduler::recover(&state.db) {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(count, "recovered stale scheduled runs"),
+        Err(err) => tracing::warn!(%err, "could not recover scheduled runs"),
+    }
+    spawn_scheduler(state.clone());
+
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
     }
@@ -653,6 +763,23 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())
+}
+
+/// Start the cron loop (`scheduler::tick` every 15 s).
+///
+/// Only `serve` calls this: the test suite builds [`AppState`] directly and
+/// never runs a background loop.
+fn spawn_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            fleett::scheduler::TICK_INTERVAL_S,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            fleett::scheduler::tick(&state).await;
+        }
+    });
 }
 
 /// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).

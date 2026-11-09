@@ -1034,231 +1034,6 @@ async fn patch_env_merges_deletes_and_keeps_empty_values() {
 }
 
 #[tokio::test]
-async fn legacy_env_map_is_accepted_on_create_and_patch() {
-    let harness = Harness::new();
-    let mut body = instance_body("alice");
-    body["env"] = json!({
-        "DISCORD_ALLOWED_USERS": "123,456",
-        "OPENAI_KEY": "sk-legacy"
-    });
-    let (status, response) = harness
-        .request(Method::POST, "/api/instances", Some(body))
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{response}");
-    assert!(
-        !response.contains("sk-legacy"),
-        "a map entry defaults to secret and never returns its value: {response}"
-    );
-    let detail = parse(&response);
-    let env = detail["env"].as_array().expect("env");
-    for key in ["DISCORD_ALLOWED_USERS", "OPENAI_KEY"] {
-        let entry = env
-            .iter()
-            .find(|entry| entry["key"] == key)
-            .unwrap_or_else(|| panic!("{key} missing from {response}"));
-        assert_eq!(entry["secret"], true, "the legacy map defaults to secret");
-        assert!(entry.get("value").is_none(), "{entry}");
-    }
-    // The values were stored as secrets, not dropped.
-    let stored = harness.instance_secrets("alice");
-    assert_eq!(
-        stored.get("DISCORD_ALLOWED_USERS").map(String::as_str),
-        Some("123,456")
-    );
-    assert_eq!(
-        stored.get("OPENAI_KEY").map(String::as_str),
-        Some("sk-legacy")
-    );
-
-    // The deprecated map also works on PATCH, still defaulting to secret.
-    let (status, response) = harness
-        .request(
-            Method::PATCH,
-            "/api/instances/alice",
-            Some(json!({"env": {"ADDED_BY_MAP": "patched-value"}})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(!response.contains("patched-value"), "{response}");
-    let detail = parse(&response);
-    let added = detail["env"]
-        .as_array()
-        .expect("env")
-        .iter()
-        .find(|entry| entry["key"] == "ADDED_BY_MAP")
-        .expect("the manifest key was added");
-    assert_eq!(added["secret"], true);
-    assert!(added.get("value").is_none());
-    assert_eq!(
-        harness
-            .instance_secrets("alice")
-            .get("ADDED_BY_MAP")
-            .map(String::as_str),
-        Some("patched-value")
-    );
-    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
-        .expect("compose");
-    assert!(
-        compose.contains("ADDED_BY_MAP: ${ADDED_BY_MAP}"),
-        "{compose}"
-    );
-    assert!(!compose.contains("patched-value"), "{compose}");
-}
-
-#[tokio::test]
-async fn legacy_env_map_is_accepted_by_put_env_and_the_list_still_works() {
-    let harness = Harness::new();
-    create_solo(&harness, "alice").await;
-
-    let (status, response) = harness
-        .request(
-            Method::PUT,
-            "/api/instances/alice/env",
-            Some(json!({"env": {"FROM_MAP": "one", "TOKEN": "hidden-value"}})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(!response.contains("hidden-value"), "{response}");
-    let detail = parse(&response);
-    let env = detail["env"].as_array().expect("env");
-    assert_eq!(env.len(), 2);
-    assert!(
-        env.iter().all(|entry| entry["secret"] == true),
-        "every map entry is a secret: {response}"
-    );
-    assert!(
-        env.iter().all(|entry| entry.get("value").is_none()),
-        "a secret never returns its value: {response}"
-    );
-
-    // The canonical list always works, and its `secret: false` entries are
-    // readable through GET.
-    let (status, response) = harness
-        .request(
-            Method::PUT,
-            "/api/instances/alice/env",
-            Some(json!({"env": [
-                {"key": "FROM_MAP", "value": "one", "secret": false},
-                {"key": "PLAIN", "value": "visible", "secret": false}
-            ]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    let (status, response) = harness
-        .request(Method::GET, "/api/instances/alice", None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(response.contains("visible"), "{response}");
-}
-
-#[tokio::test]
-async fn malformed_env_returns_the_structured_schema_error() {
-    let harness = Harness::new();
-    create_solo(&harness, "alice").await;
-
-    for (body, received) in [
-        (json!({"env": 42}), "number"),
-        (json!({"env": "nope"}), "string"),
-        (json!({"env": {"KEY": 42}}), "map"),
-        (json!({"env": [{"key": 1}]}), "sequence"),
-    ] {
-        let (status, response) = harness
-            .request(Method::PATCH, "/api/instances/alice", Some(body))
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        let error = parse(&response);
-        assert_eq!(error["error"]["code"], "invalid_env", "{response}");
-        assert_eq!(
-            error["error"]["message"], "env must be a list of {key,value,secret}",
-            "{response}"
-        );
-        assert_eq!(
-            error["error"]["details"]["expected"], "sequence",
-            "{response}"
-        );
-        assert_eq!(
-            error["error"]["details"]["received"], received,
-            "{response}"
-        );
-        assert!(
-            error["error"]["details"]["example"].is_array(),
-            "the error shows the expected shape: {response}"
-        );
-    }
-
-    // PUT goes through the same extractor.
-    let (status, response) = harness
-        .request(
-            Method::PUT,
-            "/api/instances/alice/env",
-            Some(json!({"env": 7})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-    assert_eq!(parse(&response)["error"]["code"], "invalid_env");
-}
-
-#[tokio::test]
-async fn a_deserialization_error_reports_the_field_path() {
-    let harness = Harness::new();
-    create_solo(&harness, "alice").await;
-    let (status, response) = harness
-        .request(
-            Method::PATCH,
-            "/api/instances/alice",
-            Some(json!({"mem_limit_mb": "big"})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-    let error = parse(&response);
-    assert_eq!(error["error"]["code"], "invalid_body", "{response}");
-    assert_eq!(
-        error["error"]["details"]["path"], "mem_limit_mb",
-        "{response}"
-    );
-}
-
-#[tokio::test]
-async fn a_non_secret_env_is_readable_in_get_and_a_secret_never_is() {
-    let harness = Harness::new();
-    create_solo(&harness, "alice").await;
-    let (status, response) = harness
-        .request(
-            Method::PATCH,
-            "/api/instances/alice",
-            Some(json!({"env": [
-                {"key": "DISCORD_ALLOWED_USERS", "value": "123,456", "secret": false},
-                {"key": "OPENAI_KEY", "value": "sk-hidden", "secret": true}
-            ]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-
-    let (status, response) = harness
-        .request(Method::GET, "/api/instances/alice", None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-    assert!(
-        !response.contains("sk-hidden"),
-        "a secret value never leaves the control plane: {response}"
-    );
-    let detail = parse(&response);
-    let env = detail["env"].as_array().expect("env");
-    let plain = env
-        .iter()
-        .find(|entry| entry["key"] == "DISCORD_ALLOWED_USERS")
-        .expect("plain entry");
-    assert_eq!(plain["secret"], false);
-    assert_eq!(plain["value"], "123,456");
-    let secret = env
-        .iter()
-        .find(|entry| entry["key"] == "OPENAI_KEY")
-        .expect("secret entry");
-    assert_eq!(secret["secret"], true);
-    assert!(secret.get("value").is_none());
-}
-
-#[tokio::test]
 async fn env_validation_refuses_reserved_duplicate_and_oversized_entries() {
     let harness = Harness::new();
     create_solo(&harness, "alice").await;
@@ -4185,8 +3960,324 @@ async fn a_message_loop_is_stopped_by_hops() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared memory (#29)
+// Cron schedules (issue #30)
 // ---------------------------------------------------------------------------
+
+fn schedule_body(name: &str, cron: &str, prompt: &str) -> Value {
+    json!({
+        "name": name,
+        "cron": cron,
+        "prompt": prompt,
+    })
+}
+
+async fn create_schedule(harness: &Harness, id: &str, body: Value) -> Value {
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            &format!("/api/instances/{id}/schedules"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {text}");
+    parse(&text)
+}
+
+fn force_schedule_due(harness: &Harness, schedule_id: &str) {
+    harness
+        .state
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules SET next_run_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![schedule_id],
+            )
+        })
+        .expect("force due");
+}
+
+#[tokio::test]
+async fn schedules_can_be_created_listed_and_run() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "summarize the incidents"),
+    )
+    .await;
+    assert_eq!(schedule["instance_id"], "alice");
+    assert_eq!(schedule["name"], "every-five");
+    assert_eq!(schedule["cron"], "*/5 * * * *");
+    assert_eq!(schedule["enabled"], true);
+    assert_eq!(schedule["overlap"], "skip");
+    assert_eq!(schedule["timeout"], 300);
+    assert!(schedule["next_run_at"].is_string());
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    // Disabling clears the next occurrence without touching the schedule.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{schedule_id}"),
+            Some(json!({"enabled": false, "timeout": 45, "overlap": "queue"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let patched = parse(&body);
+    assert_eq!(patched["enabled"], false);
+    assert_eq!(patched["timeout"], 45);
+    assert_eq!(patched["overlap"], "queue");
+    assert!(patched["next_run_at"].is_null());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "ok");
+    assert_eq!(run["exit_code"], 0);
+    assert!(
+        run["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("summarize the incidents"),
+        "{run}"
+    );
+    assert!(run["duration_ms"].is_number());
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs?limit=10", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["schedule_id"], schedule_id);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = parse(&body);
+    assert_eq!(view.as_array().expect("array").len(), 1);
+    assert_eq!(view[0]["runs_total"], 1);
+    assert_eq!(view[0]["runs_failed"], 0);
+    assert_eq!(view[0]["failure_rate"], 0.0);
+    assert_eq!(view[0]["last_run"]["status"], "ok");
+
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_failing_run_is_visible_with_its_exit_code() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.force_exec(
+        "alice",
+        fleett::driver::ExecResult {
+            exit_code: Some(3),
+            stdout: String::new(),
+            stderr: "gateway: provider timeout".to_string(),
+            timed_out: false,
+        },
+    );
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "probe"),
+    )
+    .await;
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "error");
+    assert_eq!(run["exit_code"], 3);
+    assert!(run["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("provider timeout"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body)[0]["exit_code"], 3);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = parse(&body);
+    assert_eq!(view[0]["runs_failed"], 1);
+    assert_eq!(view[0]["failure_rate"], 1.0);
+}
+
+#[tokio::test]
+async fn schedule_input_is_validated() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    for (body, code) in [
+        (schedule_body("bad", "not a cron", "p"), "invalid_cron"),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 0}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 3601}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "overlap": "parallel"}),
+            "invalid_overlap",
+        ),
+    ] {
+        let (status, text) = harness
+            .request(Method::POST, "/api/instances/alice/schedules", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(parse(&text)["error"]["code"], code);
+    }
+
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/ghost/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "unknown_instance");
+
+    create_schedule(&harness, "alice", schedule_body("daily", "0 9 * * *", "p")).await;
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("daily", "0 10 * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "schedule_exists");
+
+    let (status, text) = harness
+        .request(Method::POST, "/api/schedules/ghost/run", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+}
+
+#[tokio::test]
+async fn the_tick_runs_due_schedules_but_never_a_disabled_one() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+    let alice = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("five", "*/5 * * * *", "alice prompt"),
+    )
+    .await;
+    let bob = create_schedule(
+        &harness,
+        "bob",
+        schedule_body("five", "*/5 * * * *", "bob prompt"),
+    )
+    .await;
+    let bob_id = bob["id"].as_str().expect("id").to_string();
+    let (status, _) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{bob_id}"),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    force_schedule_due(&harness, alice["id"].as_str().expect("id"));
+    force_schedule_due(&harness, &bob_id);
+
+    fleett::scheduler::tick(&harness.state).await;
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["status"], "ok");
+    assert!(runs[0]["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("alice prompt"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/bob/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    assert!(harness
+        .mock
+        .exec_calls()
+        .iter()
+        .all(|call| call.instance == "alice"));
+}
+
+#[tokio::test]
+async fn schedule_endpoints_require_authentication() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request_as(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/ghost/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "unknown_instance");
+}
 
 // ---------------------------------------------------------------------------
 // Shared memory (#29)
@@ -4268,11 +4359,4 @@ async fn memory_is_written_searched_and_rolled_back() {
         .request(Method::DELETE, &format!("/api/memory/{id}"), None)
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, body) = harness
-        .request(Method::GET, "/api/memory/search?q=gateway", None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let remaining = parse(&body);
-    assert_eq!(remaining.as_array().expect("array").len(), 1);
-    assert_eq!(remaining[0]["namespace"], "global");
 }

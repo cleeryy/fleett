@@ -382,6 +382,51 @@ the path id). 16 KiB max, TTL 30 s … 30 days. A conversation that reaches 8 ho
 
 `DELETE /api/messages/expired` → `{"removed": N}` (admin only).
 
+## Cron schedules
+
+Per-agent cron schedules and their run history; see [docs/SCHEDULES.md](docs/SCHEDULES.md)
+for cron semantics, overlap, catch-up and the run command contract.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/schedules` | `{"name","cron","prompt","enabled"?,"timezone"?,"overlap"?,"timeout"?,"catchup"?}` | `201 Schedule` · `400 invalid_cron\|invalid_timeout\|invalid_overlap\|…` · `404 unknown_instance` · `409 schedule_exists` |
+| GET | `/api/instances/{id}/schedules` | — | `[Schedule]`, ordered by name |
+| PATCH | `/api/schedules/{sid}` | every create field, all optional | `200 Schedule` · `404 not_found` |
+| DELETE | `/api/schedules/{sid}` | — | `204` (history included) · `404` |
+| POST | `/api/schedules/{sid}/run` | — | `201 ScheduleRun` (executed inline) · `409 run_in_progress` |
+| GET | `/api/instances/{id}/runs?limit=50` | — | `[ScheduleRun]`, newest first, `limit` `1..=500` |
+| GET | `/api/schedules` | — | `[ScheduleView]`, admin only |
+
+`Schedule`:
+```json
+{"id":"2b6d…","instance_id":"alice","name":"every-five","cron":"*/5 * * * *",
+ "prompt":"summarize","enabled":true,"timezone":"UTC","overlap":"skip",
+ "timeout":300,"catchup":false,
+ "last_run_at":"2026-11-09T10:05:00Z","next_run_at":"2026-11-09T10:10:00Z",
+ "created_at":"…","updated_at":"…"}
+```
+
+`cron` is a five-field expression evaluated in UTC (`*`, `*/n`, lists, ranges,
+stepped ranges; day-of-month and day-of-week are ORed when both are
+restricted). `overlap` is `skip` (default; a due occurrence is recorded as
+`skipped` while the previous run is still going) or `queue` (it waits for the
+next tick after the run finishes). `timeout` is `1..=3600` seconds (default
+300; `timeout_s` is accepted as an alias). `catchup` defaults to `false`: at
+startup a schedule whose slot is long past is moved to its next future
+occurrence; `true` fires exactly one catch-up run. `timezone` is stored but
+evaluation is UTC for now. A disabled schedule has no `next_run_at`.
+
+`ScheduleRun.status`: `running`, `ok`, `error`, `timeout` or `skipped`.
+`exit_code` is the command exit code (`null` on timeout or Docker failure).
+`output` combines stdout and stderr, truncated to 64 KiB. `duration_ms` is the
+wall-clock duration of the command.
+
+`ScheduleView` is a `Schedule` flattened with
+`{"last_run": ScheduleRun|null, "runs_total": 12, "runs_failed": 2,
+"failure_rate": 0.1667}`. Failures are `error` and `timeout`; `skipped` and
+`running` runs are not counted in the rate. Deleting an instance removes its
+schedules and run history.
+
 ## Shares
 
 | Method | Route | Body | Response |

@@ -102,6 +102,20 @@ impl InspectInfo {
     }
 }
 
+/// Result of one command executed inside an instance container.
+///
+/// A non-zero exit code is a *successful* driver call: the command ran and its
+/// code is part of the result (the scheduler records it). `timed_out` means the
+/// command was killed after the requested budget; `stdout`/`stderr` then hold
+/// whatever was captured, if anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecResult {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("docker compose {operation} failed: {detail}")]
@@ -183,6 +197,19 @@ pub trait Driver: Send + Sync {
         &'a self,
         specs: &'a [InstanceSpec],
     ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>>;
+
+    /// Run one command inside the instance container.
+    ///
+    /// `argv` is a complete argument vector (`["gateway", "ask", "<prompt>"]`
+    /// for the scheduler): it is never interpreted by a shell. A non-zero exit
+    /// code is returned as [`ExecResult`], not as an error; only a failure to
+    /// start Docker or `docker compose exec` itself is a [`DriverError`].
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecResult, DriverError>>;
 
     /// Make sure `image` is present locally, pulling it when it is not.
     ///

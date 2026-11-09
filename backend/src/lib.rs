@@ -21,6 +21,7 @@ pub mod migrate;
 pub mod models;
 pub mod providers;
 pub mod render;
+pub mod scheduler;
 pub mod secrets;
 pub mod store;
 pub mod templates_builtin;

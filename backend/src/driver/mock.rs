@@ -5,7 +5,8 @@
 //! Docker.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecResult, ImageRecord, InspectInfo, LogsOptions, PsResult,
+    UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -26,6 +27,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct MockCall {
     pub operation: &'static str,
     pub instance: String,
+}
+
+/// One recorded `exec` call (scheduler tests assert the argv contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockExecCall {
+    pub instance: String,
+    pub argv: Vec<String>,
+    pub timeout_s: u64,
 }
 
 #[derive(Debug)]
@@ -65,6 +74,10 @@ pub struct MockDriver {
     image_calls: Mutex<Vec<String>>,
     /// `up` sleeps this long, so the upgrade tests can observe concurrency.
     up_delay: Mutex<Option<Duration>>,
+    /// Canned `exec` results, per instance (`force_exec`).
+    exec_results: Mutex<HashMap<String, ExecResult>>,
+    /// Every `exec` call with the argv and timeout the scheduler passed down.
+    exec_calls: Mutex<Vec<MockExecCall>>,
     in_flight_ups: AtomicUsize,
     max_in_flight_ups: AtomicUsize,
 }
@@ -101,6 +114,8 @@ impl MockDriver {
             known_images: Mutex::new(known),
             image_calls: Mutex::new(Vec::new()),
             up_delay: Mutex::new(None),
+            exec_results: Mutex::new(HashMap::new()),
+            exec_calls: Mutex::new(Vec::new()),
             in_flight_ups: AtomicUsize::new(0),
             max_in_flight_ups: AtomicUsize::new(0),
         }
@@ -142,6 +157,21 @@ impl MockDriver {
     /// Every image passed to `ensure_image`, oldest first.
     pub fn image_calls(&self) -> Vec<String> {
         lock(&self.image_calls).clone()
+    }
+
+    /// Report a canned result for every `exec` call of one instance.
+    pub fn force_exec(&self, id: &str, result: ExecResult) {
+        lock(&self.exec_results).insert(id.to_string(), result);
+    }
+
+    /// Drop the canned `exec` result of one instance.
+    pub fn clear_exec(&self, id: &str) {
+        lock(&self.exec_results).remove(id);
+    }
+
+    /// Every `exec` call, oldest first.
+    pub fn exec_calls(&self) -> Vec<MockExecCall> {
+        lock(&self.exec_calls).clone()
     }
 
     /// Image the simulated container of `id` currently runs.
@@ -503,6 +533,33 @@ impl Driver for MockDriver {
                     }
                 })
                 .collect())
+        })
+    }
+
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecResult, DriverError>> {
+        Box::pin(async move {
+            lock(&self.exec_calls).push(MockExecCall {
+                instance: spec.id.clone(),
+                argv: argv.to_vec(),
+                timeout_s,
+            });
+            self.fail_if_requested("exec")?;
+            if let Some(result) = lock(&self.exec_results).get(&spec.id) {
+                return Ok(result.clone());
+            }
+            // The default is a successful simulated run: the prompt is echoed
+            // so a test can assert the argv contract from the recorded output.
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: format!("[mock] executed: {}\n", argv.join(" ")),
+                stderr: String::new(),
+                timed_out: false,
+            })
         })
     }
 
