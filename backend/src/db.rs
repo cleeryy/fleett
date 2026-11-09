@@ -11,7 +11,9 @@
 //! outside `FLEETT_ROOT`.
 
 use crate::config::Config;
-use crate::models::{now_iso, ChannelKind, InstanceSpec, ShareMode, ShareRef, Status};
+use crate::models::{
+    now_iso, ChannelKind, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
+};
 use crate::store;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::{HashMap, HashSet};
@@ -116,6 +118,26 @@ CREATE TABLE IF NOT EXISTS instance_env (
     PRIMARY KEY (instance_id, key)
 );
 "#,
+    // v8 — reusable provider credentials (issue #25). One encrypted secret per
+    // provider; an instance may reference it and draw its API key from it
+    // instead of storing its own token. `provider` stays NULL for every
+    // instance created before this release (no forced migration).
+    r#"
+CREATE TABLE IF NOT EXISTS providers (
+    id           TEXT PRIMARY KEY NOT NULL,
+    name         TEXT NOT NULL UNIQUE,
+    kind         TEXT NOT NULL,
+    base_url     TEXT NOT NULL,
+    api_key_env  TEXT NOT NULL,
+    nonce        BLOB NOT NULL,
+    ciphertext   BLOB NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+ALTER TABLE instances ADD COLUMN provider TEXT;
+CREATE INDEX IF NOT EXISTS idx_instances_provider ON instances (provider);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -192,6 +214,14 @@ pub struct NewAuditRecord {
     pub details: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRecord {
+    pub spec: ProviderSpec,
+    /// AES-GCM nonce of the stored secret.
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
 /// A named API token. The secret is never stored, only its digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTokenRecord {
@@ -261,8 +291,8 @@ impl Db {
         let conn = self.lock();
         let stored = conn
             .query_row(
-                "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
-                 last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
+                "SELECT id, name, template, model, base_url, api_key_env, provider, channel, \
+                 status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
                  updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
@@ -279,7 +309,7 @@ impl Db {
     pub fn list(&self) -> Result<Vec<InstanceSpec>, DbError> {
         let conn = self.lock();
         let mut statement = conn.prepare(
-            "SELECT id, name, template, model, base_url, api_key_env, channel, status, \
+            "SELECT id, name, template, model, base_url, api_key_env, provider, channel, status, \
              last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
              updated_at \
              FROM instances ORDER BY id",
@@ -325,10 +355,10 @@ impl Db {
             return Err(DbError::Conflict(spec.id.clone()));
         }
         transaction.execute(
-            "INSERT INTO instances (id, name, template, model, base_url, api_key_env, channel, \
-             status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
-             updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO instances (id, name, template, model, base_url, api_key_env, provider, \
+             channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 spec.id,
                 spec.name,
@@ -336,6 +366,7 @@ impl Db {
                 spec.model,
                 spec.base_url,
                 spec.api_key_env,
+                spec.provider,
                 spec.channel.as_str(),
                 spec.status.as_str(),
                 spec.last_error,
@@ -360,8 +391,9 @@ impl Db {
         let transaction = conn.transaction()?;
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
-             api_key_env = ?6, channel = ?7, status = ?8, last_error = ?9, mem_limit_mb = ?10, \
-             cpu_limit = ?11, image = ?12, allow_lan = ?13, notes = ?14, updated_at = ?15 \
+             api_key_env = ?6, provider = ?7, channel = ?8, status = ?9, last_error = ?10, \
+             mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, notes = ?15, \
+             updated_at = ?16 \
              WHERE id = ?1",
             params![
                 spec.id,
@@ -370,6 +402,7 @@ impl Db {
                 spec.model,
                 spec.base_url,
                 spec.api_key_env,
+                spec.provider,
                 spec.channel.as_str(),
                 spec.status.as_str(),
                 spec.last_error,
@@ -717,6 +750,176 @@ impl Db {
         Ok(())
     }
 
+    /// Insert one provider and its encrypted secret.
+    ///
+    /// A duplicate name is a [`DbError::Conflict`], exactly like a duplicate id.
+    pub fn insert_provider(
+        &self,
+        spec: &ProviderSpec,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        let taken = conn
+            .query_row(
+                "SELECT 1 FROM providers WHERE id = ?1 OR name = ?2",
+                params![spec.id, spec.name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(DbError::Conflict(spec.name.clone()));
+        }
+        conn.execute(
+            "INSERT INTO providers (id, name, kind, base_url, api_key_env, nonce, ciphertext, \
+             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                spec.id,
+                spec.name,
+                spec.kind,
+                spec.base_url,
+                spec.api_key_env,
+                nonce,
+                ciphertext,
+                spec.created_at,
+                spec.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the metadata of one provider, optionally replacing its secret.
+    ///
+    /// An empty `secret` tuple keeps the stored blob; a rotation passes a fresh
+    /// nonce and ciphertext (never overwrite in place without a new nonce).
+    pub fn update_provider(
+        &self,
+        spec: &ProviderSpec,
+        secret: Option<(&[u8], &[u8])>,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        let clash = conn
+            .query_row(
+                "SELECT 1 FROM providers WHERE name = ?1 AND id != ?2",
+                params![spec.name, spec.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if clash {
+            return Err(DbError::Conflict(spec.name.clone()));
+        }
+        let updated = match secret {
+            Some((nonce, ciphertext)) => conn.execute(
+                "UPDATE providers SET name = ?2, kind = ?3, base_url = ?4, api_key_env = ?5, \
+                 nonce = ?6, ciphertext = ?7, updated_at = ?8 WHERE id = ?1",
+                params![
+                    spec.id,
+                    spec.name,
+                    spec.kind,
+                    spec.base_url,
+                    spec.api_key_env,
+                    nonce,
+                    ciphertext,
+                    spec.updated_at,
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE providers SET name = ?2, kind = ?3, base_url = ?4, api_key_env = ?5, \
+                 updated_at = ?6 WHERE id = ?1",
+                params![
+                    spec.id,
+                    spec.name,
+                    spec.kind,
+                    spec.base_url,
+                    spec.api_key_env,
+                    spec.updated_at,
+                ],
+            )?,
+        };
+        if updated == 0 {
+            return Err(DbError::Conflict(spec.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// One provider with its encrypted secret columns.
+    pub fn provider(&self, id: &str) -> Result<Option<ProviderRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT id, name, kind, base_url, api_key_env, nonce, ciphertext, created_at, \
+                 updated_at FROM providers WHERE id = ?1",
+                params![id],
+                provider_record,
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Every provider, sorted by name. The secret blobs are not read.
+    pub fn list_providers(&self) -> Result<Vec<ProviderSpec>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, name, kind, base_url, api_key_env, created_at, updated_at \
+             FROM providers ORDER BY name",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ProviderSpec {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    base_url: row.get(3)?,
+                    api_key_env: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete one provider row. Returns `false` when the id is unknown.
+    pub fn delete_provider(&self, id: &str) -> Result<bool, DbError> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM providers WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Instances that reference one provider, `(id, name)`, sorted by id.
+    pub fn provider_instances(&self, provider_id: &str) -> Result<Vec<(String, String)>, DbError> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT id, name FROM instances WHERE provider = ?1 ORDER BY id")?;
+        let rows = statement
+            .query_map(params![provider_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Number of instances attached to each provider.
+    pub fn provider_instance_counts(&self) -> Result<HashMap<String, usize>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT provider, COUNT(*) FROM instances WHERE provider IS NOT NULL \
+             GROUP BY provider",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, count)| (id, count.max(0) as usize))
+            .collect())
+    }
+
     /// Append one mutation to the audit trail, returning its row id.
     pub fn record_audit(&self, entry: &NewAuditRecord) -> Result<i64, DbError> {
         let conn = self.lock();
@@ -881,6 +1084,7 @@ struct StoredRow {
     model: String,
     base_url: String,
     api_key_env: String,
+    provider: Option<String>,
     channel: String,
     status: String,
     last_error: Option<String>,
@@ -902,6 +1106,7 @@ impl StoredRow {
             model: self.model,
             base_url: self.base_url,
             api_key_env: self.api_key_env,
+            provider: self.provider,
             channel: ChannelKind::parse(&self.channel).unwrap_or(ChannelKind::None),
             shares,
             mem_limit_mb: self.mem_limit_mb.clamp(0, u32::MAX as i64) as u32,
@@ -932,6 +1137,7 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         model: row.get("model")?,
         base_url: row.get("base_url")?,
         api_key_env: row.get("api_key_env")?,
+        provider: row.get("provider")?,
         channel: row.get("channel")?,
         status: row.get("status")?,
         last_error: row.get("last_error")?,
@@ -942,6 +1148,22 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+    })
+}
+
+fn provider_record(row: &Row<'_>) -> rusqlite::Result<ProviderRecord> {
+    Ok(ProviderRecord {
+        spec: ProviderSpec {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+            base_url: row.get(3)?,
+            api_key_env: row.get(4)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        },
+        nonce: row.get(5)?,
+        ciphertext: row.get(6)?,
     })
 }
 
@@ -1038,6 +1260,7 @@ mod tests {
             model: "m".to_string(),
             base_url: "https://example.test/v1".to_string(),
             api_key_env: DEFAULT_API_KEY_ENV.to_string(),
+            provider: None,
             channel: ChannelKind::Telegram,
             shares: vec![ShareRef {
                 name: "findings".to_string(),
@@ -1137,6 +1360,7 @@ mod tests {
             "instance_env",
             "audit_log",
             "api_tokens",
+            "providers",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -1150,6 +1374,78 @@ mod tests {
         assert!(columns.iter().any(|column| column == "cpu_limit"));
         assert!(columns.iter().any(|column| column == "allow_lan"));
         assert!(columns.iter().any(|column| column == "image"));
+        assert!(columns.iter().any(|column| column == "provider"));
+    }
+
+    #[test]
+    fn providers_round_trip_and_link_instances() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        let now = now_iso();
+        let provider = ProviderSpec {
+            id: "provider-1".to_string(),
+            name: "shared".to_string(),
+            kind: "openai-compatible".to_string(),
+            base_url: "https://provider.test/v1".to_string(),
+            api_key_env: "PROVIDER_KEY".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        db.insert_provider(&provider, &[1u8; 12], &[2u8, 3u8])
+            .expect("insert provider");
+        // The name is unique.
+        let mut clash = provider.clone();
+        clash.id = "provider-2".to_string();
+        assert!(matches!(
+            db.insert_provider(&clash, &[4u8; 12], &[5u8]),
+            Err(DbError::Conflict(_))
+        ));
+
+        let record = db.provider("provider-1").expect("read").expect("present");
+        assert_eq!(record.spec.name, "shared");
+        assert_eq!(record.nonce, vec![1u8; 12]);
+        assert_eq!(record.ciphertext, vec![2u8, 3u8]);
+        assert!(db.provider("ghost").expect("read").is_none());
+        assert_eq!(db.list_providers().expect("list").len(), 1);
+
+        let mut alice = spec("alice");
+        alice.provider = Some("provider-1".to_string());
+        db.insert_instance(&alice).expect("insert alice");
+        db.insert_instance(&spec("legacy")).expect("insert legacy");
+        assert_eq!(
+            db.provider_instance_counts()
+                .expect("counts")
+                .get("provider-1")
+                .copied(),
+            Some(1)
+        );
+        let linked = db.provider_instances("provider-1").expect("linked");
+        assert_eq!(linked, vec![("alice".to_string(), "alice".to_string())]);
+        assert_eq!(
+            db.get("alice").expect("get").expect("present").provider,
+            Some("provider-1".to_string())
+        );
+
+        // Detaching the instance releases the provider.
+        let mut detached = db.get("alice").expect("get").expect("present");
+        detached.provider = None;
+        db.update_instance(&detached).expect("update");
+        assert!(db
+            .provider_instances("provider-1")
+            .expect("linked")
+            .is_empty());
+
+        let mut renamed = provider.clone();
+        renamed.name = "renamed".to_string();
+        db.update_provider(&renamed, Some((&[6u8; 12], &[7u8])))
+            .expect("update provider");
+        let record = db.provider("provider-1").expect("read").expect("present");
+        assert_eq!(record.spec.name, "renamed");
+        assert_eq!(record.ciphertext, vec![7u8]);
+
+        assert!(db.delete_provider("provider-1").expect("delete"));
+        assert!(!db.delete_provider("provider-1").expect("delete again"));
+        assert!(db.list_providers().expect("list").is_empty());
     }
 
     #[test]

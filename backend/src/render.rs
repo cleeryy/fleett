@@ -675,6 +675,7 @@ mod tests {
             model: "deepseek-v4.1-flash".to_string(),
             base_url: "https://opencode.ai/inference/go/openai/v1".to_string(),
             api_key_env: DEFAULT_API_KEY_ENV.to_string(),
+            provider: None,
             channel,
             shares: vec![
                 ShareRef {

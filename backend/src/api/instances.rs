@@ -191,7 +191,8 @@ pub async fn create(
     // Refuse a create that could not store its secrets *before* writing any
     // file, so a refused create leaves nothing behind.
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
-    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    crate::api::push_provider_key(&mut env_keys, &spec);
 
     let rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &env_keys)
         .map_err(ApiError::from)?;
@@ -288,17 +289,34 @@ pub async fn clone(
     let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
     let channel_token = normalize_token(request.channel_token.as_deref(), "invalid_channel_token")?;
 
+    // The clone inherits the provider of its source: a provider is a reference
+    // to a fleet-wide credential, not a per-instance secret. An explicit
+    // `provider` overrides it, and an empty string detaches the clone.
+    let clone_provider = match request.provider.as_deref() {
+        Some(value) if value.trim().is_empty() => None,
+        Some(value) => Some(load_provider(&state, value.trim())?),
+        None => match source.provider.as_deref() {
+            Some(provider_id) => state
+                .db
+                .provider(provider_id)
+                .map_err(ApiError::from)?
+                .map(|record| record.spec),
+            None => None,
+        },
+    };
+
     // Tokens are never inherited: every token the source holds has to be
     // replaced by the request. Checked before the first write so a refused
     // clone leaves nothing behind. Non-secret variables, on the other hand,
-    // are configuration and are copied.
+    // are configuration and are copied. A provider supplies the gate key at
+    // runtime, so a clone that keeps one needs no gate token.
     let source_env = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     let source_secrets: BTreeMap<String, String> = source_env
         .iter()
         .map(|entry| (entry.key.clone(), entry.value.clone()))
         .collect();
     let mut missing: Vec<String> = Vec::new();
-    if gate_token.is_none() {
+    if gate_token.is_none() && clone_provider.is_none() {
         missing.extend(
             gate_env_keys(&source)
                 .into_iter()
@@ -352,6 +370,18 @@ pub async fn clone(
         validate_model(model).map_err(|message| ApiError::bad_request("invalid_model", message))?;
         clone.model = model.to_string();
     }
+    if request.provider.is_some() {
+        // An explicit provider owns the endpoint and the variable name the
+        // clone draws its key from; the source values would point elsewhere.
+        match &clone_provider {
+            Some(provider) => {
+                clone.base_url = provider.base_url.clone();
+                clone.api_key_env = provider.api_key_env.clone();
+                clone.provider = Some(provider.id.clone());
+            }
+            None => clone.provider = None,
+        }
+    }
     clone.shares = if shares_inherit {
         source
             .shares
@@ -391,7 +421,8 @@ pub async fn clone(
     let forced = token_keys(&clone, gate_token.is_some(), channel_token.is_some());
     let entries = env_entries(values, &flags, &forced);
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
-    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    crate::api::push_provider_key(&mut env_keys, &clone);
     let rendered = render::render_instance(&state.cfg, &clone, &template, &env_keys)
         .map_err(ApiError::from)?;
 
@@ -616,13 +647,30 @@ async fn import_archive(
         .as_deref()
         .and_then(store::compose_image)
         .unwrap_or_else(|| state.cfg.image.clone());
-    let env_keys = extraction
+    let mut env_keys = extraction
         .compose_yaml
         .as_deref()
         .map(crate::instance_archive::compose_env_keys)
         .unwrap_or_default();
+    crate::api::push_provider_key(&mut env_keys, &spec);
 
     let mut warnings = extraction.warnings;
+    // A provider is a local reference: an archive never carries the secret, so
+    // an unknown one is dropped with a warning instead of failing the import.
+    if let Some(provider_id) = spec.provider.clone() {
+        if state
+            .db
+            .provider(&provider_id)
+            .map_err(ApiError::from)?
+            .is_none()
+        {
+            warnings.push(format!(
+                "the archive references provider \"{provider_id}\", which does not exist on this \
+                 host; the instance keeps its own token instead"
+            ));
+            spec.provider = None;
+        }
+    }
     let mut missing_shares = Vec::new();
     spec.shares
         .retain(|share| match state.db.share_exists(&share.name) {
@@ -756,7 +804,8 @@ pub async fn patch(
     let forced = token_keys(&spec, gate_token.is_some(), channel_token.is_some());
     let entries = env_entries(values, &flags, &forced);
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
-    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    crate::api::push_provider_key(&mut env_keys, &spec);
     let rendered = render_for_update(&state, &spec, &env_keys)?;
     // The new rows are durable before the compose file starts referencing the
     // new key names; the driver reads them on its next `docker compose` call.
@@ -1360,6 +1409,7 @@ fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
         health: health.as_str().to_string(),
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
+        provider: spec.provider.clone(),
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
@@ -1392,6 +1442,7 @@ fn to_detail(
         image: spec.image.clone(),
         base_url: spec.base_url.clone(),
         api_key_env: spec.api_key_env.clone(),
+        provider: spec.provider.clone(),
         channel: spec.channel.as_str().to_string(),
         status: status.as_str().to_string(),
         health: health.as_str().to_string(),
@@ -1437,12 +1488,16 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         })?,
     };
 
+    // A reusable provider supplies the default endpoint and variable name; an
+    // explicit request value always wins.
+    let provider = resolve_provider(state, request.provider.as_deref())?;
     let base_url = request
         .base_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+        .or_else(|| provider.as_ref().map(|entry| entry.base_url.clone()))
         .ok_or_else(|| ApiError::bad_request("invalid_base_url", "base_url is required"))?;
     validate_base_url(&base_url)
         .map_err(|message| ApiError::bad_request("invalid_base_url", message))?;
@@ -1452,8 +1507,9 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_API_KEY_ENV)
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| provider.as_ref().map(|entry| entry.api_key_env.clone()))
+        .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string());
     validate_api_key_env(&api_key_env)
         .map_err(|message| ApiError::bad_request("invalid_api_key_env", message))?;
 
@@ -1520,6 +1576,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             model,
             base_url,
             api_key_env,
+            provider: provider.map(|entry| entry.id),
             channel,
             shares,
             mem_limit_mb,
@@ -1545,6 +1602,28 @@ fn apply_patch(
     spec: &mut InstanceSpec,
     request: &PatchInstanceRequest,
 ) -> Result<Option<String>, ApiError> {
+    // Provider attachment comes first so the provider defaults are applied
+    // before explicit `base_url`/`api_key_env` values of the same request.
+    if let Some(requested) = &request.provider {
+        match requested
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(provider_id) => {
+                let provider = load_provider(state, provider_id)?;
+                if request.base_url.is_none() {
+                    spec.base_url = provider.base_url.clone();
+                }
+                if request.api_key_env.is_none() {
+                    spec.api_key_env = provider.api_key_env.clone();
+                }
+                spec.provider = Some(provider.id);
+            }
+            None => spec.provider = None,
+        }
+    }
+
     if let Some(name) = request.name.as_deref() {
         let name = name.trim();
         if name.is_empty() {
@@ -1638,6 +1717,35 @@ fn normalize_channel(
         return Ok((kind, None));
     }
     Ok((kind, token))
+}
+
+/// Provider referenced by a request, validated against the store.
+///
+/// A blank or missing id means "no provider" (`Ok(None)`); an unknown id is a
+/// `400 unknown_provider` so a console typo never silently falls back to a
+/// per-instance token.
+fn resolve_provider(
+    state: &AppState,
+    id: Option<&str>,
+) -> Result<Option<crate::models::ProviderSpec>, ApiError> {
+    match id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(id) => load_provider(state, id).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn load_provider(state: &AppState, id: &str) -> Result<crate::models::ProviderSpec, ApiError> {
+    state
+        .db
+        .provider(id)
+        .map_err(ApiError::from)?
+        .map(|record| record.spec)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_provider",
+                format!("provider \"{id}\" does not exist"),
+            )
+        })
 }
 
 fn validate_share_refs(state: &AppState, shares: &[ShareRef]) -> Result<Vec<ShareRef>, ApiError> {

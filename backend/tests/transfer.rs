@@ -176,6 +176,7 @@ fn manifest_of(instance: &Value) -> ArchiveInstance {
             .expect("api_key_env")
             .to_string(),
         channel: instance["channel"].as_str().expect("channel").to_string(),
+        provider: None,
         mem_limit_mb: instance["mem_limit_mb"].as_u64().expect("mem") as u32,
         cpu_limit: instance["cpu_limit"].as_f64().expect("cpu"),
         allow_lan: instance["allow_lan"].as_bool().expect("allow_lan"),

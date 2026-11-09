@@ -7,6 +7,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod instances;
+pub mod providers;
 pub mod shares;
 pub mod templates;
 pub mod tokens;
@@ -145,6 +146,14 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/usage", get(usage::usage))
         .route("/images", get(upgrade::images))
         .route("/upgrade", get(upgrade::status).post(upgrade::start))
+        .route("/providers", get(providers::list).post(providers::create))
+        .route(
+            "/providers/{id}",
+            get(providers::get)
+                .patch(providers::patch)
+                .delete(providers::delete),
+        )
+        .route("/providers/{id}/test", post(providers::test))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(
@@ -311,12 +320,33 @@ pub(crate) async fn apply_compose(
 /// `${KEY}` so the driver keeps injecting the values at runtime.
 pub(crate) fn write_compose_file(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
-    let keys = crate::envs::keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
+    let keys = compose_env_keys(state, spec)?;
     let compose =
         crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
             .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
         .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))
+}
+
+/// Environment variable names the compose file must declare as `${KEY}`.
+///
+/// Every stored instance variable, plus the provider key when a provider is
+/// attached: the provider secret is injected by the driver and never stored as
+/// a row, but the compose document still has to interpolate its variable.
+pub(crate) fn compose_env_keys(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<Vec<String>, ApiError> {
+    let mut keys = crate::envs::keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
+    push_provider_key(&mut keys, spec);
+    Ok(keys)
+}
+
+/// Append the provider key to a variable-name list (no-op without a provider).
+pub(crate) fn push_provider_key(keys: &mut Vec<String>, spec: &InstanceSpec) {
+    if spec.provider.is_some() && !keys.iter().any(|key| key == &spec.api_key_env) {
+        keys.push(spec.api_key_env.clone());
+    }
 }
 
 /// Carry the `fleett.previous_image` label of the compose file into the spec

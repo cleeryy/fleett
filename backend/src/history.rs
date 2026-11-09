@@ -1036,6 +1036,7 @@ mod tests {
             model: "deepseek-v4.1-flash".to_string(),
             base_url: "https://example.test/v1".to_string(),
             api_key_env: "HERMES_GATE_PROFILE_TOKEN".to_string(),
+            provider: None,
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
             mem_limit_mb: 1536,

@@ -50,14 +50,34 @@ SHA-256 digest only.
   "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids"}]}]
 ```
 
+## Providers
+
+Reusable API credentials shared by several agents; see `docs/PROVIDERS.md`.
+The secret is never returned by any endpoint.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/providers` | — | `[{"id":"…","name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","instances_count":2,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/providers` | `{"name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","secret":"…"}` | `201` summary, admin only |
+| GET | `/api/providers/{id}` | — | summary + `"instances":[{"id":"alice","name":"Alice"}]` |
+| PATCH | `/api/providers/{id}` | `{"name"?,"kind"?,"base_url"?,"api_key_env"?,"secret"?}` | `{"provider":{…},"restarted":[{"id":"alice","status":"healthy\|failed","error"?}]}`, admin only |
+| DELETE | `/api/providers/{id}` | — | `204`, or `409 provider_in_use` with `details.instances`, admin only |
+| POST | `/api/providers/{id}/test` | — | `{"ok":true,"status":200,"latency_ms":42}`, admin only |
+
+An instance attaches a provider with `"provider":"<id>"`. `base_url` and
+`api_key_env` default to the provider's values; an explicit value in the same
+request wins. `secret` on `PATCH` rotates the credential and restarts every
+attached instance sequentially (one `restarted` entry each). Instances without
+a provider keep their own `gate_token`/`api_key_env`.
+
 ## Instances
 
 `GET /api/instances` → `InstanceSummary[]`
 ```json
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
- "health":"healthy","cpu_limit":1.0,"allow_lan":false,"shares":["findings"],
- "last_error":null,"created_at":"2026-11-08T01:00:00Z"}
+ "health":"healthy","cpu_limit":1.0,"allow_lan":false,"provider":"9e2c…",
+ "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z"}
 ```
 
 `POST /api/instances` → `201 InstanceDetail`
@@ -66,6 +86,7 @@ SHA-256 digest only.
  "model":"deepseek-v4.1-flash",
  "base_url":"https://opencode.ai/inference/go/openai/v1",
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN",
+ "provider":"9e2c…",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"notes":"",
@@ -80,6 +101,7 @@ The token is **never** returned by the API.
  "image":"hermes-agent:0.22.2-local",
  "base_url":"https://opencode.ai/inference/go/openai/v1",
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
+ "provider":"9e2c…",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,
  "warnings":[],"notes":"","created_at":"...","updated_at":"...",
@@ -99,9 +121,9 @@ unhealthy, or the `docker inspect` cause (`State.Error`, `OOMKilled`, non-zero e
 the container is not healthy. It is `null` for a healthy container and for a clean stop.
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
-`base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
-`mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the compose file and runs
-`up -d`.
+`base_url`, `api_key_env`, `provider` (`null` detaches), `channel` (`token` optional =
+rotation), `shares`, `mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the
+compose file and runs `up -d`.
 
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
 `memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,

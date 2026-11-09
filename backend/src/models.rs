@@ -15,6 +15,14 @@ pub const DEFAULT_CPU_LIMIT: f64 = 1.0;
 /// Written to `last_error` while the container health check keeps failing.
 pub const HEALTH_UNHEALTHY_MESSAGE: &str =
     "container health check failed: the Hermes gateway is not answering on /opt/data/gateway.sock";
+/// Provider names follow the same slug grammar as instance and share names.
+pub const PROVIDER_NAME_MIN: usize = 2;
+pub const PROVIDER_NAME_MAX: usize = 63;
+/// Provider kinds understood by this build (metadata only: every kind is
+/// probed through its OpenAI-compatible `/models` endpoint).
+pub const PROVIDER_KINDS: [&str; 3] = ["openai-compatible", "anthropic", "google"];
+/// Longest provider secret accepted by the API (ASCII bytes, single line).
+pub const PROVIDER_SECRET_MAX_BYTES: usize = 8 * 1024;
 pub const DEFAULT_TEMPLATE: &str = "guest";
 pub const DEFAULT_API_KEY_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
 pub const GATE_TOKEN_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
@@ -220,6 +228,9 @@ pub struct InstanceSpec {
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Reusable provider credential this instance draws its API key from
+    /// (`None` keeps the historical per-instance token).
+    pub provider: Option<String>,
     pub channel: ChannelKind,
     pub shares: Vec<ShareRef>,
     pub mem_limit_mb: u32,
@@ -248,6 +259,116 @@ impl InstanceSpec {
     }
 }
 
+/// A reusable provider credential (issue #25).
+///
+/// The secret is never part of this struct: it lives encrypted in its own
+/// columns and is only decrypted by the compose driver (injection) and by the
+/// connectivity test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSpec {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One provider, as returned by `GET /api/providers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    /// Number of instances that reference this provider.
+    pub instances_count: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// `GET /api/providers/{id}`: the summary plus the instances that use it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderDetail {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub instances_count: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    pub instances: Vec<ProviderInstanceRef>,
+}
+
+/// One instance attached to a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderInstanceRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// Outcome of one instance in a rotation report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderRestart {
+    pub id: String,
+    /// `healthy` when the instance came back, `failed` otherwise.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response of `PATCH /api/providers/{id}` when the secret was rotated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderRotateResponse {
+    pub provider: ProviderSummary,
+    pub restarted: Vec<ProviderRestart>,
+}
+
+/// Response of `POST /api/providers/{id}/test`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderTestResponse {
+    pub ok: bool,
+    /// HTTP status of `${base_url}/models`, `0` when no answer arrived.
+    pub status: u16,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `POST /api/providers`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateProviderRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+/// `PATCH /api/providers/{id}`. A missing field is left untouched; `secret`
+/// rotates the credential and restarts every attached instance.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PatchProviderRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
 /// Container runtime details returned by the driver.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ContainerInfo {
@@ -268,6 +389,9 @@ pub struct InstanceSummary {
     pub health: String,
     pub cpu_limit: f64,
     pub allow_lan: bool,
+    /// Provider credential in use, when the instance has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub shares: Vec<String>,
     pub last_error: Option<String>,
     pub created_at: String,
@@ -282,6 +406,9 @@ pub struct InstanceDetail {
     pub image: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Provider credential in use (`null`/absent for a legacy instance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub channel: String,
     pub status: String,
     pub health: String,
@@ -542,6 +669,10 @@ pub struct CreateInstanceRequest {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Attach a reusable provider. When set, `base_url` and `api_key_env`
+    /// default to the provider's values.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
@@ -578,6 +709,10 @@ pub struct CloneInstanceRequest {
     /// Model of the clone (defaults to the source model).
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider of the clone (defaults to the source provider). An empty
+    /// string detaches the clone from any provider.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Replacement for `HERMES_GATE_PROFILE_TOKEN` (and `api_key_env`).
     #[serde(default)]
     pub gate_token: Option<String>,
@@ -602,6 +737,10 @@ pub struct PatchInstanceRequest {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// `null` detaches the provider, a string attaches one, a missing field
+    /// leaves the current attachment alone.
+    #[serde(default, deserialize_with = "double_option")]
+    pub provider: Option<Option<String>>,
     #[serde(default)]
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
@@ -642,6 +781,16 @@ pub struct DetachShareRequest {
     pub instance: Option<String>,
 }
 
+/// Deserialize a field in a way that tells "absent" (`None`) from "null"
+/// (`Some(None)`): used by PATCH bodies that can detach a reference.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// RFC 3339 UTC timestamp, second precision (`2026-11-08T01:00:00Z`).
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -653,6 +802,20 @@ pub fn validate_instance_id(id: &str) -> Result<(), String> {
 
 pub fn validate_share_name(name: &str) -> Result<(), String> {
     validate_slug(name, "share name", SHARE_NAME_MIN, SHARE_NAME_MAX)
+}
+
+/// Provider names share the slug grammar of ids (lowercase, digits, `-`).
+pub fn validate_provider_name(name: &str) -> Result<(), String> {
+    validate_slug(name, "provider name", PROVIDER_NAME_MIN, PROVIDER_NAME_MAX)
+}
+
+/// A provider kind is metadata; unknown kinds are refused so the console can
+/// offer a fixed list instead of free text.
+pub fn validate_provider_kind(kind: &str) -> Result<(), String> {
+    if PROVIDER_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    Err(format!("kind must be one of {}", PROVIDER_KINDS.join(", ")))
 }
 
 fn validate_slug(value: &str, what: &str, min: usize, max: usize) -> Result<(), String> {

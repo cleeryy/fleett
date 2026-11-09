@@ -83,7 +83,10 @@ impl ComposeDriver {
     }
 
     /// Environment of the compose process: every instance variable, decrypted
-    /// for the secret rows and plaintext for the others.
+    /// for the secret rows and plaintext for the others, with the provider
+    /// secret injected under the instance [`InstanceSpec::api_key_env`] when a
+    /// reusable provider is attached (it always wins over a per-instance value
+    /// of that key).
     ///
     /// The compose file declares `${KEY}` for every variable, so the values
     /// only exist in this child process (`docker inspect` sees them per
@@ -93,7 +96,7 @@ impl ComposeDriver {
         id: &str,
     ) -> Result<std::collections::BTreeMap<String, String>, DriverError> {
         let values = match &self.db {
-            Some(db) => crate::envs::values(&self.cfg, db, id),
+            Some(db) => crate::providers::resolved_env(&self.cfg, db, id),
             None => Ok(crate::store::read_legacy_secrets(&self.cfg, id)),
         };
         values.map_err(|err| DriverError::new("secrets", err.to_string()))
@@ -1240,6 +1243,7 @@ mod tests {
             model: "m".to_string(),
             base_url: "https://example.test/v1".to_string(),
             api_key_env: crate::models::DEFAULT_API_KEY_ENV.to_string(),
+            provider: None,
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
             mem_limit_mb: 512,

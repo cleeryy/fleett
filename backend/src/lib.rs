@@ -17,6 +17,7 @@ pub mod logs;
 pub mod metrics;
 pub mod migrate;
 pub mod models;
+pub mod providers;
 pub mod render;
 pub mod secrets;
 pub mod store;

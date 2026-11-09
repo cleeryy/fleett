@@ -430,7 +430,10 @@ async fn upgrade_one(
 ///
 /// `Ok(status)` carries the observed lifecycle status of the container;
 /// `Err(reason)` explains why the image is not usable.
-async fn wait_until_healthy(
+///
+/// Shared with the provider rotation (`PATCH /api/providers/{id}`), which
+/// recreates attached instances with the rotated credential.
+pub(crate) async fn wait_until_healthy(
     state: &AppState,
     spec: &InstanceSpec,
     timeout: Duration,

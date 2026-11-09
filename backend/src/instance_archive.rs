@@ -75,6 +75,10 @@ pub struct ArchiveInstance {
     pub api_key_env: String,
     #[serde(default)]
     pub channel: String,
+    /// Provider the instance drew its key from, when it had one. The archive
+    /// carries the reference only, never the provider secret.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     pub allow_lan: bool,
@@ -94,6 +98,7 @@ impl ArchiveInstance {
             base_url: spec.base_url.clone(),
             api_key_env: spec.api_key_env.clone(),
             channel: spec.channel.as_str().to_string(),
+            provider: spec.provider.clone(),
             mem_limit_mb: spec.mem_limit_mb,
             cpu_limit: spec.cpu_limit,
             allow_lan: spec.allow_lan,
@@ -332,6 +337,7 @@ pub fn spec_from_manifest(
         model: manifest.model.trim().to_string(),
         base_url: manifest.base_url.trim().to_string(),
         api_key_env,
+        provider: manifest.provider.clone(),
         channel,
         shares,
         mem_limit_mb,
@@ -437,6 +443,7 @@ mod tests {
             model: "deepseek-v4.1-flash".to_string(),
             base_url: "https://example.test/v1".to_string(),
             api_key_env: GATE_TOKEN_ENV.to_string(),
+            provider: None,
             channel: ChannelKind::Telegram,
             shares: vec![ShareRef {
                 name: "findings".to_string(),

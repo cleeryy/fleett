@@ -497,6 +497,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         model: model.unwrap_or_default(),
         base_url: base_url.unwrap_or_default(),
         api_key_env: api_key_env.unwrap_or_else(|| GATE_TOKEN_ENV.to_string()),
+        provider: None,
         channel,
         shares,
         mem_limit_mb,
