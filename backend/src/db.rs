@@ -413,6 +413,15 @@ CREATE TABLE IF NOT EXISTS deployments (
 CREATE INDEX IF NOT EXISTS idx_deployments_started ON deployments (started_at);
 CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments (status);
 "#,
+    // a secret value, only `secret_ref` references.
+    r#"
+CREATE TABLE IF NOT EXISTS desired_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    document   TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    source     TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -2311,4 +2320,51 @@ fn notification_delivery_record(row: &Row<'_>) -> rusqlite::Result<NotificationD
         created_at: row.get(7)?,
         delivered_at: row.get(8)?,
     })
+}
+
+/// The last applied declarative document (`desired_state`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredStateRecord {
+    /// Raw `fleet.yaml` text, as submitted (secret references only).
+    pub document: String,
+    pub applied_at: String,
+    /// Where the apply came from (`api`, `cli`, …).
+    pub source: String,
+}
+
+impl Db {
+    /// The last applied declarative document, when one has been applied.
+    pub fn desired_state(&self) -> Result<Option<DesiredStateRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT document, applied_at, source FROM desired_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok(DesiredStateRecord {
+                        document: row.get(0)?,
+                        applied_at: row.get(1)?,
+                        source: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Record the document an apply just converged the fleet to.
+    pub fn put_desired_state(
+        &self,
+        document: &str,
+        applied_at: &str,
+        source: &str,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO desired_state (id, document, applied_at, source) VALUES (1, ?1, ?2, ?3) \
+             ON CONFLICT (id) DO UPDATE SET document = excluded.document, \
+             applied_at = excluded.applied_at, source = excluded.source",
+            params![document, applied_at, source],
+        )?;
+        Ok(())
+    }
 }
