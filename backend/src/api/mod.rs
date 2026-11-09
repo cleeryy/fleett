@@ -167,6 +167,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
+        .route("/instances/{id}/check", get(instances::check))
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",

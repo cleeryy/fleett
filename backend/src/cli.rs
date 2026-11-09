@@ -1301,6 +1301,36 @@ async fn run_doctor(client: &Client) -> Vec<Check> {
         )),
     }
 
+    // Instance warnings (missing allowlists, plaintext secrets, LAN egress):
+    // one `warn` line per warning, so the operator sees the same message as
+    // the console without opening the instance. A clean fleet adds no line.
+    match client
+        .json::<Vec<InstanceSummary>>(Method::GET, "/api/instances", &[], None)
+        .await
+    {
+        Ok(instances) => {
+            for instance in instances {
+                let path = format!("/api/instances/{}", instance.id);
+                let Ok(detail) = client
+                    .json::<InstanceDetail>(Method::GET, &path, &[], None)
+                    .await
+                else {
+                    continue;
+                };
+                for warning in detail.warnings {
+                    checks.push(Check::warn(
+                        "warnings",
+                        format!("{}: {warning}", instance.id),
+                    ));
+                }
+            }
+        }
+        Err(err) => checks.push(Check::warn(
+            "warnings",
+            format!("the instance list is unreadable: {err}"),
+        )),
+    }
+
     checks
 }
 

@@ -175,6 +175,28 @@ v0.5.0 (breaking).
 | value contains no newline, carriage return or NUL | `invalid_env` |
 | no duplicate key in one request | `duplicate_env` |
 | secret flag present where required | `invalid_env` |
+| value matches the `format` of the template suggestion | `invalid_env_format` |
+
+The format of a suggested variable is enforced on `POST /api/instances`, on
+`POST .../clone` for the values the clone inherits, on the `env` of a `PATCH`
+and on `PUT .../env`. Unknown keys are never rejected; a suggestion without a
+format (or with a format this release does not know) is not checked.
+
+| `format` | Accepted values |
+|---|---|
+| `csv-of-ids` | comma-separated ASCII digits, spaces around entries allowed (`123, 456`) |
+| `bool` | `true`, `false`, `1`, `0`, `yes`, `no` (case-insensitive) |
+| `url` | absolute `http://` or `https://` URL with a host |
+| `text` | any non-empty value |
+
+A refused value answers `400` with the key, the expected format and the
+received value:
+
+```json
+{"error":{"code":"invalid_env_format",
+          "message":"environment variable \"DISCORD_ALLOWED_USERS\" must match format \"csv-of-ids\": \"alice\" is not a numeric id: use comma-separated ASCII digits",
+          "details":{"key":"DISCORD_ALLOWED_USERS","expected":"csv-of-ids","received":"alice"}}}
+```
 
 The reserved names belong to the container contract: `HERMES_UID` and
 `HERMES_GID` are literals in the compose file, and the driver environment would
@@ -203,34 +225,91 @@ never a value.
 
 ## Templates
 
-`GET /api/templates` now returns the variables a template expects, so the
-console can propose them:
+`GET /api/templates` returns the variables a template expects, with an
+`example`, a `required` flag and the `format` the API enforces:
 
 | Template | Suggestions |
 |---|---|
-| `guest` (Telegram) | `TELEGRAM_ALLOWED_USERS`, `GATEWAY_ALLOW_ALL_USERS` |
-| `guest-discord` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOWED_ROLES`, `DISCORD_ALLOWED_CHANNELS`, `DISCORD_ALLOW_ALL_USERS` |
+| `guest` (Telegram) | `TELEGRAM_ALLOWED_USERS` (required, `csv-of-ids`), `GATEWAY_ALLOW_ALL_USERS` (`bool`) |
+| `guest-discord` | `DISCORD_ALLOWED_USERS` (required, `csv-of-ids`), `DISCORD_ALLOWED_ROLES` (`csv-of-ids`), `DISCORD_ALLOWED_CHANNELS` (`csv-of-ids`), `DISCORD_ALLOW_ALL_USERS` (`bool`) |
 | `solo` | none |
 
 ```json
 {
   "id": "guest-discord",
   "env": [
-    {"key": "DISCORD_ALLOWED_USERS", "description": "Comma-separated Discord user ids…", "secret": false}
+    {
+      "key": "DISCORD_ALLOWED_USERS",
+      "description": "Comma-separated Discord user ids allowed to talk to the agent…",
+      "secret": false,
+      "example": "274575374111866880",
+      "required": true,
+      "format": "csv-of-ids"
+    }
   ]
 }
 ```
 
-A custom template can declare its own list in `templates/<id>/template.yaml`:
+A custom template can declare its own list in `templates/<id>/template.yaml`.
+The three new fields are optional, so a `template.yaml` written for an older
+release still parses (`required` defaults to `false`, `format` and `example` to
+`null`):
 
 ```yaml
 env:
   - key: DISCORD_ALLOWED_USERS
     description: Comma-separated Discord user ids allowed to talk to the agent.
     secret: false
+    example: "274575374111866880"
+    required: true
+    format: csv-of-ids
 ```
 
-All suggestions are non-secret: they are allowlists, not credentials.
+All built-in suggestions are non-secret: they are allowlists, not credentials.
+
+## Check endpoint and warnings
+
+`GET /api/instances/{id}/check` reports whether the template allowlists of an
+instance are satisfied (the container is queried for its health, not started):
+
+```json
+{
+  "ok": false,
+  "warnings": [
+    {
+      "code": "allowlist_missing",
+      "key": "DISCORD_ALLOWED_USERS",
+      "message": "DISCORD_ALLOWED_USERS is required by the guest-discord template but is not set: the gateway will refuse every message until it is",
+      "field": "env.DISCORD_ALLOWED_USERS"
+    },
+    {
+      "code": "gateway_may_refuse",
+      "key": "DISCORD_ALLOWED_USERS",
+      "message": "the container is healthy but DISCORD_ALLOWED_USERS is empty: the gateway is probably refusing every message",
+      "field": "env.DISCORD_ALLOWED_USERS"
+    }
+  ],
+  "template": "guest-discord"
+}
+```
+
+- `allowlist_missing`: a `required` key of the template is absent or empty;
+- `gateway_may_refuse`: the container is `healthy` while such a key is missing,
+  i.e. the gateway is up and rejecting every message (the exact failure from
+  issue #27);
+- `ok` is `true` only when there is no warning;
+- `field` is the console form field to focus (`env.<KEY>`);
+- `template` is the id of the template that was checked (the same value as
+  `InstanceDetail.template`; an adopted `custom` instance has no suggestion).
+
+The same messages are appended to `warnings` in `InstanceDetail`, after the
+egress/LAN and plaintext-secrets warnings, so the console can display them
+without calling `/check`. A stopped instance only gets `allowlist_missing`:
+`gateway_may_refuse` requires a healthy container.
+
+Adding the missing key through `PATCH`/`PUT .../env` rewrites the compose file
+and runs `docker compose up -d`, so the agent is unblocked after the write
+without a manual restart.
 
 ## Clone and export
 

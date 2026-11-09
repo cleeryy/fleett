@@ -5,6 +5,19 @@
 //! substitutes `{{MODEL}}`, `{{BASE_URL}}`, `{{AGENT_NAME}}` and
 //! `{{API_KEY_ENV}}`; the model block is normalised by the renderer.
 
+/// One environment variable a built-in template expects.
+///
+/// The console pre-fills `example` and validates the value against `format`;
+/// `required` keys are the allowlists that make the gateway refuse every
+/// message when they are absent (issue #27).
+pub struct BuiltinEnv {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub example: Option<&'static str>,
+    pub required: bool,
+    pub format: Option<&'static str>,
+}
+
 /// One built-in template and its API metadata.
 pub struct BuiltinTemplate {
     pub id: &'static str,
@@ -12,8 +25,8 @@ pub struct BuiltinTemplate {
     pub description: &'static str,
     pub default_model: &'static str,
     pub channel: &'static str,
-    /// Environment variables the template expects: `(key, description)`.
-    pub env: &'static [(&'static str, &'static str)],
+    /// Environment variables the template expects.
+    pub env: &'static [BuiltinEnv],
     pub config_yaml: &'static str,
     pub soul_md: &'static str,
 }
@@ -177,34 +190,69 @@ API server.
 - Ask before doing anything destructive or expensive.
 "#;
 
-const GUEST_ENV: &[(&str, &str)] = &[
-    (
+const fn env(
+    key: &'static str,
+    description: &'static str,
+    example: Option<&'static str>,
+    required: bool,
+    format: Option<&'static str>,
+) -> BuiltinEnv {
+    BuiltinEnv {
+        key,
+        description,
+        example,
+        required,
+        format,
+    }
+}
+
+const GUEST_ENV: &[BuiltinEnv] = &[
+    env(
         "TELEGRAM_ALLOWED_USERS",
         "Comma-separated Telegram user ids allowed to talk to the agent; without it every \
          message is denied.",
+        Some("123456789"),
+        true,
+        Some("csv-of-ids"),
     ),
-    (
+    env(
         "GATEWAY_ALLOW_ALL_USERS",
         "Set to true to accept every user on the platform, with no allowlist. Use with care.",
+        Some("false"),
+        false,
+        Some("bool"),
     ),
 ];
 
-const GUEST_DISCORD_ENV: &[(&str, &str)] = &[
-    (
+const GUEST_DISCORD_ENV: &[BuiltinEnv] = &[
+    env(
         "DISCORD_ALLOWED_USERS",
-        "Comma-separated Discord user ids allowed to talk to the agent.",
+        "Comma-separated Discord user ids allowed to talk to the agent; without it every \
+         message is denied. Right-click a user in Discord (Developer Mode) and copy its id.",
+        Some("274575374111866880"),
+        true,
+        Some("csv-of-ids"),
     ),
-    (
+    env(
         "DISCORD_ALLOWED_ROLES",
         "Comma-separated Discord role ids allowed to talk to the agent.",
+        Some("987654321098765432"),
+        false,
+        Some("csv-of-ids"),
     ),
-    (
+    env(
         "DISCORD_ALLOWED_CHANNELS",
         "Comma-separated Discord channel ids where the agent answers.",
+        Some("123456789012345678"),
+        false,
+        Some("csv-of-ids"),
     ),
-    (
+    env(
         "DISCORD_ALLOW_ALL_USERS",
         "Set to true to accept every Discord user, with no allowlist. Use with care.",
+        Some("false"),
+        false,
+        Some("bool"),
     ),
 ];
 

@@ -4,6 +4,7 @@ use crate::api::audit;
 use crate::api::error::ApiError;
 use crate::api::{up_and_record, AppState};
 use crate::auth::AuthContext;
+use crate::checks::{self, CheckReport};
 use crate::config::EgressMode;
 use crate::driver::LogsOptions;
 use crate::egress;
@@ -12,10 +13,10 @@ use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
 use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
-    validate_env_key, validate_env_value, validate_instance_id, validate_mem_limit, validate_model,
-    validate_notes, validate_secret_value, validate_share_name, ChannelKind, ChannelRequest,
-    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput, Health,
-    InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
+    validate_env_key, validate_env_raw_value, validate_instance_id, validate_mem_limit,
+    validate_model, validate_notes, validate_secret_value, validate_share_name, ChannelKind,
+    ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput,
+    Health, InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
     TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
     GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
@@ -150,6 +151,25 @@ pub async fn get(
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
     )))
+}
+
+/// `GET /api/instances/{id}/check`: template allowlists against the live state.
+///
+/// Read-only: it never records health, never writes a file and never talks to
+/// `docker compose` beyond `ps`.
+pub async fn check(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<CheckReport>, ApiError> {
+    let spec = load(&state, &id)?;
+    let health = state
+        .driver
+        .ps(&spec)
+        .await
+        .map(|result| result.health)
+        .unwrap_or(Health::Unknown);
+    let env = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    Ok(Json(checks::report(&state.cfg, &spec, health, &env)))
 }
 
 pub async fn create(
@@ -411,6 +431,13 @@ pub async fn clone(
         .filter(|entry| !entry.secret)
         .map(|entry| (entry.key.clone(), entry.value.clone()))
         .collect();
+    checks::validate_values(
+        template.meta.env.as_deref().unwrap_or_default(),
+        inherited
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(env_format_error)?;
     let values = render::build_secrets(
         &clone,
         gate_token.as_deref(),
@@ -786,6 +813,9 @@ pub async fn patch(
 
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
+    let suggestions = checks::template_info(&state.cfg, &spec).env;
+    checks::validate_values(&suggestions, supplied_env_values(request.env.as_deref()))
+        .map_err(env_format_error)?;
     let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
     enforce_caps(&state, Some(&id), &spec)?;
     check_egress_policy(&state, &spec).await?;
@@ -859,6 +889,9 @@ pub async fn put_env(
 
     let mut spec = load(&state, &id)?;
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let suggestions = checks::template_info(&state.cfg, &spec).env;
+    checks::validate_values(&suggestions, supplied_env_values(Some(&vars)))
+        .map_err(env_format_error)?;
     let entries = resolve_full_env(&existing, &vars)?;
 
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
@@ -1434,6 +1467,15 @@ fn to_detail(
     if crate::secrets::has_plaintext_file(&state.cfg, &spec.id) {
         warnings.push(crate::secrets::WARNING_LEGACY.to_string());
     }
+    // Template allowlists (issue #27): appended after the egress/LAN and
+    // plaintext-secrets warnings, never instead of them.
+    let template = checks::template_info(&state.cfg, spec);
+    warnings.extend(checks::detail_warnings(
+        &template,
+        spec.channel,
+        health,
+        &env,
+    ));
     InstanceDetail {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -1556,6 +1598,12 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
                 secret: var.secret.unwrap_or(false),
             })
             .collect();
+    checks::validate_values(
+        template.meta.env.as_deref().unwrap_or_default(),
+        env.iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str())),
+    )
+    .map_err(env_format_error)?;
     let gate_token = request
         .gate_token
         .as_deref()
@@ -1810,7 +1858,7 @@ fn validate_env_inputs(
             ));
         }
         match &var.value {
-            Some(value) => validate_env_value(value)
+            Some(value) => validate_env_raw_value(value)
                 .map_err(|message| ApiError::bad_request("invalid_env", message))?,
             None if require_value => {
                 return Err(ApiError::bad_request(
@@ -1961,6 +2009,28 @@ fn env_entries(
             value,
         })
         .collect()
+}
+
+/// Values a request actually supplies, for template format validation.
+///
+/// A `value: null` entry deletes a key (PATCH) or keeps a stored secret (PUT):
+/// it carries nothing to validate.
+fn supplied_env_values<'a>(
+    vars: Option<&'a [EnvVarInput]>,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    vars.unwrap_or_default()
+        .iter()
+        .filter_map(|var| var.value.as_deref().map(|value| (var.key.as_str(), value)))
+}
+
+/// `400 invalid_env_format` with the key, the expected format and the value.
+fn env_format_error(err: checks::EnvFormatError) -> ApiError {
+    let message = err.message();
+    ApiError::bad_request("invalid_env_format", message).with_details(serde_json::json!({
+        "key": err.key,
+        "expected": err.expected,
+        "received": err.received,
+    }))
 }
 
 /// Keys supplied by the gate/channel tokens of a request: always secret, even
