@@ -42,6 +42,8 @@ import type {
   ExecResult,
   FileContent,
   FileEntry,
+  FileSearchParams,
+  FileSearchResult,
   FleetApi,
   GitDiff,
   GitDiffOptions,
@@ -133,6 +135,7 @@ import type {
   Template,
   TokenInfo,
   UpdateMemoryInput,
+  UploadResult,
   WriteFileInput,
   WriteFileResult,
   WriteMemoryResult,
@@ -140,6 +143,7 @@ import type {
 import { toPatch } from "@/lib/diff";
 import { tokenStore } from "@/lib/token";
 import { isValidProviderName, isValidSlug, isHttpUrl } from "@/lib/validation";
+import { zipStore, type ZipEntry } from "@/lib/zip";
 
 /**
  * In-memory adapter used when VITE_MOCK is on (default in development).
@@ -1504,6 +1508,95 @@ function isEditablePath(path: string): boolean {
 
 function isRenderedPath(path: string): boolean {
   return path === "/config.yaml" || path === "/healthcheck.py";
+}
+
+/* Mirrors `docs/FILES.md` for the demo: the mock refuses what the controller
+ * refuses, so the UI paths (409, 415, 413) are exercised in development. */
+const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
+const MAX_SEARCH_FILES = 50_000;
+const BLOCKED_UPLOAD_EXTENSIONS = [
+  "exe",
+  "com",
+  "bat",
+  "cmd",
+  "msi",
+  "dll",
+  "so",
+  "dylib",
+  "bin",
+  "app",
+  "scr",
+  "ps1",
+  "sh",
+  "bash",
+  "zsh",
+];
+
+function isBlockedUploadName(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return false;
+  return BLOCKED_UPLOAD_EXTENSIONS.includes(name.slice(dot + 1).toLowerCase());
+}
+
+/** ELF, PE or Mach-O magic bytes, the second half of the upload refusal. */
+function executableMagic(head: Uint8Array): string | null {
+  const starts = (...bytes: number[]): boolean =>
+    bytes.every((byte, index) => head[index] === byte);
+  if (starts(0x7f, 0x45, 0x4c, 0x46)) return "ELF";
+  if (starts(0x4d, 0x5a)) return "PE";
+  if (
+    starts(0xfe, 0xed, 0xfa, 0xce) ||
+    starts(0xfe, 0xed, 0xfa, 0xcf) ||
+    starts(0xce, 0xfa, 0xed, 0xfe) ||
+    starts(0xcf, 0xfa, 0xed, 0xfe) ||
+    starts(0xca, 0xfe, 0xba, 0xbe)
+  ) {
+    return "Mach-O";
+  }
+  return null;
+}
+
+function joinVirtual(directory: string, name: string): string {
+  return directory === "/" ? `/${name}` : `${directory}/${name}`;
+}
+
+/** Every file below one directory, deepest first is not needed: sorted paths. */
+function filesUnder(fs: MockFs, directory: string): string[] {
+  const prefix = directory === "/" ? "/" : `${directory}/`;
+  return [...fs.files.keys()].filter((path) => path.startsWith(prefix)).sort();
+}
+
+/** Directory entries and files of one subtree, as the controller zips them. */
+function archiveEntries(fs: MockFs, directory: string): ZipEntry[] {
+  const encoder = new TextEncoder();
+  const entries: ZipEntry[] = [];
+
+  const walk = (dir: string, prefix: string) => {
+    const children = [...fs.dirs]
+      .filter((candidate) => candidate !== dir && parentPath(candidate) === dir)
+      .sort((left, right) => baseName(left).localeCompare(baseName(right)));
+    for (const child of children) {
+      const name = `${prefix}${baseName(child)}/`;
+      entries.push({ name, bytes: new Uint8Array(0), directory: true });
+      walk(child, name);
+    }
+    const files = [...fs.files.keys()]
+      .filter((path) => parentPath(path) === dir)
+      .sort((left, right) => baseName(left).localeCompare(baseName(right)));
+    for (const path of files) {
+      const file = fs.files.get(path) as MockFile;
+      entries.push({ name: `${prefix}${baseName(path)}`, bytes: encoder.encode(file.content) });
+    }
+  };
+
+  walk(directory, "");
+  return entries;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Mirrors `history::is_tracked`: the editor allowlist minus runtime files. */
@@ -5905,6 +5998,203 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     ensureDir(fs, target);
     recordAudit(identity, "instance.file.mkdir", id, { path: target });
     return { path: target, type: "dir" };
+  },
+
+  async uploadFile(
+    id: string,
+    directory: string,
+    file: File,
+    options?: { overwrite?: boolean },
+  ): Promise<UploadResult> {
+    const identity = requireWrite();
+    await delay(300);
+    const row = findRow(id);
+    const fs = fsFor(id);
+    const targetDirectory = normalizeVirtual(directory);
+
+    if (fs.files.has(targetDirectory)) {
+      fail(400, "not_a_directory", `"${targetDirectory}" is a file`);
+    }
+    if (!fs.dirs.has(targetDirectory)) {
+      fail(404, "not_found", `"${targetDirectory}" does not exist`);
+    }
+
+    const name = file.name.trim();
+    if (
+      !name ||
+      name === "." ||
+      name === ".." ||
+      name.includes("/") ||
+      name.includes("\\")
+    ) {
+      fail(400, "invalid_upload", "a file name is a single component, never a path");
+    }
+    if (file.size > MAX_UPLOAD_FILE_BYTES) {
+      fail(413, "file_too_large", `"${name}" is larger than 10 MiB`, {
+        size: file.size,
+        limit: MAX_UPLOAD_FILE_BYTES,
+      });
+    }
+    if (isBlockedUploadName(name)) {
+      fail(415, "executable_file", `"${name}" has an executable extension and cannot be uploaded`, {
+        extensions: BLOCKED_UPLOAD_EXTENSIONS,
+      });
+    }
+    const buffer = new Uint8Array(await file.arrayBuffer());
+    const magic = executableMagic(buffer.slice(0, 8));
+    if (magic) {
+      fail(
+        415,
+        "executable_file",
+        `"${name}" is a native executable (${magic}), not data: the upload is refused`,
+        { extensions: BLOCKED_UPLOAD_EXTENSIONS },
+      );
+    }
+
+    const target = joinVirtual(targetDirectory, name);
+    if (isRenderedPath(target)) {
+      fail(409, "file_regenerated", `"${target}" is rendered by fleett and cannot be uploaded`, {
+        file: target,
+        rendered: true,
+        hint: RENDERED_NOTE,
+      });
+    }
+    if (fs.dirs.has(target)) {
+      fail(400, "not_a_file", `"${target}" is a directory`);
+    }
+    const existing = fs.files.get(target);
+    if (existing && options?.overwrite !== true) {
+      fail(409, "file_exists", `"${target}" already exists: overwrite it to replace it`, {
+        file: target,
+        overwrite: false,
+      });
+    }
+
+    // The mock keeps text: a binary upload is stored as a readable placeholder
+    // instead of mojibake, which is enough to drive the console in development.
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch {
+      content = `[demo] ${name} is binary: the mock stores a placeholder, the controller keeps the bytes.`;
+    }
+    if (content.includes("\0")) {
+      content = `[demo] ${name} is binary: the mock stores a placeholder, the controller keeps the bytes.`;
+    }
+
+    let backup: string | undefined;
+    if (existing) {
+      backup = nextBackupPath(fs, target);
+      fs.files.set(backup, { content: existing.content, mtime: Date.now(), rendered: false });
+    }
+    const writtenAt = Date.now();
+    fs.files.set(target, { content, mtime: writtenAt, rendered: false });
+    recordUiWrite(id, fs, identity, target);
+    const size = buffer.length;
+    recordAudit(identity, "instance.file.upload", row.id, {
+      directory: targetDirectory,
+      overwrite: options?.overwrite === true,
+      total: size,
+      files: [{ path: target, size, backup: backup ?? null }],
+    });
+    if (target === "/SOUL.md" && row.persona) row.persona_state = "diverged";
+
+    const written: UploadResult["files"][number] = { path: target, size };
+    if (backup) written.backup = backup;
+    return { directory: targetDirectory, total: size, files: [written] };
+  },
+
+  async downloadFile(id: string, path: string): Promise<{ blob: Blob; filename: string }> {
+    requireAuth();
+    await delay(120);
+    const fs = fsFor(id);
+    const target = normalizeVirtual(path);
+    const file = fs.files.get(target);
+    if (!file) {
+      if (fs.dirs.has(target)) {
+        fail(400, "not_a_file", `"${target}" is a directory`);
+      }
+      fail(404, "not_found", `"${target}" does not exist`);
+    }
+    return {
+      blob: new Blob([file.content], { type: "text/plain;charset=utf-8" }),
+      filename: baseName(target),
+    };
+  },
+
+  async downloadArchive(id: string, path: string): Promise<{ blob: Blob; filename: string }> {
+    requireAuth();
+    await delay(240);
+    const fs = fsFor(id);
+    const directory = normalizeVirtual(path);
+    if (fs.files.has(directory)) {
+      fail(400, "not_a_directory", `"${directory}" is a file`);
+    }
+    if (!fs.dirs.has(directory)) {
+      fail(404, "not_found", `"${directory}" does not exist`);
+    }
+    const entries = archiveEntries(fs, directory);
+    const suffix = directory === "/" ? "data" : baseName(directory);
+    return {
+      blob: new Blob([zipStore(entries)], { type: "application/zip" }),
+      filename: `${id}-${suffix}.zip`,
+    };
+  },
+
+  async searchFiles(id: string, params: FileSearchParams): Promise<FileSearchResult> {
+    requireAuth();
+    await delay(220);
+    const fs = fsFor(id);
+    const directory = normalizeVirtual(params.path ?? "/");
+    if (fs.files.has(directory)) {
+      fail(400, "not_a_directory", `"${directory}" is a file`);
+    }
+    if (!fs.dirs.has(directory)) {
+      fail(404, "not_found", `"${directory}" does not exist`);
+    }
+    const needle = params.q.trim();
+    if (!needle) {
+      fail(400, "invalid_query", "\"q\" is required: pass the text to look for");
+    }
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(params.regex ? needle : escapeRegExp(needle), "i");
+    } catch {
+      fail(400, "invalid_regex", `"${needle}" is not a valid regular expression`);
+    }
+    const limit = Math.min(Math.max(params.limit ?? MAX_SEARCH_RESULTS, 1), MAX_SEARCH_RESULTS);
+
+    const results: FileSearchResult["results"] = [];
+    let scanned = 0;
+    let truncated = false;
+    for (const filePath of filesUnder(fs, directory)) {
+      if (scanned >= MAX_SEARCH_FILES) {
+        truncated = true;
+        break;
+      }
+      const file = fs.files.get(filePath) as MockFile;
+      if (byteLength(file.content) > MAX_SEARCH_FILE_BYTES) {
+        scanned += 1;
+        continue;
+      }
+      scanned += 1;
+      const lines = file.content.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!pattern.test(lines[index])) continue;
+        results.push({
+          path: filePath,
+          line: index + 1,
+          preview: lines[index].trim().slice(0, 240),
+        });
+        if (results.length >= limit) {
+          truncated = true;
+          break;
+        }
+      }
+      if (truncated) break;
+    }
+
+    return { results, truncated, scanned };
   },
 
   async gitLog(id: string, options: GitLogOptions = {}): Promise<GitLog> {

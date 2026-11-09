@@ -693,6 +693,46 @@ export interface MkdirResult {
   type: "dir";
 }
 
+/** One file written by an upload request. */
+export interface UploadedFile {
+  path: string;
+  size: number;
+  /** Sibling `.bak-YYYYMMDD-HHMMSS` when the upload replaced a file. */
+  backup?: string;
+}
+
+/** Result of `POST /files/upload`; the console sends one file per request. */
+export interface UploadResult {
+  directory: string;
+  total: number;
+  files: UploadedFile[];
+}
+
+export interface FileSearchParams {
+  /** Needle; a regular expression when `regex` is set. */
+  q: string;
+  /** Virtual directory to walk; the current folder in the console. */
+  path?: string;
+  regex?: boolean;
+  /** Hits to keep; the controller caps it at 200. */
+  limit?: number;
+}
+
+export interface FileSearchHit {
+  path: string;
+  /** 1-based line number. */
+  line: number;
+  preview: string;
+}
+
+export interface FileSearchResult {
+  results: FileSearchHit[];
+  /** The scan stopped at the hit or file cap: more matches may exist. */
+  truncated: boolean;
+  /** Files the walk opened (or skipped for their size). */
+  scanned: number;
+}
+
 /* --------------------------------------------------------------------------
  * Instance history (docs/GIT.md)
  * -------------------------------------------------------------------------- */
@@ -1606,6 +1646,23 @@ export interface FleetApi {
   ): Promise<WriteFileResult>;
   deleteFile(id: string, path: string): Promise<void>;
   mkdir(id: string, path: string): Promise<MkdirResult>;
+  /**
+   * Multipart upload into `directory`. The console sends one file per request so
+   * a `409 file_exists` refuses that file only, and the rest of a drop keeps
+   * going; `overwrite` backs the previous bytes up as a `.bak`.
+   */
+  uploadFile(
+    id: string,
+    directory: string,
+    file: File,
+    options?: { overwrite?: boolean },
+  ): Promise<UploadResult>;
+  /** Exact bytes, attachment filename taken from `Content-Disposition`. */
+  downloadFile(id: string, path: string): Promise<{ blob: Blob; filename: string }>;
+  /** One directory of the tree as a `.zip`, built on the controller. */
+  downloadArchive(id: string, path: string): Promise<{ blob: Blob; filename: string }>;
+  /** Full-text search under `path`, literal by default. */
+  searchFiles(id: string, params: FileSearchParams): Promise<FileSearchResult>;
   gitLog(id: string, options?: GitLogOptions): Promise<GitLog>;
   gitDiff(id: string, options?: GitDiffOptions): Promise<GitDiff>;
   gitStatus(id: string): Promise<GitStatus>;

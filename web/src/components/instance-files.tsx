@@ -1,25 +1,38 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent,
+} from "react";
 import {
   ArrowUp,
+  Download,
   FileDiff,
   FilePlus2,
   FileText,
   Folder,
+  FolderDown,
   FolderPlus,
   Info,
   Loader2,
   Lock,
   RefreshCw,
+  Regex,
   RotateCw,
   Save,
+  ScanSearch,
+  Search,
   Trash2,
   TriangleAlert,
+  Upload,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { FileEntry } from "@/api/types";
+import type { FileEntry, FileSearchHit, FileSearchResult } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,9 +41,13 @@ import { CopyButton } from "@/components/copy-button";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { LineDiff } from "@/components/diff-view";
+import { FileUploadsList } from "@/components/file-uploads-list";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MarkdownView } from "@/components/markdown-view";
+import { Segmented } from "@/components/segmented";
 import { Skeleton } from "@/components/ui/skeleton";
+import { SyntaxBlock } from "@/components/syntax-block";
 import {
   Dialog,
   DialogContent,
@@ -46,9 +63,12 @@ import {
   useAssistantScope,
   type AssistantAppliedDetail,
 } from "@/lib/assistant";
+import { saveBlob } from "@/lib/download";
 import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
 import { setRouteGuard } from "@/lib/router";
+import { isMarkdownPath, syntaxLanguage } from "@/lib/syntax";
 import { useResource } from "@/lib/use-resource";
+import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES, useUploads } from "@/lib/use-uploads";
 import { EDITABLE_EXTENSIONS_LABEL, isEditableFileName } from "@/lib/validation";
 import { cn } from "@/lib/utils";
 
@@ -91,8 +111,44 @@ function joinPath(directory: string, name: string): string {
   return directory === "/" ? `/${name}` : `${directory}/${name}`;
 }
 
-function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: string) => void }) {
-  const segments = path === "/" ? [] : path.split("/").filter(Boolean);
+/** How a file is shown: editable text, rendered Markdown, coloured config. */
+type FileView = "source" | "preview" | "highlight";
+
+function defaultView(path: string, editable: boolean): FileView {
+  if (!isMarkdownPath(path)) return "source";
+  // A Markdown file nobody can save opens rendered: reading is the point.
+  return editable ? "source" : "preview";
+}
+
+/** One line of the editor and of every read-only view: `leading-5`. */
+const LINE_HEIGHT = 20;
+
+/** Character range of one 1-based line, for the search reveal. */
+function lineBounds(text: string, line: number): { start: number; end: number } {
+  let start = 0;
+  for (let index = 1; index < line; index += 1) {
+    const next = text.indexOf("\n", start);
+    if (next === -1) return { start: text.length, end: text.length };
+    start = next + 1;
+  }
+  const end = text.indexOf("\n", start);
+  return { start, end: end === -1 ? text.length : end };
+}
+
+/** Touch devices: focusing the editor pops the keyboard, so only scroll. */
+function coarsePointer(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+}
+
+const EXTERNAL_LINK_RE = /\[[^\]]*\]\(https?:\/\//i;
+
+/** `10 MiB per file · 32 MiB per drop`, straight from the client caps. */
+const UPLOAD_LIMITS_LABEL = `${MAX_UPLOAD_FILE_BYTES / (1024 * 1024)} MiB per file · ${
+  MAX_UPLOAD_TOTAL_BYTES / (1024 * 1024)
+} MiB per drop`;
+
+
+function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: string) => void }) {  const segments = path === "/" ? [] : path.split("/").filter(Boolean);
   const crumbs = [
     { label: "data", path: "/" },
     ...segments.map((segment, index) => ({
@@ -128,6 +184,82 @@ function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: str
         ))}
       </ol>
     </nav>
+  );
+}
+
+/**
+ * Hits of one search, scoped to the folder in the header: the path, the line
+ * and the trimmed text, so a click is a decision and not a guess.
+ */
+function SearchHits({
+  cwd,
+  query,
+  result,
+  error,
+  searching,
+  onOpen,
+}: {
+  cwd: string;
+  query: string;
+  result: FileSearchResult | null;
+  error: ApiError | null;
+  searching: boolean;
+  onOpen: (hit: FileSearchHit) => void;
+}) {
+  if (error) {
+    return (
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        <ErrorAlert error={error} />
+      </div>
+    );
+  }
+
+  if (!result) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+        {searching ? "Walking the folder…" : null}
+      </div>
+    );
+  }
+
+  if (result.results.length === 0) {
+    return (
+      <div className="min-h-0 flex-1 p-6 text-center text-sm text-muted-foreground">
+        No match for <span className="font-mono">{query}</span> in{" "}
+        <span className="font-mono">{cwd}</span>.
+        <p className="mt-1 text-[11px]">
+          {result.scanned} {result.scanned === 1 ? "file" : "files"} scanned. Files above 1 MiB and
+          binaries are skipped.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <ul className="min-h-0 flex-1 divide-y overflow-auto">
+        {result.results.map((hit) => (
+          <li key={`${hit.path}:${hit.line}`}>
+            <button
+              type="button"
+              className="w-full px-3 py-2 text-left hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:-outline-offset-2"
+              onClick={() => onOpen(hit)}
+            >
+              <span className="flex items-baseline gap-1 font-mono text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">{hit.path}</span>
+                <span className="shrink-0">:{hit.line}</span>
+              </span>
+              <span className="block truncate font-mono text-xs">{hit.preview || "\u00a0"}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+      {result.truncated ? (
+        <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+          Stopped at the hit or file cap: narrow the folder or the pattern to see the rest.
+        </p>
+      ) : null}
+    </>
   );
 }
 
@@ -167,10 +299,35 @@ export function InstanceFiles({
   const [dialogError, setDialogError] = useState<ApiError | null>(null);
   const [dialogPending, setDialogPending] = useState(false);
 
+  const [view, setView] = useState<FileView>("source");
+  const [revealLine, setRevealLine] = useState<number | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<ApiError | null>(null);
+
+  const [query, setQuery] = useState("");
+  const [regexMode, setRegexMode] = useState(false);
+  const [searchResult, setSearchResult] = useState<FileSearchResult | null>(null);
+  const [searchError, setSearchError] = useState<ApiError | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [dropping, setDropping] = useState(false);
+
   const requestId = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const gutterRef = useRef<HTMLPreElement>(null);
+  const readOnlyRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
+  const searchSeq = useRef(0);
   const wasActive = useRef(active);
+
+  const uploads = useUploads({
+    id,
+    directory: cwd,
+    onUploaded: () => {
+      listing.reload();
+      onFileSaved?.();
+    },
+  });
 
   const dirty = open ? (open.isNew ? true : draft !== open.content) : false;
   const entries = listing.data ?? [];
@@ -216,7 +373,7 @@ export function InstanceFiles({
         toast.info(`${current.name} changed on disk. Your unsaved buffer was kept.`);
         return;
       }
-      void loadFileRef.current(applied.path);
+      void loadFileRef.current(applied.path, { keepView: true });
     }
     window.addEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
     return () => window.removeEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
@@ -232,8 +389,24 @@ export function InstanceFiles({
     setConflict(null);
     setPreview(false);
     setDialog(null);
+    setView("source");
+    setRevealLine(null);
+    setQuery("");
+    setSearchResult(null);
+    setSearchError(null);
+    setDownloadError(null);
+    searchSeq.current += 1;
     requestId.current += 1;
   }, [id]);
+
+  // A search is scoped to one folder: walking into another one starts over
+  // instead of showing hits the header would no longer explain.
+  useEffect(() => {
+    searchSeq.current += 1;
+    setSearchResult(null);
+    setSearchError(null);
+    setSearching(false);
+  }, [cwd]);
 
   // The panel stays mounted behind the other tabs; on return, refresh what is
   // on disk so a revert or an outside edit cannot linger silently. A dirty
@@ -241,7 +414,7 @@ export function InstanceFiles({
   useEffect(() => {
     if (active && !wasActive.current) {
       listing.reload();
-      if (!dirty && open && !open.isNew) void loadFile(open.path);
+      if (!dirty && open && !open.isNew) void loadFile(open.path, { keepView: true });
     }
     wasActive.current = active;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -287,7 +460,10 @@ export function InstanceFiles({
     return window.confirm(`Discard unsaved changes to ${open?.name ?? "this file"}?`);
   }
 
-  async function loadFile(path: string) {
+  async function loadFile(
+    path: string,
+    options: { line?: number; keepView?: boolean } = {},
+  ) {
     const ticket = requestId.current + 1;
     requestId.current = ticket;
     setSelectedPath(path);
@@ -301,18 +477,26 @@ export function InstanceFiles({
       if (requestId.current !== ticket) return;
       setOpen({ ...content, name: baseName(content.path), isNew: false });
       setDraft(content.content);
+      // A search hit always lands in the text, even for a file that would
+      // otherwise open rendered; a silent reload keeps the view the reader chose.
+      if (options.line) setView("source");
+      else if (!options.keepView) {
+        setView(defaultView(content.path, content.editable && canEdit));
+      }
+      setRevealLine(options.line ?? null);
     } catch (cause) {
       if (requestId.current !== ticket) return;
       setOpen(null);
+      setRevealLine(null);
       setFileError(toApiError(cause));
     } finally {
       if (requestId.current === ticket) setLoadingFile(false);
     }
   }
 
-  function requestOpen(path: string) {
+  function requestOpen(path: string, line?: number) {
     if (!confirmDiscard()) return;
-    void loadFile(path);
+    void loadFile(path, { line });
   }
 
   function closeFile() {
@@ -325,6 +509,8 @@ export function InstanceFiles({
     setSaveError(null);
     setConflict(null);
     setPreview(false);
+    setRevealLine(null);
+    setView("source");
   }
 
   function openEntry(entry: FileEntry) {
@@ -373,6 +559,8 @@ export function InstanceFiles({
     setSaveError(null);
     setConflict(null);
     setPreview(false);
+    setView("source");
+    setRevealLine(null);
     closeDialog();
   }
 
@@ -460,6 +648,8 @@ export function InstanceFiles({
       setSelectedPath(null);
       setDraft("");
       setPreview(false);
+      setRevealLine(null);
+      setView("source");
       listing.reload();
       onFileSaved?.();
       closeDialog();
@@ -490,6 +680,147 @@ export function InstanceFiles({
     });
   }
 
+  /* ------------------------------------------------------------------------
+   * Download
+   * ---------------------------------------------------------------------- */
+
+  async function downloadFile(path: string) {
+    setDownloading(path);
+    setDownloadError(null);
+    try {
+      const { blob, filename } = await api.downloadFile(id, path);
+      saveBlob(blob, filename || baseName(path));
+    } catch (cause) {
+      setDownloadError(toApiError(cause));
+    } finally {
+      setDownloading(null);
+    }
+  }
+
+  async function downloadFolder() {
+    setDownloading("folder");
+    setDownloadError(null);
+    try {
+      const { blob, filename } = await api.downloadArchive(id, cwd);
+      saveBlob(blob, filename);
+    } catch (cause) {
+      setDownloadError(toApiError(cause));
+    } finally {
+      setDownloading(null);
+    }
+  }
+
+  /* ------------------------------------------------------------------------
+   * Search
+   * ---------------------------------------------------------------------- */
+
+  async function runSearch() {
+    const needle = query.trim();
+    if (!needle) {
+      clearSearch();
+      return;
+    }
+    const ticket = searchSeq.current + 1;
+    searchSeq.current = ticket;
+    setSearching(true);
+    setSearchError(null);
+    try {
+      const result = await api.searchFiles(id, {
+        q: needle,
+        path: cwd,
+        regex: regexMode,
+        limit: 200,
+      });
+      if (searchSeq.current !== ticket) return;
+      setSearchResult(result);
+    } catch (cause) {
+      if (searchSeq.current !== ticket) return;
+      setSearchResult(null);
+      setSearchError(toApiError(cause));
+    } finally {
+      if (searchSeq.current === ticket) setSearching(false);
+    }
+  }
+
+  function clearSearch() {
+    searchSeq.current += 1;
+    setSearching(false);
+    setQuery("");
+    setSearchResult(null);
+    setSearchError(null);
+  }
+
+  function openHit(hit: FileSearchHit) {
+    // The hit names a line of the text: read it in the editor, not rendered.
+    requestOpen(hit.path, hit.line);
+  }
+
+  // Reveal the line of a search hit once the buffer is on screen. Both views
+  // use `leading-5`, so one line is one LINE_HEIGHT step.
+  useEffect(() => {
+    if (revealLine === null || !open) return;
+    const line = revealLine;
+    const offset = Math.max(0, (line - 1) * LINE_HEIGHT - LINE_HEIGHT * 2);
+    const frame = requestAnimationFrame(() => {
+      const field = textareaRef.current;
+      if (field) {
+        field.scrollTop = offset;
+        if (!coarsePointer()) {
+          const bounds = lineBounds(draft, line);
+          field.focus({ preventScroll: true });
+          field.setSelectionRange(bounds.start, bounds.end);
+          field.scrollTop = offset;
+        }
+      } else if (readOnlyRef.current) {
+        readOnlyRef.current.scrollTop = offset;
+      }
+      setRevealLine(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [revealLine, open, draft]);
+
+  /* ------------------------------------------------------------------------
+   * Upload (drop or picker), one request per file
+   * ---------------------------------------------------------------------- */
+
+  function pickFiles() {
+    fileInputRef.current?.click();
+  }
+
+  function onDragEnter(event: ReactDragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    // A viewer has no upload gesture; the drop is still swallowed so a stray
+    // file never navigates the console away from the page.
+    event.preventDefault();
+    if (!canEdit) return;
+    dragDepth.current += 1;
+    setDropping(true);
+  }
+
+  function onDragOver(event: ReactDragEvent<HTMLDivElement>) {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    // Preventing the default is what makes the drop legal in the browser.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = canEdit ? "copy" : "none";
+  }
+
+  function onDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
+  }
+
+  function onDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
+    if (!canEdit) {
+      toast.info("This account can download and read files, not upload them.");
+      return;
+    }
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length > 0) uploads.enqueue(files);
+  }
+
   // A viewer may browse and copy, never type: the controller would refuse the
   // save anyway, and an editor that cannot save is a trap.
   const editableFile = open ? open.editable && canEdit : false;
@@ -500,6 +831,30 @@ export function InstanceFiles({
   const folderCount = entries.filter((entry) => entry.type === "dir").length;
   const fileCount = entries.length - folderCount;
 
+  // Which readings a file offers. Markdown renders, config files colour; a
+  // plain text file has only its source.
+  const markdown = open ? isMarkdownPath(open.path) : false;
+  const language = open ? syntaxLanguage(open.path) : null;
+  const viewOptions: Array<{ value: FileView; label: string; title: string }> = markdown
+    ? [
+        { value: "source", label: "Source", title: "Show the Markdown source" },
+        { value: "preview", label: "Preview", title: "Render the Markdown" },
+      ]
+    : language
+      ? [
+          { value: "source", label: "Source", title: "Edit the text" },
+          {
+            value: "highlight",
+            label: "Coloured",
+            title: `Read ${language.toUpperCase()} with syntax colouring`,
+          },
+        ]
+      : [];
+  const showsRendered = view === "preview" && markdown;
+  const showsHighlight = view === "highlight" && language !== null;
+  const externalLinks = markdown && EXTERNAL_LINK_RE.test(draft);
+  const searchActive = searching || searchResult !== null || searchError !== null;
+
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -507,6 +862,31 @@ export function InstanceFiles({
         <div className="flex flex-wrap items-center gap-1.5">
           {canEdit ? (
             <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={pickFiles}
+                disabled={uploads.busy}
+                title={`Upload files into ${cwd} (${UPLOAD_LIMITS_LABEL})`}
+              >
+                {uploads.busy ? (
+                  <Loader2 aria-hidden className="animate-spin" />
+                ) : (
+                  <Upload aria-hidden />
+                )}
+                Upload
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => {
+                  const files = Array.from(event.target.files ?? []);
+                  event.target.value = "";
+                  if (files.length > 0) uploads.enqueue(files);
+                }}
+              />
               <Button
                 size="sm"
                 variant="outline"
@@ -536,6 +916,20 @@ export function InstanceFiles({
             </>
           ) : null}
           <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void downloadFolder()}
+            disabled={downloading !== null}
+            title={`Download ${cwd} as a .zip archive (built on the controller)`}
+          >
+            {downloading === "folder" ? (
+              <Loader2 aria-hidden className="animate-spin" />
+            ) : (
+              <FolderDown aria-hidden />
+            )}
+            Download .zip
+          </Button>
+          <Button
             size="icon-sm"
             variant="ghost"
             onClick={listing.reload}
@@ -547,17 +941,131 @@ export function InstanceFiles({
         </div>
       </div>
 
-      <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)]">
+      <form
+        className="flex flex-wrap items-center gap-1.5"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void runSearch();
+        }}
+      >
+        <div className="relative min-w-0 flex-1 sm:max-w-sm">
+          <Search
+            aria-hidden
+            className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground"
+          />
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={`Search in ${cwd}`}
+            aria-label={`Search the text of ${cwd}`}
+            className="pl-8 font-mono text-xs"
+            spellCheck={false}
+          />
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant={regexMode ? "default" : "outline"}
+          aria-pressed={regexMode}
+          title="Treat the search as a regular expression instead of plain text"
+          onClick={() => setRegexMode((value) => !value)}
+        >
+          <Regex aria-hidden />
+          Regex
+        </Button>
+        <Button type="submit" size="sm" variant="outline" disabled={searching || !query.trim()}>
+          {searching ? <Loader2 aria-hidden className="animate-spin" /> : <ScanSearch aria-hidden />}
+          Search
+        </Button>
+        {query || searchActive ? (
+          <Button type="button" size="sm" variant="ghost" onClick={clearSearch}>
+            <X aria-hidden />
+            Clear
+          </Button>
+        ) : null}
+        <span className="hidden text-[11px] text-muted-foreground sm:inline">
+          Literal by default · 200 hits, 50 000 files max
+        </span>
+      </form>
+
+      {uploads.items.length > 0 ? (
+        <FileUploadsList
+          items={uploads.items}
+          onOverwrite={uploads.overwrite}
+          onSkip={uploads.skip}
+          onRetry={uploads.retry}
+          onDismiss={uploads.dismiss}
+          onClear={uploads.clearDone}
+        />
+      ) : null}
+
+      {uploads.notice ? (
+        <p className="text-xs text-muted-foreground" role="status">
+          {uploads.notice}
+        </p>
+      ) : null}
+
+      {downloadError ? <ErrorAlert error={downloadError} /> : null}
+
+      <div
+        className="relative"
+        onDragEnter={onDragEnter}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        {dropping ? (
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-md border-2 border-dashed border-ring bg-background/90 p-6 text-center">
+            <div className="space-y-1">
+              <Upload aria-hidden className="mx-auto size-5 text-muted-foreground" />
+              <p className="text-sm font-medium">
+                Drop to upload into <span className="font-mono">{cwd}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {UPLOAD_LIMITS_LABEL} · executables are refused
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)]">
         <div className="flex max-h-[70vh] flex-col overflow-hidden rounded-md border">
           <div className="flex items-center justify-between gap-2 border-b bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
-            <span>
-              {folderCount} {folderCount === 1 ? "folder" : "folders"} · {fileCount}{" "}
-              {fileCount === 1 ? "file" : "files"}
-            </span>
+            {searchActive ? (
+              <span className="flex min-w-0 items-center gap-1.5">
+                {searching ? <Loader2 aria-hidden className="size-3 shrink-0 animate-spin" /> : null}
+                <span className="truncate">
+                  {searchResult
+                    ? `${searchResult.results.length} ${searchResult.results.length === 1 ? "hit" : "hits"} · ${searchResult.scanned} scanned`
+                    : searching
+                      ? "Searching…"
+                      : "Search failed"}
+                </span>
+                {searchResult?.truncated ? (
+                  <Badge variant="outline" className="px-1 py-0 text-[10px] font-normal">
+                    truncated
+                  </Badge>
+                ) : null}
+              </span>
+            ) : (
+              <span>
+                {folderCount} {folderCount === 1 ? "folder" : "folders"} · {fileCount}{" "}
+                {fileCount === 1 ? "file" : "files"}
+              </span>
+            )}
             {listing.refreshing ? <Loader2 aria-hidden className="size-3 animate-spin" /> : null}
           </div>
 
-          {listing.loading && !listing.data ? (
+          {searchActive ? (
+            <SearchHits
+              cwd={cwd}
+              query={query}
+              result={searchResult}
+              error={searchError}
+              searching={searching}
+              onOpen={openHit}
+            />
+          ) : listing.loading && !listing.data ? (
             <div className="space-y-2 p-3">
               <Skeleton className="h-8 w-full" />
               <Skeleton className="h-8 w-full" />
@@ -585,14 +1093,17 @@ export function InstanceFiles({
               {entries.map((entry) => {
                 const selected = selectedPath === entry.path;
                 return (
-                  <li key={entry.path}>
+                  <li
+                    key={entry.path}
+                    className={cn(
+                      "flex items-stretch hover:bg-muted/60",
+                      selected && "bg-muted",
+                    )}
+                  >
                     <button
                       type="button"
                       aria-current={selected ? "true" : undefined}
-                      className={cn(
-                        "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:-outline-offset-2",
-                        selected && "bg-muted",
-                      )}
+                      className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:-outline-offset-2"
                       onClick={() => openEntry(entry)}
                     >
                       {entry.type === "dir" ? (
@@ -617,6 +1128,21 @@ export function InstanceFiles({
                         </span>
                       ) : null}
                     </button>
+                    {entry.type === "file" ? (
+                      <button
+                        type="button"
+                        className="shrink-0 px-2 text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:-outline-offset-2"
+                        aria-label={`Download ${entry.name}`}
+                        title="Download file"
+                        onClick={() => void downloadFile(entry.path)}
+                      >
+                        {downloading === entry.path ? (
+                          <Loader2 aria-hidden className="size-3.5 animate-spin" />
+                        ) : (
+                          <Download aria-hidden className="size-3.5" />
+                        )}
+                      </button>
+                    ) : null}
                   </li>
                 );
               })}
@@ -683,6 +1209,22 @@ export function InstanceFiles({
                   {open.isNew ? "not saved yet" : `${formatBytes(open.size)} · ${formatRelative(open.mtime)}`}
                 </span>
                 <div className="flex shrink-0 items-center gap-0.5">
+                  {!open.isNew ? (
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Download ${open.name}`}
+                      title="Download file"
+                      onClick={() => void downloadFile(open.path)}
+                      disabled={downloading !== null}
+                    >
+                      {downloading === open.path ? (
+                        <Loader2 aria-hidden className="animate-spin" />
+                      ) : (
+                        <Download aria-hidden />
+                      )}
+                    </Button>
+                  ) : null}
                   {canEdit && !open.rendered && !open.isNew ? (
                     <Button
                       variant="ghost"
@@ -802,7 +1344,37 @@ export function InstanceFiles({
                 </div>
               ) : null}
 
-              {editableFile ? (
+              {viewOptions.length > 1 ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/20 px-3 py-1.5">
+                  <span className="text-[11px] text-muted-foreground">
+                    {showsRendered
+                      ? "Rendered Markdown · images, tables and raw HTML stay text."
+                      : showsHighlight && language
+                        ? `Coloured ${language.toUpperCase()} · reading view, edit in Source`
+                        : "Plain source view"}
+                  </span>
+                  <Segmented
+                    value={view}
+                    options={viewOptions}
+                    onChange={setView}
+                    label={`${open.name} view`}
+                  />
+                </div>
+              ) : null}
+
+              {showsRendered ? (
+                <>
+                  <MarkdownView value={draft} maxHeight={`${editorHeight}px`} />
+                  <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+                    {externalLinks
+                      ? "Links to web addresses open in a new tab."
+                      : "Plain preview: images, tables and raw HTML are not rendered."}
+                    {dirty ? " Showing your unsaved text." : null}
+                  </p>
+                </>
+              ) : showsHighlight && language ? (
+                <SyntaxBlock value={draft} language={language} maxHeight={editorHeight} />
+              ) : editableFile ? (
                 preview && diff ? (
                   <div>
                     <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5 text-xs text-muted-foreground">
@@ -856,6 +1428,7 @@ export function InstanceFiles({
                 )
               ) : (
                 <div
+                  ref={readOnlyRef}
                   tabIndex={0}
                   role="region"
                   aria-label={`${open.name} content`}
@@ -878,13 +1451,15 @@ export function InstanceFiles({
                 <span className="text-[11px] text-muted-foreground">
                   {lineCount} {lineCount === 1 ? "line" : "lines"} · {formatBytes(draftBytes)}
                 </span>
-                {editableFile && !preview ? (
+                {editableFile && !preview && view === "source" ? (
                   <span id="editor-hint" className="hidden text-[11px] text-muted-foreground sm:inline">
                     Tab inserts two spaces · Esc leaves the editor
                   </span>
                 ) : null}
                 <div className="ml-auto flex flex-wrap items-center gap-2">
-                  {editableFile ? (
+                  {view !== "source" ? (
+                    <CopyButton value={draft} label="Copy file" showLabel size="sm" variant="outline" />
+                  ) : editableFile ? (
                     <Button
                       variant="ghost"
                       size="sm"
@@ -948,6 +1523,7 @@ export function InstanceFiles({
               />
             </div>
           )}
+        </div>
         </div>
       </div>
 

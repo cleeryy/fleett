@@ -33,6 +33,8 @@ import type {
   ExecResult,
   FileContent,
   FileEntry,
+  FileSearchParams,
+  FileSearchResult,
   FleetApi,
   GitDiff,
   GitDiffOptions,
@@ -112,6 +114,7 @@ import type {
   Template,
   TokenInfo,
   UpdateMemoryInput,
+  UploadResult,
   WriteFileInput,
   WriteFileResult,
   WriteMemoryResult,
@@ -441,6 +444,40 @@ export const httpApi: FleetApi = {
       method: "POST",
       body: JSON.stringify({ path }),
     }),
+
+  uploadFile: (id, directory, file, options) => {
+    const body = new FormData();
+    // The controller reads a `path` field (the target folder) and `file` parts;
+    // this console sends one file per request so a refusal names one file.
+    body.append("path", directory);
+    body.append("file", file, file.name);
+    const query = options?.overwrite ? "?overwrite=true" : "";
+    return request<UploadResult>(
+      `/api/instances/${encodeURIComponent(id)}/files/upload${query}`,
+      { method: "POST", body },
+    );
+  },
+
+  downloadFile: (id, path) =>
+    download(
+      `/api/instances/${encodeURIComponent(id)}/files/download?path=${encodeURIComponent(path)}`,
+    ),
+
+  downloadArchive: (id, path) =>
+    download(
+      `/api/instances/${encodeURIComponent(id)}/files/archive?path=${encodeURIComponent(path)}`,
+    ),
+
+  searchFiles: (id, params: FileSearchParams) => {
+    const query = new URLSearchParams();
+    query.set("q", params.q);
+    query.set("path", params.path ?? "/");
+    if (params.regex) query.set("regex", "true");
+    if (params.limit) query.set("limit", String(params.limit));
+    return request<FileSearchResult>(
+      `/api/instances/${encodeURIComponent(id)}/files/search?${query.toString()}`,
+    );
+  },
 
   gitLog: (id, options: GitLogOptions = {}) => {
     const query = new URLSearchParams();
