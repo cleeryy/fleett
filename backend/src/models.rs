@@ -577,9 +577,79 @@ pub struct TemplateInfo {
     pub description: String,
     pub default_model: String,
     pub channel: String,
-    /// Environment variables the template expects, so the console can propose
-    /// them instead of making the operator guess (allowlists, mostly).
+    /// Environment variables the template expects, resolved through the
+    /// inheritance chain, so the console can propose them instead of making
+    /// the operator guess.
     pub env: Vec<EnvSuggestion>,
+    /// Declared parent template (`null` for a root or a built-in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Built-in templates are immutable.
+    pub read_only: bool,
+    /// Instance-creation defaults from `defaults.yaml` (merged with the
+    /// parent chain).
+    pub defaults: TemplateDefaults,
+    /// Instance a custom template was saved from, when it was created with
+    /// `POST /api/templates/from-instance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_instance: Option<String>,
+    /// Number of instances whose `template` field is this id.
+    pub instances_count: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One template, with its files (custom templates only).
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateDetail {
+    #[serde(flatten)]
+    pub info: TemplateInfo,
+    pub config_yaml: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soul_md: Option<String>,
+    pub versions_count: usize,
+}
+
+/// Defaults applied by `POST /api/instances` when the request leaves a field
+/// out. A custom template declares them in `defaults.yaml`; the parent chain is
+/// merged field by field (the child wins).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TemplateDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_limit_mb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_lan: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl TemplateDefaults {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.base_url.is_none()
+            && self.mem_limit_mb.is_none()
+            && self.cpu_limit.is_none()
+            && self.allow_lan.is_none()
+            && self.notes.is_none()
+    }
+
+    /// Child values first, parent values for the fields the child leaves out.
+    pub fn over(&self, parent: &TemplateDefaults) -> TemplateDefaults {
+        TemplateDefaults {
+            model: self.model.clone().or_else(|| parent.model.clone()),
+            base_url: self.base_url.clone().or_else(|| parent.base_url.clone()),
+            mem_limit_mb: self.mem_limit_mb.or(parent.mem_limit_mb),
+            cpu_limit: self.cpu_limit.or(parent.cpu_limit),
+            allow_lan: self.allow_lan.or(parent.allow_lan),
+            notes: self.notes.clone().or_else(|| parent.notes.clone()),
+        }
+    }
 }
 
 /// One environment variable a template suggests.
@@ -588,9 +658,32 @@ pub struct EnvSuggestion {
     pub key: String,
     #[serde(default)]
     pub description: String,
+    /// Example value, shown as a placeholder by the console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example: Option<String>,
+    /// A `POST /api/instances` request must supply this key.
+    #[serde(default)]
+    pub required: bool,
+    /// Free-form hint (`comma-separated`, `user-id`, `boolean`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
     /// `true` when the value must be stored encrypted (default `false`).
     #[serde(default)]
     pub secret: bool,
+}
+
+impl EnvSuggestion {
+    /// A non-secret suggestion with no example and no format.
+    pub fn new(key: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            description: description.into(),
+            example: None,
+            required: false,
+            format: None,
+            secret: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -607,15 +700,26 @@ pub struct ShareInfo {
 }
 
 /// Optional `template.yaml` next to a custom `config.yaml`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TemplateMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Parent template this one extends (`null` for a root template).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
-    /// Environment variables the template suggests.
-    #[serde(default)]
+    /// Environment variables the template declares (own entries only; the
+    /// parent list is merged at resolution time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<Vec<EnvSuggestion>>,
+    /// Instance the template was saved from (`POST .../from-instance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instance: Option<String>,
 }
 
 /// One environment variable of an instance, as returned by the API.
@@ -798,6 +902,12 @@ pub fn now_iso() -> String {
 
 pub fn validate_instance_id(id: &str) -> Result<(), String> {
     validate_slug(id, "instance id", INSTANCE_ID_MIN, INSTANCE_ID_MAX)
+}
+
+/// Template ids follow the same grammar as instance ids: they name a
+/// directory under `$FLEETT_ROOT/templates`.
+pub fn validate_template_id(id: &str) -> Result<(), String> {
+    validate_slug(id, "template id", INSTANCE_ID_MIN, INSTANCE_ID_MAX)
 }
 
 pub fn validate_share_name(name: &str) -> Result<(), String> {

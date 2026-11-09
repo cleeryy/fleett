@@ -221,16 +221,23 @@ console can propose them:
 }
 ```
 
-A custom template can declare its own list in `templates/<id>/template.yaml`:
+A custom template declares its own list in `templates/<id>/template.yaml`:
 
 ```yaml
 env:
   - key: DISCORD_ALLOWED_USERS
     description: Comma-separated Discord user ids allowed to talk to the agent.
+    example: "123456789,987654321"
+    required: true
+    format: comma-separated
     secret: false
 ```
 
-All suggestions are non-secret: they are allowlists, not credentials.
+`required: true` makes `POST /api/instances` fail with
+`400 missing_required_env` (`details: [{"key":"…","field":"env"}]`) until the
+variable is supplied; `secret` defaults to `false` and a request that omits the
+flag follows the schema. The parent template's entries are merged by key. See
+[TEMPLATES.md](TEMPLATES.md) for the full schema and inheritance rules.
 
 ## Clone and export
 

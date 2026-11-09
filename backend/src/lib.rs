@@ -22,6 +22,7 @@ pub mod providers;
 pub mod render;
 pub mod secrets;
 pub mod store;
+pub mod templates;
 pub mod templates_builtin;
 
 pub use api::{router, AppState};

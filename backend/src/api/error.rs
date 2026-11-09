@@ -118,6 +118,7 @@ impl From<RenderError> for ApiError {
                 "invalid_template",
                 format!("the template does not render to valid Hermes YAML: {detail}"),
             ),
+            RenderError::Template(detail) => ApiError::bad_request("invalid_template", detail),
             other => ApiError::internal(other.to_string()),
         }
     }

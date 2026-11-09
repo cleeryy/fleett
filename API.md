@@ -43,12 +43,51 @@ SHA-256 digest only.
 
 ## Templates
 
-`GET /api/templates`
+Built-in templates (`guest`, `guest-discord`, `solo`) are compiled constants and
+read-only. Custom templates live under `$FLEETT_ROOT/templates/<id>/` and keep a
+versioned history; see `docs/TEMPLATES.md`.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/templates` | — | `TemplateInfo[]` (built-ins + custom, env schema and defaults resolved through the parent chain) |
+| POST | `/api/templates` | `{"id","name","description"?,"parent"?,"default_model"?,"channel"?,"env":[…],"config_yaml"?,"soul_md"?,"defaults"?}` | `201 TemplateDetail`, admin only |
+| GET | `/api/templates/{id}` | — | `TemplateDetail` (`config_yaml`, `soul_md`, `versions_count`) |
+| PUT | `/api/templates/{id}` | same fields, all optional; `null` clears | `200 TemplateDetail`, admin only |
+| DELETE | `/api/templates/{id}` | — | `204`; `409 read_only` for a built-in; `409 template_in_use` with `details.instances` / `details.templates` (child templates), admin only |
+| POST | `/api/templates/from-instance` | `{"instance_id","id","name"?}` | `201 TemplateDetail`, admin only |
+| GET | `/api/templates/{id}/versions` | — | `[{"version":1,"action":"create\|update\|delete","actor":"…","at":"…","sha256":{"config.yaml":"…","soul.md":"…"}}]` |
+| POST | `/api/templates/{id}/restore` | `{"version":1}` | `200 TemplateDetail`; the restored files are written and a new version is appended, admin only |
+
+`TemplateInfo`:
 ```json
-[{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
-  "default_model":"deepseek-v4.1-flash","channel":"telegram",
-  "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids"}]}]
+{"id":"house","name":"House","description":"…","default_model":"deepseek-v4.1-flash",
+ "channel":"telegram","parent":"guest","read_only":false,
+ "env":[{"key":"HOUSE_FLAG","description":"…","example":"1","required":true,
+         "format":"boolean","secret":false}],
+ "defaults":{"mem_limit_mb":2048,"cpu_limit":2.0,"allow_lan":false},
+ "source_instance":null,"instances_count":2,
+ "created_at":"2026-11-09T01:00:00Z","updated_at":"2026-11-09T02:00:00Z"}
 ```
+
+`env` entries extend the pre-0.6 shape: `example`, `required` and `format` are
+optional (`required` defaults to `false`). Inherited entries are merged by key,
+the child winning the description/flags. `defaults` drive
+`POST /api/instances` when the request leaves `model`, `base_url`,
+`mem_limit_mb`, `cpu_limit`, `allow_lan` or `notes` out.
+
+A custom template may set `parent`; resolution merges the parent then the child
+per field. A cycle is `400 template_cycle`. Built-ins can be parents but never
+modified (`409 read_only` on PUT/DELETE/restore).
+
+`POST /api/instances` refuses an unknown template (`400 unknown_template`), and
+a template with a `required` env entry the request does not supply returns
+`400 missing_required_env`:
+```json
+{"error":{"code":"missing_required_env","message":"template \"house\" requires environment variable(s): HOUSE_FLAG",
+ "details":[{"key":"HOUSE_FLAG","field":"env"}]}}
+```
+When an env entry omits `secret`, the template schema decides; an explicit
+`secret` in the request wins.
 
 ## Providers
 

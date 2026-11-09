@@ -77,6 +77,11 @@ impl AppState {
         auth: AuthService,
     ) -> anyhow::Result<Self> {
         store::ensure_layout(&cfg)?;
+        // Rebuild the template index from `templates/<id>/`: the files are the
+        // source of truth, the database only lists and versions them.
+        if let Err(err) = crate::templates::reindex(&cfg, &db) {
+            tracing::warn!(%err, "could not index the custom templates");
+        }
         db::reconcile(&cfg, &db)?;
         // Import the pre-0.5 encrypted secret maps into `instance_env` (idempotent;
         // a missing key only logs a warning and leaves them readable in place).
@@ -145,7 +150,16 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/messages/expired", delete(bus::purge))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
-        .route("/templates", get(templates::list))
+        .route("/templates", get(templates::list).post(templates::create))
+        .route("/templates/from-instance", post(templates::from_instance))
+        .route(
+            "/templates/{id}",
+            get(templates::get)
+                .put(templates::update)
+                .delete(templates::delete),
+        )
+        .route("/templates/{id}/versions", get(templates::versions))
+        .route("/templates/{id}/restore", post(templates::restore))
         .route("/usage", get(usage::usage))
         .route("/images", get(upgrade::images))
         .route("/upgrade", get(upgrade::status).post(upgrade::start))

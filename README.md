@@ -151,7 +151,7 @@ Every command accepts `--json`; the server URL and token come from
 |---|---|
 | [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | how to run it, as a binary, a `.deb` or a container |
 | [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
-| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) | the per-agent surface |
+| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [templates](docs/TEMPLATES.md) · [providers](docs/PROVIDERS.md) | the per-agent surface |
 | [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
 
 ## Development

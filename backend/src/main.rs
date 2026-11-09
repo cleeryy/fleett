@@ -229,6 +229,86 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// List the instance templates (client mode).
+    Templates,
+    /// Manage one custom template (client mode). See docs/TEMPLATES.md.
+    Template {
+        #[command(subcommand)]
+        action: TemplateCommands,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum TemplateCommands {
+    /// List templates (same as `fleett templates`).
+    List,
+    /// Show one template, its env schema and its defaults.
+    Get {
+        /// Template id.
+        id: String,
+    },
+    /// Create a custom template.
+    Create {
+        /// Complete YAML definition (the `POST /api/templates` body).
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+        /// Template id (`[a-z0-9-]{2,32}`).
+        #[arg(long)]
+        id: Option<String>,
+        /// Display name (defaults to the id).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// Parent template to inherit from.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        default_model: Option<String>,
+        /// `telegram`, `discord` or `none`.
+        #[arg(long)]
+        channel: Option<String>,
+        /// File copied to `config.yaml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// File copied to `soul.md`.
+        #[arg(long)]
+        soul: Option<PathBuf>,
+        /// YAML defaults copied to `defaults.yaml`.
+        #[arg(long)]
+        defaults: Option<PathBuf>,
+        /// Environment key of the schema (repeatable).
+        #[arg(long = "env")]
+        env: Vec<String>,
+    },
+    /// Save an existing instance as a template.
+    FromInstance {
+        /// Source instance id.
+        instance: String,
+        /// Id of the new template.
+        #[arg(long)]
+        id: String,
+        /// Display name (defaults to "<instance name> template").
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a custom template (409 when an instance still uses it).
+    Rm {
+        /// Template id.
+        id: String,
+    },
+    /// List the recorded versions of a custom template.
+    Versions {
+        /// Template id.
+        id: String,
+    },
+    /// Rewrite a custom template from one of its versions.
+    Restore {
+        /// Template id.
+        id: String,
+        /// Version number.
+        version: i64,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +546,47 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Templates => cli::run(cli::Command::Templates, json).await,
+        Commands::Template { action } => {
+            let command = match action {
+                TemplateCommands::List => cli::TemplateCommand::List,
+                TemplateCommands::Get { id } => cli::TemplateCommand::Get(id),
+                TemplateCommands::Create {
+                    file,
+                    id,
+                    name,
+                    description,
+                    parent,
+                    default_model,
+                    channel,
+                    config,
+                    soul,
+                    defaults,
+                    env,
+                } => cli::TemplateCommand::Create(cli::TemplateCreateArgs {
+                    file,
+                    id,
+                    name,
+                    description,
+                    parent,
+                    default_model,
+                    channel,
+                    config,
+                    soul,
+                    defaults,
+                    env,
+                }),
+                TemplateCommands::FromInstance { instance, id, name } => {
+                    cli::TemplateCommand::FromInstance { instance, id, name }
+                }
+                TemplateCommands::Rm { id } => cli::TemplateCommand::Remove(id),
+                TemplateCommands::Versions { id } => cli::TemplateCommand::Versions(id),
+                TemplateCommands::Restore { id, version } => {
+                    cli::TemplateCommand::Restore { id, version }
+                }
+            };
+            cli::run(cli::Command::Template(command), json).await
         }
     };
 
