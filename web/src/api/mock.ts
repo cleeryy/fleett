@@ -212,7 +212,16 @@ export const mockConfig = {
    * most often.
    */
   doctor: readMockDoctor(import.meta.env.VITE_MOCK_DOCTOR as string | undefined),
+  /**
+   * Live log transport, from `?mock_logs=live|poll|down` or
+   * `VITE_MOCK_LOG_TRANSPORT`. `poll` fails the SSE stream so the one-second
+   * polling fallback runs; `down` fails both so the error state is visible.
+   */
+  logTransport: readMockLogTransport(import.meta.env.VITE_MOCK_LOG_TRANSPORT as string | undefined),
 };
+
+/** SSE stream, polling fallback, or both endpoints down. */
+export type MockLogTransport = "live" | "poll" | "down";
 
 export type MockAssistantMode = "live" | "off" | "unconfigured" | "exhausted";
 
@@ -241,6 +250,17 @@ function readMockDoctor(raw: string | undefined): MockDoctorMode {
   if (value === "ok" || value === "pass") return "ok";
   if (value === "error" || value === "errors") return "error";
   return "mixed";
+}
+
+function readMockLogTransport(raw: string | undefined): MockLogTransport {
+  const query =
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("mock_logs");
+  const value = (query ?? raw)?.trim().toLowerCase();
+  if (value === "poll" || value === "polling") return "poll";
+  if (value === "down" || value === "error") return "down";
+  return "live";
 }
 
 function readAssistantMode(raw: string | undefined): MockAssistantMode {
@@ -432,6 +452,8 @@ let usageEvents: {
 }[] = [];
 let logEntries: LogEntry[] = [];
 let logSequence = 5000;
+/** Open mock SSE clients, per instance, so a burst reaches every panel. */
+const logStreamListeners = new Map<string, Set<(entry: LogEntry) => void>>();
 let deploymentStore: Deployment[] = [];
 let maintenanceStore: MaintenanceWindow[] = [];
 let snapshotStore: Snapshot[] = [];
@@ -3257,6 +3279,7 @@ function seedOperations(): void {
         updated_at: iso(SEEDED_AT - 3 * DAY),
         proxy: "http://fleett-egress-proxy:3128",
         proxy_acl: "acl alice_dst dstdomain .api.telegram.org .opencode.ai\nhttp_access allow alice alice_dst",
+        legacy_equivalent: false,
         warnings: [],
       };
     } else if (row.allow_lan) {
@@ -3267,6 +3290,7 @@ function seedOperations(): void {
         fqdns: [],
         cidrs: [],
         ports: [],
+        legacy_equivalent: false,
         warnings: ["LAN access is enabled: the host egress firewall does not filter this instance."],
       };
     } else {
@@ -3277,10 +3301,31 @@ function seedOperations(): void {
         fqdns: [],
         cidrs: [],
         ports: [],
+        legacy_equivalent: false,
         warnings: [],
       };
     }
   }
+  // One explicit policy points at a proxy that does not answer, so the
+  // console's destructive "proxy unreachable" alert and the removal path can
+  // be exercised without a backend (issue #58).
+  egressStore.workshop = {
+    instance: "workshop",
+    source: "explicit",
+    mode: "deny",
+    fqdns: ["api.anthropic.com"],
+    cidrs: [],
+    ports: [443],
+    updated_at: iso(SEEDED_AT - 26 * HOUR),
+    proxy: "http://fleett-egress-proxy:3128",
+    proxy_acl: "acl workshop_dst dstdomain .api.anthropic.com\nhttp_access allow workshop workshop_dst",
+    legacy_equivalent: false,
+    warnings: [
+      "proxy http://fleett-egress-proxy:3128 is unreachable: Connection refused (os error 111): " +
+        "the instance points at a proxy that does not answer, so every outbound connection fails; " +
+        "start the proxy or remove the policy with DELETE /api/instances/workshop/egress",
+    ],
+  };
 }
 
 export function resetMock(): void {
@@ -4520,6 +4565,99 @@ function searchLogEntries(params: LogQueryParams = {}): LogEntry[] {
     })
     .sort((left, right) => Date.parse(right.at) - Date.parse(left.at) || right.id - left.id)
     .slice(0, limit);
+}
+
+/** Plausible agent lines for the mock stream; the level drives the row colour. */
+const MOCK_STREAM_LINES: Record<LogLevel, string[]> = {
+  info: [
+    "session ses_{hex} turn started",
+    "tool web.search ok {ms}ms",
+    "message delivered to {channel}",
+    "memory.write ns=ops key=standup",
+    "gateway heartbeat ok",
+    "schedule tick: no due job",
+    "provider response in {ms}ms",
+    "file.read /opt/data/SOUL.md 214 B",
+  ],
+  warn: [
+    "upstream 429, retry 1/3 in 2s",
+    "slow tool call {ms}ms: web.fetch",
+    "memory near budget: 82% used",
+    "gateway socket closed, reconnecting",
+  ],
+  error: [
+    "upstream 502 bad gateway while calling the model",
+    "tool exec refused: command not in allowlist",
+    "delivery failed: telegram 400 bad request",
+  ],
+};
+
+function mockStreamMessage(level: LogLevel): string {
+  const pool = MOCK_STREAM_LINES[level];
+  const template = pool[Math.floor(Math.random() * pool.length)] ?? "activity";
+  return template
+    .replace("{hex}", logSequence.toString(16).padStart(4, "0"))
+    .replace("{ms}", String(120 + Math.floor(Math.random() * 4_800)))
+    .replace("{channel}", Math.random() > 0.5 ? "telegram:81459823" : "discord:310472918374");
+}
+
+function nextMockLogEntry(instance: string, at = Date.now()): LogEntry {
+  logSequence += 1;
+  const roll = Math.random();
+  const level: LogLevel = roll > 0.96 ? "error" : roll > 0.82 ? "warn" : "info";
+  return {
+    id: logSequence,
+    instance,
+    at: new Date(at).toISOString(),
+    level,
+    message: mockStreamMessage(level),
+  };
+}
+
+/** Append to the store and fan out to the mock SSE clients of that instance. */
+function publishMockLog(entry: LogEntry): void {
+  logEntries.push(entry);
+  if (logEntries.length > 20_000) logEntries = logEntries.slice(-20_000);
+  for (const listener of logStreamListeners.get(entry.instance) ?? []) listener(entry);
+}
+
+/**
+ * Queue `count` lines now, with one millisecond between them so ordering is
+ * stable. Exposed for the mock-only controls in the log panel: 5 000 lines is
+ * the burst the 2 000-line buffer and `content-visibility` need to survive.
+ */
+export function burstMockLogs(instance: string, count = 5_000): void {
+  const now = Date.now();
+  for (let index = 0; index < count; index += 1) {
+    // Spread the burst over the recent past: the newest line is *now*, so the
+    // live timer keeps appending after it instead of behind future timestamps.
+    publishMockLog(nextMockLogEntry(instance, now - (count - 1 - index)));
+  }
+}
+
+/** True when `entry` is a CIDR wholly inside one of the RFC 1918 ranges. */
+function cidrIsPrivate(entry: string): boolean {
+  const [base, bitsRaw] = entry.split("/");
+  if (!base || bitsRaw === undefined) return false;
+  const bits = Number(bitsRaw);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const parts = base.split(".").map(Number);
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return false;
+  }
+  const value = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+  return [
+    [0x0a00_0000, 8],
+    [0xac10_0000, 12],
+    [0xc0a8_0000, 16],
+  ].some(([network, prefix]) => {
+    if (bits < prefix) return false;
+    const mask = prefix === 0 ? 0 : (0xffff_ffff << (32 - prefix)) >>> 0;
+    return (value & mask) === (network & mask);
+  });
 }
 
 function egressMatches(policy: { fqdns: string[]; cidrs: string[]; ports: number[] }, host: string, port: number): boolean {
@@ -6071,6 +6209,72 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     const row = findRow(id);
     const count = Number.isFinite(tail) && tail > 0 ? Math.min(tail, 5000) : 200;
     return row.logs.slice(-count).join("\n");
+  },
+
+  async instanceLogs(id, params = {}) {
+    requireAuth();
+    findRow(id);
+    if (mockConfig.logTransport === "down") {
+      await delay(60);
+      fail(503, "log_center_unavailable", "the mock log center is down");
+    }
+    await delay(120);
+    const entries = searchLogEntries({ ...params, instances: [id] });
+    return { entries, count: entries.length, limit: params.limit ?? 100 };
+  },
+
+  async streamLogs(id, handlers, signal) {
+    requireAuth();
+    findRow(id);
+    if (mockConfig.logTransport === "down" || mockConfig.logTransport === "poll") {
+      await delay(80);
+      fail(
+        503,
+        "log_stream_unavailable",
+        "the mock stream is off; the console falls back to polling",
+      );
+    }
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    await delay(180);
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+    handlers.onOpen?.();
+    handlers.onActivity?.();
+    return new Promise<void>((resolve) => {
+      let timer: number | null = null;
+      const listener = (entry: LogEntry) => handlers.onEntry(entry);
+      const listeners = logStreamListeners.get(id) ?? new Set<(entry: LogEntry) => void>();
+      logStreamListeners.set(id, listeners);
+      listeners.add(listener);
+
+      const cleanup = () => {
+        if (timer !== null) window.clearTimeout(timer);
+        timer = null;
+        signal.removeEventListener("abort", cleanup);
+        listeners.delete(listener);
+        if (listeners.size === 0) logStreamListeners.delete(id);
+        resolve();
+      };
+
+      const schedule = () => {
+        timer = window.setTimeout(
+          () => {
+            if (signal.aborted) return;
+            publishMockLog(nextMockLogEntry(id));
+            handlers.onActivity?.();
+            schedule();
+          },
+          700 + Math.random() * 1_900,
+        );
+      };
+
+      signal.addEventListener("abort", cleanup, { once: true });
+      if (signal.aborted) {
+        cleanup();
+        return;
+      }
+      schedule();
+    });
   },
 
   async listFiles(id: string, path: string): Promise<FileEntry[]> {
@@ -7738,6 +7942,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       fqdns: [],
       cidrs: [],
       ports: [],
+      legacy_equivalent: false,
       warnings: [],
     };
   },
@@ -7745,7 +7950,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
   async putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView> {
     requireWrite();
     await delay(300);
-    const row = findRow(id);
+    findRow(id);
     if (input.mode !== "deny" && input.mode !== "allow") {
       fail(400, "invalid_egress_policy", "mode must be deny or allow");
     }
@@ -7755,6 +7960,11 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     if (ports.length !== input.ports.length) {
       fail(400, "invalid_egress_policy", "ports must be integers between 1 and 65535");
     }
+    const legacyEquivalent =
+      input.mode === "allow" &&
+      fqdns.length === 0 &&
+      ports.length === 0 &&
+      cidrs.every(cidrIsPrivate);
     const policy: EgressPolicyView = {
       instance: id,
       source: "explicit",
@@ -7763,13 +7973,47 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       cidrs,
       ports,
       updated_at: nowIso(),
-      proxy: "http://fleett-egress-proxy:3128",
-      proxy_acl: `${row.id}: ${input.mode} ${fqdns.join(" ") || "(no domain)"}`,
+      ...(legacyEquivalent ? {} : { proxy: "http://fleett-egress-proxy:3128" }),
+      proxy_acl: `${id}: ${input.mode} ${fqdns.join(" ") || "(no domain)"}`,
+      legacy_equivalent: legacyEquivalent,
       warnings: [],
     };
     egressStore[id] = policy;
     recordAudit(requireAuth(), "egress.policy.update", id, { ...input });
     return { ...policy, fqdns: [...fqdns], cidrs: [...cidrs], ports: [...ports], warnings: [] };
+  },
+
+  async deleteEgress(id: string): Promise<EgressPolicyView> {
+    requireWrite();
+    await delay(320);
+    const row = findRow(id);
+    const existing = egressStore[id];
+    if (!existing || existing.source !== "explicit") {
+      fail(404, "not_found", `instance "${id}" has no explicit egress policy`);
+    }
+    delete egressStore[id];
+    recordAudit(requireAuth(), "egress.policy.delete", id, null);
+    return row.allow_lan
+      ? {
+          instance: id,
+          source: "allow_lan",
+          mode: "allow",
+          fqdns: [],
+          cidrs: [],
+          ports: [],
+          legacy_equivalent: false,
+          warnings: ["LAN access is enabled: the host egress firewall does not filter this instance."],
+        }
+      : {
+          instance: id,
+          source: "legacy",
+          mode: "deny",
+          fqdns: [],
+          cidrs: [],
+          ports: [],
+          legacy_equivalent: false,
+          warnings: [],
+        };
   },
 
   async testEgress(id: string, host: string, port: number): Promise<EgressTestResult> {

@@ -1,5 +1,6 @@
 import { ApiError } from "./errors";
 import { readCookie } from "@/lib/cookies";
+import { SseParser } from "@/lib/logs";
 import { tokenStore } from "@/lib/token";
 import type {
   AckMessageResult,
@@ -49,15 +50,18 @@ import type {
   Incident,
   InstanceAcl,
   InstanceDetail,
+  InstanceLogQuery,
   InstanceMessagesParams,
   InstanceSummary,
   LifecycleResult,
   ListIncidentsParams,
   ListMemoryParams,
   ListMessagesParams,
+  LogEntry,
   LogExportFormat,
   LogQueryParams,
   LogSearchResponse,
+  LogStreamHandlers,
   MaintenanceStatus,
   MaintenanceWindow,
   MaintenanceWindowInput,
@@ -251,6 +255,92 @@ async function download(path: string): Promise<{ blob: Blob; filename: string }>
   return { blob: await response.blob(), filename: match?.[1] ?? "fleett-export" };
 }
 
+/**
+ * Read one server-sent event stream. `EventSource` has no way to send the
+ * bearer header, so the fetch body is decoded here; the caller owns the
+ * `AbortSignal` and the reconnect policy.
+ */
+async function openLogStream(
+  id: string,
+  handlers: LogStreamHandlers,
+  signal: AbortSignal,
+): Promise<void> {
+  const token = tokenStore.get();
+  const headers = new Headers({ Accept: "text/event-stream" });
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  let response: Response;
+  try {
+    response = await fetch(
+      `${BASE}/api/logs/stream?instances=${encodeURIComponent(id)}`,
+      { headers, credentials: "same-origin", signal },
+    );
+  } catch (cause) {
+    if (signal.aborted) throw cause;
+    throw new ApiError(
+      0,
+      "network_error",
+      "Controller unreachable. Check that the backend is running.",
+    );
+  }
+
+  if (!response.ok) {
+    let code = "http_error";
+    let message = response.statusText || `HTTP ${response.status}`;
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const body = (await response.json().catch(() => null)) as {
+        error?: { code?: string; message?: string };
+      } | null;
+      if (body?.error?.code) code = body.error.code;
+      if (body?.error?.message) message = body.error.message;
+    }
+    if (response.status === 401) {
+      window.dispatchEvent(new CustomEvent("fleett:unauthorized"));
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  if (!response.body) {
+    throw new ApiError(0, "stream_unavailable", "The controller returned no stream body.");
+  }
+
+  handlers.onOpen?.();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parser = new SseParser();
+
+  const dispatch = (frames: ReturnType<SseParser["push"]>) => {
+    for (const frame of frames) {
+      if (frame.event !== "log" || !frame.data) continue;
+      try {
+        const entry = JSON.parse(frame.data) as LogEntry;
+        if (
+          entry &&
+          typeof entry.id === "number" &&
+          typeof entry.instance === "string" &&
+          typeof entry.message === "string"
+        ) {
+          handlers.onEntry(entry);
+        }
+      } catch {
+        // One malformed frame must not kill the stream; the next one is whole.
+      }
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      handlers.onActivity?.();
+      dispatch(parser.push(decoder.decode(value, { stream: true })));
+    }
+    dispatch(parser.flush());
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export const httpApi: FleetApi = {
   health: () => request<Health>("/api/health"),
 
@@ -408,6 +498,19 @@ export const httpApi: FleetApi = {
     }),
 
   logs: (id, tail) => request<string>(`/api/instances/${encodeURIComponent(id)}/logs?tail=${tail}`),
+
+  instanceLogs: (id, params: InstanceLogQuery = {}) =>
+    request<LogSearchResponse>(
+      `/api/logs/instances/${encodeURIComponent(id)}${queryString({
+        q: params.q,
+        level: params.level,
+        since: params.since,
+        until: params.until,
+        limit: params.limit,
+      })}`,
+    ),
+
+  streamLogs: (id, handlers, signal) => openLogStream(id, handlers, signal),
 
   listFiles: (id, path) =>
     request<FileEntry[]>(`/api/instances/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`),
@@ -848,6 +951,11 @@ export const httpApi: FleetApi = {
     request<EgressPolicyView>(`/api/instances/${encodeURIComponent(id)}/egress`, {
       method: "PUT",
       body: JSON.stringify(input),
+    }),
+
+  deleteEgress: (id) =>
+    request<EgressPolicyView>(`/api/instances/${encodeURIComponent(id)}/egress`, {
+      method: "DELETE",
     }),
 
   testEgress: (id, host, port) =>

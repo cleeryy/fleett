@@ -8,7 +8,6 @@ import {
   RefreshCw,
   RotateCw,
   Square,
-  Terminal,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
@@ -43,9 +42,9 @@ import { CopyButton } from "@/components/copy-button";
 import { DataList, Section } from "@/components/data-list";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
-import { EmptyState } from "@/components/empty-state";
 import { InstanceMemoryTab, InstanceMessagesTab } from "@/components/instance-bus";
 import { InstanceEnvironment } from "@/components/instance-env";
+import { InstanceLogs } from "@/components/instance-logs";
 import { InstanceFiles } from "@/components/instance-files";
 import { InstanceHistory } from "@/components/instance-history";
 import {
@@ -73,7 +72,7 @@ import {
 } from "@/lib/assistant";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
-import { formatClock, formatDateTime, formatRelative, formatUptime } from "@/lib/format";
+import { formatDateTime, formatRelative, formatUptime } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { applySucceeded, compactVariables } from "@/lib/personas";
 import {
@@ -1156,92 +1155,6 @@ function ConfigurationTab({
   );
 }
 
-function LogsTab({ id }: { id: string }) {
-  const { t } = useI18n();
-  const [tail, setTail] = useState("200");
-  const [nonce, setNonce] = useState(0);
-  const [fetchedAt, setFetchedAt] = useState<Date | null>(null);
-  const logs = useResource(() => api.logs(id, Number(tail)), [id, tail, nonce]);
-  const preRef = useRef<HTMLPreElement>(null);
-
-  useEffect(() => {
-    if (logs.data !== null) setFetchedAt(new Date());
-  }, [logs.data]);
-
-  useEffect(() => {
-    const node = preRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [logs.data]);
-
-  const text = logs.data ?? "";
-  const lineCount = text ? text.split("\n").length : 0;
-
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Select value={tail} onValueChange={setTail}>
-          <SelectTrigger className="w-32" aria-label={t("detail.linesAria")}>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {["100", "200", "500", "1000"].map((value) => (
-              <SelectItem key={value} value={value}>
-                {t("logs.limitN", { count: Number(value) })}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
-          <RefreshCw aria-hidden className={logs.refreshing ? "animate-spin" : undefined} />
-          {t("common.refresh")}
-        </Button>
-        <CopyButton
-          value={text}
-          label={t("detail.copyLogs")}
-          showLabel
-          size="sm"
-          variant="outline"
-          disabled={!text}
-        />
-        <span className="text-xs text-muted-foreground sm:ml-auto">
-          {text ? t("files.lineMany", { count: lineCount }) : t("detail.noOutput")}
-          {fetchedAt ? ` · ${formatClock(fetchedAt)}` : ""}
-        </span>
-      </div>
-
-      {logs.error ? <ErrorAlert error={logs.error} onRetry={logs.reload} /> : null}
-
-      {logs.loading && logs.data === null ? (
-        <Skeleton className="h-64 w-full rounded-md" />
-      ) : text ? (
-        <pre
-          ref={preRef}
-          tabIndex={0}
-          role="region"
-          aria-label={t("detail.containerLogs")}
-          className="max-h-[60vh] overflow-auto rounded-md border bg-muted/20 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words"
-        >
-          {text}
-        </pre>
-      ) : (
-        <div className="rounded-md border">
-          <EmptyState
-            icon={Terminal}
-            title={t("detail.noOutput")}
-            description={t("detail.noOutputDescription")}
-            action={
-              <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
-                <RefreshCw aria-hidden />
-                {t("common.refresh")}
-              </Button>
-            }
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 const TAB_PAGES: Record<string, string> = {
   overview: "detail.tab.overview",
   configuration: "detail.tab.configuration",
@@ -1738,7 +1651,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
         </TabsContent>
 
         <TabsContent value="logs" className="mt-4">
-          <LogsTab id={data.id} />
+          <InstanceLogs id={data.id} />
         </TabsContent>
         <TabsContent value="access" className="mt-4">
           <InstanceAccess id={data.id} />

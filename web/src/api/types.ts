@@ -1245,6 +1245,22 @@ export interface LogQueryParams {
   limit?: number;
 }
 
+/** `GET /api/logs/instances/{id}`: the search filters without the instance list. */
+export type InstanceLogQuery = Omit<LogQueryParams, "instances">;
+
+/**
+ * `GET /api/logs/stream` is SSE and `EventSource` cannot send the bearer
+ * header, so the adapter opens it with `fetch` and reports frames here.
+ * `onActivity` fires on every chunk, including the keep-alive comment, which
+ * is what resets the console's idle watchdog.
+ */
+export interface LogStreamHandlers {
+  onEntry: (entry: LogEntry) => void;
+  /** Headers are in; the server is about to stream. */
+  onOpen?: () => void;
+  onActivity?: () => void;
+}
+
 export type LogExportFormat = "json" | "csv";
 
 /* --------------------------------------------------------------------------
@@ -1426,6 +1442,12 @@ export interface EgressPolicyView {
   updated_at?: string;
   proxy?: string;
   proxy_acl?: string;
+  /**
+   * The policy decides nothing more than the host firewall already does, so no
+   * proxy variable is rendered (issue #58). Absent on controllers older than
+   * that change.
+   */
+  legacy_equivalent?: boolean;
   warnings: string[];
 }
 
@@ -1682,6 +1704,14 @@ export interface FleetApi {
   action(id: string, action: "start" | "stop" | "restart"): Promise<LifecycleResult>;
   deleteInstance(id: string, purge: boolean): Promise<void>;
   logs(id: string, tail: number): Promise<string>;
+  /** One instance's stored lines from the log center, newest first. */
+  instanceLogs(id: string, params?: InstanceLogQuery): Promise<LogSearchResponse>;
+  /**
+   * Live log feed (SSE) opened with `fetch`, so the bearer header travels.
+   * Resolves when the server closes, rejects on a transport or HTTP error;
+   * abort `signal` to stop.
+   */
+  streamLogs(id: string, handlers: LogStreamHandlers, signal: AbortSignal): Promise<void>;
   listFiles(id: string, path: string): Promise<FileEntry[]>;
   readFile(id: string, path: string): Promise<FileContent>;
   /** Compare-and-swap write; `restart` restarts, `force` sends `If-Match: *`. */
@@ -1812,6 +1842,8 @@ export interface FleetApi {
   putInstanceAcl(id: string, acl: AclItemInput[]): Promise<InstanceAcl>;
   getEgress(id: string): Promise<EgressPolicyView>;
   putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView>;
+  /** Drops the explicit policy and returns the legacy view now in force. */
+  deleteEgress(id: string): Promise<EgressPolicyView>;
   testEgress(id: string, host: string, port: number): Promise<EgressTestResult>;
   exec(id: string, input: ExecInput): Promise<ExecResult>;
 

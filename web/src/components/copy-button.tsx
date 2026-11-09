@@ -14,7 +14,8 @@ export function CopyButton({
   className,
   disabled,
 }: {
-  value: string;
+  /** A string, or a function read at click time for large values. */
+  value: string | (() => string);
   label?: string;
   showLabel?: boolean;
   size?: "icon-xs" | "icon-sm" | "sm";
@@ -35,7 +36,8 @@ export function CopyButton({
   const labelText = label ?? t("common.copy");
 
   async function onCopy() {
-    const ok = await copyText(value);
+    const text = typeof value === "function" ? value() : value;
+    const ok = await copyText(text);
     if (!ok) return;
     setCopied(true);
     if (timer.current !== null) window.clearTimeout(timer.current);

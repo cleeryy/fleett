@@ -3,6 +3,7 @@ import {
   ArrowRightLeft,
   Check,
   Camera,
+  Info,
   Loader2,
   Play,
   Plus,
@@ -56,6 +57,7 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { DataList, Section } from "@/components/data-list";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { RichText } from "@/components/rich-text";
@@ -1111,8 +1113,22 @@ export function InstanceEgress({ id }: { id: string }) {
   const [port, setPort] = useState("443");
   const [testResult, setTestResult] = useState<Awaited<ReturnType<typeof api.testEgress>> | null>(null);
   const [testing, setTesting] = useState(false);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<ApiError | null>(null);
   const policy = useResource(() => api.getEgress(id), [id, nonce]);
   const data: EgressPolicyView | null = policy.data;
+  const proxyDown =
+    !!data?.proxy &&
+    data.warnings.some((warning) =>
+      /unreachable|does not answer|connection refused|timed out|no route/i.test(warning),
+    );
+  const emptyPolicy =
+    !!data &&
+    data.source === "explicit" &&
+    data.fqdns.length === 0 &&
+    data.cidrs.length === 0 &&
+    data.ports.length === 0;
 
   useEffect(() => {
     if (!data) return;
@@ -1180,6 +1196,28 @@ export function InstanceEgress({ id }: { id: string }) {
     }
   }
 
+  async function remove() {
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      const result = await api.deleteEgress(id);
+      policy.setData(() => result);
+      setDraft({
+        mode: result.mode,
+        fqdns: result.fqdns.join("\n"),
+        cidrs: result.cidrs.join("\n"),
+        ports: result.ports.join(", "),
+      });
+      setRemoveOpen(false);
+      setNonce((value) => value + 1);
+      toast.success(t("ops.egress.removed", { source: result.source }));
+    } catch (cause) {
+      setRemoveError(toApiError(cause));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       {policy.error ? <ErrorAlert error={policy.error} onRetry={policy.reload} /> : null}
@@ -1190,37 +1228,184 @@ export function InstanceEgress({ id }: { id: string }) {
       ) : data ? (
         <>
           {data.warnings.length > 0 ? (
-            <Alert className="border-amber-600/40">
-              <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-              <AlertTitle>{t("ops.egress.warningsTitle")}</AlertTitle>
+            <Alert
+              variant={proxyDown ? "destructive" : "default"}
+              className={proxyDown ? "border-destructive/50" : "border-amber-600/40"}
+            >
+              <TriangleAlert
+                aria-hidden
+                className={
+                  proxyDown ? "text-destructive" : "text-amber-600 dark:text-amber-400"
+                }
+              />
+              <AlertTitle>
+                {proxyDown ? t("ops.egress.proxyDownTitle") : t("ops.egress.warningsTitle")}
+              </AlertTitle>
               <AlertDescription>
-                <ul className="list-disc space-y-1 pl-4">
+                {proxyDown ? (
+                  <p className="font-medium">
+                    {t("ops.egress.proxyDownBody", { proxy: data.proxy ?? "" })}
+                  </p>
+                ) : null}
+                <ul className="list-disc space-y-1 pl-4 text-sm">
                   {data.warnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
+                    <li key={warning} className="break-words">
+                      {warning}
+                    </li>
                   ))}
                 </ul>
+                {proxyDown ? (
+                  <p className="text-xs opacity-90">{t("ops.egress.proxyDownHint")}</p>
+                ) : null}
               </AlertDescription>
             </Alert>
           ) : null}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="outline" className="font-mono text-xs font-normal">
-              {t("ops.egress.source", { source: data.source })}
-            </Badge>
-            <Badge variant="outline" className="font-mono text-xs font-normal">
-              {t("ops.egress.mode", { mode: data.mode })}
-            </Badge>
-            {data.proxy ? (
-              <span className="font-mono text-xs text-muted-foreground">{data.proxy}</span>
-            ) : null}
-            {data.updated_at ? (
-              <span className="text-xs text-muted-foreground">
-                {t("skills.picker.updated", { time: formatDateTime(data.updated_at) })}
-              </span>
-            ) : null}
-          </div>
+          <Section
+            title={t("ops.egress.summaryTitle")}
+            description={t("ops.egress.summaryDescription")}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline" className="font-mono text-xs font-normal">
+                {t("ops.egress.source", { source: data.source })}
+              </Badge>
+              <Badge variant="outline" className="font-mono text-xs font-normal">
+                {t("ops.egress.mode", { mode: data.mode })}
+              </Badge>
+              {data.legacy_equivalent ? (
+                <Badge variant="outline" className="font-mono text-xs font-normal">
+                  {t("ops.egress.legacyEquivalent")}
+                </Badge>
+              ) : null}
+              {data.updated_at ? (
+                <span className="text-xs text-muted-foreground">
+                  {t("skills.picker.updated", { time: formatDateTime(data.updated_at) })}
+                </span>
+              ) : null}
+            </div>
+
+            <DataList
+              items={[
+                {
+                  label: t("ops.egress.modeLabel"),
+                  value: (
+                    <div className="space-y-1">
+                      <span className="font-mono text-xs">
+                        {t(
+                          data.mode === "deny"
+                            ? "ops.egress.modeDeny"
+                            : "ops.egress.modeAllow",
+                        )}
+                      </span>
+                      <p className="text-xs text-muted-foreground">{t("ops.egress.modeHint")}</p>
+                    </div>
+                  ),
+                },
+                {
+                  label: t("ops.egress.sourceLabel"),
+                  value: (
+                    <div className="space-y-1">
+                      <span className="font-mono text-xs">{data.source}</span>
+                      <p className="text-xs text-muted-foreground">
+                        {t(`ops.egress.sourceHint.${data.source}`)}
+                      </p>
+                    </div>
+                  ),
+                },
+                {
+                  label: t("ops.egress.proxyLabel"),
+                  value: data.proxy ? (
+                    <div className="space-y-1">
+                      <code className="block font-mono text-xs break-all">{data.proxy}</code>
+                      <p className="text-xs text-muted-foreground">
+                        {t("ops.egress.proxyHint")}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      <span className="text-xs text-muted-foreground">
+                        {t("ops.egress.noProxy")}
+                      </span>
+                      <p className="text-xs text-muted-foreground">
+                        {t(
+                          data.legacy_equivalent
+                            ? "ops.egress.legacyEquivalentHint"
+                            : data.source === "explicit"
+                              ? "ops.egress.noProxyExplicitHint"
+                              : "ops.egress.noProxyHint",
+                        )}
+                      </p>
+                    </div>
+                  ),
+                },
+                {
+                  label: t("ops.egress.domainsLabel"),
+                  value:
+                    data.fqdns.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {data.fqdns.map((value) => (
+                          <Badge
+                            key={value}
+                            variant="outline"
+                            className="font-mono text-[11px] font-normal"
+                          >
+                            {value}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">{t("common.none")}</span>
+                    ),
+                },
+                {
+                  label: t("ops.egress.cidrsLabel"),
+                  value:
+                    data.cidrs.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {data.cidrs.map((value) => (
+                          <Badge
+                            key={value}
+                            variant="outline"
+                            className="font-mono text-[11px] font-normal"
+                          >
+                            {value}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">{t("common.none")}</span>
+                    ),
+                },
+                {
+                  label: t("ops.egress.portsLabel"),
+                  value:
+                    data.ports.length > 0 ? (
+                      <span className="font-mono text-xs">{data.ports.join(", ")}</span>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">
+                        {t("ops.egress.everyPort")}
+                      </span>
+                    ),
+                },
+              ]}
+            />
+          </Section>
+
+          {emptyPolicy && data.proxy ? (
+            <Alert className="border-amber-600/40">
+              <Info aria-hidden className="text-amber-600 dark:text-amber-400" />
+              <AlertTitle>{t("ops.egress.emptyPolicyTitle")}</AlertTitle>
+              <AlertDescription>
+                {t("ops.egress.emptyPolicyBody", { proxy: data.proxy })}
+              </AlertDescription>
+            </Alert>
+          ) : null}
 
           <form onSubmit={save} className="space-y-4 rounded-md border p-4">
+            <div>
+              <p className="text-sm font-medium">{t("ops.egress.editTitle")}</p>
+              <p className="text-xs text-muted-foreground">{t("ops.egress.editDescription")}</p>
+            </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="egress-mode">{t("ops.egress.modeLabel")}</Label>
@@ -1295,14 +1480,14 @@ export function InstanceEgress({ id }: { id: string }) {
             </div>
             {admin ? (
               <div className="flex flex-wrap items-center gap-2">
-                <Button type="submit" disabled={!dirty || pending}>
+                <Button type="submit" disabled={!dirty || pending || removing}>
                   {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
                   {t("ops.egress.save")}
                 </Button>
                 <Button
                   type="button"
                   variant="outline"
-                  disabled={!dirty || pending}
+                  disabled={!dirty || pending || removing}
                   onClick={() =>
                     setDraft({
                       mode: data.mode,
@@ -1381,8 +1566,57 @@ export function InstanceEgress({ id }: { id: string }) {
               </div>
             ) : null}
           </form>
+
+          {data.source === "explicit" ? (
+            <section className="space-y-3 rounded-md border border-destructive/30 p-4">
+              <div>
+                <p className="text-sm font-medium">{t("ops.egress.removeTitle")}</p>
+                <p className="text-xs text-muted-foreground">
+                  {t("ops.egress.removeDescription")}
+                </p>
+              </div>
+              {admin ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                  disabled={pending || removing}
+                  onClick={() => {
+                    setRemoveError(null);
+                    setRemoveOpen(true);
+                  }}
+                >
+                  <Trash2 aria-hidden />
+                  {t("ops.egress.removeButton")}
+                </Button>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t("ops.egress.readOnly")}</p>
+              )}
+            </section>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {t("ops.egress.noPolicyDescription")}
+            </p>
+          )}
         </>
       ) : null}
+
+      <ConfirmDialog
+        open={removeOpen}
+        onOpenChange={(open) => {
+          if (!removing) setRemoveOpen(open);
+        }}
+        title={t("ops.egress.removeConfirmTitle")}
+        description={t("ops.egress.removeConfirmBody")}
+        confirmLabel={t("ops.egress.removeButton")}
+        destructive
+        pending={removing}
+        error={removeError}
+        onConfirm={() => void remove()}
+      >
+        <p className="text-xs text-muted-foreground">{t("ops.egress.removeConfirmClearing")}</p>
+        <p className="text-xs text-muted-foreground">{t("ops.egress.removeConfirmRestart")}</p>
+      </ConfirmDialog>
     </div>
   );
 }

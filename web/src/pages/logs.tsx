@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { Highlight } from "@/components/highlight";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
 import { RichText } from "@/components/rich-text";
@@ -54,29 +55,6 @@ const SINCE_OPTIONS = [
   { value: "24h", labelKey: "logs.since24h" },
   { value: "7d", labelKey: "logs.since7d" },
 ];
-
-function Highlight({ text, needle }: { text: string; needle: string }) {
-  const query = needle.trim();
-  if (!query) return <>{text}</>;
-  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
-  return (
-    <>
-      {parts.map((part, index) =>
-        part.toLowerCase() === query.toLowerCase() ? (
-          <mark
-            key={`${part}-${index}`}
-            className="rounded-[2px] bg-amber-200 px-0.5 text-amber-950 dark:bg-amber-500/40 dark:text-amber-50"
-          >
-            {part}
-          </mark>
-        ) : (
-          <span key={`${part}-${index}`}>{part}</span>
-        ),
-      )}
-    </>
-  );
-}
 
 function mergeEntries(previous: LogEntry[], incoming: LogEntry[]): LogEntry[] {
   const byId = new Map(previous.map((entry) => [entry.id, entry]));
