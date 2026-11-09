@@ -1002,6 +1002,107 @@ async fn token_endpoints_are_admin_only() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn a_viewer_session_only_reaches_acld_instances_and_revocation_is_immediate() {
+    let harness = Harness::oidc(&[VIEWER_GROUP]);
+    // The bootstrap admin creates the fleet.
+    for id in ["alice", "bob"] {
+        let (status, _, body) = harness
+            .send(
+                Method::POST,
+                "/api/instances",
+                Some(instance_body(id)),
+                Some(TOKEN),
+                &BTreeMap::new(),
+                &[],
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let cookies = harness.sign_in().await;
+
+    // A viewer session sees nothing before an ACL grants an instance, and the
+    // id is not even listed.
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances", None, None, &cookies, &[])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body), json!([]));
+
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice",
+            None,
+            None,
+            &cookies,
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&body), "forbidden");
+
+    // The subject of a session is its email.
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/acl",
+            Some(json!({"acl": [{"subject": "cleeryy@example.test", "role": "viewer"}]})),
+            Some(TOKEN),
+            &BTreeMap::new(),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice",
+            None,
+            None,
+            &cookies,
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/bob", None, None, &cookies, &[])
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances", None, None, &cookies, &[])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = parse(&body);
+    assert_eq!(listed.as_array().expect("array").len(), 1);
+    assert_eq!(listed[0]["id"], "alice");
+
+    // Removing the row applies to the very next request: no new login.
+    let (status, _, _) = harness
+        .send(
+            Method::DELETE,
+            "/api/instances/alice/acl/cleeryy@example.test",
+            None,
+            Some(TOKEN),
+            &BTreeMap::new(),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice",
+            None,
+            None,
+            &cookies,
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 // ---------------------------------------------------------------------------
 // Bearer mode is unchanged
 // ---------------------------------------------------------------------------

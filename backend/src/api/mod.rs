@@ -1,5 +1,6 @@
 //! HTTP layer.
 
+pub mod acl;
 pub mod audit;
 pub mod auth;
 pub mod bus;
@@ -248,6 +249,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .patch(instances::patch)
                 .delete(instances::delete),
         )
+        .route("/instances/{id}/acl", get(acl::get).put(acl::put))
+        .route("/instances/{id}/acl/{subject}", delete(acl::delete))
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
         .route(
@@ -319,6 +322,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/shares/{name}", delete(shares::delete))
         .route("/shares/{name}/attach", post(shares::attach))
         .route("/shares/{name}/detach", post(shares::detach))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::authz::require_instance_access,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

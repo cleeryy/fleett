@@ -3,6 +3,7 @@
 pub mod api;
 pub mod archive;
 pub mod auth;
+pub mod authz;
 pub mod backup;
 pub mod bus;
 pub mod cli;

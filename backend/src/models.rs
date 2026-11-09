@@ -493,6 +493,10 @@ pub struct InstanceSummary {
     pub shares: Vec<String>,
     pub last_error: Option<String>,
     pub created_at: String,
+    /// Level of the caller on this instance (`owner|operator|viewer`), when it
+    /// has one (issue #37).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

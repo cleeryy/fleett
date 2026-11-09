@@ -999,9 +999,11 @@ mod tests {
     fn context(method: AuthMethod) -> AuthContext {
         AuthContext {
             actor: "cleeryy@example.test".to_string(),
+            subject: "cleeryy@example.test".to_string(),
             role: Role::Admin,
             method,
             user: None,
+            scope: None,
             ip: None,
         }
     }
@@ -1009,6 +1011,7 @@ mod tests {
     fn session() -> AuthContext {
         AuthContext {
             actor: "cleeryy@example.test".to_string(),
+            subject: "cleeryy@example.test".to_string(),
             role: Role::Admin,
             method: AuthMethod::Session,
             user: Some(SessionUser {
@@ -1016,6 +1019,7 @@ mod tests {
                 email: Some("cleeryy@example.test".to_string()),
                 name: Some("Cleeryy".to_string()),
             }),
+            scope: None,
             ip: None,
         }
     }
