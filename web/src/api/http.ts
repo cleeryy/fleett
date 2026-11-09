@@ -3,14 +3,30 @@ import { readCookie } from "@/lib/cookies";
 import { tokenStore } from "@/lib/token";
 import type {
   AckMessageResult,
+  AclItemInput,
   AuditEntry,
   AuthConfig,
+  BudgetInput,
+  BudgetStatus,
+  BudgetView,
+  CostReport,
+  CostReportParams,
   CreateInstanceInput,
   CreateMemoryInput,
+  CreatePipelineInput,
   CreateProviderInput,
+  CreateScheduleInput,
+  CreateSnapshotInput,
   CreateTokenInput,
   CreatedToken,
+  Deployment,
+  DeploymentStatus,
+  EgressPolicyInput,
+  EgressPolicyView,
+  EgressTestResult,
   EnvInput,
+  ExecInput,
+  ExecResult,
   FileContent,
   FileEntry,
   FleetApi,
@@ -19,31 +35,56 @@ import type {
   GitLog,
   GitLogOptions,
   GitStatus,
+  HealPolicyInput,
+  HealPolicyView,
   Health,
   Identity,
+  Incident,
+  InstanceAcl,
   InstanceDetail,
   InstanceMessagesParams,
   InstanceSummary,
   LifecycleResult,
+  ListIncidentsParams,
   ListMemoryParams,
   ListMessagesParams,
+  LogExportFormat,
+  LogQueryParams,
+  LogSearchResponse,
+  MaintenanceStatus,
+  MaintenanceWindow,
+  MaintenanceWindowInput,
   MemoryEntry,
   MemoryVersion,
   Message,
   MkdirResult,
   PatchInstanceInput,
+  PatchPipelineInput,
   PatchProviderInput,
+  PatchScheduleInput,
+  Pipeline,
+  PipelineRun,
+  PipelineRunDetail,
+  Pricing,
+  PricingInput,
   ProviderDetail,
   ProviderRotateResult,
   ProviderSummary,
   ProviderTestResult,
   PurgeResult,
+  RestoreReport,
   RevertInput,
   RevertResult,
+  Schedule,
+  ScheduleRun,
+  ScheduleView,
   SearchMemoryParams,
+  SecurityStatus,
   SendMessageInput,
   Share,
   ShareMode,
+  Snapshot,
+  SnapshotDiff,
   Template,
   TokenInfo,
   UpdateMemoryInput,
@@ -143,6 +184,33 @@ async function request<T>(path: string, init: RequestInit = {}, options: Request
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) return (await response.json()) as T;
   return (await response.text()) as T;
+}
+
+/** Fetch a binary attachment with the same credential rules as `request`. */
+async function download(path: string): Promise<{ blob: Blob; filename: string }> {
+  const token = tokenStore.get();
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${BASE}${path}`, { headers, credentials: "same-origin" });
+  if (!response.ok) {
+    let code = "http_error";
+    let message = response.statusText || `HTTP ${response.status}`;
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const body = (await response.json().catch(() => null)) as {
+        error?: { code?: string; message?: string };
+      } | null;
+      if (body?.error?.code) code = body.error.code;
+      if (body?.error?.message) message = body.error.message;
+    }
+    if (response.status === 401) {
+      window.dispatchEvent(new CustomEvent("fleett:unauthorized"));
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  return { blob: await response.blob(), filename: match?.[1] ?? "fleett-export" };
 }
 
 export const httpApi: FleetApi = {
@@ -403,4 +471,243 @@ export const httpApi: FleetApi = {
     }),
 
   purgeExpiredMemory: () => request<PurgeResult>("/api/memory/expired", { method: "DELETE" }),
+
+  /* Schedules */
+
+  listSchedules: () => request<ScheduleView[]>("/api/schedules"),
+
+  listInstanceSchedules: (id) =>
+    request<Schedule[]>(`/api/instances/${encodeURIComponent(id)}/schedules`),
+
+  createSchedule: (id, input: CreateScheduleInput) =>
+    request<Schedule>(`/api/instances/${encodeURIComponent(id)}/schedules`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  patchSchedule: (scheduleId, input: PatchScheduleInput) =>
+    request<Schedule>(`/api/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deleteSchedule: (scheduleId) =>
+    request<void>(`/api/schedules/${encodeURIComponent(scheduleId)}`, { method: "DELETE" }),
+
+  runSchedule: (scheduleId) =>
+    request<ScheduleRun>(`/api/schedules/${encodeURIComponent(scheduleId)}/run`, {
+      method: "POST",
+    }),
+
+  listRuns: (id, limit = 50) =>
+    request<ScheduleRun[]>(
+      `/api/instances/${encodeURIComponent(id)}/runs?limit=${Math.min(Math.max(limit, 1), 500)}`,
+    ),
+
+  /* Pipelines */
+
+  listPipelines: () => request<Pipeline[]>("/api/pipelines"),
+
+  getPipeline: (id) => request<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}`),
+
+  createPipeline: (input: CreatePipelineInput) =>
+    request<Pipeline>("/api/pipelines", { method: "POST", body: JSON.stringify(input) }),
+
+  patchPipeline: (id, input: PatchPipelineInput) =>
+    request<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deletePipeline: (id) =>
+    request<void>(`/api/pipelines/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  runPipeline: (id, context) =>
+    request<PipelineRunDetail>(`/api/pipelines/${encodeURIComponent(id)}/run`, {
+      method: "POST",
+      body: JSON.stringify(context === undefined ? {} : { context }),
+    }),
+
+  listPipelineRuns: (id, limit = 50) =>
+    request<PipelineRun[]>(
+      `/api/pipelines/${encodeURIComponent(id)}/runs?limit=${Math.min(Math.max(limit, 1), 500)}`,
+    ),
+
+  getPipelineRun: (id, runId) =>
+    request<PipelineRunDetail>(
+      `/api/pipelines/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`,
+    ),
+
+  cancelPipelineRun: (id, runId) =>
+    request<PipelineRunDetail>(
+      `/api/pipelines/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" },
+    ),
+
+  /* Incidents */
+
+  listIncidents: (params: ListIncidentsParams = {}) =>
+    request<Incident[]>(
+      `/api/incidents${queryString({
+        status: params.status,
+        instance: params.instance,
+        limit: params.limit,
+      })}`,
+    ),
+
+  instanceIncidents: (id, limit) =>
+    request<Incident[]>(
+      `/api/instances/${encodeURIComponent(id)}/incidents${queryString({ limit })}`,
+    ),
+
+  closeIncident: (id) =>
+    request<Incident>(`/api/incidents/${encodeURIComponent(id)}/close`, { method: "POST" }),
+
+  patchHeal: (id, input: HealPolicyInput) =>
+    request<HealPolicyView>(`/api/instances/${encodeURIComponent(id)}/heal`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  /* Cost */
+
+  costReport: (params: CostReportParams = {}) =>
+    request<CostReport>(
+      `/api/cost${queryString({
+        from: params.from,
+        to: params.to,
+        group_by: params.group_by,
+      })}`,
+    ),
+
+  listBudgets: () => request<BudgetStatus[]>("/api/cost/budgets"),
+
+  getBudget: (id) => request<BudgetView>(`/api/instances/${encodeURIComponent(id)}/budget`),
+
+  setBudget: (id, input: BudgetInput) =>
+    request<BudgetView>(`/api/instances/${encodeURIComponent(id)}/budget`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+
+  listPricing: () => request<Pricing[]>("/api/models/pricing"),
+
+  setPricing: (input: PricingInput) =>
+    request<Pricing>("/api/models/pricing", { method: "POST", body: JSON.stringify(input) }),
+
+  deletePricing: (model) =>
+    request<void>(`/api/models/pricing/${encodeURIComponent(model)}`, { method: "DELETE" }),
+
+  /* Log center */
+
+  searchLogs: (params: LogQueryParams = {}) =>
+    request<LogSearchResponse>(
+      `/api/logs${queryString({
+        instances: params.instances?.length ? params.instances.join(",") : undefined,
+        q: params.q,
+        level: params.level,
+        since: params.since,
+        until: params.until,
+        limit: params.limit,
+      })}`,
+    ),
+
+  exportLogs: (params: LogQueryParams | undefined, format: LogExportFormat) =>
+    download(
+      `/api/logs/export${queryString({
+        format,
+        instances: params?.instances?.length ? params.instances.join(",") : undefined,
+        q: params?.q,
+        level: params?.level,
+        since: params?.since,
+        until: params?.until,
+        limit: params?.limit,
+      })}`,
+    ),
+
+  /* Security */
+
+  securityStatus: () => request<SecurityStatus>("/api/security/status"),
+
+  /* Deployments and maintenance */
+
+  listDeployments: (params: { limit?: number; status?: DeploymentStatus } = {}) =>
+    request<Deployment[]>(
+      `/api/deployments${queryString({ limit: params.limit, status: params.status })}`,
+    ),
+
+  getDeployment: (id) => request<Deployment>(`/api/deployments/${encodeURIComponent(id)}`),
+
+  listMaintenanceWindows: () => request<MaintenanceWindow[]>("/api/maintenance-windows"),
+
+  createMaintenanceWindow: (input: MaintenanceWindowInput) =>
+    request<MaintenanceWindow>("/api/maintenance-windows", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  patchMaintenanceWindow: (id, input) =>
+    request<MaintenanceWindow>(`/api/maintenance-windows/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deleteMaintenanceWindow: (id) =>
+    request<void>(`/api/maintenance-windows/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  maintenanceStatus: () => request<MaintenanceStatus>("/api/maintenance-windows/status"),
+
+  /* Snapshots */
+
+  listSnapshots: (id) => request<Snapshot[]>(`/api/instances/${encodeURIComponent(id)}/snapshots`),
+
+  createSnapshot: (id, input: CreateSnapshotInput = {}) =>
+    request<Snapshot>(`/api/instances/${encodeURIComponent(id)}/snapshots`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  compareSnapshots: (id, a, b) =>
+    request<SnapshotDiff>(`/api/instances/${encodeURIComponent(id)}/snapshots/compare`, {
+      method: "POST",
+      body: JSON.stringify({ a, b }),
+    }),
+
+  restoreSnapshot: (snapshotId) =>
+    request<RestoreReport>(`/api/snapshots/${encodeURIComponent(snapshotId)}/restore`, {
+      method: "POST",
+    }),
+
+  deleteSnapshot: (snapshotId) =>
+    request<void>(`/api/snapshots/${encodeURIComponent(snapshotId)}`, { method: "DELETE" }),
+
+  /* Instance ACL, egress and exec */
+
+  getInstanceAcl: (id) => request<InstanceAcl>(`/api/instances/${encodeURIComponent(id)}/acl`),
+
+  putInstanceAcl: (id, acl: AclItemInput[]) =>
+    request<InstanceAcl>(`/api/instances/${encodeURIComponent(id)}/acl`, {
+      method: "PUT",
+      body: JSON.stringify({ acl }),
+    }),
+
+  getEgress: (id) => request<EgressPolicyView>(`/api/instances/${encodeURIComponent(id)}/egress`),
+
+  putEgress: (id, input: EgressPolicyInput) =>
+    request<EgressPolicyView>(`/api/instances/${encodeURIComponent(id)}/egress`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+
+  testEgress: (id, host, port) =>
+    request<EgressTestResult>(`/api/instances/${encodeURIComponent(id)}/egress/test`, {
+      method: "POST",
+      body: JSON.stringify({ host, port }),
+    }),
+
+  exec: (id, input: ExecInput) =>
+    request<ExecResult>(`/api/instances/${encodeURIComponent(id)}/exec`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 };

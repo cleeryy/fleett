@@ -10,11 +10,12 @@ import {
   Square,
   Terminal,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvEntry, InstanceDetail, PatchInstanceInput, ProviderSummary, ShareRef } from "@/api/types";
+import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, ProviderSummary, ShareRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,14 @@ import { InstanceMemoryTab, InstanceMessagesTab } from "@/components/instance-bu
 import { InstanceEnvironment } from "@/components/instance-env";
 import { InstanceFiles } from "@/components/instance-files";
 import { InstanceHistory } from "@/components/instance-history";
+import {
+  InstanceAccess,
+  InstanceEgress,
+  InstanceIncidents,
+  InstanceSnapshots,
+  InstanceTerminal,
+} from "@/components/instance-ops";
+import { InstanceSchedules } from "@/components/schedules";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { SharePicker } from "@/components/share-picker";
@@ -417,6 +426,7 @@ const CONFIG_FIELD_IDS: Record<string, string> = {
 function ConfigurationTab({
   detail,
   provider,
+  templateEnv,
   draft,
   onDraftChange,
   envRows,
@@ -426,6 +436,7 @@ function ConfigurationTab({
 }: {
   detail: InstanceDetail;
   provider: ProviderSummary | null;
+  templateEnv: EnvSuggestion[];
   draft: ConfigDraft;
   onDraftChange: (next: ConfigDraft) => void;
   envRows: EnvRow[];
@@ -763,12 +774,15 @@ function ConfigurationTab({
         </div>
       </form>
 
-      <InstanceEnvironment
-        detail={detail}
-        rows={envRows}
-        onRowsChange={onEnvRowsChange}
-        onApplied={onEnvApplied}
-      />
+      <div id="instance-env" className="scroll-mt-24">
+        <InstanceEnvironment
+          detail={detail}
+          rows={envRows}
+          suggestions={templateEnv}
+          onRowsChange={onEnvRowsChange}
+          onApplied={onEnvApplied}
+        />
+      </div>
     </div>
   );
 }
@@ -882,6 +896,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
 
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
   const providers = useResource(() => api.listProviders(), []);
+  const templatesResource = useResource(() => api.listTemplates(), []);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);
@@ -966,8 +981,22 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const provider = data.provider
     ? (providers.data?.find((candidate) => candidate.id === data.provider) ?? null)
     : null;
+  const templateEnv =
+    templatesResource.data?.find((candidate) => candidate.id === data.template)?.env ?? [];
   const uptime =
     running && data.container ? formatUptime(data.container.uptime_s) : null;
+  const warnings = data.warnings ?? [];
+  const envWarning = warnings.some((warning) => /required|allowlist|environment|is not set/i.test(warning));
+
+  function reviewWarnings() {
+    setTab("configuration");
+    window.setTimeout(() => {
+      const node = document.getElementById(envWarning ? "instance-env" : "cfg-name");
+      if (envWarning) node?.scrollIntoView({ block: "start" });
+      node?.querySelector?.("input")?.focus();
+      if (node instanceof HTMLInputElement) node.focus();
+    }, 60);
+  }
 
   return (
     <>
@@ -1064,16 +1093,41 @@ export function InstanceDetailPage({ id }: { id: string }) {
 
       {actionError ? <ErrorAlert error={actionError} /> : null}
 
+      {warnings.length > 0 ? (
+        <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
+          <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
+          <AlertTitle>Needs attention</AlertTitle>
+          <AlertDescription>
+            <ul className="list-disc space-y-1 pl-4 text-sm text-muted-foreground">
+              {warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+            {canEdit ? (
+              <Button type="button" variant="outline" size="sm" className="mt-2" onClick={reviewWarnings}>
+                {envWarning ? "Fix environment" : "Review configuration"}
+              </Button>
+            ) : null}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
       <Tabs value={tab} onValueChange={setTab}>
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             {canEdit ? <TabsTrigger value="configuration">Configuration</TabsTrigger> : null}
+            <TabsTrigger value="schedules">Schedules</TabsTrigger>
+            <TabsTrigger value="incidents">Incidents</TabsTrigger>
+            <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
             <TabsTrigger value="files">Files</TabsTrigger>
             <TabsTrigger value="messages">Messages</TabsTrigger>
             <TabsTrigger value="memory">Memory</TabsTrigger>
             <TabsTrigger value="history">History</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
+            <TabsTrigger value="access">Access</TabsTrigger>
+            <TabsTrigger value="egress">Egress</TabsTrigger>
+            {canEdit ? <TabsTrigger value="terminal">Terminal</TabsTrigger> : null}
             <TabsTrigger value="compose">Compose</TabsTrigger>
           </TabsList>
         </div>
@@ -1093,6 +1147,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
               <ConfigurationTab
                 detail={data}
                 provider={provider}
+                templateEnv={templateEnv}
                 draft={configDraft}
                 onDraftChange={setConfigDraft}
                 envRows={envRows}
@@ -1105,6 +1160,18 @@ export function InstanceDetailPage({ id }: { id: string }) {
             )}
           </TabsContent>
         ) : null}
+
+        <TabsContent value="schedules" className="mt-4">
+          <InstanceSchedules instanceId={data.id} canEdit={canEdit} />
+        </TabsContent>
+
+        <TabsContent value="incidents" className="mt-4">
+          <InstanceIncidents id={data.id} />
+        </TabsContent>
+
+        <TabsContent value="snapshots" className="mt-4">
+          <InstanceSnapshots id={data.id} />
+        </TabsContent>
 
         {/* `forceMount` keeps the editor mounted while another tab is shown;
             the `hidden` class keeps an inactive panel out of the a11y tree. */}
@@ -1138,6 +1205,17 @@ export function InstanceDetailPage({ id }: { id: string }) {
         <TabsContent value="logs" className="mt-4">
           <LogsTab id={data.id} />
         </TabsContent>
+        <TabsContent value="access" className="mt-4">
+          <InstanceAccess id={data.id} />
+        </TabsContent>
+        <TabsContent value="egress" className="mt-4">
+          <InstanceEgress id={data.id} />
+        </TabsContent>
+        {canEdit ? (
+          <TabsContent value="terminal" className="mt-4">
+            <InstanceTerminal id={data.id} />
+          </TabsContent>
+        ) : null}
         <TabsContent value="compose" className="mt-4 space-y-3">
           <p className="text-sm text-muted-foreground">
             <span className="font-mono">compose.yaml</span> is the source of truth. The controller rewrites it on

@@ -1,4 +1,4 @@
-import type { EnvEntry, EnvInput } from "@/api/types";
+import type { EnvEntry, EnvInput, EnvSuggestion } from "@/api/types";
 
 /**
  * One editable environment variable. The controller encrypts `secret: true`
@@ -70,22 +70,58 @@ export function envValueError(value: string): string | null {
   return null;
 }
 
+/** Check one value against the format a template declares. */
+export function envSuggestionValueError(
+  format: string | undefined,
+  value: string,
+): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  switch (format) {
+    case "csv-of-ids":
+      return /^\d+(\s*,\s*\d+)*$/.test(trimmed)
+        ? null
+        : "Use comma-separated numeric ids, for example 81459823,310472918374.";
+    case "bool":
+      return /^(true|false|1|0|yes|no)$/i.test(trimmed)
+        ? null
+        : "Use true or false.";
+    case "url":
+      return isHttpUrl(trimmed) ? null : "Use an absolute http or https URL.";
+    default:
+      return null;
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Validate every row. `create` treats all of them as new (a secret needs a
  * value); `apply` accepts an empty value on a stored secret, which the full
- * replace sends without a value so the controller keeps it.
+ * replace sends without a value so the controller keeps it. Template
+ * suggestions add the required and format rules the controller enforces.
  */
 export function validateEnvRows(
   rows: EnvRow[],
   mode: EnvMode,
+  suggestions: EnvSuggestion[] = [],
 ): { rows: Record<number, EnvRowErrors>; count: number } {
   const errors: Record<number, EnvRowErrors> = {};
   const seen = new Set<string>();
+  const suggestionByKey = new Map(suggestions.map((suggestion) => [suggestion.key, suggestion]));
   let count = 0;
 
   for (const row of rows) {
     const key = row.key.trim();
     const rowErrors: EnvRowErrors = {};
+    const suggestion = suggestionByKey.get(key);
 
     const keyProblem = envKeyError(key);
     if (keyProblem) {
@@ -105,6 +141,11 @@ export function validateEnvRows(
         rowErrors.value = "Enter a value for this secret.";
       } else if (!row.secret && !row.value && row.storedSecret) {
         rowErrors.value = "Enter a value to store this variable in clear text.";
+      } else if (!row.value && !keepsStored && suggestion?.required) {
+        rowErrors.value = "Required by the template: the gateway refuses every message without it.";
+      } else {
+        const formatProblem = envSuggestionValueError(suggestion?.format, row.value);
+        if (formatProblem) rowErrors.value = formatProblem;
       }
     }
 

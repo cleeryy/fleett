@@ -3,7 +3,7 @@ import { Check, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, ShareRef } from "@/api/types";
+import type { ChannelType, EnvSuggestion, ShareRef } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -106,7 +106,7 @@ function slugify(value: string): string {
     .replace(/-+$/g, "");
 }
 
-function validate(draft: Draft, step: number): Record<string, string> {
+function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = []): Record<string, string> {
   const errors: Record<string, string> = {};
 
   if (step === 0) {
@@ -130,7 +130,7 @@ function validate(draft: Draft, step: number): Record<string, string> {
     if (!Number.isFinite(memory) || memory < 128 || memory > 8192)
       errors.memLimit = "Use 128 to 8192 MB.";
 
-    const envErrors = validateEnvRows(draft.env, "create").rows;
+    const envErrors = validateEnvRows(draft.env, "create", templateEnv).rows;
     for (const row of draft.env) {
       const rowErrors = envErrors[row.id];
       if (rowErrors?.key) errors[`env-${row.id}-key`] = rowErrors.key;
@@ -179,13 +179,19 @@ export function NewInstancePage() {
   const presetApplied = useRef(false);
   const leaveAllowed = useRef(false);
 
-  const errors = validate(draft, step);
+  const draftTemplateEnv =
+    templates.data?.find((candidate) => candidate.id === draft.template)?.env ?? [];
+  const errors = validate(draft, step, draftTemplateEnv);
   const showErrors = attempted === step;
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(DEFAULT_DRAFT), [draft]);
   const errorCount = useMemo(
-    () => STEPS.reduce((total, _label, index) => total + Object.keys(validate(draft, index)).length, 0),
-    [draft],
+    () =>
+      STEPS.reduce(
+        (total, _label, index) => total + Object.keys(validate(draft, index, draftTemplateEnv)).length,
+        0,
+      ),
+    [draft, draftTemplateEnv],
   );
 
   useEffect(() => {
@@ -241,7 +247,7 @@ export function NewInstancePage() {
   }
 
   function next() {
-    const stepErrors = validate(draft, step);
+    const stepErrors = validate(draft, step, draftTemplateEnv);
     const keys = Object.keys(stepErrors);
     if (keys.length > 0) {
       setAttempted(step);
@@ -289,7 +295,7 @@ export function NewInstancePage() {
 
   async function create() {
     for (let index = 0; index < LAST_STEP; index += 1) {
-      const stepErrors = validate(draft, index);
+      const stepErrors = validate(draft, index, draftTemplateEnv);
       const keys = Object.keys(stepErrors);
       if (keys.length > 0) {
         setStep(index);
@@ -381,7 +387,8 @@ export function NewInstancePage() {
   const envSuggestions = (selectedTemplate?.env ?? []).filter(
     (suggestion) => !draft.env.some((row) => row.key.trim() === suggestion.key),
   );
-  const envErrors = showErrors && step === 2 ? validateEnvRows(draft.env, "create").rows : {};
+  const envErrors =
+    showErrors && step === 2 ? validateEnvRows(draft.env, "create", selectedTemplate?.env ?? []).rows : {};
   const envHasSecrets = draft.env.some((row) => row.secret);
   const secretsErrorShownInline =
     secretsError !== null && step === 2 && (!draft.provider || envHasSecrets);
@@ -768,6 +775,7 @@ export function NewInstancePage() {
                     }}
                     errors={envErrors}
                     suggestions={envSuggestions}
+                    hints={selectedTemplate?.env}
                     templateName={selectedTemplate?.name}
                   />
                   {secretsError && envHasSecrets ? <ErrorAlert error={secretsError} /> : null}

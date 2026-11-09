@@ -13,14 +13,21 @@ import { navigate, useRoute } from "@/lib/router";
 import { SessionContext } from "@/lib/session";
 import { tokenStore } from "@/lib/token";
 import { AuditPage } from "@/pages/audit";
+import { CostPage } from "@/pages/cost";
+import { DeploymentsPage } from "@/pages/deployments";
 import { FleetPage } from "@/pages/fleet";
+import { IncidentsPage } from "@/pages/incidents";
 import { InstanceDetailPage } from "@/pages/instance-detail";
 import { NewInstancePage } from "@/pages/instance-new";
 import { LoginPage } from "@/pages/login";
+import { LogsPage } from "@/pages/logs";
 import { MemoryPage } from "@/pages/memory";
 import { MessagesPage } from "@/pages/messages";
+import { PipelinesPage } from "@/pages/pipelines";
 import { ProviderDetailPage } from "@/pages/provider-detail";
 import { ProvidersPage } from "@/pages/providers";
+import { SchedulesPage } from "@/pages/schedules";
+import { SecurityPage } from "@/pages/security";
 import { SharesPage } from "@/pages/shares";
 import { TemplatesPage } from "@/pages/templates";
 import { TokensPage } from "@/pages/tokens";
@@ -42,6 +49,13 @@ function titleFor(path: string): string {
   if (path === "/templates") return "Templates";
   if (path === "/tokens") return "Tokens";
   if (path === "/audit") return "Audit log";
+  if (path === "/schedules") return "Schedules";
+  if (path === "/pipelines") return "Pipelines";
+  if (path === "/incidents") return "Incidents";
+  if (path === "/cost") return "Cost";
+  if (path === "/logs") return "Logs";
+  if (path === "/security") return "Security";
+  if (path === "/deployments") return "Deployments";
   if (path === "/messages") return "Messages";
   if (path === "/memory") return "Memory";
   if (path === "/login") return "Sign in";
@@ -277,6 +291,41 @@ export default function App() {
   } else if (path === "/templates") {
     crumbs = [{ label: "Templates" }];
     screen = <TemplatesPage />;
+  } else if (path === "/schedules") {
+    crumbs = [{ label: "Schedules" }];
+    screen = admin ? (
+      <SchedulesPage />
+    ) : (
+      <RestrictedScreen
+        title="Schedules"
+        message="The global schedule view is readable by admins only. Your account can still open an instance and read its Schedules tab."
+      />
+    );
+  } else if (path === "/pipelines") {
+    crumbs = [{ label: "Pipelines" }];
+    screen = <PipelinesPage />;
+  } else if (path === "/incidents") {
+    crumbs = [{ label: "Incidents" }];
+    screen = <IncidentsPage />;
+  } else if (path === "/cost") {
+    crumbs = [{ label: "Cost" }];
+    screen = <CostPage />;
+  } else if (path === "/logs") {
+    crumbs = [{ label: "Logs" }];
+    screen = <LogsPage />;
+  } else if (path === "/deployments") {
+    crumbs = [{ label: "Deployments" }];
+    screen = <DeploymentsPage />;
+  } else if (path === "/security") {
+    crumbs = [{ label: "Security" }];
+    screen = admin ? (
+      <SecurityPage />
+    ) : (
+      <RestrictedScreen
+        title="Security"
+        message="The security posture is readable by admins only."
+      />
+    );
   } else if (path === "/tokens") {
     crumbs = [{ label: "Tokens" }];
     screen = admin ? (
