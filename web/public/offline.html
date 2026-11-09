@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <meta name="robots" content="noindex" />
+    <title>Offline · fleett</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <style>
+      :root {
+        --background: #ffffff;
+        --foreground: #0a0a0a;
+        --muted-foreground: #71717a;
+        --border: #e4e4e7;
+        --secondary: #f4f4f5;
+        --secondary-foreground: #18181b;
+        --ring: #a1a1aa;
+        color-scheme: light;
+      }
+
+      html.dark {
+        --background: #0a0a0a;
+        --foreground: #fafafa;
+        --muted-foreground: #a1a1aa;
+        --border: rgba(255, 255, 255, 0.1);
+        --secondary: #27272a;
+        --secondary-foreground: #fafafa;
+        --ring: #71717a;
+        color-scheme: dark;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2rem 1.5rem;
+        padding-bottom: calc(2rem + env(safe-area-inset-bottom));
+        background: var(--background);
+        color: var(--foreground);
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+          sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      main {
+        width: 100%;
+        max-width: 24rem;
+        text-align: center;
+      }
+
+      .mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 3.5rem;
+        height: 3.5rem;
+        border-radius: 0.75rem;
+        background: var(--secondary);
+        border: 1px solid var(--border);
+        margin-bottom: 1.75rem;
+      }
+
+      h1 {
+        margin: 0 0 0.5rem;
+        font-size: 1.25rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted-foreground);
+      }
+
+      p + p {
+        margin-top: 0.5rem;
+        font-size: 13px;
+      }
+
+      button {
+        margin-top: 1.75rem;
+        min-height: 44px;
+        padding: 0 1rem;
+        border-radius: 0.375rem;
+        border: 1px solid var(--border);
+        background: var(--secondary);
+        color: var(--secondary-foreground);
+        font: inherit;
+        font-weight: 500;
+        cursor: pointer;
+        transition: opacity 120ms ease;
+      }
+
+      button:hover {
+        opacity: 0.9;
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: 2px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        button {
+          transition: none;
+        }
+      }
+    </style>
+    <script>
+      // Same key and default as the console: dark unless the operator chose light.
+      try {
+        var stored = localStorage.getItem("fleett.theme") || localStorage.getItem("fleet.theme");
+        document.documentElement.classList.toggle("dark", stored !== "light");
+      } catch (error) {}
+    </script>
+  </head>
+  <body>
+    <main>
+      <span class="mark" aria-hidden="true">
+        <svg width="26" height="26" viewBox="0 0 32 32">
+          <g fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="7.5" y="7.5" width="7" height="7" rx="1.5" />
+            <rect x="17.5" y="7.5" width="7" height="7" rx="1.5" />
+            <rect x="7.5" y="17.5" width="7" height="7" rx="1.5" />
+          </g>
+          <rect x="17.5" y="17.5" width="7" height="7" rx="1.5" fill="currentColor" />
+        </svg>
+      </span>
+
+      <h1>You are offline</h1>
+      <p>The console could not reach the fleett controller.</p>
+      <p>Check the network, then reload. Nothing was lost: instances keep running on their host.</p>
+
+      <button type="button" onclick="location.reload()">Try again</button>
+    </main>
+  </body>
+</html>

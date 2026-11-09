@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { KeyRound, Plug, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/api";
 import type { ProviderSummary } from "@/api/types";
@@ -19,7 +19,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { formatDateTime, formatRelative, plural } from "@/lib/format";
-import { hrefFor } from "@/lib/router";
+import { hrefFor, navigate, useRoute } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
@@ -72,10 +72,23 @@ function ProviderActions({
 
 export function ProvidersPage() {
   const canEdit = useCanEdit();
+  const route = useRoute();
+  const createRequested = route.query.get("new") === "1";
   const [nonce, setNonce] = useState(0);
-  const [createOpen, setCreateOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(createRequested);
   const [deleteTarget, setDeleteTarget] = useState<ProviderSummary | null>(null);
   const providers = useResource(() => api.listProviders(), [nonce]);
+
+  // The command palette links here as `?new=1` to open the form directly.
+  useEffect(() => {
+    if (createRequested) setCreateOpen(true);
+  }, [createRequested]);
+
+  function handleCreateOpenChange(open: boolean) {
+    setCreateOpen(open);
+    // Drop the one-shot query so a reload does not reopen the form.
+    if (!open && createRequested) navigate("/providers", { replace: true });
+  }
 
   const rows = providers.data ?? [];
   const linked = rows.reduce((total, provider) => total + provider.instances_count, 0);
@@ -271,7 +284,7 @@ export function ProvidersPage() {
 
       <ProviderFormDialog
         open={createOpen}
-        onOpenChange={setCreateOpen}
+        onOpenChange={handleCreateOpenChange}
         onSaved={() => setNonce((value) => value + 1)}
       />
 

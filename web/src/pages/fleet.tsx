@@ -54,6 +54,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
+import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
 import { formatClock, formatUptime, plural } from "@/lib/format";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
@@ -190,6 +191,15 @@ export function FleetPage() {
     persisted.q = q;
     persisted.status = status;
   }, [q, status]);
+
+  // The command palette can start, stop or restart an instance from any screen.
+  useEffect(() => {
+    function onChanged() {
+      setNonce((value) => value + 1);
+    }
+    window.addEventListener(INSTANCES_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(INSTANCES_CHANGED_EVENT, onChanged);
+  }, []);
 
   // The list endpoint has no uptime or share modes; hydrate each row from the
   // detail endpoint. Failures are non-fatal: the row keeps its summary values.

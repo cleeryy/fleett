@@ -16,6 +16,7 @@ import {
   Plug,
   Rocket,
   ScrollText,
+  Search,
   ShieldCheck,
   Sun,
   TriangleAlert,
@@ -25,6 +26,7 @@ import {
 import type { Health, Identity } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Kbd } from "@/components/ui/kbd";
 import {
   Sheet,
   SheetContent,
@@ -34,6 +36,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { identityLabel } from "@/lib/session";
+import { COMMAND_KEY_ARIA, COMMAND_KEY_LABEL } from "@/lib/shortcut";
 import { cn } from "@/lib/utils";
 
 export interface Crumb {
@@ -229,6 +232,7 @@ export function AppShell({
   theme,
   onToggleTheme,
   onSignOut,
+  onOpenCommand,
   children,
 }: {
   path: string;
@@ -239,6 +243,7 @@ export function AppShell({
   theme: "dark" | "light";
   onToggleTheme: () => void;
   onSignOut: () => void;
+  onOpenCommand: () => void;
   children: ReactNode;
 }) {
   const [navOpen, setNavOpen] = useState(false);
@@ -296,7 +301,7 @@ export function AppShell({
             </SheetContent>
           </Sheet>
 
-          <nav aria-label="Breadcrumb" className="min-w-0">
+          <nav aria-label="Breadcrumb" className="min-w-0 flex-1">
             <ol className="flex min-w-0 items-center gap-2 text-sm">
               {crumbs.map((crumb, index) => (
                 <li key={`${crumb.label}-${index}`} className="flex min-w-0 items-center gap-2">
@@ -321,6 +326,31 @@ export function AppShell({
               ))}
             </ol>
           </nav>
+
+          {/* One palette, two entry points: a labelled button on desktop and
+              the same dialog behind an icon on a phone. */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onOpenCommand}
+            aria-keyshortcuts={COMMAND_KEY_ARIA}
+            className="hidden w-56 shrink-0 justify-start gap-2 font-normal text-muted-foreground md:inline-flex"
+          >
+            <Search aria-hidden />
+            <span>Search…</span>
+            <Kbd className="ml-auto">{COMMAND_KEY_LABEL}</Kbd>
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onOpenCommand}
+            aria-label="Search commands"
+            aria-keyshortcuts={COMMAND_KEY_ARIA}
+            title={`Search commands (${COMMAND_KEY_LABEL})`}
+            className="shrink-0 md:hidden"
+          >
+            <Search aria-hidden />
+          </Button>
         </header>
 
         <main

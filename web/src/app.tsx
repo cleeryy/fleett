@@ -6,6 +6,7 @@ import { toApiError, type ApiError } from "@/api/errors";
 import type { AuthConfig, Health, Identity } from "@/api/types";
 import { AppShell, type Crumb } from "@/components/app-shell";
 import { AssistantPanel } from "@/components/assistant";
+import { CommandPalette } from "@/components/command-palette";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { EmptyState } from "@/components/empty-state";
@@ -116,6 +117,7 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [health, setHealth] = useState<Health | null>(null);
   const [healthFailed, setHealthFailed] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const identityRef = useRef<Identity | null>(null);
 
   useEffect(() => {
@@ -197,6 +199,7 @@ export default function App() {
       tokenStore.clear();
       setIdentity(null);
       setBootError(null);
+      setPaletteOpen(false);
       toast.error("Session expired. Sign in again.");
     }
     window.addEventListener("fleett:unauthorized", onUnauthorized);
@@ -221,7 +224,12 @@ export default function App() {
     setBootError(null);
   }
 
+  function toggleTheme() {
+    setTheme((current) => (current === "dark" ? "light" : "dark"));
+  }
+
   async function handleSignOut() {
+    setPaletteOpen(false);
     const method = identity?.method;
     try {
       // Sessions live in cookies the server must clear. With OIDC enabled the
@@ -401,12 +409,19 @@ export default function App() {
           health={health}
           healthFailed={healthFailed}
           theme={theme}
-          onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+          onToggleTheme={toggleTheme}
           onSignOut={() => void handleSignOut()}
+          onOpenCommand={() => setPaletteOpen(true)}
         >
           {screen}
         </AppShell>
         <AssistantPanel />
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+        />
       </SessionContext.Provider>
       {/* Lifted so toasts clear the floating assistant button. */}
       <Toaster theme={theme} position="bottom-right" offset={{ bottom: 88 }} />

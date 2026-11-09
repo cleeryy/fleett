@@ -70,9 +70,10 @@ import {
   type AssistantAppliedDetail,
 } from "@/lib/assistant";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
+import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
 import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
 import { applySucceeded, compactVariables } from "@/lib/personas";
-import { navigate, hrefFor } from "@/lib/router";
+import { navigate, hrefFor, useRoute } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 import { isHttpUrl } from "@/lib/validation";
@@ -1135,6 +1136,19 @@ const TAB_PAGES: Record<string, string> = {
   compose: "Compose",
 };
 
+/** Tabs that only an editor may open; a viewer falls back to the overview. */
+const EDIT_ONLY_TABS = new Set(["configuration", "terminal"]);
+
+/**
+ * The palette links to a tab as `?tab=logs`, so one keystroke from anywhere
+ * lands on the right panel. Unknown or forbidden values fall back to Overview.
+ */
+function requestedTab(value: string | null, canEdit: boolean): string {
+  if (!value || !Object.hasOwn(TAB_PAGES, value)) return "overview";
+  if (!canEdit && EDIT_ONLY_TABS.has(value)) return "overview";
+  return value;
+}
+
 function DetailSkeleton() {
   return (
     <div className="space-y-6">
@@ -1154,8 +1168,11 @@ function DetailSkeleton() {
 
 export function InstanceDetailPage({ id }: { id: string }) {
   const canEdit = useCanEdit();
+  const route = useRoute();
+  const tabParam = route.query.get("tab");
   const [nonce, setNonce] = useState(0);
-  const [tab, setTab] = useState("overview");
+  const [tab, setTab] = useState(() => requestedTab(tabParam, canEdit));
+  const appliedTabParam = useRef(tabParam);
   // The Files tab is mounted on first visit and then kept alive (hidden), so an
   // unsaved buffer survives a trip to Overview and back.
   const [filesMounted, setFilesMounted] = useState(false);
@@ -1189,6 +1206,22 @@ export function InstanceDetailPage({ id }: { id: string }) {
     window.addEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
     return () => window.removeEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
   }, [id]);
+
+  // A lifecycle action from the command palette targets this instance too.
+  useEffect(() => {
+    function onChanged() {
+      setNonce((value) => value + 1);
+    }
+    window.addEventListener(INSTANCES_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(INSTANCES_CHANGED_EVENT, onChanged);
+  }, []);
+
+  // The palette can send a second command while this page is already open.
+  useEffect(() => {
+    if (tabParam === appliedTabParam.current) return;
+    appliedTabParam.current = tabParam;
+    setTab(requestedTab(tabParam, canEdit));
+  }, [tabParam, canEdit]);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);
