@@ -1,96 +1,184 @@
-# fleett
+<div align="center">
+  <img src="web/public/favicon.svg" width="64" height="64" alt="">
+  <h1>fleett</h1>
+  <p><strong>A small control plane for fleets of Hermes agents.</strong><br>
+  Create, configure, inspect and upgrade each agent in its own Docker container —
+  without ever touching the one you already run.</p>
 
-Web console to create, configure, start/stop and delete Hermes agents, each in its own
-Docker container. Your existing Hermes instance is never touched.
+  <p>
+    <a href="https://github.com/cleeryy/fleett/actions/workflows/ci.yml"><img src="https://github.com/cleeryy/fleett/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+    <a href="https://github.com/cleeryy/fleett/actions/workflows/compose-integration.yml"><img src="https://github.com/cleeryy/fleett/actions/workflows/compose-integration.yml/badge.svg" alt="compose"></a>
+    <a href="https://github.com/cleeryy/fleett/releases"><img src="https://img.shields.io/github/v/release/cleeryy/fleett?display_name=tag&amp;sort=semver" alt="release"></a>
+    <a href="https://github.com/cleeryy/fleett/pkgs/container/fleett"><img src="https://img.shields.io/badge/ghcr.io-cleeryy%2Ffleett-2496ED?logo=docker&amp;logoColor=white" alt="ghcr"></a>
+    <img src="https://img.shields.io/badge/rust-1.99-dea584?logo=rust&amp;logoColor=white" alt="rust">
+  </p>
+</div>
 
-`fleett` is the control plane; the agents it manages are still Hermes agents. The project
-was renamed from `hermes-fleet` in v0.2.0 — see [Upgrading from `hermes-fleet`](#upgrading-from-hermes-fleet).
+![Fleet](docs/screenshots/fleet.png)
 
-## What it does
+## Why
 
-- create an instance from a template (`guest`, `guest-discord`, `solo`) with model, base URL,
-  provider token, chat channel and shared mounts
-- start, stop, restart and delete instances (data kept or purged)
-- read logs, the generated Compose file and the runtime state
-- share a directory between instances (`rw` or `ro`) for findings and knowledge
-- agents keep running when the console is stopped, updated or deleted: Docker owns them
-- sign in with SSO (OIDC/Authentik) or a bearer token, with `admin`/`viewer` roles, CSRF
-  protection, named revocable API tokens and an audit log — see `docs/OIDC.md`
-- export one instance as a portable `.tgz` and import it under another id (same data, no
-  secrets), and run rotating host backups with `fleett backup` — see `docs/BACKUP.md`
-- move the whole fleet to another image with `fleett upgrade`: one instance at a time by
-  default, health-checked, with automatic rollback to the previous tag — see `docs/UPGRADE.md`
-- drive everything from a terminal: `fleett ls`, `ps`, `logs`, `create`, `start`/`stop`/
-  `restart`, `delete`, `usage`, `images`, `upgrade`, `doctor` — see `docs/CLI.md`
-- scrape the fleet from Prometheus on a dedicated loopback listener (`GET /metrics`,
-  optional bearer token) — see `docs/METRICS.md`
-- harden the agent container on demand: `FLEETT_HARDENING=strict` adds a read-only
-  rootfs and `cap_drop: [ALL]` — see `docs/HARDENING.md`
+One agent is easy. Five is not: five configs, five bots, five upgrade paths, five sets of
+tokens. `fleett` keeps the part that matters — one Compose project per agent, on disk — and
+gives you the rest: a console, a CLI, logs, history, backups and one place to rotate a
+credential.
 
-## Install
+The instance you already run is never touched. `fleett` manages the new ones, side by side.
+
+## Features
+
+| | |
+|---|---|
+| **Lifecycle** | Create from a template, start, stop, restart, delete (data kept or purged), clone with fresh credentials. |
+| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions; per-key `secret` flag; encrypted at rest, values never returned. |
+| **Providers** | Share one credential across agents, test it, rotate once and restart every linked agent with a per-instance report. |
+| **Files** | Browse and edit `SOUL.md`, skills and notes from the console; ETag conflicts, timestamped backups, “save & restart”. |
+| **History** | One git repo per agent, actor-attributed commits, diff, restore. Readable while the agent is stopped. |
+| **Logs** | `tail`, `since`, `grep`, `level`, JSON; error summary; `docker inspect` cause (`OOMKilled`, exit code, `State.Error`). |
+| **Backups** | Rotating host backups, portable instance export/import, restore into a fresh root. |
+| **Upgrades** | Move the whole fleet to a new image: one at a time, health-checked, automatic rollback to the previous tag. |
+| **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit log, named revocable tokens, encrypted secrets, LAN egress firewall, opt-in strict hardening. |
+| **Ops** | Real healthcheck, Prometheus `/metrics`, usage, `fleett doctor`, compose integration in CI. |
+
+## Quick start
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cleeryy/fleett/master/install.sh | bash
-fleett                           # reads ~/.fleett/fleett.env
+fleett
 # open http://127.0.0.1:8090
 ```
 
-Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). The installer also creates a
-`hermes-fleet` symlink for scripts written against the old name. A `.deb` (systemd unit,
-UID 10000, secrets key) and the OCI image `ghcr.io/cleeryy/fleett` are published with each
-release — see `docs/PACKAGING.md`. Details: `docs/INSTALL.md`,
-deployment as a service: `docs/DEPLOY.md`, encrypted secrets: `docs/SECRETS.md`,
-backups and instance archives: `docs/BACKUP.md`, rolling image upgrades: `docs/UPGRADE.md`,
-metrics: `docs/METRICS.md`, container hardening: `docs/HARDENING.md`.
+Linux (static musl, x86_64/aarch64) and macOS (arm64/x86_64). Also published with every
+release: a `.deb` (systemd unit, UID 10000, secrets key) and the image
+`ghcr.io/cleeryy/fleett`.
 
-## Architecture
-
-One instance = one Docker Compose project written to disk
-(`instances/<id>/compose.yaml`), driven by `docker compose -p fleett-<id>`. The project name
-is read back from the compose file, so projects created by the previous name
-(`hermes-<id>`) stay manageable without being recreated. The control plane only writes files
-and calls Compose; it supervises no process. `restart: unless-stopped` means agents survive a
-console restart, an update, or the console being deleted.
-
-The SQLite database is a rebuildable index; `instances/` and `shares/` are the source of
-truth. See `SPEC.md` for the decisions and `API.md` for the HTTP contract.
-
-## Upgrading from `hermes-fleet`
-
-v0.2.0 keeps the old installation working:
-
-- environment variables: `FLEETT_*` is read first, `FLEET_*` is still accepted, and the
-  installer also accepts `HERMES_FLEET_*`
-- data root: `~/.fleett`; when it does not exist, an existing `~/.hermes-fleet` is adopted
-  (and logged once)
-- environment file: `fleett.env` first, then `fleet.env`
-- compose projects: the driver uses the `name:` declared in each `compose.yaml`, and updates
-  write that same name back, so `hermes-<id>` instances keep starting, stopping, serving logs
-  and accepting configuration changes without ever being duplicated
-- the database file is still `fleet.db`, and `/opt/data`, `HERMES_UID`/`HERMES_GID` and the
-  `hermes-agent` image are unchanged
-
-Renaming the projects themselves is opt-in:
+<details>
+<summary><strong>Debian / Ubuntu</strong></summary>
 
 ```bash
-fleett migrate --from hermes-fleet            # print the plan, change nothing
-fleett migrate --from hermes-fleet --apply    # down, rewrite, up (running instances only)
+curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.5.0_amd64.deb
+sudo dpkg -i fleett_0.5.0_amd64.deb
+sudoedit /etc/fleett/fleett.env   # set FLEETT_TOKEN
+sudo systemctl enable --now fleett
+```
+</details>
+
+<details>
+<summary><strong>Container</strong></summary>
+
+```bash
+docker run -d --name fleett \
+  -p 127.0.0.1:8090:8090 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v fleett-data:/data \
+  -e FLEETT_TOKEN=change-me \
+  -e FLEETT_DRIVER=compose \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+  ghcr.io/cleeryy/fleett:0.5.0
+```
+</details>
+
+Three things before the first agent:
+
+1. `sudo fleett egress install` — otherwise restricted agents are refused
+   (`409 egress_not_enforced`).
+2. Build the agent image and set `FLEETT_IMAGE`:
+   `docker build -t hermes-agent:0.22.2-local /path/to/hermes-official`.
+3. Create a provider (or paste a token on the instance), then create the instance.
+
+## A look inside
+
+| | |
+|---|---|
+| ![Create](docs/screenshots/create.png) | ![Files](docs/screenshots/files.png) |
+| **Create** — template, provider, model, LAN policy. | **Files** — edit the soul, keep every version. |
+| ![History](docs/screenshots/history.png) | ![Providers](docs/screenshots/providers.png) |
+| **History** — who changed what, restore in one click. | **Providers** — one credential, many agents. |
+
+## How it fits together
+
+```
+          browser / fleett CLI
+                    │  HTTP + OIDC session or bearer token
+          ┌─────────▼──────────────────────────────────┐
+          │  fleett                                     │
+          │  axum · SQLite · files · git · /metrics     │
+          │  writes instances/<id>/compose.yaml         │
+          └─────────┬───────────────────────────────────┘
+                    │  docker compose -p fleett-<id>
+          ┌─────────▼───────────────────────────────────┐
+          │  Docker                                     │
+          │  fleett-tchouniz   fleett-walter   fleett-ops│
+          │    /opt/data         /opt/data       …       │
+          └─────────────────────────────────────────────┘
 ```
 
-The rewrite goes through `serde_yaml`, not string replacement, and the plan is also available
-without Docker. Running instances are restarted as `fleett-<id>`; stopped ones are only
-rewritten. While legacy projects exist, a single warning at startup points at this command.
+Each agent is a Compose project on disk with `restart: unless-stopped`. The control plane
+only writes files and calls Compose; it supervises no process. Stop it, update it or delete
+it — the agents keep running. The SQLite database is a rebuildable index; `instances/` and
+`shares/` are the source of truth.
+
+## Security model
+
+- **Agents are contained**: no host network, no Docker socket, one data mount, `NET_RAW`
+  dropped, `pids_limit`, memory and CPU limits.
+- **Egress**: agents only reach the restricted `fleett` network. `fleett egress install`
+  drops RFC1918 destinations with tagged `DOCKER-USER` rules; `allow_lan` is an explicit
+  per-instance exception.
+- **Secrets**: AES-256-GCM at rest, the key lives outside `FLEETT_ROOT`, Compose only sees
+  `${KEY}`, and no endpoint returns a secret value.
+- **Humans**: OIDC/Authentik, signed session cookies, `admin`/`viewer`, CSRF double-submit,
+  named tokens stored as digests, every mutation in the audit log.
+
+## CLI
+
+```bash
+fleett ls
+fleett create --template guest-discord --id tchouniz
+fleett logs tchouniz --since 30m --grep error --level error
+fleett usage
+fleett upgrade --image hermes-agent:0.23.0-local
+fleett backup --keep 7
+fleett doctor
+```
+
+Every command accepts `--json`; the server URL and token come from
+`~/.config/fleett/config.toml` or `FLEETT_URL` / `FLEETT_TOKEN`.
+
+## Docs
+
+| | |
+|---|---|
+| [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | how to run it, as a binary, a `.deb` or a container |
+| [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
+| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) | the per-agent surface |
+| [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
 
 ## Development
 
 ```bash
-cd backend && cargo run          # mock driver by default, no Docker calls
+cd backend && cargo run          # mock driver, no Docker calls
 cd web && pnpm install && pnpm dev
 ```
 
-Build a single binary with the UI embedded:
+Single binary with the console embedded:
 
 ```bash
 cd web && pnpm build
 cd ../backend && cargo build --release --features embed-web
+```
+
+`cargo test` (433 tests), `cargo clippy --all-targets -- -D warnings` and `pnpm build` are
+the gates. The compose-driver job runs the real `docker compose` lifecycle against a
+stand-in agent image on every push.
+
+## Upgrading from `hermes-fleet`
+
+`FLEETT_*` is read first, `FLEET_*` still works, `~/.hermes-fleet` is adopted when
+`~/.fleett` is absent, and legacy `hermes-<id>` Compose projects stay manageable. Renaming
+the projects themselves is opt-in:
+
+```bash
+fleett migrate --from hermes-fleet           # print the plan
+fleett migrate --from hermes-fleet --apply   # down, rewrite, up
 ```
