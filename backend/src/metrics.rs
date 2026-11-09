@@ -1273,6 +1273,7 @@ mod tests {
             provider: None,
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
+            skills: Vec::new(),
             mem_limit_mb: 512,
             cpu_limit: 1.0,
             image: "agent:1".to_string(),

@@ -1016,6 +1016,20 @@ impl Config {
         self.personas_dir().join(id)
     }
 
+    /// Shared skills (issue #54): one directory per skill, and one directory
+    /// per version under it. The whole tree is one git repository at its root.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
+    pub fn skill_dir(&self, name: &str) -> PathBuf {
+        self.skills_dir().join(name)
+    }
+
+    pub fn skill_version_dir(&self, name: &str, version: &str) -> PathBuf {
+        self.skill_dir(name).join(version)
+    }
+
     pub fn template_config_path(&self, id: &str) -> PathBuf {
         self.template_dir(id).join("config.yaml")
     }

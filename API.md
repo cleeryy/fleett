@@ -252,6 +252,30 @@ binding and restarts the instance. `persona_state` is `applied` (the file is a
 fresh render of the persona with the current values), `diverged` (hand edit,
 persona change or missing file) or `none`.
 
+## Skills
+
+A versioned, read-only skill registry shared by several instances. Each version
+lives under `$FLEETT_ROOT/skills/<name>/<version>/` (`SKILL.md` required, plus
+any text files, `skill.yaml` metadata); one git repository covers the tree and
+a `latest` pointer drives the instances that do not pin a version. See
+[docs/SKILLS.md](docs/SKILLS.md).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/skills` | — | `[{name,description,latest,versions,instances_count}]` |
+| GET | `/api/skills/{name}` | — | metadata, versions and files |
+| POST | `/api/skills` | `{"name","version","description"?,"files":[{path,content}]}` | `201`; `409 skill_version_exists`, admin only |
+| POST | `/api/skills/import` | multipart zip (`skill.yaml` + files) | `201` with the next free version, admin only |
+| POST | `/api/skills/{name}/promote` | `{"version":"v2"}` | `{"latest","results":[{id,status:"restarted\|failed",error?}]}`; restarts followers only, admin only |
+| DELETE | `/api/skills/{name}` | — | `204`; `409 skill_in_use` with `details.instances`, admin only |
+| GET | `/api/skills/{name}/git/log?limit=50` | — | commits touching the skill |
+| GET | `/api/skills/{name}/git/diff?from=&to=` | — | unified patch |
+
+On an instance, `skills: [{name, version?}]` mounts each skill read-only at
+`/opt/data/skills/<name>`. Omitting `version` follows `latest`; pinning freezes
+the mount. The instance detail returns `{name, version, effective_version}`.
+Changing the list rewrites the compose file and runs `up -d`.
+
 ## Providers
 
 Reusable API credentials shared by several agents; see `docs/PROVIDERS.md`.

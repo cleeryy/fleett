@@ -17,12 +17,12 @@ use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
     validate_disk_quota_mb, validate_env_key, validate_env_raw_value, validate_instance_id,
     validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
-    ChannelKind, ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest,
-    DiskPolicy, EnvInput, EnvSuggestion, EnvVarInput, HealPolicy, Health, InstanceDetail,
-    InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status, TemplateMeta,
-    DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS,
-    DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE, DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV,
-    HEALTH_UNHEALTHY_MESSAGE,
+    validate_skill_name, validate_skill_version, ChannelKind, ChannelRequest, CloneInstanceRequest,
+    ContainerInfo, CreateInstanceRequest, DiskPolicy, EnvInput, EnvSuggestion, EnvVarInput,
+    HealPolicy, Health, InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest,
+    ShareRef, SkillRefDetail, Status, TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT,
+    DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
@@ -176,6 +176,7 @@ pub async fn list(
             crate::authz::instance_role(&context, &acl, &spec.id),
             &binding,
             persona_state,
+            &skill_views(&state, spec),
         ));
     }
     Ok(Json(summaries))
@@ -306,6 +307,11 @@ pub async fn create(
             "allow_lan": stored.allow_lan,
             "host": stored.host,
             "persona": prepared.persona.as_ref().map(|persona| persona.id.clone()),
+            "skills": stored
+                .skills
+                .iter()
+                .map(|skill| serde_json::json!({"name": skill.name, "version": skill.version}))
+                .collect::<Vec<_>>(),
         })),
     );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
@@ -475,6 +481,14 @@ pub async fn clone(
     } else {
         Vec::new()
     };
+    // Skills are configuration, not secrets: the clone mounts the same ones,
+    // with the same pins (`version: None` keeps following latest).
+    clone.skills = source
+        .skills
+        .iter()
+        .filter(|skill| crate::skills::effective_version(&state.cfg, skill).is_some())
+        .cloned()
+        .collect();
     clone.status = Status::Created;
     clone.last_error = None;
     // The target image is inherited, but the clone has no upgrade history of
@@ -751,8 +765,9 @@ async fn import_archive(
     .map_err(|err| ApiError::internal(format!("the import task failed: {err}")))?
     .map_err(import_error)?;
 
-    let mut spec = crate::instance_archive::spec_from_manifest(&extraction.manifest.instance, id)
-        .map_err(import_error)?;
+    let mut spec =
+        crate::instance_archive::spec_from_manifest(&state.cfg, &extraction.manifest.instance, id)
+            .map_err(import_error)?;
     // An archive never dictates placement: an imported instance starts on the
     // local host of the control plane that receives it.
     spec.host = crate::hosts::LOCAL_HOST.to_string();
@@ -1115,6 +1130,24 @@ pub async fn patch(
             "instance.persona",
             &spec.id,
             Some(details),
+        );
+    }
+    if request.skills.is_some() {
+        audit::record(
+            &state,
+            &context,
+            "instance.skills",
+            &spec.id,
+            Some(serde_json::json!({
+                "skills": spec
+                    .skills
+                    .iter()
+                    .map(|skill| serde_json::json!({
+                        "name": skill.name,
+                        "version": skill.version,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
         );
     }
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
@@ -1795,6 +1828,7 @@ fn to_summary(
     role: Option<crate::authz::InstanceRole>,
     persona: &crate::models::PersonaBinding,
     persona_state: crate::personas::PersonaState,
+    skills: &[SkillRefDetail],
 ) -> InstanceSummary {
     InstanceSummary {
         id: spec.id.clone(),
@@ -1815,6 +1849,7 @@ fn to_summary(
         persona_vars: persona.variables.clone(),
         persona_state: persona_state.as_str().to_string(),
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
+        skills: skills.to_vec(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
         role: role.map(|role| role.as_str().to_string()),
@@ -1847,6 +1882,22 @@ fn persona_view(
             )
         }
     }
+}
+
+/// Skills of one instance, with the version each one is mounted at.
+///
+/// Resolution reads the registry (`latest` pointer or the pinned directory):
+/// an unresolvable reference reports `effective_version: null` and the compose
+/// renderer leaves it out.
+fn skill_views(state: &AppState, spec: &InstanceSpec) -> Vec<SkillRefDetail> {
+    spec.skills
+        .iter()
+        .map(|skill| SkillRefDetail {
+            name: skill.name.clone(),
+            version: skill.version.clone(),
+            effective_version: crate::skills::effective_version(&state.cfg, skill),
+        })
+        .collect()
 }
 
 fn to_detail(
@@ -1893,6 +1944,7 @@ fn to_detail(
         status: status.as_str().to_string(),
         health: health.as_str().to_string(),
         shares: spec.shares.clone(),
+        skills: skill_views(state, spec),
         mem_limit_mb: spec.mem_limit_mb,
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
@@ -2045,6 +2097,7 @@ async fn prepare_create(
         Some(shares) => validate_share_refs(state, shares)?,
         None => Vec::new(),
     };
+    let skills = validate_skill_refs(state, request.skills.as_deref().unwrap_or_default())?;
 
     let mem_limit_mb = request
         .mem_limit_mb
@@ -2204,6 +2257,7 @@ async fn prepare_create(
             provider: provider.map(|entry| entry.id),
             channel,
             shares,
+            skills,
             mem_limit_mb,
             cpu_limit,
             image: state.cfg.image.clone(),
@@ -2410,6 +2464,9 @@ fn apply_patch(
     if let Some(shares) = &request.shares {
         spec.shares = validate_share_refs(state, shares)?;
     }
+    if let Some(skills) = &request.skills {
+        spec.skills = validate_skill_refs(state, skills)?;
+    }
 
     let mut channel_token = None;
     if let Some(channel) = &request.channel {
@@ -2479,6 +2536,72 @@ fn load_provider(state: &AppState, id: &str) -> Result<crate::models::ProviderSp
                 format!("provider \"{id}\" does not exist"),
             )
         })
+}
+
+/// Validate the skills of a create/patch request (issue #54).
+///
+/// A skill must exist in the registry, a pinned version must be published, the
+/// list must be unique and bounded. A reference that cannot be satisfied is a
+/// 400 here rather than a silent missing mount later.
+fn validate_skill_refs(
+    state: &AppState,
+    skills: &[crate::models::SkillRef],
+) -> Result<Vec<crate::models::SkillRef>, ApiError> {
+    if skills.len() > crate::skills::MAX_SKILLS_PER_INSTANCE {
+        return Err(ApiError::bad_request(
+            "invalid_skills",
+            format!(
+                "at most {} skills may be mounted",
+                crate::skills::MAX_SKILLS_PER_INSTANCE
+            ),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut validated = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let name = skill.name.trim();
+        validate_skill_name(name)
+            .map_err(|message| ApiError::bad_request("invalid_skill", message))?;
+        if !seen.insert(name.to_string()) {
+            return Err(ApiError::bad_request(
+                "duplicate_skill",
+                format!("skill \"{name}\" is listed twice"),
+            ));
+        }
+        let version = skill
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match version {
+            Some(version) => {
+                validate_skill_version(version)
+                    .map_err(|message| ApiError::bad_request("invalid_skill", message))?;
+                if !state.cfg.skill_version_dir(name, version).is_dir() {
+                    return Err(ApiError::bad_request(
+                        "unknown_skill_version",
+                        format!("version \"{version}\" of skill \"{name}\" does not exist"),
+                    )
+                    .with_details(serde_json::json!({ "skill": name, "version": version })));
+                }
+            }
+            None => {
+                if crate::skills::latest(&state.cfg, name).is_none() {
+                    return Err(ApiError::bad_request(
+                        "unknown_skill",
+                        format!("skill \"{name}\" is not in the registry"),
+                    )
+                    .with_details(serde_json::json!({ "skill": name })));
+                }
+            }
+        }
+        validated.push(crate::models::SkillRef {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+        });
+    }
+    validated.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(validated)
 }
 
 fn validate_share_refs(state: &AppState, shares: &[ShareRef]) -> Result<Vec<ShareRef>, ApiError> {

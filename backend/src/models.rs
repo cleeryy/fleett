@@ -227,6 +227,30 @@ pub struct ShareRef {
     pub mode: ShareMode,
 }
 
+/// A shared skill attached to an instance (issue #54).
+///
+/// The registry lives under `$FLEETT_ROOT/skills/<name>/<version>/` and is
+/// mounted read-only at `/opt/data/skills/<name>`. A missing `version` follows
+/// the `latest` pointer of the skill; a pinned version never moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRef {
+    pub name: String,
+    /// Pinned version (`v1`, `v2`, …); `None` follows `latest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// One skill as reported on an instance (issue #54).
+///
+/// `version` is the pin the operator asked for (`null` = follow latest);
+/// `effective_version` is what the compose file actually mounts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SkillRefDetail {
+    pub name: String,
+    pub version: Option<String>,
+    pub effective_version: Option<String>,
+}
+
 /// Lifecycle status of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -369,6 +393,8 @@ pub struct InstanceSpec {
     pub provider: Option<String>,
     pub channel: ChannelKind,
     pub shares: Vec<ShareRef>,
+    /// Shared skills mounted read-only into the container (issue #54).
+    pub skills: Vec<SkillRef>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     /// Container image the instance runs (`services.agent.image` of its
@@ -572,6 +598,9 @@ pub struct InstanceSummary {
     /// persona changed since the last application) or `none`.
     pub persona_state: String,
     pub shares: Vec<String>,
+    /// Shared skills attached to the instance, with the version each one is
+    /// mounted at (issue #54).
+    pub skills: Vec<SkillRefDetail>,
     pub last_error: Option<String>,
     pub created_at: String,
     /// Level of the caller on this instance (`owner|operator|viewer`), when it
@@ -602,6 +631,10 @@ pub struct InstanceDetail {
     pub status: String,
     pub health: String,
     pub shares: Vec<ShareRef>,
+    /// Shared skills attached to the instance, with the version each one is
+    /// effectively mounted at (`version` is `null` when the instance follows
+    /// latest) (issue #54).
+    pub skills: Vec<SkillRefDetail>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     pub allow_lan: bool,
@@ -1150,6 +1183,10 @@ pub struct CreateInstanceRequest {
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
     pub shares: Option<Vec<ShareRef>>,
+    /// Shared skills to mount read-only (issue #54). A skill without a
+    /// `version` follows the registry `latest` pointer.
+    #[serde(default)]
+    pub skills: Option<Vec<SkillRef>>,
     #[serde(default)]
     pub mem_limit_mb: Option<u32>,
     #[serde(default)]
@@ -1238,6 +1275,10 @@ pub struct PatchInstanceRequest {
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
     pub shares: Option<Vec<ShareRef>>,
+    /// Replace the attached skills (issue #54). A missing field leaves the
+    /// current list alone.
+    #[serde(default)]
+    pub skills: Option<Vec<SkillRef>>,
     #[serde(default)]
     pub mem_limit_mb: Option<u32>,
     #[serde(default)]
@@ -1332,6 +1373,31 @@ pub fn validate_persona_variable_key(key: &str) -> Result<(), String> {
 
 pub fn validate_share_name(name: &str) -> Result<(), String> {
     validate_slug(name, "share name", SHARE_NAME_MIN, SHARE_NAME_MAX)
+}
+
+/// Skill names follow the slug grammar and name a directory under
+/// `$FLEETT_ROOT/skills` (issue #54).
+pub fn validate_skill_name(name: &str) -> Result<(), String> {
+    validate_slug(name, "skill name", SHARE_NAME_MIN, SHARE_NAME_MAX)
+}
+
+/// Skill versions are `v` followed by a positive integer (`v1`, `v2`, …).
+///
+/// The registry directory is named exactly after this value, so the grammar is
+/// deliberately narrow: no dots, no zero, no sign.
+pub fn validate_skill_version(version: &str) -> Result<(), String> {
+    let digits = version.strip_prefix('v').unwrap_or_default();
+    let valid = !digits.is_empty()
+        && digits.len() <= 9
+        && !digits.starts_with('0')
+        && digits.bytes().all(|byte| byte.is_ascii_digit());
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "version \"{version}\" must match ^v[1-9][0-9]{{0,8}}$"
+        ))
+    }
 }
 
 /// Provider names share the slug grammar of ids (lowercase, digits, `-`).

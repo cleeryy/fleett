@@ -187,6 +187,7 @@ fn manifest_of(instance: &Value) -> ArchiveInstance {
             .unwrap_or("warn")
             .to_string(),
         shares: Vec::new(),
+        skills: Vec::new(),
         notes: String::new(),
         host: fleett::hosts::LOCAL_HOST.to_string(),
     }

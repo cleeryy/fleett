@@ -90,6 +90,11 @@ pub struct ArchiveInstance {
     pub disk_policy: String,
     #[serde(default)]
     pub shares: Vec<ShareRef>,
+    /// Skills mounted when the archive was written (issue #54). Missing in
+    /// older archives; a skill the receiving fleet does not know is dropped on
+    /// import rather than mounted as an empty directory.
+    #[serde(default)]
+    pub skills: Vec<crate::models::SkillRef>,
     #[serde(default)]
     pub notes: String,
     /// Host the instance ran on when the archive was written. Informational
@@ -123,6 +128,7 @@ impl ArchiveInstance {
             disk_quota_mb: spec.disk_quota_mb,
             disk_policy: spec.disk_policy.as_str().to_string(),
             shares: spec.shares.clone(),
+            skills: spec.skills.clone(),
             notes: spec.notes.clone(),
             host: spec.host.clone(),
         }
@@ -292,6 +298,7 @@ pub fn extract(reader: impl Read, data_dir: &Path) -> Result<Extraction, Archive
 /// The id always comes from the request: a manifest id is metadata of the
 /// source instance, never the identity of the copy.
 pub fn spec_from_manifest(
+    cfg: &Config,
     manifest: &ArchiveInstance,
     id: &str,
 ) -> Result<InstanceSpec, ArchiveError> {
@@ -362,6 +369,28 @@ pub fn spec_from_manifest(
     }
     shares.sort_by(|left, right| left.name.cmp(&right.name));
 
+    // Skills are resolved against the receiving registry: an unknown skill (or
+    // a pinned version that was never published here) is dropped instead of
+    // being mounted as an empty directory.
+    let mut skills = Vec::new();
+    for skill in &manifest.skills {
+        if crate::models::validate_skill_name(&skill.name).is_err() {
+            return Err(invalid(format!("invalid skill name \"{}\"", skill.name)));
+        }
+        if let Some(version) = skill.version.as_deref() {
+            if crate::models::validate_skill_version(version).is_err() {
+                return Err(invalid(format!(
+                    "invalid version \"{version}\" of skill \"{}\"",
+                    skill.name
+                )));
+            }
+        }
+        if crate::skills::effective_version(cfg, skill).is_some() {
+            skills.push(skill.clone());
+        }
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+
     let now = now_iso();
     Ok(InstanceSpec {
         id: id.to_string(),
@@ -373,6 +402,7 @@ pub fn spec_from_manifest(
         provider: manifest.provider.clone(),
         channel,
         shares,
+        skills,
         mem_limit_mb,
         cpu_limit,
         image: String::new(),
@@ -489,6 +519,7 @@ mod tests {
                 name: "findings".to_string(),
                 mode: ShareMode::Ro,
             }],
+            skills: Vec::new(),
             mem_limit_mb: 2048,
             cpu_limit: 1.5,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -637,7 +668,7 @@ mod tests {
     fn specs_are_built_from_the_manifest_metadata() {
         let (_dir, cfg) = temp_config();
         let manifest = ArchiveInstance::from_spec(&spec());
-        let imported = spec_from_manifest(&manifest, "bob").expect("spec");
+        let imported = spec_from_manifest(&cfg, &manifest, "bob").expect("spec");
         assert_eq!(imported.id, "bob");
         assert_eq!(imported.name, "Alice");
         assert_eq!(imported.mem_limit_mb, 2048);
@@ -651,21 +682,22 @@ mod tests {
 
     #[test]
     fn invalid_manifest_values_are_refused() {
+        let (_dir, cfg) = temp_config();
         let mut manifest = ArchiveInstance::from_spec(&spec());
         manifest.mem_limit_mb = 1;
-        assert!(spec_from_manifest(&manifest, "bob").is_err());
+        assert!(spec_from_manifest(&cfg, &manifest, "bob").is_err());
 
         let mut manifest = ArchiveInstance::from_spec(&spec());
         manifest.cpu_limit = 99.0;
-        assert!(spec_from_manifest(&manifest, "bob").is_err());
+        assert!(spec_from_manifest(&cfg, &manifest, "bob").is_err());
 
         let mut manifest = ArchiveInstance::from_spec(&spec());
         manifest.channel = "carrier-pigeon".to_string();
-        assert!(spec_from_manifest(&manifest, "bob").is_err());
+        assert!(spec_from_manifest(&cfg, &manifest, "bob").is_err());
 
         let mut manifest = ArchiveInstance::from_spec(&spec());
         manifest.shares.push(manifest.shares[0].clone());
-        assert!(spec_from_manifest(&manifest, "bob").is_err());
+        assert!(spec_from_manifest(&cfg, &manifest, "bob").is_err());
     }
 
     #[test]

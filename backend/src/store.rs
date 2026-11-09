@@ -33,6 +33,9 @@ pub fn ensure_layout(cfg: &Config) -> io::Result<()> {
     ] {
         create_dir_private(&dir)?;
     }
+    // The skill registry is world-readable (0755): containers mount it
+    // read-only and its contents are never secret.
+    crate::skills::ensure_registry(cfg)?;
     Ok(())
 }
 
@@ -465,6 +468,18 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         })
         .unwrap_or_default();
 
+    let skills = agent
+        .and_then(|service| service.get("volumes"))
+        .and_then(Value::as_sequence)
+        .map(|volumes| {
+            volumes
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(parse_skill_volume)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let config_doc = fs::read_to_string(cfg.data_dir(id).join("config.yaml"))
         .ok()
         .and_then(|text| serde_yaml::from_str::<Value>(&text).ok());
@@ -513,6 +528,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         provider: None,
         channel,
         shares,
+        skills,
         mem_limit_mb,
         cpu_limit,
         image,
@@ -554,6 +570,26 @@ fn parse_share_volume(volume: &str) -> Option<ShareRef> {
     Some(ShareRef {
         name: name.to_string(),
         mode,
+    })
+}
+
+/// `../../skills/<name>/<version>:/opt/data/skills/<name>:ro` → a pinned skill.
+///
+/// The compose file names a concrete version (the resolved `latest`), so an
+/// instance adopted from disk is pinned to what it actually runs; a promote
+/// therefore restarts only the instances the database says follow latest.
+fn parse_skill_volume(volume: &str) -> Option<models::SkillRef> {
+    let rest = volume.strip_prefix("../../skills/")?;
+    let (source, _target) = rest.split_once(':')?;
+    let (name, version) = source.split_once('/')?;
+    if models::validate_skill_name(name).is_err()
+        || models::validate_skill_version(version).is_err()
+    {
+        return None;
+    }
+    Some(models::SkillRef {
+        name: name.to_string(),
+        version: Some(version.to_string()),
     })
 }
 

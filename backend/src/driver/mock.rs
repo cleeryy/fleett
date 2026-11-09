@@ -841,6 +841,7 @@ mod tests {
             provider: None,
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
+            skills: Vec::new(),
             mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),

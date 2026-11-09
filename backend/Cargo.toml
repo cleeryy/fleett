@@ -15,7 +15,7 @@ embed-web = ["dep:rust-embed"]
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
+# Shared skills (issue #54): a `.zip` import is read entirely in memory, only
+# the deflate codec is needed (no encryption, no exotic formats).
+zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
 # Instance history (docs/GIT.md): local repositories only, so the default
 # features (OpenSSL, libssh2) are not needed; libgit2 is vendored and built by
 # the build script.

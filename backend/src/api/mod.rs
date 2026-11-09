@@ -30,6 +30,7 @@ pub mod quota;
 pub mod schedules;
 pub mod security;
 pub mod shares;
+pub mod skills;
 pub mod snapshots;
 pub mod templates;
 pub mod tokens;
@@ -284,6 +285,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/personas/{id}/apply", post(personas::apply))
         .route("/personas/{id}/git/log", get(personas::log))
         .route("/personas/{id}/git/diff", get(personas::diff))
+        .route("/skills", get(skills::list).post(skills::publish))
+        .route(
+            "/skills/import",
+            post(skills::import).layer(axum::extract::DefaultBodyLimit::max(
+                skills::MAX_IMPORT_BODY,
+            )),
+        )
+        .route("/skills/{name}", get(skills::detail).delete(skills::delete))
+        .route("/skills/{name}/promote", post(skills::promote))
+        .route("/skills/{name}/git/log", get(skills::log))
+        .route("/skills/{name}/git/diff", get(skills::diff))
         .route("/security/status", get(security::status))
         .route("/usage/ingest", post(cost::ingest))
         .route("/cost", get(cost::report))

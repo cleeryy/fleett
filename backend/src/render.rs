@@ -388,6 +388,25 @@ pub fn render_compose_with_project_and_policy(
             name = share.name
         ));
     }
+    // Shared skills (issue #54): always read-only, one volume per skill, the
+    // concrete version resolved from the pin (or from `latest`). A reference
+    // that cannot be resolved is left out rather than mounted as an empty
+    // directory Docker would create root-owned.
+    for skill in &spec.skills {
+        let Some(version) = crate::skills::effective_version(cfg, skill) else {
+            tracing::debug!(
+                instance = %spec.id,
+                skill = %skill.name,
+                version = ?skill.version,
+                "skipping a skill that is not in the registry"
+            );
+            continue;
+        };
+        volumes.push(format!(
+            "../../skills/{name}/{version}:/opt/data/skills/{name}:ro",
+            name = skill.name
+        ));
+    }
 
     let mut environment = BTreeMap::new();
     environment.insert("HERMES_UID".to_string(), "10000".to_string());
@@ -638,6 +657,7 @@ mod tests {
                     mode: ShareMode::Ro,
                 },
             ],
+            skills: Vec::new(),
             mem_limit_mb: 1536,
             cpu_limit: DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),

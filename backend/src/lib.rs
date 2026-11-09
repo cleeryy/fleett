@@ -41,6 +41,7 @@ pub mod render;
 pub mod scheduler;
 pub mod secrets;
 pub mod security;
+pub mod skills;
 pub mod snapshots;
 pub mod store;
 pub mod templates;

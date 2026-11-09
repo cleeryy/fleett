@@ -13,7 +13,8 @@
 use crate::config::Config;
 use crate::hosts::HostSpec;
 use crate::models::{
-    now_iso, ChannelKind, HealPolicy, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
+    now_iso, ChannelKind, HealPolicy, InstanceSpec, ProviderSpec, ShareMode, ShareRef, SkillRef,
+    Status,
 };
 use crate::store;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -656,6 +657,20 @@ ALTER TABLE instances ADD COLUMN persona_hash TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_instances_persona ON instances (persona);
 "#,
+    // v27 — shared skills (issue #54). The registry files under `skills/<name>/`
+    // are the source of truth and stay versioned in their own git repository;
+    // this table only records which skill an instance mounts and whether it
+    // follows `latest` (`version` NULL) or pins one version.
+    r#"
+CREATE TABLE IF NOT EXISTS instance_skills (
+    instance_id TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    version     TEXT,
+    PRIMARY KEY (instance_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instance_skills_name ON instance_skills (name);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -966,7 +981,8 @@ impl Db {
             return Ok(None);
         };
         let shares = load_links(&conn, id)?;
-        Ok(Some(stored.into_spec(shares)))
+        let skills = load_skills(&conn, id)?;
+        Ok(Some(stored.into_spec(shares, skills)))
     }
 
     pub fn list(&self) -> Result<Vec<InstanceSpec>, DbError> {
@@ -984,11 +1000,13 @@ impl Db {
         drop(statement);
 
         let mut links = load_all_links(&conn)?;
+        let mut skill_links = load_all_skills(&conn)?;
         Ok(stored
             .into_iter()
             .map(|row| {
                 let shares = links.remove(&row.id).unwrap_or_default();
-                row.into_spec(shares)
+                let skills = skill_links.remove(&row.id).unwrap_or_default();
+                row.into_spec(shares, skills)
             })
             .collect())
     }
@@ -1055,6 +1073,9 @@ impl Db {
         for share in &spec.shares {
             insert_link(&transaction, share, &spec.id)?;
         }
+        for skill in &spec.skills {
+            insert_skill_link(&transaction, skill, &spec.id)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1104,6 +1125,13 @@ impl Db {
         )?;
         for share in &spec.shares {
             insert_link(&transaction, share, &spec.id)?;
+        }
+        transaction.execute(
+            "DELETE FROM instance_skills WHERE instance_id = ?1",
+            params![spec.id],
+        )?;
+        for skill in &spec.skills {
+            insert_skill_link(&transaction, skill, &spec.id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -1206,6 +1234,48 @@ impl Db {
         Ok(rows)
     }
 
+    /// Ids of the instances mounting `skill`, pinned or not, sorted.
+    pub fn instances_using_skill(&self, name: &str) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id FROM instance_skills WHERE name = ?1 ORDER BY instance_id",
+        )?;
+        let rows = statement
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Ids of the instances that follow the `latest` pointer of `skill`
+    /// (`version` NULL), sorted.
+    pub fn instances_following_skill(&self, name: &str) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id FROM instance_skills WHERE name = ?1 AND version IS NULL \
+             ORDER BY instance_id",
+        )?;
+        let rows = statement
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Number of instances mounting each skill, keyed by skill name.
+    pub fn skill_instance_counts(&self) -> Result<HashMap<String, usize>, DbError> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT name, COUNT(*) FROM instance_skills GROUP BY name ORDER BY name")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, count)| (name, count.max(0) as usize))
+            .collect())
+    }
+
     /// Record the watchdog policy of one instance.
     ///
     /// Only the policy columns (and `updated_at`) move: a policy change must
@@ -1269,6 +1339,10 @@ impl Db {
         let transaction = conn.transaction()?;
         transaction.execute(
             "DELETE FROM share_links WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM instance_skills WHERE instance_id = ?1",
             params![id],
         )?;
         transaction.execute(
@@ -2179,6 +2253,19 @@ fn insert_link(conn: &Connection, share: &ShareRef, instance_id: &str) -> Result
     Ok(())
 }
 
+fn insert_skill_link(
+    conn: &Connection,
+    skill: &SkillRef,
+    instance_id: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO instance_skills (instance_id, name, version) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (instance_id, name) DO UPDATE SET version = excluded.version",
+        params![instance_id, skill.name, skill.version],
+    )?;
+    Ok(())
+}
+
 struct StoredRow {
     id: String,
     name: String,
@@ -2207,7 +2294,7 @@ struct StoredRow {
 }
 
 impl StoredRow {
-    fn into_spec(self, shares: Vec<ShareRef>) -> InstanceSpec {
+    fn into_spec(self, shares: Vec<ShareRef>, skills: Vec<SkillRef>) -> InstanceSpec {
         InstanceSpec {
             id: self.id,
             name: self.name,
@@ -2218,6 +2305,7 @@ impl StoredRow {
             provider: self.provider,
             channel: ChannelKind::parse(&self.channel).unwrap_or(ChannelKind::None),
             shares,
+            skills,
             mem_limit_mb: self.mem_limit_mb.clamp(0, u32::MAX as i64) as u32,
             cpu_limit: if crate::models::validate_cpu_limit(self.cpu_limit).is_ok() {
                 self.cpu_limit
@@ -2378,6 +2466,43 @@ fn load_all_links(conn: &Connection) -> Result<HashMap<String, Vec<ShareRef>>, D
     Ok(links)
 }
 
+fn load_skills(conn: &Connection, instance_id: &str) -> Result<Vec<SkillRef>, DbError> {
+    let mut statement = conn.prepare(
+        "SELECT name, version FROM instance_skills WHERE instance_id = ?1 ORDER BY name",
+    )?;
+    let rows = statement
+        .query_map(params![instance_id], |row| {
+            Ok(SkillRef {
+                name: row.get(0)?,
+                version: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_all_skills(conn: &Connection) -> Result<HashMap<String, Vec<SkillRef>>, DbError> {
+    let mut statement = conn.prepare(
+        "SELECT instance_id, name, version FROM instance_skills ORDER BY instance_id, name",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SkillRef {
+                    name: row.get(1)?,
+                    version: row.get(2)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut links: HashMap<String, Vec<SkillRef>> = HashMap::new();
+    for (instance_id, skill) in rows {
+        links.entry(instance_id).or_default().push(skill);
+    }
+    Ok(links)
+}
+
 /// Rebuild the index from the filesystem. Instances whose compose file
 /// disappeared are dropped from the index; new directories are adopted.
 ///
@@ -2438,6 +2563,7 @@ mod tests {
                 name: "findings".to_string(),
                 mode: ShareMode::Rw,
             }],
+            skills: Vec::new(),
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -2753,6 +2879,7 @@ mod tests {
             "the historical behaviour is warn"
         );
         assert!(table_exists(&db.lock(), "share_links"));
+        assert!(table_exists(&db.lock(), "instance_skills"));
         assert!(table_exists(&db.lock(), "disk_events"));
 
         // Re-opening an up-to-date database applies nothing.
