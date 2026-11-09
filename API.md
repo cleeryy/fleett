@@ -141,7 +141,7 @@ versioned history; see `docs/TEMPLATES.md`.
  "env":[{"key":"HOUSE_FLAG","description":"…","example":"1","required":true,
          "format":"boolean","secret":false}],
  "defaults":{"mem_limit_mb":2048,"cpu_limit":2.0,"allow_lan":false},
- "source_instance":null,"instances_count":2,
+ "source_instance":null,"persona":"house","instances_count":2,
  "created_at":"2026-11-09T01:00:00Z","updated_at":"2026-11-09T02:00:00Z"}
 ```
 
@@ -206,6 +206,51 @@ The same messages are appended to `InstanceDetail.warnings` (after the
 egress/LAN and plaintext-secrets warnings), so the console does not need to call
 `/check` to display them. Read-only: no health/last_error write, no compose
 call.
+
+## Personas
+
+A persona is a reusable `SOUL.md` template plus the variables it is rendered
+with. It lives under `$FLEETT_ROOT/personas/<id>/` (`persona.yaml` + `SOUL.md`),
+is versioned in one git repository at the root of that directory, and can be
+assigned to any instance. See [docs/PERSONAS.md](docs/PERSONAS.md).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/personas` | — | `PersonaSummary[]` (`instances_count`, `excerpt`, `updated_at`) |
+| POST | `/api/personas` | `{"id","name","description"?,"tags":[…],"variables":[{key,description,default}],"soul_md"}` | `201 PersonaDetail`, admin only |
+| GET | `/api/personas/{id}` | — | `PersonaDetail` (`soul_md`, `variables`, `instances`) |
+| PATCH | `/api/personas/{id}` | same fields, all optional; `description:""` clears | `200 PersonaDetail`, admin only |
+| DELETE | `/api/personas/{id}` | — | `204`; `409 persona_in_use` with `details.instances`, admin only |
+| POST | `/api/personas/{id}/preview` | `{"variables":{…}?,"instance":"alice"?}` | `{"rendered","missing":[…]}` |
+| POST | `/api/personas/{id}/apply` | `{"instances":["alice","bob"],"variables":{…}?}` | `{"results":[{"id","status":"applied\|failed","error"?}]}`, admin only |
+| GET | `/api/personas/{id}/git/log?limit=50` | — | `{"commits":[GitCommit]}` touching this persona |
+| GET | `/api/personas/{id}/git/diff?from=&to=` | — | `{"from","to","diff"}` (unified patch of the persona files) |
+
+`PersonaDetail`:
+```json
+{"id":"house","name":"House","description":"The shared voice of the fleet",
+ "tags":["ops","french"],
+ "variables":[{"key":"tone","description":"How direct the agent is","default":"direct"},
+              {"key":"language","description":"Answer language","default":"français"}],
+ "soul_md":"# Identité\n\nTu es {{agent_name}}.\nTon ton est {{tone}}.\n",
+ "instances":["alice","bob"],"instances_count":2,
+ "created_at":"2026-11-09T10:00:00Z","updated_at":"2026-11-09T11:00:00Z"}
+```
+
+Placeholders are `{{key}}` (inner spaces allowed) where `key` matches
+`^[a-z][a-z0-9_]{0,31}$`; `{{MODEL}}` and any other non-matching text are left
+verbatim so the instance placeholders keep working. `agent_name` is filled with
+the instance name when one is known. A key with no value (no default, no
+override) is reported in `missing` by the preview and refuses an `apply`
+(`400 missing_persona_variables`, `details.missing`).
+
+On an instance, `PATCH` accepts `persona` (`null` detaches **without** touching
+`SOUL.md`) and `persona_vars` (merged; `null` deletes one key). Assigning or
+changing a value renders `data/SOUL.md`, backs the previous file up
+(`SOUL.md.bak-YYYYMMDD-HHMMSS`), commits it to the instance history, stores the
+binding and restarts the instance. `persona_state` is `applied` (the file is a
+fresh render of the persona with the current values), `diverged` (hand edit,
+persona change or missing file) or `none`.
 
 ## Providers
 
@@ -291,6 +336,7 @@ first with `fleett instances move` (scp/ssh) and then calls `--skip-transfer`. S
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
  "health":"healthy","cpu_limit":1.0,"allow_lan":false,"host":"local","provider":"9e2c…",
+ "persona":"house","persona_vars":{"tone":"direct"},"persona_state":"applied",
  "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z",
  "role":"owner"}
 ```
@@ -324,7 +370,8 @@ deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every en
  "image":"hermes-agent:0.22.2-local",
  "base_url":"https://opencode.ai/inference/go/openai/v1",
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN","channel":"telegram",
- "provider":"9e2c…",
+ "provider":"9e2c…","persona":"house","persona_vars":{"tone":"direct"},
+ "persona_state":"applied",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local",
  "disk_quota_mb":0,"disk_policy":"warn",
@@ -351,7 +398,8 @@ the structured form (with `code`, `key` and `field`) comes from
 `GET /api/instances/{id}/check`.
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
-`base_url`, `api_key_env`, `provider` (`null` detaches), `channel` (`token` optional =
+`base_url`, `api_key_env`, `provider` (`null` detaches), `persona` (`null` detaches without
+touching `SOUL.md`), `persona_vars`, `channel` (`token` optional =
 rotation), `shares`, `mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the
 compose file and runs `up -d`.
 

@@ -1006,6 +1006,16 @@ impl Config {
         self.templates_dir().join(id)
     }
 
+    /// Reusable personas, versioned by one git repository at its root
+    /// (issue #55).
+    pub fn personas_dir(&self) -> PathBuf {
+        self.root.join("personas")
+    }
+
+    pub fn persona_dir(&self, id: &str) -> PathBuf {
+        self.personas_dir().join(id)
+    }
+
     pub fn template_config_path(&self, id: &str) -> PathBuf {
         self.template_dir(id).join("config.yaml")
     }

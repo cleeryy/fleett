@@ -178,6 +178,10 @@ pub struct CreateTemplateRequest {
     pub default_model: Option<String>,
     #[serde(default)]
     pub channel: Option<String>,
+    /// Default persona of the instances created from this template
+    /// (issue #55).
+    #[serde(default)]
+    pub persona: Option<String>,
     #[serde(default)]
     pub env: Option<Vec<EnvSuggestion>>,
     #[serde(default)]
@@ -205,6 +209,10 @@ pub struct UpdateTemplateRequest {
     pub default_model: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub channel: Option<Option<String>>,
+    /// `null` clears the default persona, a string replaces it, a missing
+    /// field leaves it untouched (issue #55).
+    #[serde(default, deserialize_with = "double_option")]
+    pub persona: Option<Option<String>>,
     #[serde(default)]
     pub env: Option<Vec<EnvSuggestion>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -340,6 +348,7 @@ fn resolve_layer(
             .source_instance
             .clone()
             .or(parent_meta.source_instance),
+        persona: layer.meta.persona.clone().or(parent_meta.persona),
     };
     let defaults = layer
         .defaults
@@ -434,6 +443,7 @@ fn load_layer(cfg: &Config, id: &str) -> Result<Layer, TemplateError> {
                 channel: Some(builtin.channel.to_string()),
                 env: Some(builtin.env.iter().map(builtin_suggestion).collect()),
                 source_instance: None,
+                persona: None,
             },
             config_yaml: Some(builtin.config_yaml.to_string()),
             soul_md: Some(builtin.soul_md.to_string()),
@@ -573,6 +583,11 @@ fn info_of(resolved: &ResolvedTemplate, row: &IndexRow, instances_count: usize) 
             .clone()
             .or_else(|| row.metadata.source_instance.clone())
             .or_else(|| row.source_instance.clone()),
+        persona: resolved
+            .meta
+            .persona
+            .clone()
+            .or_else(|| row.metadata.persona.clone()),
         instances_count,
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
@@ -624,6 +639,7 @@ fn create_inner(
         channel: normalize_channel(request.channel.as_deref())?,
         env: Some(env),
         source_instance: source_instance.map(str::to_string),
+        persona: clean(request.persona.as_deref()),
     };
     validate_meta(&meta)?;
 
@@ -700,6 +716,9 @@ pub fn update(
     }
     if let Some(channel) = &request.channel {
         meta.channel = normalize_channel(channel.as_deref())?;
+    }
+    if let Some(persona) = &request.persona {
+        meta.persona = clean(persona.as_deref());
     }
     if let Some(env) = &request.env {
         meta.env = Some(sanitize_env(env.clone())?);
@@ -856,6 +875,11 @@ pub fn from_instance(
         config_yaml: Some(config_yaml),
         soul_md,
         defaults: Some(defaults),
+        persona: db
+            .instance_persona(&instance_id)
+            .ok()
+            .flatten()
+            .and_then(|binding| binding.persona),
     };
     create_inner(cfg, db, &request, actor, Some(&instance_id))
 }
@@ -968,6 +992,7 @@ pub fn reindex(cfg: &Config, db: &Db) -> Result<(), TemplateError> {
             channel: Some(builtin.channel.to_string()),
             env: Some(builtin.env.iter().map(builtin_suggestion).collect()),
             source_instance: None,
+            persona: None,
         };
         upsert_index(db, builtin.id, &meta, true, &now)?;
     }

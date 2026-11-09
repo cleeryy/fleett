@@ -149,10 +149,16 @@ history semantics as `docs/GIT.md`, without shelling out to git.
   creation;
 - records the instance limits and model in `defaults.yaml` (`mem_limit_mb`,
   `cpu_limit`, `allow_lan`, `notes`, `model`, `base_url`);
-- sets `channel` from the instance and `source_instance` in the metadata.
+- sets `channel` from the instance and `source_instance` in the metadata;
+- copies the instance `persona` into the metadata, so a new instance created
+  from the template inherits it (see [PERSONAS.md](PERSONAS.md)).
 
 That is the "save as template" acceptance path: create a new instance from the
 saved template and it starts with the same limits and the same starting soul.
+
+A template may declare `persona: <id>` in `template.yaml`; `POST /api/instances`
+uses it only when the request names no persona. A request with
+`"persona": null` creates the instance unassigned.
 
 ## Limits and errors
 

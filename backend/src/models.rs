@@ -409,6 +409,22 @@ impl InstanceSpec {
     }
 }
 
+/// Persona currently attached to an instance (issue #55).
+///
+/// Stored in three `instances` columns but read and written on their own, so an
+/// ordinary PATCH (name, model, limits) never rewrites the assignment and a
+/// failed persona render never leaves the row half-updated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PersonaBinding {
+    /// Persona id, `None` when the instance has none.
+    pub persona: Option<String>,
+    /// Values of the persona variables for this instance.
+    pub variables: BTreeMap<String, String>,
+    /// SHA-256 of the `SOUL.md` rendered by the last application (hex).
+    /// Informational: divergence compares the file with a fresh render.
+    pub hash: String,
+}
+
 /// A reusable provider credential (issue #25).
 ///
 /// The secret is never part of this struct: it lives encrypted in its own
@@ -548,6 +564,13 @@ pub struct InstanceSummary {
     /// Provider credential in use, when the instance has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Reusable persona assigned to the instance (`null` when none).
+    pub persona: Option<String>,
+    /// Values of the persona variables for this instance.
+    pub persona_vars: BTreeMap<String, String>,
+    /// `applied` (SOUL.md is the rendered persona), `diverged` (the file or the
+    /// persona changed since the last application) or `none`.
+    pub persona_state: String,
     pub shares: Vec<String>,
     pub last_error: Option<String>,
     pub created_at: String,
@@ -569,6 +592,12 @@ pub struct InstanceDetail {
     /// Provider credential in use (`null`/absent for a legacy instance).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Reusable persona assigned to the instance (`null` when none).
+    pub persona: Option<String>,
+    /// Values of the persona variables for this instance.
+    pub persona_vars: BTreeMap<String, String>,
+    /// `applied`, `diverged` or `none`.
+    pub persona_state: String,
     pub channel: String,
     pub status: String,
     pub health: String,
@@ -792,6 +821,10 @@ pub struct TemplateInfo {
     /// `POST /api/templates/from-instance`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_instance: Option<String>,
+    /// Persona a new instance inherits when the create request names none
+    /// (issue #55).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     /// Number of instances whose `template` field is this id.
     pub instances_count: usize,
     pub created_at: String,
@@ -925,6 +958,10 @@ pub struct TemplateMeta {
     /// Instance the template was saved from (`POST .../from-instance`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_instance: Option<String>,
+    /// Persona a new instance gets when the create request names none
+    /// (issue #55). Optional: a template without it starts unassigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// One environment variable of an instance, as returned by the API.
@@ -1102,6 +1139,13 @@ pub struct CreateInstanceRequest {
     /// default to the provider's values.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Reusable persona (issue #55). Defaults to the template metadata; an
+    /// explicit `null` creates the instance without a persona.
+    #[serde(default, deserialize_with = "double_option")]
+    pub persona: Option<Option<String>>,
+    /// Values of the persona variables (`{}` by default).
+    #[serde(default)]
+    pub persona_vars: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
@@ -1182,6 +1226,14 @@ pub struct PatchInstanceRequest {
     /// leaves the current attachment alone.
     #[serde(default, deserialize_with = "double_option")]
     pub provider: Option<Option<String>>,
+    /// `null` detaches the persona without touching `SOUL.md`; a string
+    /// assigns one; a missing field leaves the current attachment alone.
+    #[serde(default, deserialize_with = "double_option")]
+    pub persona: Option<Option<String>>,
+    /// Merge into the current persona variables: a `null` value deletes the
+    /// key. Only meaningful with an assigned persona.
+    #[serde(default)]
+    pub persona_vars: Option<BTreeMap<String, Option<String>>>,
     #[serde(default)]
     pub channel: Option<ChannelRequest>,
     #[serde(default)]
@@ -1247,6 +1299,35 @@ pub fn validate_instance_id(id: &str) -> Result<(), String> {
 /// directory under `$FLEETT_ROOT/templates`.
 pub fn validate_template_id(id: &str) -> Result<(), String> {
     validate_slug(id, "template id", INSTANCE_ID_MIN, INSTANCE_ID_MAX)
+}
+
+/// Persona ids follow the same grammar: they name a directory under
+/// `$FLEETT_ROOT/personas` (issue #55).
+pub fn validate_persona_id(id: &str) -> Result<(), String> {
+    validate_slug(id, "persona id", INSTANCE_ID_MIN, INSTANCE_ID_MAX)
+}
+
+/// Grammar of one persona variable key: `^[a-z][a-z0-9_]{0,31}$`.
+///
+/// The same grammar decides what counts as a `{{placeholder}}` in a persona
+/// template, so an uppercase `{{MODEL}}` (the instance placeholders) is left
+/// untouched.
+pub fn validate_persona_variable_key(key: &str) -> Result<(), String> {
+    let valid = key.len() <= 32
+        && key
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "variable key \"{key}\" must match ^[a-z][a-z0-9_]{{0,31}}$"
+        ))
+    }
 }
 
 pub fn validate_share_name(name: &str) -> Result<(), String> {

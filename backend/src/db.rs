@@ -645,6 +645,17 @@ CREATE TABLE IF NOT EXISTS disk_events (
 CREATE INDEX IF NOT EXISTS idx_disk_events_instance ON disk_events (instance_id, at);
 CREATE INDEX IF NOT EXISTS idx_disk_events_at ON disk_events (at);
 "#,
+    // v26 — reusable personas (issue #55). The files under `personas/<id>/`
+    // are the source of truth and stay versioned in their own git repository;
+    // these columns only record which persona an instance currently applies,
+    // the values of its variables and the digest of the rendered `SOUL.md`.
+    r#"
+ALTER TABLE instances ADD COLUMN persona TEXT;
+ALTER TABLE instances ADD COLUMN persona_vars TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE instances ADD COLUMN persona_hash TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_instances_persona ON instances (persona);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -1130,6 +1141,69 @@ impl Db {
             params![id, image, now_iso()],
         )?;
         Ok(())
+    }
+
+    /// Record the persona attached to one instance (issue #55).
+    ///
+    /// Only the three persona columns (and `updated_at`) move: assigning a
+    /// persona never rewrites the rest of the instance row.
+    pub fn set_instance_persona(
+        &self,
+        id: &str,
+        binding: &crate::models::PersonaBinding,
+    ) -> Result<(), DbError> {
+        let variables = serde_json::to_string(&binding.variables).unwrap_or_else(|_| "{}".into());
+        self.lock().execute(
+            "UPDATE instances SET persona = ?2, persona_vars = ?3, persona_hash = ?4, \
+             updated_at = ?5 WHERE id = ?1",
+            params![id, binding.persona, variables, binding.hash, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Persona binding of one instance (`None` when the row does not exist).
+    pub fn instance_persona(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::models::PersonaBinding>, DbError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT persona, persona_vars, persona_hash FROM instances WHERE id = ?1",
+                params![id],
+                row_to_persona_binding,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Persona binding of every instance, keyed by instance id.
+    pub fn instance_personas(
+        &self,
+    ) -> Result<HashMap<String, crate::models::PersonaBinding>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn
+            .prepare("SELECT id, persona, persona_vars, persona_hash FROM instances ORDER BY id")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row_to_persona_binding_offset(row, 1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Ids of the instances currently applying `persona`, sorted.
+    pub fn instances_using_persona(&self, persona: &str) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT id FROM instances WHERE persona = ?1 ORDER BY id")?;
+        let rows = statement
+            .query_map(params![persona], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Record the watchdog policy of one instance.
@@ -2211,6 +2285,26 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         host: row.get("host")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+    })
+}
+
+fn row_to_persona_binding(row: &Row<'_>) -> rusqlite::Result<crate::models::PersonaBinding> {
+    row_to_persona_binding_offset(row, 0)
+}
+
+/// Same as [`row_to_persona_binding`] starting at `offset` (the batched query
+/// selects `id` first).
+fn row_to_persona_binding_offset(
+    row: &Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<crate::models::PersonaBinding> {
+    let persona: Option<String> = row.get(offset)?;
+    let variables: String = row.get(offset + 1)?;
+    let hash: String = row.get(offset + 2)?;
+    Ok(crate::models::PersonaBinding {
+        persona: persona.filter(|value| !value.trim().is_empty()),
+        variables: serde_json::from_str(&variables).unwrap_or_default(),
+        hash,
     })
 }
 

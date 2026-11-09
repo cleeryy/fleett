@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod migrate;
 pub mod models;
 pub mod notify;
+pub mod personas;
 pub mod pipelines;
 pub mod providers;
 pub mod quota;

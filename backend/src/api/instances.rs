@@ -121,6 +121,17 @@ struct Prepared {
     gate_token: Option<String>,
     channel_token: Option<String>,
     env: Vec<EnvWrite>,
+    /// Persona rendered for the new instance, if one was requested (or
+    /// inherited from the template).
+    persona: Option<PersonaAssignment>,
+}
+
+/// A persona rendered for one instance at create time (issue #55).
+struct PersonaAssignment {
+    id: String,
+    variables: BTreeMap<String, String>,
+    rendered: String,
+    hash: String,
 }
 
 pub async fn list(
@@ -142,6 +153,7 @@ pub async fn list(
     };
     let all_ids: Vec<String> = specs.iter().map(|spec| spec.id.clone()).collect();
     let visible = crate::authz::visible_instances(&context, &acl, &all_ids);
+    let bindings = state.db.instance_personas().map_err(ApiError::from)?;
     let mut summaries = Vec::with_capacity(visible.len());
     for spec in specs.iter_mut().filter(|spec| visible.contains(&spec.id)) {
         let mut health = Health::Unknown;
@@ -156,10 +168,14 @@ pub async fn list(
             }
             record_health(&state, spec, health);
         }
+        let binding = bindings.get(&spec.id).cloned().unwrap_or_default();
+        let persona_state = crate::personas::state(&state.cfg, spec, &binding);
         summaries.push(to_summary(
             spec,
             health,
             crate::authz::instance_role(&context, &acl, &spec.id),
+            &binding,
+            persona_state,
         ));
     }
     Ok(Json(summaries))
@@ -243,10 +259,24 @@ pub async fn create(
     let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     crate::api::push_provider_key(&mut env_keys, &spec);
 
-    let rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &env_keys)
+    let mut rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &env_keys)
         .map_err(ApiError::from)?;
+    if let Some(persona) = &prepared.persona {
+        rendered.soul_md = Some(persona.rendered.clone());
+    }
 
     state.db.insert_instance(&spec).map_err(ApiError::from)?;
+    if let Some(persona) = &prepared.persona {
+        let binding = crate::models::PersonaBinding {
+            persona: Some(persona.id.clone()),
+            variables: persona.variables.clone(),
+            hash: persona.hash.clone(),
+        };
+        if let Err(err) = state.db.set_instance_persona(&spec.id, &binding) {
+            let _ = state.db.delete_instance(&spec.id);
+            return Err(ApiError::from(err));
+        }
+    }
     if let Err(err) = envs::replace(&state.cfg, &state.db, &spec.id, &entries) {
         let _ = state.db.delete_instance(&spec.id);
         return Err(ApiError::from(err));
@@ -275,6 +305,7 @@ pub async fn create(
             "template": stored.template,
             "allow_lan": stored.allow_lan,
             "host": stored.host,
+            "persona": prepared.persona.as_ref().map(|persona| persona.id.clone()),
         })),
     );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
@@ -1004,6 +1035,10 @@ pub async fn patch(
 
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
+    // Persona (issue #55): `null` detaches without touching SOUL.md; a new id
+    // or a variable change re-renders the file. Resolved here so a bad persona
+    // refuses the PATCH before anything is written.
+    let persona_patch = prepare_persona_patch(&state, &spec, &request)?;
     let suggestions = checks::template_info(&state.cfg, &spec).env;
     let supplied = request
         .env
@@ -1049,6 +1084,16 @@ pub async fn patch(
     spec.status = Status::Created;
     spec.last_error = None;
     state.db.update_instance(&spec).map_err(ApiError::from)?;
+    if let Some(binding) = &persona_patch.binding {
+        state
+            .db
+            .set_instance_persona(&spec.id, binding)
+            .map_err(ApiError::from)?;
+    }
+    if let Some(soul) = &persona_patch.soul {
+        crate::personas::write_soul(&state.cfg, &spec.id, soul).map_err(ApiError::from)?;
+        crate::history::record_ui_write(&state.cfg, &spec.id, &context, "/SOUL.md");
+    }
 
     up_and_record(&state, &mut spec).await?;
     let (status, health, container) = match state.driver.ps(&spec).await {
@@ -1063,6 +1108,15 @@ pub async fn patch(
         &spec.id,
         audit::with_assistant_tag(None, &headers),
     );
+    if let Some(details) = persona_patch.audit {
+        audit::record(
+            &state,
+            &context,
+            "instance.persona",
+            &spec.id,
+            Some(details),
+        );
+    }
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
@@ -1739,6 +1793,8 @@ fn to_summary(
     spec: &InstanceSpec,
     health: Health,
     role: Option<crate::authz::InstanceRole>,
+    persona: &crate::models::PersonaBinding,
+    persona_state: crate::personas::PersonaState,
 ) -> InstanceSummary {
     InstanceSummary {
         id: spec.id.clone(),
@@ -1755,10 +1811,41 @@ fn to_summary(
         disk_quota_mb: spec.disk_quota_mb,
         disk_policy: spec.disk_policy.as_str().to_string(),
         provider: spec.provider.clone(),
+        persona: persona.persona.clone(),
+        persona_vars: persona.variables.clone(),
+        persona_state: persona_state.as_str().to_string(),
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
         role: role.map(|role| role.as_str().to_string()),
+    }
+}
+
+/// Persona binding of one instance plus its divergence state (issue #55).
+///
+/// Read failures are surfaced as a warning: a broken persona must never make
+/// the whole detail call fail.
+fn persona_view(
+    state: &AppState,
+    spec: &InstanceSpec,
+    warnings: &mut Vec<String>,
+) -> (crate::models::PersonaBinding, crate::personas::PersonaState) {
+    match state.db.instance_persona(&spec.id) {
+        Ok(Some(binding)) => {
+            let state = crate::personas::state(&state.cfg, spec, &binding);
+            (binding, state)
+        }
+        Ok(None) => (
+            crate::models::PersonaBinding::default(),
+            crate::personas::PersonaState::None,
+        ),
+        Err(err) => {
+            warnings.push(format!("the persona assignment is unreadable: {err}"));
+            (
+                crate::models::PersonaBinding::default(),
+                crate::personas::PersonaState::None,
+            )
+        }
     }
 }
 
@@ -1780,6 +1867,7 @@ fn to_detail(
     if crate::secrets::has_plaintext_file(&state.cfg, &spec.id) {
         warnings.push(crate::secrets::WARNING_LEGACY.to_string());
     }
+    let (persona, persona_state) = persona_view(state, spec, &mut warnings);
     // Template allowlists (issue #27): appended after the egress/LAN and
     // plaintext-secrets warnings, never instead of them.
     let template = checks::template_info(&state.cfg, spec);
@@ -1798,6 +1886,9 @@ fn to_detail(
         base_url: spec.base_url.clone(),
         api_key_env: spec.api_key_env.clone(),
         provider: spec.provider.clone(),
+        persona: persona.persona.clone(),
+        persona_vars: persona.variables.clone(),
+        persona_state: persona_state.as_str().to_string(),
         channel: spec.channel.as_str().to_string(),
         status: status.as_str().to_string(),
         health: health.as_str().to_string(),
@@ -2021,6 +2112,51 @@ async fn prepare_create(
         .unwrap_or_default();
     validate_notes(&notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
 
+    // Persona (issue #55): explicit `persona` wins, an explicit `null` opts
+    // out, a missing field inherits the template metadata. The template is
+    // rendered here so an unknown persona or a missing variable refuses the
+    // create before any file is written.
+    let requested_vars = request.persona_vars.clone().unwrap_or_default();
+    let (persona_id, explicit) = match &request.persona {
+        Some(Some(value)) => (
+            Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+            true,
+        ),
+        Some(None) => (None, true),
+        None => (template.meta.persona.clone(), false),
+    };
+    let persona = match persona_id {
+        Some(persona_id) => {
+            match crate::personas::render_for(&state.cfg, &persona_id, &requested_vars, &name) {
+                Ok((rendered, hash)) => {
+                    if !rendered.missing.is_empty() {
+                        return Err(crate::api::personas::missing_variables(&rendered.missing));
+                    }
+                    Some(PersonaAssignment {
+                        id: persona_id,
+                        variables: requested_vars,
+                        rendered: rendered.rendered,
+                        hash,
+                    })
+                }
+                // A template default that no longer exists (deleted persona)
+                // must not block a creation the operator asked for; an
+                // explicitly requested persona is still a 404.
+                Err(crate::personas::PersonaError::NotFound(_)) if !explicit => None,
+                Err(err) => return Err(ApiError::from(err)),
+            }
+        }
+        None => {
+            if !requested_vars.is_empty() {
+                return Err(ApiError::bad_request(
+                    "invalid_persona",
+                    "persona_vars requires an assigned persona",
+                ));
+            }
+            None
+        }
+    };
+
     let env: Vec<EnvWrite> = validate_env_inputs(&env_vars, true, true, Some(&schema))?
         .into_iter()
         .map(|var| {
@@ -2090,6 +2226,107 @@ async fn prepare_create(
         gate_token,
         channel_token,
         env,
+        persona,
+    })
+}
+
+/// What a PATCH must do with the persona (issue #55).
+#[derive(Debug, Default)]
+struct PersonaPatch {
+    /// Rendered `SOUL.md` to write, when one is assigned or re-applied.
+    soul: Option<String>,
+    /// Binding to store (including the cleared one of a detach).
+    binding: Option<crate::models::PersonaBinding>,
+    /// Audit payload of `instance.persona`.
+    audit: Option<serde_json::Value>,
+}
+
+/// Resolve the persona part of a PATCH (issue #55).
+///
+/// `persona: null` detaches: the binding is cleared and `SOUL.md` is left
+/// untouched, by design.
+fn prepare_persona_patch(
+    state: &AppState,
+    spec: &InstanceSpec,
+    request: &PatchInstanceRequest,
+) -> Result<PersonaPatch, ApiError> {
+    if request.persona.is_none() && request.persona_vars.is_none() {
+        return Ok(PersonaPatch::default());
+    }
+    let current = state
+        .db
+        .instance_persona(&spec.id)
+        .map_err(ApiError::from)?
+        .unwrap_or_default();
+    let mut binding = current.clone();
+    let mut detach = false;
+    if let Some(requested) = &request.persona {
+        match requested
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(persona_id) => {
+                crate::models::validate_persona_id(persona_id)
+                    .map_err(|message| ApiError::bad_request("invalid_persona", message))?;
+                binding.persona = Some(persona_id.to_string());
+            }
+            None => {
+                binding.persona = None;
+                detach = true;
+            }
+        }
+    }
+    if let Some(patch) = &request.persona_vars {
+        for key in patch.keys() {
+            crate::models::validate_persona_variable_key(key)
+                .map_err(|message| ApiError::bad_request("invalid_persona_vars", message))?;
+        }
+        for (key, value) in patch {
+            match value {
+                Some(value) => {
+                    binding.variables.insert(key.clone(), value.clone());
+                }
+                None => {
+                    binding.variables.remove(key);
+                }
+            }
+        }
+    }
+    let Some(persona_id) = binding.persona.clone() else {
+        if detach {
+            binding.variables.clear();
+            binding.hash.clear();
+            return Ok(PersonaPatch {
+                soul: None,
+                binding: Some(binding),
+                audit: Some(serde_json::json!({ "persona": null, "detached": true })),
+            });
+        }
+        return Err(ApiError::bad_request(
+            "invalid_persona",
+            "persona_vars requires an assigned persona",
+        ));
+    };
+    let (rendered, hash) =
+        crate::personas::render_for(&state.cfg, &persona_id, &binding.variables, &spec.name)
+            .map_err(ApiError::from)?;
+    if !rendered.missing.is_empty() {
+        return Err(crate::api::personas::missing_variables(&rendered.missing));
+    }
+    binding.hash = hash;
+    // An explicit persona field always re-applies, even with identical values:
+    // the operator asked for the file to be rewritten.
+    let reapplied =
+        current.persona.as_deref() != Some(persona_id.as_str()) || current.hash != binding.hash;
+    Ok(PersonaPatch {
+        soul: Some(rendered.rendered),
+        binding: Some(binding.clone()),
+        audit: Some(serde_json::json!({
+            "persona": persona_id,
+            "variables": binding.variables,
+            "reapplied": reapplied,
+        })),
     })
 }
 

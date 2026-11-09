@@ -23,6 +23,7 @@ pub mod maintenance;
 pub mod memory;
 pub mod notifications;
 pub mod openapi;
+pub mod personas;
 pub mod pipelines;
 pub mod providers;
 pub mod quota;
@@ -272,6 +273,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/templates/{id}/versions", get(templates::versions))
         .route("/templates/{id}/restore", post(templates::restore))
+        .route("/personas", get(personas::list).post(personas::create))
+        .route(
+            "/personas/{id}",
+            get(personas::detail)
+                .patch(personas::update)
+                .delete(personas::delete),
+        )
+        .route("/personas/{id}/preview", post(personas::preview))
+        .route("/personas/{id}/apply", post(personas::apply))
+        .route("/personas/{id}/git/log", get(personas::log))
+        .route("/personas/{id}/git/diff", get(personas::diff))
         .route("/security/status", get(security::status))
         .route("/usage/ingest", post(cost::ingest))
         .route("/cost", get(cost::report))

@@ -31,6 +31,10 @@
       "name": "Templates"
     },
     {
+      "name": "Personas",
+      "description": "Reusable personas: a versioned SOUL.md template plus variables, assignable to any instance"
+    },
+    {
       "name": "Providers"
     },
     {
@@ -4491,6 +4495,484 @@
           }
         }
       }
+    },
+    "/api/personas": {
+      "get": {
+        "summary": "List personas",
+        "tags": [
+          "Personas"
+        ],
+        "responses": {
+          "200": {
+            "description": "Personas with their instance count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PersonaSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a persona",
+        "tags": [
+          "Personas"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name",
+                  "soul_md"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "variables": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PersonaVariable"
+                    }
+                  },
+                  "soul_md": {
+                    "type": "string",
+                    "description": "Template, at most 64 KiB; {{variables}} are rendered at assignment"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_persona"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The viewer role is read-only"
+          },
+          "409": {
+            "description": "persona_exists"
+          }
+        }
+      }
+    },
+    "/api/personas/{id}": {
+      "get": {
+        "summary": "Get one persona",
+        "tags": [
+          "Personas"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Persona detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Unknown persona"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update a persona",
+        "tags": [
+          "Personas"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "variables": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PersonaVariable"
+                    }
+                  },
+                  "soul_md": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_persona"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The viewer role is read-only"
+          },
+          "404": {
+            "description": "Unknown persona"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a persona",
+        "tags": [
+          "Personas"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The viewer role is read-only"
+          },
+          "404": {
+            "description": "Unknown persona"
+          },
+          "409": {
+            "description": "persona_in_use; details.instances lists the instances"
+          }
+        }
+      }
+    },
+    "/api/personas/{id}/preview": {
+      "post": {
+        "summary": "Render the persona without applying it",
+        "tags": [
+          "Personas"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "variables": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Overrides on top of the instance values and the defaults"
+                  },
+                  "instance": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Instance whose name fills agent_name and whose values seed the overrides"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rendered template and the unresolved keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaPreview"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Unknown persona or instance"
+          }
+        }
+      }
+    },
+    "/api/personas/{id}/apply": {
+      "post": {
+        "summary": "Propagate the persona to instances",
+        "tags": [
+          "Personas"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "instances"
+                ],
+                "properties": {
+                  "instances": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "variables": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One result per instance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaApplyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_instances or missing_persona_variables"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The viewer role is read-only"
+          },
+          "404": {
+            "description": "Unknown persona"
+          }
+        }
+      }
+    },
+    "/api/personas/{id}/git/log": {
+      "get": {
+        "summary": "Persona commit history",
+        "tags": [
+          "Personas",
+          "Git"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Commits, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "commits": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/GitCommit"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Unknown persona"
+          }
+        }
+      }
+    },
+    "/api/personas/{id}/git/diff": {
+      "get": {
+        "summary": "Persona diff between two commits",
+        "tags": [
+          "Personas",
+          "Git"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unified patch of the persona files",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GitDiff"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Unknown persona or commit"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5114,6 +5596,24 @@
             "type": "string",
             "nullable": true
           },
+          "persona": {
+            "type": "string",
+            "nullable": true
+          },
+          "persona_vars": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "persona_state": {
+            "type": "string",
+            "enum": [
+              "applied",
+              "diverged",
+              "none"
+            ]
+          },
           "shares": {
             "type": "array",
             "items": {
@@ -5160,6 +5660,24 @@
           "provider": {
             "type": "string",
             "nullable": true
+          },
+          "persona": {
+            "type": "string",
+            "nullable": true
+          },
+          "persona_vars": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "persona_state": {
+            "type": "string",
+            "enum": [
+              "applied",
+              "diverged",
+              "none"
+            ]
           },
           "channel": {
             "type": "string"
@@ -5329,6 +5847,17 @@
           "provider": {
             "type": "string"
           },
+          "persona": {
+            "type": "string",
+            "nullable": true,
+            "description": "Defaults to the template metadata; null opts out"
+          },
+          "persona_vars": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
           "env": {
             "type": "array",
             "items": {
@@ -5381,6 +5910,19 @@
           "provider": {
             "type": "string",
             "nullable": true
+          },
+          "persona": {
+            "type": "string",
+            "nullable": true,
+            "description": "null detaches without touching SOUL.md"
+          },
+          "persona_vars": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "nullable": true
+            },
+            "description": "Merged into the stored values; a null value deletes the key"
           },
           "env": {
             "type": "array",
@@ -5939,6 +6481,148 @@
               "rw",
               "ro"
             ]
+          }
+        }
+      },
+      "PersonaVariable": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,31}$"
+          },
+          "description": {
+            "type": "string"
+          },
+          "default": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "PersonaSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonaVariable"
+            }
+          },
+          "instances_count": {
+            "type": "integer"
+          },
+          "excerpt": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonaDetail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonaVariable"
+            }
+          },
+          "soul_md": {
+            "type": "string"
+          },
+          "instances": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "instances_count": {
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonaPreview": {
+        "type": "object",
+        "properties": {
+          "rendered": {
+            "type": "string"
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "PersonaApplyResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "applied",
+                    "failed"
+                  ]
+                },
+                "error": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
           }
         }
       }
