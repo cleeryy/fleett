@@ -93,7 +93,9 @@ a provider keep their own `gate_token`/`api_key_env`.
  "env":[{"key":"DISCORD_ALLOWED_USERS","value":"123","secret":false}]}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
-The token is **never** returned by the API.
+The token is **never** returned by the API. `env` is a list of `{key, value, secret}`; the
+deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every entry as a secret
+(see [Environment variables](#environment-variables)).
 
 `GET /api/instances/{id}` → `InstanceDetail`
 ```json
@@ -131,10 +133,22 @@ compose file and runs `up -d`.
 
 ### Environment variables
 
+`env` is a **list of objects**:
+
+```json
+[{"key": "DISCORD_ALLOWED_USERS", "value": "123,456", "secret": false}]
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `key` | string | yes | `^[A-Z_][A-Z0-9_]{0,63}$`, not a reserved name |
+| `value` | string \| null | create: yes; PATCH: no; PUT: for a new or non-secret key | `null` deletes on PATCH and keeps a stored secret on PUT |
+| `secret` | boolean | create/PUT: yes; PATCH: no | encrypted at rest and never returned; a missing flag on PATCH keeps the current one (`false` for a new key) |
+
 Every env entry is rendered as `${KEY}` in the compose file and injected by the driver, so no
 value is written to disk. `secret=true` values are encrypted at rest (AES-GCM, same key as the
 instance secrets) and are never returned; `secret=false` values are readable and are returned
-as `value`.
+as `value` by `GET /api/instances/{id}`.
 
 | Method | Route | Body | Effect |
 |---|---|---|---|
@@ -142,11 +156,63 @@ as `value`.
 | DELETE | `/api/instances/{id}/env/{key}` | — | remove one and apply |
 | PATCH | `/api/instances/{id}` | `"env":[…]` | merge: `value:null` deletes, `""` keeps an empty value, missing `secret` keeps the flag |
 
+Two copy-paste examples:
+
+```bash
+# PATCH: merge one key (rewrites compose and runs up -d)
+curl -X PATCH https://fleett.example/api/instances/tchouniz \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[{"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false}]}'
+```
+
+```bash
+# PUT: replace the whole environment
+curl -X PUT https://fleett.example/api/instances/tchouniz/env \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[
+        {"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false},
+        {"key":"DISCORD_BOT_TOKEN","secret":true}
+      ]}'
+```
+
 To keep a stored secret in a full replace, resend `{"key":"TOKEN","secret":true}` without a
 `value` (or with `null`). Keys match `^[A-Z_][A-Z0-9_]{0,63}$`; reserved names (`HERMES_UID`,
 `HERMES_GID`, `PATH`, `HOME`, `FLEETT_*`) are refused. `409 secrets_key_missing` means the host
 has no secrets key yet (`sudo fleett secrets init`). Templates expose suggested variables in
 their `env` field (Telegram/Discord allowlists).
+
+#### Deprecated v0.4.0 object form
+
+Releases up to v0.4.0 sent `"env": {"KEY": "value"}` on create. That form is **still accepted**
+by `POST /api/instances`, `PATCH /api/instances/{id}` and `PUT /api/instances/{id}/env`, but it
+is deprecated and logs `deprecated=env_map` at `warn` level. Every entry of it is stored with
+`secret: true` (the v0.4.0 behaviour), so the values are encrypted and never returned by `GET`.
+Migrate to the list form: a non-secret allowlist has to be resent explicitly with
+`"secret": false` (a `PUT` replaces the whole set). The object form is never returned: the
+response `env` is always a list.
+
+A malformed `env` (a string, a number, an array entry that is not an object, an object value
+that is not a string) is a `400 invalid_env` that names the expected schema and the received
+JSON type, instead of axum's raw deserialization text:
+
+```json
+{"error":{"code":"invalid_env","message":"env must be a list of {key,value,secret}","details":{"expected":"sequence","received":"map","example":[{"key":"DISCORD_ALLOWED_USERS","value":"123,456","secret":false}]}}}
+```
+
+Any other deserialization failure of these bodies is a `400 invalid_body`; `error.details.path`
+names the offending field when serde reports one (for example `mem_limit_mb`).
+
+#### Precedence with the historical `secrets.env`
+
+The per-key `instance_env` rows written by the `env` API are the only source the compose file
+interpolates. The historical plaintext `instances/<id>/secrets.env` is still injected by the
+driver while the instance has no row, and `GET` lists its keys as secrets; the first env write
+(`POST`, `PATCH`, `PUT .../env`, `DELETE .../env/{key}`) supersedes it and removes the file. An
+`env` entry therefore always wins over a key of the same name in `secrets.env`, and a value
+that exists only there disappears from the compose file after that write. See `docs/ENV.md` and
+`docs/SECRETS.md`.
 
 ### Instance files
 

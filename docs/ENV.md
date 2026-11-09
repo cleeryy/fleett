@@ -162,8 +162,40 @@ curl -X PATCH https://fleett.example/api/instances/tchouniz \
 
 The gate token (`gate_token`) and the platform token (`channel.token`) are
 always secret, whether or not they appear in `env`, and win over an entry with
-the same key. `env` used to be a map of strings on create: that shape is gone in
-v0.5.0 (breaking).
+the same key.
+
+### Deprecated v0.4.0 object form
+
+`env` used to be an object of strings on create (`"env": {"KEY": "value"}`).
+That form is **deprecated but still accepted** on `POST /api/instances`,
+`PATCH /api/instances/{id}` and `PUT /api/instances/{id}/env`; it logs
+`deprecated=env_map` at `warn` level. Every entry of it is stored with
+`secret = 1`, exactly as v0.4.0 did, so the values are encrypted and never
+returned by `GET /api/instances/{id}`. The response `env` is always the list
+form.
+
+Migrating is a one-time request:
+
+```bash
+# 1. Make the allowlists explicitly non-secret (they were secret in v0.4.0).
+curl -X PATCH https://fleett.example/api/instances/tchouniz \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[{"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false}]}'
+
+# 2. A PUT replaces the whole set; resend each secret without its value to keep it.
+curl -X PUT https://fleett.example/api/instances/tchouniz/env \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[
+        {"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false},
+        {"key":"DISCORD_BOT_TOKEN","secret":true}
+      ]}'
+```
+
+A malformed `env` returns `400 invalid_env` with the expected schema in
+`error.details` (`expected`, `received`, `example`), both on the canonical list
+and on the object form.
 
 ## Validation
 

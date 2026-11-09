@@ -1034,6 +1034,231 @@ async fn patch_env_merges_deletes_and_keeps_empty_values() {
 }
 
 #[tokio::test]
+async fn legacy_env_map_is_accepted_on_create_and_patch() {
+    let harness = Harness::new();
+    let mut body = instance_body("alice");
+    body["env"] = json!({
+        "DISCORD_ALLOWED_USERS": "123,456",
+        "OPENAI_KEY": "sk-legacy"
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert!(
+        !response.contains("sk-legacy"),
+        "a map entry defaults to secret and never returns its value: {response}"
+    );
+    let detail = parse(&response);
+    let env = detail["env"].as_array().expect("env");
+    for key in ["DISCORD_ALLOWED_USERS", "OPENAI_KEY"] {
+        let entry = env
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {response}"));
+        assert_eq!(entry["secret"], true, "the legacy map defaults to secret");
+        assert!(entry.get("value").is_none(), "{entry}");
+    }
+    // The values were stored as secrets, not dropped.
+    let stored = harness.instance_secrets("alice");
+    assert_eq!(
+        stored.get("DISCORD_ALLOWED_USERS").map(String::as_str),
+        Some("123,456")
+    );
+    assert_eq!(
+        stored.get("OPENAI_KEY").map(String::as_str),
+        Some("sk-legacy")
+    );
+
+    // The deprecated map also works on PATCH, still defaulting to secret.
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"env": {"ADDED_BY_MAP": "patched-value"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(!response.contains("patched-value"), "{response}");
+    let detail = parse(&response);
+    let added = detail["env"]
+        .as_array()
+        .expect("env")
+        .iter()
+        .find(|entry| entry["key"] == "ADDED_BY_MAP")
+        .expect("the manifest key was added");
+    assert_eq!(added["secret"], true);
+    assert!(added.get("value").is_none());
+    assert_eq!(
+        harness
+            .instance_secrets("alice")
+            .get("ADDED_BY_MAP")
+            .map(String::as_str),
+        Some("patched-value")
+    );
+    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+        .expect("compose");
+    assert!(
+        compose.contains("ADDED_BY_MAP: ${ADDED_BY_MAP}"),
+        "{compose}"
+    );
+    assert!(!compose.contains("patched-value"), "{compose}");
+}
+
+#[tokio::test]
+async fn legacy_env_map_is_accepted_by_put_env_and_the_list_still_works() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": {"FROM_MAP": "one", "TOKEN": "hidden-value"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(!response.contains("hidden-value"), "{response}");
+    let detail = parse(&response);
+    let env = detail["env"].as_array().expect("env");
+    assert_eq!(env.len(), 2);
+    assert!(
+        env.iter().all(|entry| entry["secret"] == true),
+        "every map entry is a secret: {response}"
+    );
+    assert!(
+        env.iter().all(|entry| entry.get("value").is_none()),
+        "a secret never returns its value: {response}"
+    );
+
+    // The canonical list always works, and its `secret: false` entries are
+    // readable through GET.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "FROM_MAP", "value": "one", "secret": false},
+                {"key": "PLAIN", "value": "visible", "secret": false}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(response.contains("visible"), "{response}");
+}
+
+#[tokio::test]
+async fn malformed_env_returns_the_structured_schema_error() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+
+    for (body, received) in [
+        (json!({"env": 42}), "number"),
+        (json!({"env": "nope"}), "string"),
+        (json!({"env": {"KEY": 42}}), "map"),
+        (json!({"env": [{"key": 1}]}), "sequence"),
+    ] {
+        let (status, response) = harness
+            .request(Method::PATCH, "/api/instances/alice", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        let error = parse(&response);
+        assert_eq!(error["error"]["code"], "invalid_env", "{response}");
+        assert_eq!(
+            error["error"]["message"], "env must be a list of {key,value,secret}",
+            "{response}"
+        );
+        assert_eq!(
+            error["error"]["details"]["expected"], "sequence",
+            "{response}"
+        );
+        assert_eq!(
+            error["error"]["details"]["received"], received,
+            "{response}"
+        );
+        assert!(
+            error["error"]["details"]["example"].is_array(),
+            "the error shows the expected shape: {response}"
+        );
+    }
+
+    // PUT goes through the same extractor.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": 7})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(parse(&response)["error"]["code"], "invalid_env");
+}
+
+#[tokio::test]
+async fn a_deserialization_error_reports_the_field_path() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"mem_limit_mb": "big"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    let error = parse(&response);
+    assert_eq!(error["error"]["code"], "invalid_body", "{response}");
+    assert_eq!(
+        error["error"]["details"]["path"], "mem_limit_mb",
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_secret_env_is_readable_in_get_and_a_secret_never_is() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "123,456", "secret": false},
+                {"key": "OPENAI_KEY", "value": "sk-hidden", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(
+        !response.contains("sk-hidden"),
+        "a secret value never leaves the control plane: {response}"
+    );
+    let detail = parse(&response);
+    let env = detail["env"].as_array().expect("env");
+    let plain = env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_USERS")
+        .expect("plain entry");
+    assert_eq!(plain["secret"], false);
+    assert_eq!(plain["value"], "123,456");
+    let secret = env
+        .iter()
+        .find(|entry| entry["key"] == "OPENAI_KEY")
+        .expect("secret entry");
+    assert_eq!(secret["secret"], true);
+    assert!(secret.get("value").is_none());
+}
+
+#[tokio::test]
 async fn env_validation_refuses_reserved_duplicate_and_oversized_entries() {
     let harness = Harness::new();
     create_solo(&harness, "alice").await;

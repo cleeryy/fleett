@@ -2,6 +2,7 @@
 
 use crate::api::audit;
 use crate::api::error::ApiError;
+use crate::api::json::ApiJson;
 use crate::api::{up_and_record, AppState};
 use crate::auth::AuthContext;
 use crate::config::EgressMode;
@@ -14,7 +15,7 @@ use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
     validate_env_key, validate_env_value, validate_instance_id, validate_mem_limit, validate_model,
     validate_notes, validate_secret_value, validate_share_name, ChannelKind, ChannelRequest,
-    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput, Health,
+    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvInput, EnvVarInput, Health,
     InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
     TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
     GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
@@ -155,7 +156,7 @@ pub async fn get(
 pub async fn create(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<CreateInstanceRequest>,
+    ApiJson(request): ApiJson<CreateInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
     let prepared = prepare_create(&state, &request)?;
     let mut spec = prepared.spec;
@@ -779,7 +780,7 @@ pub async fn patch(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<PatchInstanceRequest>,
+    ApiJson(request): ApiJson<PatchInstanceRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
@@ -794,7 +795,8 @@ pub async fn patch(
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     let mut values = env_values_of(&existing);
     let mut flags = env_flags_of(&existing);
-    apply_env_merge(&mut values, &mut flags, request.env.as_deref())?;
+    let env_vars = request.env.clone().map(EnvInput::into_vars);
+    apply_env_merge(&mut values, &mut flags, env_vars.as_deref())?;
     let values = render::merge_secrets(
         values,
         &spec,
@@ -834,8 +836,10 @@ pub async fn patch(
 /// Body of `PUT /api/instances/{id}/env`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PutEnvRequest {
+    /// Canonical list (`[{key,value,secret}]`) or deprecated v0.4.0 map
+    /// (`{"KEY": "value"}`, every entry stored as a secret).
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 /// Replace the whole environment of an instance.
@@ -848,9 +852,9 @@ pub async fn put_env(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<PutEnvRequest>,
+    ApiJson(request): ApiJson<PutEnvRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
-    let vars = request.env.ok_or_else(|| {
+    let vars = request.env.map(EnvInput::into_vars).ok_or_else(|| {
         ApiError::bad_request("invalid_env", "env is required: send {\"env\": [{...}]}")
     })?;
 
@@ -1547,15 +1551,19 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     let notes = request.notes.clone().unwrap_or_default();
     validate_notes(&notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
 
-    let env: Vec<EnvWrite> =
-        validate_env_inputs(request.env.as_deref().unwrap_or_default(), true, true)?
-            .into_iter()
-            .map(|var| EnvWrite {
-                key: var.key,
-                value: var.value.unwrap_or_default(),
-                secret: var.secret.unwrap_or(false),
-            })
-            .collect();
+    let env_vars = request
+        .env
+        .clone()
+        .map(EnvInput::into_vars)
+        .unwrap_or_default();
+    let env: Vec<EnvWrite> = validate_env_inputs(&env_vars, true, true)?
+        .into_iter()
+        .map(|var| EnvWrite {
+            key: var.key,
+            value: var.value.unwrap_or_default(),
+            secret: var.secret.unwrap_or(false),
+        })
+        .collect();
     let gate_token = request
         .gate_token
         .as_deref()

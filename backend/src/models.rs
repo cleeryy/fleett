@@ -1,6 +1,7 @@
 //! Domain types, API payloads and input validation.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const INSTANCE_ID_MIN: usize = 2;
 pub const INSTANCE_ID_MAX: usize = 32;
@@ -646,6 +647,126 @@ pub struct EnvVarInput {
     pub secret: Option<bool>,
 }
 
+/// The `env` field of a request, in either accepted shape.
+///
+/// The canonical shape is a list of [`EnvVarInput`]. Releases up to v0.4.0
+/// accepted an object of `"KEY": "value"` pairs on create; it is still read
+/// for compatibility and every entry of it is stored as a secret, as v0.4.0
+/// did.
+#[derive(Debug, Clone)]
+pub enum EnvInput {
+    /// `[{"key": "…", "value": "…", "secret": false}, …]` (canonical).
+    List(Vec<EnvVarInput>),
+    /// `{"KEY": "value"}` (deprecated v0.4.0 shape; every entry is a secret).
+    Map(BTreeMap<String, String>),
+}
+
+/// Why a JSON value could not be read as an [`EnvInput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvShapeError {
+    /// JSON type that was received (`sequence`, `map`, `string`, …).
+    pub received: &'static str,
+    /// Human-readable reason (the offending entry, for example).
+    pub detail: String,
+}
+
+impl std::fmt::Display for EnvShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for EnvShapeError {}
+
+impl EnvInput {
+    /// Parse either accepted shape from a raw JSON value.
+    ///
+    /// The error carries the JSON type that was received so the API can answer
+    /// `400 invalid_env` with both accepted shapes instead of axum's generic
+    /// deserialization text.
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, EnvShapeError> {
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value.clone())
+                .map(Self::List)
+                .map_err(|err| EnvShapeError {
+                    received: "sequence",
+                    detail: err.to_string(),
+                }),
+            serde_json::Value::Object(entries) => {
+                let mut map = BTreeMap::new();
+                for (key, value) in entries {
+                    match value {
+                        serde_json::Value::String(value) => {
+                            map.insert(key.clone(), value.clone());
+                        }
+                        other => {
+                            return Err(EnvShapeError {
+                                received: "map",
+                                detail: format!(
+                                    "env[\"{key}\"] must be a string, got {}",
+                                    json_type(other)
+                                ),
+                            })
+                        }
+                    }
+                }
+                Ok(Self::Map(map))
+            }
+            other => Err(EnvShapeError {
+                received: json_type(other),
+                detail: "env must be a list of {key,value,secret}".to_string(),
+            }),
+        }
+    }
+
+    /// Canonical list of this request, consuming it.
+    ///
+    /// The deprecated object form logs one warning per request. Every entry of
+    /// it is a secret: that is what the v0.4.0 create path did.
+    pub fn into_vars(self) -> Vec<EnvVarInput> {
+        match self {
+            Self::List(vars) => vars,
+            Self::Map(entries) => {
+                tracing::warn!(
+                    deprecated = "env_map",
+                    keys = entries.len(),
+                    "env: the object form is deprecated; send a list of {{key,value,secret}}"
+                );
+                entries
+                    .into_iter()
+                    .map(|(key, value)| EnvVarInput {
+                        key,
+                        value: Some(value),
+                        secret: Some(true),
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// JSON type name used by [`EnvShapeError`].
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "sequence",
+        serde_json::Value::Object(_) => "map",
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelRequest {
     #[serde(rename = "type")]
@@ -690,11 +811,13 @@ pub struct CreateInstanceRequest {
     /// `api_key_env` when the two differ).
     #[serde(default)]
     pub gate_token: Option<String>,
-    /// Additional environment variables. Every entry must state whether it is a
-    /// secret; the gate token and the platform token are always secret and win
-    /// over an entry with the same key.
+    /// Additional environment variables. The canonical shape is a list of
+    /// `{key, value, secret}`; the deprecated v0.4.0 object form
+    /// (`{"KEY": "value"}`) is accepted too and stores every entry as a secret.
+    /// The gate token and the platform token are always secret and win over an
+    /// entry with the same key.
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 /// `POST /api/instances/{id}/clone`.
@@ -756,9 +879,11 @@ pub struct PatchInstanceRequest {
     #[serde(default)]
     pub gate_token: Option<String>,
     /// Merge into the current environment: `null` deletes a key, `""` keeps an
-    /// empty value, a missing `secret` keeps the flag of an existing key.
+    /// empty value, a missing `secret` keeps the flag of an existing key. The
+    /// deprecated v0.4.0 object form is accepted and stores its entries as
+    /// secrets.
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1107,6 +1232,59 @@ mod tests {
             assert!(validate_image(invalid).is_err(), "{invalid:?}");
         }
         assert!(validate_image(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn env_accepts_the_list_and_the_legacy_map() {
+        let list = serde_json::json!([
+            {"key": "DISCORD_ALLOWED_USERS", "value": "123", "secret": false}
+        ]);
+        let parsed = EnvInput::from_json_value(&list).expect("list");
+        let vars = parsed.into_vars();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "DISCORD_ALLOWED_USERS");
+        assert_eq!(vars[0].value.as_deref(), Some("123"));
+        assert_eq!(vars[0].secret, Some(false));
+
+        let map = serde_json::json!({"DISCORD_BOT_TOKEN": "secret"});
+        let parsed = EnvInput::from_json_value(&map).expect("map");
+        let vars = parsed.into_vars();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "DISCORD_BOT_TOKEN");
+        assert_eq!(vars[0].value.as_deref(), Some("secret"));
+        assert_eq!(vars[0].secret, Some(true), "the map defaults to secret");
+    }
+
+    #[test]
+    fn env_shape_errors_name_the_received_type() {
+        let number = serde_json::json!(42);
+        assert_eq!(
+            EnvInput::from_json_value(&number)
+                .expect_err("number")
+                .received,
+            "number"
+        );
+        let string = serde_json::json!("nope");
+        assert_eq!(
+            EnvInput::from_json_value(&string)
+                .expect_err("string")
+                .received,
+            "string"
+        );
+        let bad_entry = serde_json::json!([{"key": 1}]);
+        assert_eq!(
+            EnvInput::from_json_value(&bad_entry)
+                .expect_err("bad entry")
+                .received,
+            "sequence"
+        );
+        let bad_map_value = serde_json::json!({"KEY": 1});
+        assert_eq!(
+            EnvInput::from_json_value(&bad_map_value)
+                .expect_err("bad map value")
+                .received,
+            "map"
+        );
     }
 
     #[test]
