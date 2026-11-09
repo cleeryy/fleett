@@ -57,3 +57,7 @@ jobs:
         if: ${{ hashFiles('web/package.json') != '' }}
         working-directory: web
         run: pnpm build
+      - name: i18n gate
+        if: ${{ hashFiles('web/package.json') != '' }}
+        working-directory: web
+        run: node scripts/check-i18n.mjs --strict
