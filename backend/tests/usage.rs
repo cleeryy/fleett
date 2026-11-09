@@ -213,7 +213,7 @@ async fn forced_samples_are_reported_verbatim() {
 }
 
 #[tokio::test]
-async fn usage_failures_are_502_with_a_clear_message() {
+async fn usage_failures_are_reported_as_warnings_and_keep_the_rest() {
     let harness = Harness::new();
     harness.create("alice").await;
     harness.mock.fail_next(
@@ -222,11 +222,14 @@ async fn usage_failures_are_502_with_a_clear_message() {
     );
 
     let (status, report) = harness.get("/api/usage").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{report}");
-    assert_eq!(report["error"]["code"], "usage_unavailable");
-    let message = report["error"]["message"].as_str().expect("message");
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let warnings = report["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1);
+    let message = warnings[0].as_str().expect("message");
     assert!(message.contains("Docker daemon"), "{message}");
-    assert!(message.contains("cannot read"), "{message}");
+    assert!(message.contains("local"), "{message}");
+    assert_eq!(report["instances"][0]["id"], "alice");
+    assert_eq!(report["instances"][0]["cpu_pct"].as_f64(), Some(0.0));
 }
 
 #[tokio::test]

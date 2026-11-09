@@ -21,6 +21,7 @@ pub mod exec;
 pub mod files;
 pub mod gitops;
 pub mod history;
+pub mod hosts;
 pub mod instance_archive;
 pub mod logs;
 pub mod logstore;

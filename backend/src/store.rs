@@ -522,6 +522,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         max_restarts: models::DEFAULT_MAX_RESTARTS,
         heal_backoff_s: models::DEFAULT_HEAL_BACKOFF_S,
         notes: String::new(),
+        host: crate::hosts::LOCAL_HOST.to_string(),
         status: Status::Unknown,
         last_error: None,
         created_at: models::now_iso(),

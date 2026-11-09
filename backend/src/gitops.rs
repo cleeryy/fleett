@@ -786,6 +786,9 @@ impl DesiredInstance {
                 .unwrap_or_else(|| image.to_string()),
             previous_image: None,
             allow_lan: self.allow_lan,
+            host: existing
+                .map(|spec| spec.host.clone())
+                .unwrap_or_else(|| crate::hosts::LOCAL_HOST.to_string()),
             heal: existing
                 .map(|spec| spec.heal)
                 .unwrap_or(crate::models::HealPolicy::Off),

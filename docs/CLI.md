@@ -45,7 +45,7 @@ fleett logs <id> [--tail N] [--since DURATION|TIMESTAMP] [--grep REGEX] [--level
 fleett create --id ID [--name NAME] [--template TEMPLATE] [--model MODEL]
                [--base-url URL] [--api-key-env VAR] [--gate-token TOKEN]
                [--channel telegram|discord|none] [--channel-token TOKEN]
-               [--allow-lan] [--cpu N] [--mem MB] [--note TEXT]
+               [--allow-lan] [--cpu N] [--mem MB] [--note TEXT] [--host ID|auto]
 fleett start <id>
 fleett stop <id>
 fleett restart <id>
@@ -54,6 +54,11 @@ fleett usage
 fleett cost [--from DATE] [--to DATE] [--group-by instance|model|day]
 fleett pricing [list | set MODEL --input X --output Y [--currency C] [--effective-from DATE]]
 fleett budget <id> [--set USD]
+fleett hosts
+fleett host add --name NAME [--id ID] [--transport local|ssh] [--address ADDR] [--docker-context CTX]
+fleett host test <id>
+fleett host rm <id>
+fleett instances move <id> --to HOST [--skip-transfer] [--no-start] [--remote-instance-dir PATH]
 fleett images
 fleett exec <id> [--timeout N] -- <argv...>
 fleett exec-policy
@@ -127,7 +132,8 @@ optional and validated by the server. `--base-url` defaults to
 `https://opencode.ai/inference/go/openai/v1`, the same value the web console pre-fills.
 `--gate-token` is stored as `HERMES_GATE_PROFILE_TOKEN`; `--channel-token` is stored as
 `TELEGRAM_BOT_TOKEN` or `DISCORD_BOT_TOKEN` depending on `--channel` (it requires
-`--channel`).
+`--channel`). `--host` selects the Docker host (`local` by default, `auto` for placement);
+see `docs/HOSTS.md`.
 
 ```bash
 fleett create --id test --template solo \
@@ -135,7 +141,7 @@ fleett create --id test --template solo \
   --base-url https://opencode.ai/inference/go/openai/v1 \
   --gate-token "$FLEETT_GATE_TOKEN" \
   --channel telegram --channel-token "$TELEGRAM_BOT_TOKEN" \
-  --cpu 1.5 --mem 2048 < /dev/null
+  --cpu 1.5 --mem 2048 --host auto < /dev/null
 ```
 
 The fleet caps `FLEETT_MAX_TOTAL_CPU` / `FLEETT_MAX_TOTAL_MEM_MB` are enforced by the server:
@@ -161,8 +167,39 @@ fleett usage
 fleett --json usage | jq '.totals, .caps'
 ```
 
-A stopped instance reports zero CPU/memory usage; its disk usage is still measured. Docker
-failures answer `502 usage_unavailable` with the Docker error.
+A stopped instance reports zero CPU/memory usage; its disk usage is still measured. An
+unreachable host is printed as a `warning:` line and its instances report zeros; the rest of
+the fleet is still reported.
+
+### `hosts` / `host`
+
+```bash
+fleett hosts
+fleett host add --name "PVE 3" --id pve3 --transport ssh --address cle@10.1.20.5
+fleett host test pve3
+fleett host rm pve3
+```
+
+`fleett hosts` prints `ID`, `NAME`, `TRANSPORT`, `ADDRESS`, `STATUS`, `INSTANCES`, `CAPACITY`
+and `FREE MEM` (capacity minus the declared limits of the placed instances). A host that
+cannot be reached is still listed, with its `last_error` line. `host add` tests the
+connection immediately; `host test` re-tests and prints the Docker version. `host rm` is
+refused while instances still run on the host (`409 host_in_use`). The `local` host cannot
+be renamed or removed.
+
+### `instances move`
+
+```bash
+fleett instances move alice --to pve3
+fleett instances move alice --to pve3 --skip-transfer   # shared storage
+fleett instances move alice --to pve3 --no-start
+```
+
+Stops the instance, transfers `instances/<id>/data` to the target with `scp`/`ssh` (the
+operator's SSH configuration, no secret stored by fleett), then relabels and starts it on
+the target. If the copy or the start fails, the source is restarted and the command exits
+non-zero; with no `scp`/`ssh` available it prints the exact manual steps and refuses safely.
+`--skip-transfer` assumes the target already exposes the same absolute bind-mount path.
 
 ### `cost`
 

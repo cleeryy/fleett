@@ -1,31 +1,23 @@
 //! `GET /api/usage` — CPU, memory and disk usage of the fleet (issue #10).
+//!
+//! Instances may live on several Docker hosts (issue #40). Each host is
+//! sampled separately: an unreachable daemon yields a warning and zeroed
+//! numbers for its instances instead of failing the whole report.
 
 use crate::api::error::ApiError;
 use crate::api::AppState;
+use crate::driver;
 use crate::models::{UsageCaps, UsageEntry, UsageResponse, UsageTotals};
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::Json;
 
 /// Usage of every instance plus the fleet totals and the configured caps.
 ///
-/// Read-only, so every authenticated role may call it. The driver samples the
-/// whole fleet in one call; an empty fleet answers with zeros and never talks
-/// to Docker.
+/// Read-only, so every authenticated role may call it. An empty fleet answers
+/// with zeros and never talks to Docker.
 pub async fn usage(State(state): State<AppState>) -> Result<Json<UsageResponse>, ApiError> {
     let specs = state.db.list().map_err(ApiError::from)?;
-    let samples = state.driver.usage(&specs).await.map_err(|err| {
-        let detail = if err.detail.trim().is_empty() {
-            err.to_string()
-        } else {
-            err.detail.clone()
-        };
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "usage_unavailable",
-            format!("cannot read the container usage: {detail}"),
-        )
-    })?;
+    let usage = driver::usage_by_host(&*state.driver, &specs).await;
 
     let mut instances = Vec::with_capacity(specs.len());
     let mut totals = UsageTotals {
@@ -35,7 +27,7 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<UsageResponse>,
         disk_bytes: 0,
     };
     for (index, spec) in specs.iter().enumerate() {
-        let sample = samples.get(index).cloned().unwrap_or_default();
+        let sample = usage.samples.get(index).cloned().unwrap_or_default();
         let status = if sample.running {
             "running".to_string()
         } else {
@@ -62,5 +54,6 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<UsageResponse>,
             max_cpu: state.cfg.max_total_cpu,
             max_mem_mb: state.cfg.max_total_mem_mb,
         },
+        warnings: usage.warnings,
     }))
 }

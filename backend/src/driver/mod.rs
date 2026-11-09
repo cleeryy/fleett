@@ -7,7 +7,9 @@
 pub mod compose;
 pub mod mock;
 
+use crate::hosts::{HostCapacity, HostSpec};
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -192,7 +194,11 @@ pub trait Driver: Send + Sync {
     fn ping(&self) -> DriverFuture<'_, bool>;
 
     /// Make sure a Docker network exists. `true` when it had to be created.
-    fn ensure_network<'a>(&'a self, name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>>;
+    fn ensure_network<'a>(
+        &'a self,
+        host: &'a str,
+        name: &'a str,
+    ) -> DriverFuture<'a, Result<bool, DriverError>>;
 
     /// IPv4 subnet of a Docker network, when it can be read.
     ///
@@ -200,8 +206,18 @@ pub trait Driver: Send + Sync {
     /// it is instead of comparing subnets.
     fn network_subnet<'a>(
         &'a self,
+        host: &'a str,
         name: &'a str,
     ) -> DriverFuture<'a, Result<Option<String>, DriverError>>;
+
+    /// Connectivity test and best-effort capacity of one host.
+    ///
+    /// Runs `docker info` against the host endpoint. The mock driver answers
+    /// with canned numbers so no test ever needs SSH or Docker.
+    fn probe_host<'a>(
+        &'a self,
+        host: &'a HostSpec,
+    ) -> DriverFuture<'a, Result<HostCapacity, DriverError>>;
 
     fn up<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
     fn stop<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>>;
@@ -247,15 +263,70 @@ pub trait Driver: Send + Sync {
         timeout_s: u64,
     ) -> DriverFuture<'a, Result<ExecResult, DriverError>>;
 
-    /// Make sure `image` is present locally, pulling it when it is not.
+    /// Make sure `image` is present on `host`, pulling it when it is not.
     ///
     /// `docker image inspect` first so a local tag is never re-pulled; the
     /// pull error is returned verbatim so the API can answer `502` with the
     /// Docker detail.
-    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>>;
+    fn ensure_image<'a>(
+        &'a self,
+        host: &'a str,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
 
-    /// Images present in the local Docker image store.
-    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>>;
+    /// Images present in the Docker image store of `host`.
+    fn list_images<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> DriverFuture<'a, Result<Vec<ImageRecord>, DriverError>>;
+}
+
+/// Usage samples of one fleet, plus the hosts whose daemon was unreachable.
+#[derive(Debug, Clone, Default)]
+pub struct FleetUsage {
+    /// One sample per input spec, in the same order.
+    pub samples: Vec<UsageSample>,
+    /// Operator-facing warnings (one per unreachable host).
+    pub warnings: Vec<String>,
+}
+
+/// Read the usage of a fleet spread over several hosts.
+///
+/// Instances are grouped by `spec.host` and each group is sampled with its own
+/// endpoint. An unreachable host yields a warning instead of failing the whole
+/// report: the remaining hosts must stay visible when one machine is down.
+pub async fn usage_by_host(driver: &dyn Driver, specs: &[InstanceSpec]) -> FleetUsage {
+    if specs.is_empty() {
+        return FleetUsage::default();
+    }
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, spec) in specs.iter().enumerate() {
+        groups.entry(spec.host.as_str()).or_default().push(index);
+    }
+
+    let mut samples = vec![UsageSample::default(); specs.len()];
+    let mut warnings = Vec::new();
+    for (host, indices) in groups {
+        let group: Vec<InstanceSpec> = indices.iter().map(|index| specs[*index].clone()).collect();
+        match driver.usage(&group).await {
+            Ok(values) => {
+                for (slot, sample) in indices.into_iter().zip(values) {
+                    samples[slot] = sample;
+                }
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "host \"{host}\" is unreachable: {}",
+                    if err.detail.trim().is_empty() {
+                        err.to_string()
+                    } else {
+                        err.detail.clone()
+                    }
+                ));
+            }
+        }
+    }
+    FleetUsage { samples, warnings }
 }
 
 #[cfg(test)]

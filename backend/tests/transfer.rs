@@ -182,6 +182,7 @@ fn manifest_of(instance: &Value) -> ArchiveInstance {
         allow_lan: instance["allow_lan"].as_bool().expect("allow_lan"),
         shares: Vec::new(),
         notes: String::new(),
+        host: fleett::hosts::LOCAL_HOST.to_string(),
     }
 }
 

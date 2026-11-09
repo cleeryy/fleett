@@ -345,6 +345,8 @@ pub struct InstanceSpec {
     /// Base delay between two heal attempts, in seconds.
     pub heal_backoff_s: u64,
     pub notes: String,
+    /// Host that runs the container (`hosts.id`, `local` by default).
+    pub host: String,
     pub status: Status,
     pub last_error: Option<String>,
     pub created_at: String,
@@ -487,6 +489,8 @@ pub struct InstanceSummary {
     pub health: String,
     pub cpu_limit: f64,
     pub allow_lan: bool,
+    /// Docker host that runs the instance (`local` by default).
+    pub host: String,
     /// Provider credential in use, when the instance has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -518,6 +522,8 @@ pub struct InstanceDetail {
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     pub allow_lan: bool,
+    /// Docker host that runs the container (`local` by default).
+    pub host: String,
     /// Operator-facing security warnings (egress firewall, LAN access).
     pub warnings: Vec<String>,
     pub notes: String,
@@ -566,6 +572,10 @@ pub struct UsageResponse {
     pub instances: Vec<UsageEntry>,
     pub totals: UsageTotals,
     pub caps: UsageCaps,
+    /// Hosts whose usage could not be read: the rest of the fleet is still
+    /// reported instead of failing the whole call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Parallel upgrades allowed by one job.
@@ -1045,6 +1055,10 @@ pub struct CreateInstanceRequest {
     /// LAN access (default `false`). See `docs/EGRESS.md`.
     #[serde(default)]
     pub allow_lan: Option<bool>,
+    /// Docker host (`hosts.id`), or `auto` to place the instance on the
+    /// reachable host with the most free capacity. Defaults to the local host.
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
     /// Convenience field: stored as `HERMES_GATE_PROFILE_TOKEN` (and as

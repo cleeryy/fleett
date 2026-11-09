@@ -11,6 +11,7 @@
 //! outside `FLEETT_ROOT`.
 
 use crate::config::Config;
+use crate::hosts::HostSpec;
 use crate::models::{
     now_iso, ChannelKind, HealPolicy, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
 };
@@ -596,6 +597,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_template_versions_version
     ON template_versions (template_id, version);
 CREATE INDEX IF NOT EXISTS idx_templates_parent ON templates (parent);
 "#,
+    // v24 — multi-host Docker transport (issue #40). A host is a Docker
+    // endpoint (`local`, a docker context, or `DOCKER_HOST=ssh://…`); an
+    // instance records which host runs its container. Every pre-existing
+    // instance stays on `local`, so an upgrade changes no behaviour.
+    r#"
+CREATE TABLE IF NOT EXISTS hosts (
+    id             TEXT PRIMARY KEY NOT NULL,
+    name           TEXT NOT NULL UNIQUE,
+    transport      TEXT NOT NULL,
+    address        TEXT NOT NULL DEFAULT '',
+    docker_context TEXT,
+    status         TEXT NOT NULL DEFAULT 'unknown',
+    last_check_at  TEXT,
+    last_error     TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+ALTER TABLE instances ADD COLUMN host TEXT NOT NULL DEFAULT 'local';
+CREATE INDEX IF NOT EXISTS idx_instances_host ON instances (host);
+
+INSERT OR IGNORE INTO hosts (id, name, transport, address, docker_context, status,
+    last_check_at, last_error, created_at, updated_at)
+VALUES ('local', 'local', 'local', '', NULL, 'unknown', NULL, NULL,
+    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -895,7 +922,8 @@ impl Db {
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, provider, channel, \
                  status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
-                 unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at \
+                 unhealthy_after, max_restarts, heal_backoff_s, notes, host, created_at, \
+                 updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -913,7 +941,7 @@ impl Db {
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, provider, channel, status, \
              last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, unhealthy_after, \
-             max_restarts, heal_backoff_s, notes, created_at, updated_at \
+             max_restarts, heal_backoff_s, notes, host, created_at, updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -959,9 +987,9 @@ impl Db {
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, provider, \
              channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
-             unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at) \
+             unhealthy_after, max_restarts, heal_backoff_s, notes, host, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?21)",
+                     ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 spec.id,
                 spec.name,
@@ -982,6 +1010,7 @@ impl Db {
                 spec.max_restarts,
                 spec.heal_backoff_s as i64,
                 spec.notes,
+                spec.host,
                 spec.created_at,
                 spec.updated_at,
             ],
@@ -1001,7 +1030,7 @@ impl Db {
              api_key_env = ?6, provider = ?7, channel = ?8, status = ?9, last_error = ?10, \
              mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, heal = ?15, \
              unhealthy_after = ?16, max_restarts = ?17, heal_backoff_s = ?18, notes = ?19, \
-             updated_at = ?20 \
+             host = ?20, updated_at = ?21 \
              WHERE id = ?1",
             params![
                 spec.id,
@@ -1023,6 +1052,7 @@ impl Db {
                 spec.max_restarts,
                 spec.heal_backoff_s as i64,
                 spec.notes,
+                spec.host,
                 spec.updated_at,
             ],
         )?;
@@ -1097,6 +1127,18 @@ impl Db {
                 heal_backoff_s as i64,
                 now_iso()
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Move one instance to another host without touching anything else.
+    ///
+    /// Placement is a routing concern: the compose file, the data directory and
+    /// the image stay exactly where they are.
+    pub fn set_host(&self, id: &str, host: &str) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE instances SET host = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, host, now_iso()],
         )?;
         Ok(())
     }
@@ -1580,6 +1622,155 @@ impl Db {
             .collect())
     }
 
+    /// Every registered host, sorted by id. The local host is always present.
+    pub fn list_hosts(&self) -> Result<Vec<HostSpec>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, name, transport, address, docker_context, status, last_check_at, \
+             last_error, created_at, updated_at FROM hosts ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], host_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One host by id.
+    pub fn host(&self, id: &str) -> Result<Option<HostSpec>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT id, name, transport, address, docker_context, status, last_check_at, \
+                 last_error, created_at, updated_at FROM hosts WHERE id = ?1",
+                params![id],
+                host_record,
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// One host by id or name (a create request may reference either).
+    pub fn host_by_ref(&self, value: &str) -> Result<Option<HostSpec>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT id, name, transport, address, docker_context, status, last_check_at, \
+                 last_error, created_at, updated_at FROM hosts WHERE id = ?1 OR name = ?1",
+                params![value],
+                host_record,
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Insert one host. A duplicate id or name is a [`DbError::Conflict`].
+    pub fn insert_host(&self, host: &HostSpec) -> Result<(), DbError> {
+        let conn = self.lock();
+        if conn
+            .query_row(
+                "SELECT 1 FROM hosts WHERE id = ?1 OR name = ?2",
+                params![host.id, host.name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(DbError::Conflict(host.id.clone()));
+        }
+        conn.execute(
+            "INSERT INTO hosts (id, name, transport, address, docker_context, status, \
+             last_check_at, last_error, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                host.id,
+                host.name,
+                host.transport,
+                host.address,
+                host.docker_context,
+                host.status,
+                host.last_check_at,
+                host.last_error,
+                host.created_at,
+                host.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the definition of one host. The local row keeps its id and name.
+    pub fn update_host(&self, host: &HostSpec) -> Result<(), DbError> {
+        let conn = self.lock();
+        let clash = conn
+            .query_row(
+                "SELECT 1 FROM hosts WHERE name = ?1 AND id != ?2",
+                params![host.name, host.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if clash {
+            return Err(DbError::Conflict(host.name.clone()));
+        }
+        let updated = conn.execute(
+            "UPDATE hosts SET name = ?2, transport = ?3, address = ?4, docker_context = ?5, \
+             status = ?6, last_check_at = ?7, last_error = ?8, updated_at = ?9 WHERE id = ?1",
+            params![
+                host.id,
+                host.name,
+                host.transport,
+                host.address,
+                host.docker_context,
+                host.status,
+                host.last_check_at,
+                host.last_error,
+                host.updated_at,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(DbError::Conflict(host.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Record the last connectivity probe of one host.
+    pub fn set_host_status(
+        &self,
+        id: &str,
+        status: &str,
+        last_error: Option<&str>,
+        checked_at: &str,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE hosts SET status = ?2, last_error = ?3, last_check_at = ?4, \
+             updated_at = ?5 WHERE id = ?1",
+            params![id, status, last_error, checked_at, checked_at],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one host row. Returns `false` when the id is unknown.
+    pub fn delete_host(&self, id: &str) -> Result<bool, DbError> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM hosts WHERE id = ?1", params![id])?;
+        Ok(deleted > 0)
+    }
+
+    /// Number of instances placed on each host.
+    pub fn host_instance_counts(&self) -> Result<HashMap<String, usize>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT host, COUNT(*) FROM instances GROUP BY host")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, count)| (id, count.max(0) as usize))
+            .collect())
+    }
+
     /// Append one mutation to the audit trail, returning its row id.
     pub fn record_audit(&self, entry: &NewAuditRecord) -> Result<i64, DbError> {
         let conn = self.lock();
@@ -1887,6 +2078,7 @@ struct StoredRow {
     max_restarts: i64,
     heal_backoff_s: i64,
     notes: String,
+    host: String,
     created_at: String,
     updated_at: String,
 }
@@ -1919,6 +2111,11 @@ impl StoredRow {
             max_restarts: self.max_restarts.clamp(0, u32::MAX as i64) as u32,
             heal_backoff_s: self.heal_backoff_s.clamp(0, i64::MAX) as u64,
             notes: self.notes,
+            host: if self.host.trim().is_empty() {
+                crate::hosts::LOCAL_HOST.to_string()
+            } else {
+                self.host
+            },
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
             last_error: self.last_error,
             created_at: self.created_at,
@@ -1957,8 +2154,24 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         max_restarts: row.get("max_restarts")?,
         heal_backoff_s: row.get("heal_backoff_s")?,
         notes: row.get("notes")?,
+        host: row.get("host")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+    })
+}
+
+fn host_record(row: &Row<'_>) -> rusqlite::Result<HostSpec> {
+    Ok(HostSpec {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        transport: row.get(2)?,
+        address: row.get(3)?,
+        docker_context: row.get(4)?,
+        status: row.get(5)?,
+        last_check_at: row.get(6)?,
+        last_error: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -2087,6 +2300,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,
             last_error: None,
             created_at: now_iso(),
@@ -2178,6 +2392,7 @@ mod tests {
             "instance_acl",
             "providers",
             "incidents",
+            "hosts",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -2198,6 +2413,7 @@ mod tests {
                 "missing column {column}"
             );
         }
+        assert!(columns.iter().any(|column| column == "host"));
 
         let token_columns: Vec<String> = conn
             .prepare("PRAGMA table_info(api_tokens)")
@@ -2207,6 +2423,74 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect columns");
         assert!(token_columns.iter().any(|column| column == "scope"));
+    }
+
+    #[test]
+    fn hosts_round_trip_and_instances_carry_their_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        assert_eq!(
+            db.list_hosts().expect("hosts").len(),
+            1,
+            "seeded local host"
+        );
+        assert_eq!(
+            db.host(crate::hosts::LOCAL_HOST)
+                .expect("local")
+                .expect("present")
+                .transport,
+            "local"
+        );
+
+        let now = now_iso();
+        let host = HostSpec {
+            id: "pve3".to_string(),
+            name: "PVE 3".to_string(),
+            transport: "ssh".to_string(),
+            address: "cle@10.1.20.5".to_string(),
+            docker_context: None,
+            status: "unknown".to_string(),
+            last_check_at: None,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        db.insert_host(&host).expect("insert host");
+        assert!(matches!(db.insert_host(&host), Err(DbError::Conflict(_))));
+        assert_eq!(
+            db.host_by_ref("PVE 3")
+                .expect("by name")
+                .expect("present")
+                .id,
+            "pve3"
+        );
+        db.set_host_status("pve3", "ok", None, "2026-11-09T10:00:00Z")
+            .expect("status");
+        assert_eq!(
+            db.host("pve3").expect("host").expect("present").status,
+            "ok"
+        );
+
+        let mut alice = spec("alice");
+        alice.host = "pve3".to_string();
+        db.insert_instance(&alice).expect("insert");
+        assert_eq!(db.get("alice").expect("get").expect("present").host, "pve3");
+        assert_eq!(
+            db.host_instance_counts()
+                .expect("counts")
+                .get("pve3")
+                .copied(),
+            Some(1)
+        );
+        db.set_host("alice", crate::hosts::LOCAL_HOST)
+            .expect("move");
+        assert_eq!(
+            db.get("alice").expect("get").expect("present").host,
+            "local"
+        );
+
+        assert!(db.delete_host("pve3").expect("delete"));
+        assert!(!db.delete_host("pve3").expect("delete again"));
     }
 
     #[test]

@@ -86,6 +86,14 @@ pub struct ArchiveInstance {
     pub shares: Vec<ShareRef>,
     #[serde(default)]
     pub notes: String,
+    /// Host the instance ran on when the archive was written. Informational
+    /// only: an import starts on the local host of the receiving control plane.
+    #[serde(default = "default_host")]
+    pub host: String,
+}
+
+fn default_host() -> String {
+    crate::hosts::LOCAL_HOST.to_string()
 }
 
 impl ArchiveInstance {
@@ -104,6 +112,7 @@ impl ArchiveInstance {
             allow_lan: spec.allow_lan,
             shares: spec.shares.clone(),
             notes: spec.notes.clone(),
+            host: spec.host.clone(),
         }
     }
 }
@@ -350,6 +359,7 @@ pub fn spec_from_manifest(
         max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
         heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
         notes: manifest.notes.clone(),
+        host: crate::hosts::LOCAL_HOST.to_string(),
         status: Status::Created,
         last_error: None,
         created_at: now.clone(),
@@ -463,6 +473,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: "ported from staging".to_string(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Running,
             last_error: None,
             created_at: now.clone(),

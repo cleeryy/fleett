@@ -12,11 +12,12 @@ use super::{
 };
 use crate::config::Config;
 use crate::db::Db;
+use crate::hosts::{self, HostCapacity, HostEndpoint, HostSpec};
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use crate::render;
 use crate::store::compose_project_name;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -103,8 +104,31 @@ impl ComposeDriver {
         values.map_err(|err| DriverError::new("secrets", err.to_string()))
     }
 
-    fn command_for(&self, id: &str, project: &str) -> Result<Command, DriverError> {
-        let environment = self.environment(id)?;
+    /// Endpoint of one instance host id.
+    ///
+    /// Resolved through the registry at every call, so editing a host address
+    /// takes effect on the next lifecycle operation without a restart.
+    fn endpoint(&self, host: &str) -> Result<HostEndpoint, DriverError> {
+        hosts::endpoint_for(self.db.as_ref(), host)
+            .map_err(|detail| DriverError::new("host", detail))
+    }
+
+    /// Endpoint of one host row (used by the connectivity probe).
+    fn host_endpoint(host: &HostSpec) -> HostEndpoint {
+        hosts::endpoint(host)
+    }
+
+    fn apply_endpoint(&self, command: &mut Command, host: &str) -> Result<(), DriverError> {
+        self.endpoint(host)?.apply(command);
+        Ok(())
+    }
+
+    fn command_for(&self, id: &str, project: &str, host: &str) -> Result<Command, DriverError> {
+        let mut environment = self.environment(id)?;
+        // A per-instance variable must never redirect the daemon selector: the
+        // host registry owns DOCKER_HOST / DOCKER_CONTEXT.
+        environment.remove("DOCKER_HOST");
+        environment.remove("DOCKER_CONTEXT");
         let mut command = Command::new(&self.docker);
         command
             .arg("compose")
@@ -115,23 +139,27 @@ impl ComposeDriver {
         // An empty map keeps the parent environment untouched (a fresh driver
         // without secrets must still be able to run `docker compose down`).
         command.envs(environment);
+        self.apply_endpoint(&mut command, host)?;
         command.stdin(Stdio::null());
         command.kill_on_drop(true);
         Ok(command)
     }
 
+    /// Compose command against the local daemon (tests only).
+    #[cfg(test)]
     fn command(&self, id: &str) -> Result<Command, DriverError> {
-        self.command_for(id, &self.project(id))
+        self.command_for(id, &self.project(id), hosts::LOCAL_HOST)
     }
 
     async fn compose(
         &self,
         id: &str,
+        host: &str,
         args: &[&str],
         operation: &str,
         timeout: Duration,
     ) -> Result<String, DriverError> {
-        let mut command = self.command(id)?;
+        let mut command = self.command_for(id, &self.project(id), host)?;
         command.args(args);
         run_command(command, operation, timeout).await
     }
@@ -139,7 +167,8 @@ impl ComposeDriver {
     /// Run a compose operation against an explicit project name.
     ///
     /// The migration command uses it to talk to the legacy project before the
-    /// compose file is rewritten.
+    /// compose file is rewritten. Legacy projects only ever lived on the local
+    /// host, so this stays local.
     pub async fn project_operation(
         &self,
         id: &str,
@@ -148,7 +177,7 @@ impl ComposeDriver {
         operation: &str,
         timeout: Duration,
     ) -> Result<String, DriverError> {
-        let mut command = self.command_for(id, project)?;
+        let mut command = self.command_for(id, project, hosts::LOCAL_HOST)?;
         command.args(args);
         run_command(command, operation, timeout).await
     }
@@ -193,15 +222,16 @@ impl ComposeDriver {
         .map(|_| ())
     }
 
-    /// Make sure the external `fleett` network exists.
+    /// Make sure the external `fleett` network exists on one host.
     ///
     /// Returns `true` when the network had to be created.
-    pub async fn ensure_network_named(&self, name: &str) -> Result<bool, DriverError> {
+    pub async fn ensure_network_named(&self, host: &str, name: &str) -> Result<bool, DriverError> {
         let mut inspect = Command::new(&self.docker);
         inspect
             .args(["network", "inspect", name])
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        self.apply_endpoint(&mut inspect, host)?;
         let exists = matches!(
             tokio::time::timeout(PS_TIMEOUT, inspect.output()).await,
             Ok(Ok(output)) if output.status.success()
@@ -215,33 +245,49 @@ impl ComposeDriver {
             .args(["network", "create", name])
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        self.apply_endpoint(&mut create, host)?;
         run_command(create, "network create", CMD_TIMEOUT).await?;
         Ok(true)
     }
 
     /// Raw `docker network inspect <name>` output.
-    async fn inspect_network(&self, name: &str) -> Result<String, DriverError> {
+    async fn inspect_network(&self, host: &str, name: &str) -> Result<String, DriverError> {
         let mut command = Command::new(&self.docker);
         command
             .args(["network", "inspect", name])
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        self.apply_endpoint(&mut command, host)?;
         run_command(command, "network inspect", PS_TIMEOUT).await
     }
 
-    /// `docker stats --no-stream --format json` for every running container.
+    /// `docker stats --no-stream --format json` for every running container of
+    /// one host.
     ///
     /// The whole host is sampled in one call and the result is keyed by
     /// container name, so instances whose container is not running simply have
     /// no entry (and therefore report zero usage).
-    async fn docker_stats(&self) -> Result<HashMap<String, StatsSample>, DriverError> {
+    async fn docker_stats(&self, host: &str) -> Result<HashMap<String, StatsSample>, DriverError> {
         let mut command = Command::new(&self.docker);
         command
             .args(["stats", "--no-stream", "--format", "json"])
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        self.apply_endpoint(&mut command, host)?;
         let stdout = run_command(command, "stats", STATS_TIMEOUT).await?;
         Ok(parse_stats(&stdout))
+    }
+
+    /// `docker info` of one host row, parsed for CPU, memory and version.
+    async fn probe(&self, host: &HostSpec) -> Result<HostCapacity, DriverError> {
+        let mut command = Command::new(&self.docker);
+        command
+            .args(["info", "--format", "{{json .}}"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        Self::host_endpoint(host).apply(&mut command);
+        let stdout = run_command(command, "info", PS_TIMEOUT).await?;
+        parse_info(&stdout).ok_or_else(|| DriverError::new("info", "unparsable docker info output"))
     }
 }
 
@@ -297,26 +343,39 @@ impl Driver for ComposeDriver {
         })
     }
 
-    fn ensure_network<'a>(&'a self, name: &'a str) -> DriverFuture<'a, Result<bool, DriverError>> {
-        Box::pin(async move { self.ensure_network_named(name).await })
+    fn ensure_network<'a>(
+        &'a self,
+        host: &'a str,
+        name: &'a str,
+    ) -> DriverFuture<'a, Result<bool, DriverError>> {
+        Box::pin(async move { self.ensure_network_named(host, name).await })
     }
 
     fn network_subnet<'a>(
         &'a self,
+        host: &'a str,
         name: &'a str,
     ) -> DriverFuture<'a, Result<Option<String>, DriverError>> {
         Box::pin(async move {
-            let json = self.inspect_network(name).await?;
+            let json = self.inspect_network(host, name).await?;
             crate::egress::first_ipv4_subnet(&json)
                 .map(Some)
                 .map_err(|detail| DriverError::new("network inspect", detail))
         })
     }
 
+    fn probe_host<'a>(
+        &'a self,
+        host: &'a HostSpec,
+    ) -> DriverFuture<'a, Result<HostCapacity, DriverError>> {
+        Box::pin(async move { self.probe(host).await })
+    }
+
     fn up<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
             self.compose(
                 &spec.id,
+                &spec.host,
                 &["up", "-d", "--remove-orphans"],
                 "up",
                 UP_TIMEOUT,
@@ -328,7 +387,7 @@ impl Driver for ComposeDriver {
 
     fn stop<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.compose(&spec.id, &["stop"], "stop", CMD_TIMEOUT)
+            self.compose(&spec.id, &spec.host, &["stop"], "stop", CMD_TIMEOUT)
                 .await
                 .map(|_| ())
         })
@@ -336,7 +395,7 @@ impl Driver for ComposeDriver {
 
     fn start<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.compose(&spec.id, &["start"], "start", CMD_TIMEOUT)
+            self.compose(&spec.id, &spec.host, &["start"], "start", CMD_TIMEOUT)
                 .await
                 .map(|_| ())
         })
@@ -344,7 +403,7 @@ impl Driver for ComposeDriver {
 
     fn restart<'a>(&'a self, spec: &'a InstanceSpec) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
-            self.compose(&spec.id, &["restart"], "restart", CMD_TIMEOUT)
+            self.compose(&spec.id, &spec.host, &["restart"], "restart", CMD_TIMEOUT)
                 .await
                 .map(|_| ())
         })
@@ -354,6 +413,7 @@ impl Driver for ComposeDriver {
         Box::pin(async move {
             self.compose(
                 &spec.id,
+                &spec.host,
                 &["down", "--remove-orphans"],
                 "down",
                 DOWN_TIMEOUT,
@@ -368,6 +428,7 @@ impl Driver for ComposeDriver {
             let stdout = self
                 .compose(
                     &spec.id,
+                    &spec.host,
                     &["ps", "--all", "--format", "json"],
                     "ps",
                     PS_TIMEOUT,
@@ -385,7 +446,8 @@ impl Driver for ComposeDriver {
         Box::pin(async move {
             let args = logs_arguments(options.tail, options.since.as_deref());
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            self.compose(&spec.id, &args, "logs", LOGS_TIMEOUT).await
+            self.compose(&spec.id, &spec.host, &args, "logs", LOGS_TIMEOUT)
+                .await
         })
     }
 
@@ -403,6 +465,7 @@ impl Driver for ComposeDriver {
                 .args(["inspect", "--type", "container", &container])
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
+            self.apply_endpoint(&mut command, &spec.host)?;
             let stdout = run_command(command, "inspect", INSPECT_TIMEOUT).await?;
             parse_inspect(&stdout)
                 .ok_or_else(|| DriverError::new("inspect", "unparsable docker inspect output"))
@@ -420,26 +483,36 @@ impl Driver for ComposeDriver {
                 return Ok(Vec::new());
             }
 
-            let stats = self.docker_stats().await?;
-            let cfg = self.cfg.clone();
-            let paths: Vec<PathBuf> = specs.iter().map(|spec| cfg.data_dir(&spec.id)).collect();
-            let disks = tokio::task::spawn_blocking(move || {
-                let mut sizes = Vec::with_capacity(paths.len());
-                for path in paths {
-                    sizes.push(du_bytes(&path)?);
-                }
-                Ok::<Vec<u64>, String>(sizes)
-            })
-            .await
-            .map_err(|err| DriverError::new("du", format!("the disk usage task failed: {err}")))?
-            .map_err(|detail| DriverError::new("du", detail))?;
+            // Group by host so each daemon is sampled exactly once. The caller
+            // (API, metrics) decides how to degrade when one host is down; this
+            // call stays all-or-nothing for the hosts it was given.
+            let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (index, spec) in specs.iter().enumerate() {
+                groups.entry(spec.host.as_str()).or_default().push(index);
+            }
+            let mut samples = vec![UsageSample::default(); specs.len()];
+            for (host, indices) in groups {
+                let group: Vec<&InstanceSpec> =
+                    indices.iter().map(|index| &specs[*index]).collect();
+                let stats = self.docker_stats(host).await?;
+                let cfg = self.cfg.clone();
+                let ids: Vec<String> = group.iter().map(|spec| spec.id.clone()).collect();
+                let disks = tokio::task::spawn_blocking(move || {
+                    let mut sizes = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        sizes.push(du_bytes(&cfg.data_dir(&id))?);
+                    }
+                    Ok::<Vec<u64>, String>(sizes)
+                })
+                .await
+                .map_err(|err| {
+                    DriverError::new("du", format!("the disk usage task failed: {err}"))
+                })?
+                .map_err(|detail| DriverError::new("du", detail))?;
 
-            Ok(specs
-                .iter()
-                .zip(disks)
-                .map(|(spec, disk_bytes)| {
+                for ((index, spec), disk_bytes) in indices.into_iter().zip(group).zip(disks) {
                     let configured_limit = u64::from(spec.mem_limit_mb) * 1024 * 1024;
-                    match stats.get(&self.project(&spec.id)) {
+                    samples[index] = match stats.get(&self.project(&spec.id)) {
                         Some(sample) => UsageSample {
                             running: true,
                             cpu_pct: sample.cpu_pct,
@@ -458,9 +531,10 @@ impl Driver for ComposeDriver {
                             mem_limit_bytes: configured_limit,
                             disk_bytes,
                         },
-                    }
-                })
-                .collect())
+                    };
+                }
+            }
+            Ok(samples)
         })
     }
 
@@ -474,7 +548,7 @@ impl Driver for ComposeDriver {
             // `-T` disables the TTY, so the output is plain bytes and the call
             // never hangs waiting for a terminal. The service name is always
             // `agent` (see `render::render_compose`).
-            let mut command = self.command(&spec.id)?;
+            let mut command = self.command_for(&spec.id, &self.project(&spec.id), &spec.host)?;
             command.args(["exec", "-T", "agent"]);
             command.args(argv);
             command.stdin(Stdio::null()).kill_on_drop(true);
@@ -504,7 +578,11 @@ impl Driver for ComposeDriver {
         })
     }
 
-    fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>> {
+    fn ensure_image<'a>(
+        &'a self,
+        host: &'a str,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
             // `docker image inspect` exits non-zero when the tag is absent, so
             // its output is not parsed: only the exit status matters.
@@ -513,6 +591,7 @@ impl Driver for ComposeDriver {
                 .args(["image", "inspect", image])
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
+            self.apply_endpoint(&mut inspect, host)?;
             let present = matches!(
                 tokio::time::timeout(PS_TIMEOUT, inspect.output()).await,
                 Ok(Ok(output)) if output.status.success()
@@ -525,19 +604,24 @@ impl Driver for ComposeDriver {
             pull.args(["pull", image])
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
+            self.apply_endpoint(&mut pull, host)?;
             run_command(pull, "image pull", PULL_TIMEOUT)
                 .await
                 .map(|_| ())
         })
     }
 
-    fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>> {
+    fn list_images<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> DriverFuture<'a, Result<Vec<ImageRecord>, DriverError>> {
         Box::pin(async move {
             let mut command = Command::new(&self.docker);
             command
                 .args(["images", "--format", "json"])
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
+            self.apply_endpoint(&mut command, host)?;
             let stdout = run_command(command, "images", IMAGES_TIMEOUT).await?;
             Ok(parse_images(&stdout))
         })
@@ -670,6 +754,31 @@ fn du_bytes(path: &Path) -> Result<u64, String> {
         .next()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| format!("unparsable du output for {}", path.display()))
+}
+
+/// Parse `docker info --format '{{json .}}'` into the capacity of a host.
+///
+/// Docker versions disagree on casing (`NCPU` vs `Ncpu`), so the lookup is
+/// case-insensitive. Missing fields keep zero: capacity is best-effort and a
+/// host without numbers can still be used explicitly.
+fn parse_info(stdout: &str) -> Option<HostCapacity> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let number = |names: &[&str]| -> Option<u64> {
+        object.iter().find_map(|(key, value)| {
+            names
+                .contains(&key.to_ascii_lowercase().as_str())
+                .then(|| value.as_u64())
+                .flatten()
+        })
+    };
+    Some(HostCapacity {
+        ncpu: number(&["ncpu"]).unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+        mem_total_bytes: number(&["memtotal"]).unwrap_or(0),
+        docker_version: field(&object, &["serverversion"]),
+    })
 }
 
 /// Parse `docker images --format json` (one object per line, an array is
@@ -956,6 +1065,71 @@ mod tests {
             .any(|arg| arg.ends_with("instances/alice/compose.yaml")));
     }
 
+    #[test]
+    fn a_remote_host_sets_docker_host_on_every_command() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::for_tests(dir.path().join("root"));
+        crate::store::ensure_layout(&cfg).expect("layout");
+        std::fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
+        std::fs::write(
+            cfg.compose_path("alice"),
+            "name: fleett-alice\nservices: {}\n",
+        )
+        .expect("compose file");
+
+        let db = Db::open(&cfg.db_path()).expect("db");
+        let now = crate::models::now_iso();
+        db.insert_host(&HostSpec {
+            id: "pve3".to_string(),
+            name: "PVE 3".to_string(),
+            transport: crate::hosts::TRANSPORT_SSH.to_string(),
+            address: "cle@10.1.20.5".to_string(),
+            docker_context: None,
+            status: crate::hosts::STATUS_UNKNOWN.to_string(),
+            last_check_at: None,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .expect("host");
+
+        let driver = ComposeDriver::new(&cfg).with_secrets(db);
+        let command = driver
+            .command_for("alice", "fleett-alice", "pve3")
+            .expect("command");
+        let environment = env_of(&command);
+        assert_eq!(
+            environment.get("DOCKER_HOST").map(String::as_str),
+            Some("ssh://cle@10.1.20.5")
+        );
+
+        // The local host adds no selector, so the process environment is
+        // inherited untouched.
+        let local = driver
+            .command_for("alice", "fleett-alice", crate::hosts::LOCAL_HOST)
+            .expect("local command");
+        assert!(!env_of(&local).contains_key("DOCKER_HOST"));
+    }
+
+    #[test]
+    fn docker_info_capacity_is_parsed() {
+        let info = parse_info(
+            r#"{"NCPU":8,"MemTotal":17179869184,"ServerVersion":"27.3.1","Containers":3}"#,
+        )
+        .expect("capacity");
+        assert_eq!(info.ncpu, 8);
+        assert_eq!(info.mem_total_bytes, 17_179_869_184);
+        assert_eq!(info.docker_version.as_deref(), Some("27.3.1"));
+
+        // Casing is not stable across Docker releases, and missing fields are
+        // zero rather than a parse failure.
+        let info = parse_info(r#"{"ncpu":2,"memtotal":1024}"#).expect("capacity");
+        assert_eq!(info.ncpu, 2);
+        assert_eq!(info.mem_total_bytes, 1024);
+        assert_eq!(info.docker_version, None);
+        assert!(parse_info("not json").is_none());
+    }
+
     fn env_of(command: &Command) -> std::collections::BTreeMap<String, String> {
         command
             .as_std()
@@ -1001,6 +1175,11 @@ mod tests {
                 value: "42,43".to_string(),
                 secret: false,
             },
+            crate::envs::EnvWrite {
+                key: "DOCKER_HOST".to_string(),
+                value: "tcp://evil.test:2375".to_string(),
+                secret: false,
+            },
         ];
         crate::envs::replace(&cfg, &db, "alice", &entries).expect("store env");
 
@@ -1020,6 +1199,10 @@ mod tests {
             environment.get("DISCORD_ALLOWED_USERS").map(String::as_str),
             Some("42,43"),
             "a non-secret value must reach the compose process too"
+        );
+        assert!(
+            !environment.contains_key("DOCKER_HOST"),
+            "an instance variable must never redirect the Docker daemon"
         );
     }
 
@@ -1307,6 +1490,7 @@ mod tests {
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
+            host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,
             last_error: None,
             created_at: crate::models::now_iso(),
@@ -1416,7 +1600,10 @@ mod tests {
             ),
         );
         let driver = driver_in(dir.path()).with_docker_binary(&docker);
-        driver.ensure_image("agent:1").await.expect("local image");
+        driver
+            .ensure_image(crate::hosts::LOCAL_HOST, "agent:1")
+            .await
+            .expect("local image");
         assert_eq!(
             std::fs::read_to_string(&calls).expect("calls"),
             "image inspect agent:1\n"
@@ -1431,7 +1618,10 @@ mod tests {
             ),
         );
         let driver = driver_in(dir.path()).with_docker_binary(&docker);
-        driver.ensure_image("agent:2").await.expect("pulled image");
+        driver
+            .ensure_image(crate::hosts::LOCAL_HOST, "agent:2")
+            .await
+            .expect("pulled image");
         let recorded = std::fs::read_to_string(&calls).expect("calls");
         assert!(recorded.contains("image inspect agent:2"), "{recorded}");
         assert!(recorded.contains("pull agent:2"), "{recorded}");
@@ -1446,7 +1636,7 @@ mod tests {
         );
         let driver = driver_in(dir.path()).with_docker_binary(&docker);
         let err = driver
-            .ensure_image("agent:9")
+            .ensure_image(crate::hosts::LOCAL_HOST, "agent:9")
             .await
             .expect_err("pull fails");
         assert_eq!(err.operation, "image pull");
@@ -1461,7 +1651,10 @@ mod tests {
             "#!/bin/sh\necho '{\"ID\":\"sha256:aaa\",\"Repository\":\"agent\",\"Tag\":\"2\",\"Size\":\"9MB\",\"CreatedAt\":\"now\"}'\n",
         );
         let driver = driver_in(dir.path()).with_docker_binary(&docker);
-        let images = driver.list_images().await.expect("images");
+        let images = driver
+            .list_images(crate::hosts::LOCAL_HOST)
+            .await
+            .expect("images");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].tag, "agent:2");
         assert_eq!(images[0].size, "9MB");

@@ -408,6 +408,7 @@ async fn api_routes_expose_plan_apply_and_drift() {
             image: "image:1".to_string(),
             previous_image: None,
             allow_lan: false,
+            host: "local".to_string(),
             heal: fleett::models::HealPolicy::Off,
             unhealthy_after: fleett::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: fleett::models::DEFAULT_MAX_RESTARTS,

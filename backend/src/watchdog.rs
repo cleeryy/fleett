@@ -496,7 +496,8 @@ pub async fn tick_at(state: &AppState, now: u64) -> TickReport {
 
     // `docker images` is fetched at most once per pass, and only when an
     // instance is broken enough that a missing image could be the reason.
-    let mut images: Option<Option<Vec<String>>> = None;
+    let mut images: std::collections::HashMap<String, Option<Vec<String>>> =
+        std::collections::HashMap::new();
 
     for cached in specs {
         report.sampled += 1;
@@ -546,23 +547,22 @@ pub async fn tick_at(state: &AppState, now: u64) -> TickReport {
 async fn image_missing(
     state: &AppState,
     spec: &InstanceSpec,
-    cache: &mut Option<Option<Vec<String>>>,
+    cache: &mut std::collections::HashMap<String, Option<Vec<String>>>,
 ) -> Option<String> {
     let image = spec.image.trim();
     if image.is_empty() {
         return None;
     }
-    if cache.is_none() {
-        *cache = Some(
-            state
-                .driver
-                .list_images()
-                .await
-                .ok()
-                .map(|records| records.into_iter().map(|record| record.tag).collect()),
-        );
+    let entry = cache.entry(spec.host.clone()).or_insert_with(|| None);
+    if entry.is_none() {
+        *entry = state
+            .driver
+            .list_images(&spec.host)
+            .await
+            .ok()
+            .map(|records| records.into_iter().map(|record| record.tag).collect());
     }
-    let images = cache.as_ref().and_then(|images| images.as_ref())?;
+    let images = entry.as_ref()?;
     if images.iter().any(|tag| tag == image) {
         return None;
     }
@@ -983,6 +983,7 @@ mod tests {
             image: crate::config::DEFAULT_IMAGE.to_string(),
             previous_image: None,
             allow_lan: false,
+            host: crate::hosts::LOCAL_HOST.to_string(),
             heal: HealPolicy::Off,
             unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,

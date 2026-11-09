@@ -56,6 +56,7 @@ impl Harness {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            host: "local".to_string(),
             heal: HealPolicy::Off,
             unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
             max_restarts: 5,
