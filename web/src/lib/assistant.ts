@@ -134,6 +134,7 @@ const PAGES: Record<string, string> = {
   "/memory": "Memory",
   "/tokens": "Tokens",
   "/audit": "Audit log",
+  "/skills": "Skills",
 };
 
 /** Page label derived from the route, until a page publishes its own. */
@@ -141,6 +142,7 @@ export function pageForPath(path: string): string {
   if (PAGES[path]) return PAGES[path];
   if (path.startsWith("/instances/")) return "Instance";
   if (path.startsWith("/providers/")) return "Provider details";
+  if (path.startsWith("/skills/")) return "Skill details";
   return "Fleett";
 }
 
@@ -164,6 +166,8 @@ const SCHEMAS: Record<string, string> = {
   "/memory": "Shared memory entry: namespace (global|shared|instance:<id>|project:<name>), key, value, tags, TTL.",
   "/tokens": "Access token: name, role (admin|viewer). The secret is shown once.",
   "/audit": "Audit entry: actor, role, method, action, target, IP and details.",
+  "/skills":
+    "Skill registry: name (slug), version (vN), description, files[] (path + content, SKILL.md required), latest pointer, promote (restart followers) and linked instances.",
 };
 
 /** Shape of the page, used when no publisher refines it. */
@@ -175,14 +179,17 @@ export function schemaForPath(path: string): string | undefined {
   if (path.startsWith("/providers/")) {
     return "Provider detail: kind, base_url, api_key_env, attached instances. The secret is write-only.";
   }
+  if (path.startsWith("/skills/")) {
+    return "Skill detail: versions with their files, the latest pointer, commits, and the instances that mount it (pinned version or latest).";
+  }
   return undefined;
 }
 
 const TAB_SCHEMAS: Record<string, string> = {
   overview:
-    "Instance summary: status, model, provider, base URL, channel, memory limit, shares, LAN access, last error.",
+    "Instance summary: status, model, provider, base URL, channel, memory limit, shares, skills (pinned or latest version), LAN access, last error.",
   configuration:
-    "Instance configuration: name, provider, model, memory limit, LAN access, notes, plus the environment. An env row is KEY, value and a secret flag: secret values are stored encrypted and never sent.",
+    "Instance configuration: name, provider, model, memory limit, LAN access, notes, skills (registry mounts with an optional version pin; omitted follows latest), plus the environment. An env row is KEY, value and a secret flag: secret values are stored encrypted and never sent.",
   schedules: SCHEMAS["/schedules"],
   incidents: SCHEMAS["/incidents"],
   snapshots: "Snapshot: label, creation time, expiry, size and restore state of the data directory.",

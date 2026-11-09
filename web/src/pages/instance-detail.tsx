@@ -15,7 +15,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef } from "@/api/types";
+import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef, SkillRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,6 +62,7 @@ import { PersonaStateBadge } from "@/components/persona-state-badge";
 import { PersonaSelect } from "@/components/persona-select";
 import { PersonaVariableInputs } from "@/components/persona-vars";
 import { SharePicker } from "@/components/share-picker";
+import { SkillPicker } from "@/components/skill-picker";
 import { StatusBadge } from "@/components/status-badge";
 import {
   ASSISTANT_APPLIED_EVENT,
@@ -73,6 +74,12 @@ import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
 import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
 import { applySucceeded, compactVariables } from "@/lib/personas";
+import {
+  MAX_SKILLS_PER_INSTANCE,
+  skillRefPayload,
+  skillRefsFromDetail,
+  tooManySkills,
+} from "@/lib/skills";
 import { navigate, hrefFor, useRoute } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -299,6 +306,51 @@ function OverviewTab({
           )}
         </Section>
 
+        <Section
+          title="Skills"
+          action={
+            canEdit ? (
+              <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
+                Manage
+              </Button>
+            ) : (
+              <Button asChild variant="ghost" size="sm">
+                <a href="#/skills">Browse</a>
+              </Button>
+            )
+          }
+        >
+          {(detail.skills ?? []).length ? (
+            <ul className="divide-y rounded-md border">
+              {(detail.skills ?? []).map((skill) => (
+                <li key={skill.name} className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2">
+                  <a
+                    href={hrefFor(`/skills/${skill.name}`)}
+                    className="min-w-0 flex-1 truncate font-mono text-sm underline-offset-4 hover:underline"
+                  >
+                    {skill.name}
+                  </a>
+                  <Badge variant="outline" className="shrink-0 font-mono text-[11px] font-normal">
+                    {skill.version ?? "follows latest"}
+                  </Badge>
+                  <Badge
+                    variant={skill.effective_version ? "secondary" : "destructive"}
+                    className="shrink-0 font-mono text-[11px] font-normal"
+                  >
+                    {skill.effective_version ? `mounted ${skill.effective_version}` : "unresolved"}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
+              No skill mounted. Skills are reference files the agent reads at{" "}
+              <span className="font-mono">/opt/data/skills/&lt;name&gt;</span>; declare them in
+              Configuration.
+            </p>
+          )}
+        </Section>
+
         <Section title="Container">
           {detail.container ? (
             <DataList
@@ -452,6 +504,7 @@ interface ConfigDraft {
   personaVars: Record<string, string>;
   notes: string;
   shares: ShareRef[];
+  skills: SkillRef[];
 }
 
 const CHANNEL_TYPES: ChannelType[] = ["none", "telegram", "discord"];
@@ -492,6 +545,7 @@ function toConfigDraft(detail: InstanceDetail): ConfigDraft {
     personaVars: { ...(detail.persona_vars ?? {}) },
     notes: detail.notes,
     shares: detail.shares.map((share) => ({ ...share })),
+    skills: skillRefsFromDetail(detail.skills),
   };
 }
 
@@ -508,6 +562,9 @@ function validateConfig(draft: ConfigDraft, originalChannel: string): Record<str
   if (!Number.isFinite(memory) || memory < 128 || memory > 8192) errors.mem_limit_mb = "Use 128 to 8192 MB.";
   if (draft.channel !== "none" && draft.channel !== originalChannel && !draft.token.trim())
     errors.token = "A token is required after switching channel type.";
+  if (tooManySkills(draft.skills)) {
+    errors.skills = `An instance mounts at most ${MAX_SKILLS_PER_INSTANCE} skills.`;
+  }
   return errors;
 }
 
@@ -543,6 +600,7 @@ function ConfigurationTab({
 }) {
   const sharesResource = useResource(() => api.listShares(), []);
   const personas = useResource(() => api.listPersonas(), []);
+  const skillRegistry = useResource(() => api.listSkills(), []);
   const [attempted, setAttempted] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -651,6 +709,7 @@ function ConfigurationTab({
               ? { type: draft.channel, token: draft.token.trim() }
               : { type: draft.channel },
         shares: draft.shares,
+        skills: skillRefPayload(draft.skills),
       };
       await api.patchInstance(detail.id, patch);
       toast.success("Configuration saved.");
@@ -999,6 +1058,26 @@ function ConfigurationTab({
             error={sharesResource.error}
             onRetry={sharesResource.reload}
           />
+        </fieldset>
+
+        <fieldset className="min-w-0 space-y-3">
+          <legend className="text-sm font-medium">Skills</legend>
+          <SkillPicker
+            skills={skillRegistry.data ?? []}
+            value={draft.skills}
+            onChange={(next) => update("skills", next)}
+            loading={skillRegistry.loading && !skillRegistry.data}
+            error={skillRegistry.error}
+            onRetry={skillRegistry.reload}
+            disabled={pending}
+            idPrefix="cfg-skill"
+            effective={Object.fromEntries(
+              (detail.skills ?? []).map((skill) => [skill.name, skill.effective_version]),
+            )}
+          />
+          {showErrors && errors.skills ? (
+            <p className="text-xs text-destructive">{errors.skills}</p>
+          ) : null}
         </fieldset>
 
         <div className="space-y-2">

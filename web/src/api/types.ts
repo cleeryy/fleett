@@ -223,6 +223,128 @@ export interface PatchPersonaInput {
 }
 
 /* --------------------------------------------------------------------------
+ * Shared skills (issue #54, docs/SKILLS.md)
+ * -------------------------------------------------------------------------- */
+
+/** One skill of the registry, as listed by `GET /api/skills`. */
+export interface SkillSummary {
+  /** Slug, `[a-z0-9-]{2,32}`, also the directory name. */
+  name: string;
+  description: string;
+  /** Version an instance mounts when it pins none; `null` before the first publish. */
+  latest: string | null;
+  /** Every published version, oldest first (`v1`, `v2`, …). */
+  versions: string[];
+  /** Instances mounting the skill, pinned or not. */
+  instances_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One text file of a skill version, path relative to the version directory. */
+export interface SkillFile {
+  path: string;
+  content: string;
+}
+
+/** One published version in `GET /api/skills/{name}`. */
+export interface SkillVersionInfo {
+  version: string;
+  description: string;
+  files_count: number;
+  size_bytes: number;
+  published_at: string;
+}
+
+/**
+ * `GET /api/skills/{name}`: metadata, versions and the files of the `latest`
+ * version. The registry only serves the content of the version it points at;
+ * earlier versions are read through their diff.
+ */
+export interface SkillDetail {
+  name: string;
+  description: string;
+  latest: string | null;
+  versions: SkillVersionInfo[];
+  /** Files of the `latest` version (`skill.yaml` excluded). */
+  files: SkillFile[];
+  /** Ids of the instances mounting the skill, sorted. */
+  instances: string[];
+  instances_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `POST /api/skills`: publish one version. Publishing never overwrites. */
+export interface PublishSkillInput {
+  name: string;
+  /** `v1`, `v2`, …; an existing version is refused with `409 skill_version_exists`. */
+  version: string;
+  description?: string;
+  /** `SKILL.md` is mandatory at the root of the version. */
+  files: SkillFile[];
+}
+
+/** One instance in a promote report: the operator sees which restart failed. */
+export interface SkillPromoteEntry {
+  id: string;
+  status: "restarted" | "failed" | string;
+  error?: string;
+}
+
+/** `POST /api/skills/{name}/promote`: moves `latest` and reports each restart. */
+export interface SkillPromoteResult {
+  latest: string;
+  results: SkillPromoteEntry[];
+}
+
+/** `409 skill_in_use`: instances that still mount the skill. */
+export interface SkillInUseDetails {
+  instances?: string[];
+}
+
+/** `GET /api/skills/{name}/git/log`: commits touching this skill, newest first. */
+export interface SkillGitLog {
+  commits: CommitInfo[];
+}
+
+/** `GET /api/skills/{name}/git/diff`: unified patch, restricted to `{name}/`. */
+export interface SkillGitDiff {
+  from: string;
+  to: string;
+  diff: string;
+}
+
+export interface SkillGitLogOptions {
+  /** 1..500, defaults to 50. */
+  limit?: number;
+}
+
+export interface SkillGitDiffOptions {
+  /** Defaults to the first parent of `to`. */
+  from?: string;
+  /** Defaults to `HEAD`. */
+  to?: string;
+}
+
+/**
+ * One skill declared on an instance. Omitting `version` (or `null`) follows
+ * `latest`, so a promote restarts it; a pin keeps that version across promotes.
+ */
+export interface SkillRef {
+  name: string;
+  version?: string | null;
+}
+
+/** What an instance reports: the pin (`null` = follow latest) and the mount. */
+export interface SkillRefDetail {
+  name: string;
+  version: string | null;
+  /** Version the compose file actually mounts; `null` when unresolvable. */
+  effective_version: string | null;
+}
+
+/* --------------------------------------------------------------------------
  * Providers (docs/PROVIDERS.md)
  * -------------------------------------------------------------------------- */
 
@@ -342,6 +464,8 @@ export interface InstanceSummary {
   persona_vars?: Record<string, string>;
   /** Drift of the instance's SOUL.md against its persona. */
   persona_state?: PersonaState;
+  /** Skills mounted on the instance, with the version each one is mounted at. */
+  skills?: SkillRefDetail[];
   created_at: string;
 }
 
@@ -371,6 +495,8 @@ export interface InstanceDetail {
   persona_vars?: Record<string, string>;
   /** Drift of the instance's SOUL.md against its persona. */
   persona_state?: PersonaState;
+  /** Skills mounted on the instance, with the version each one is mounted at. */
+  skills?: SkillRefDetail[];
   /** API.md returns the channel type as a string on read. */
   channel: string;
   status: InstanceStatus;
@@ -428,6 +554,8 @@ export interface CreateInstanceInput {
   gate_token?: string;
   channel: ChannelInput;
   shares: ShareRef[];
+  /** Registry skills to mount read-only; omitted version follows `latest`. */
+  skills?: SkillRef[];
   mem_limit_mb: number;
   /** false keeps the agent on the restricted `fleett` network only. */
   allow_lan: boolean;
@@ -483,6 +611,8 @@ export interface PatchInstanceInput {
   gate_token?: string;
   channel?: ChannelInput;
   shares?: ShareRef[];
+  /** Replaces the whole mount list; the controller rewrites compose and restarts. */
+  skills?: SkillRef[];
   mem_limit_mb?: number;
   /** Turning LAN access off fails with 409 `egress_not_enforced` until the host firewall is installed. */
   allow_lan?: boolean;
@@ -1431,6 +1561,19 @@ export interface FleetApi {
   applyPersona(id: string, input: PersonaApplyInput): Promise<PersonaApplyResult>;
   personaGitLog(id: string, options?: PersonaGitLogOptions): Promise<PersonaGitLog>;
   personaGitDiff(id: string, options?: PersonaGitDiffOptions): Promise<PersonaGitDiff>;
+  /* Skills */
+  listSkills(): Promise<SkillSummary[]>;
+  getSkill(name: string): Promise<SkillDetail>;
+  /** Publishes one version; `409 skill_version_exists` when it is taken. */
+  publishSkill(input: PublishSkillInput): Promise<SkillDetail>;
+  /** Multipart zip (`skill.yaml` + files); the controller picks the next free version. */
+  importSkill(file: File): Promise<SkillDetail>;
+  /** Moves `latest` and restarts the instances that follow it, with a report. */
+  promoteSkill(name: string, version: string): Promise<SkillPromoteResult>;
+  /** `409 skill_in_use` carries the ids that still mount it. */
+  deleteSkill(name: string): Promise<void>;
+  skillGitLog(name: string, options?: SkillGitLogOptions): Promise<SkillGitLog>;
+  skillGitDiff(name: string, options?: SkillGitDiffOptions): Promise<SkillGitDiff>;
   listProviders(): Promise<ProviderSummary[]>;
   createProvider(input: CreateProviderInput): Promise<ProviderSummary>;
   getProvider(id: string): Promise<ProviderDetail>;

@@ -88,6 +88,7 @@ import type {
   ProviderSummary,
   ProviderTestResult,
   PurgeResult,
+  PublishSkillInput,
   RestoreReport,
   RevertInput,
   RevertResult,
@@ -99,6 +100,13 @@ import type {
   SendMessageInput,
   Share,
   ShareMode,
+  SkillDetail,
+  SkillGitDiff,
+  SkillGitDiffOptions,
+  SkillGitLog,
+  SkillGitLogOptions,
+  SkillPromoteResult,
+  SkillSummary,
   Snapshot,
   SnapshotDiff,
   Template,
@@ -160,7 +168,8 @@ async function request<T>(path: string, init: RequestInit = {}, options: Request
     const csrf = readCookie("fleett_csrf");
     if (csrf) headers.set("X-Fleett-CSRF", csrf);
   }
-  if (init.body !== undefined && !headers.has("Content-Type")) {
+  if (init.body !== undefined && !headers.has("Content-Type") && !(init.body instanceof FormData)) {
+    // A FormData body carries its own multipart boundary: let fetch set it.
     headers.set("Content-Type", "application/json");
   }
 
@@ -293,6 +302,42 @@ export const httpApi: FleetApi = {
   personaGitDiff: (id, options: PersonaGitDiffOptions = {}) =>
     request<PersonaGitDiff>(
       `/api/personas/${encodeURIComponent(id)}/git/diff${queryString({
+        from: options.from,
+        to: options.to,
+      })}`,
+    ),
+
+  listSkills: () => request<SkillSummary[]>("/api/skills"),
+
+  getSkill: (name) => request<SkillDetail>(`/api/skills/${encodeURIComponent(name)}`),
+
+  publishSkill: (input: PublishSkillInput) =>
+    request<SkillDetail>("/api/skills", { method: "POST", body: JSON.stringify(input) }),
+
+  importSkill: (file: File) => {
+    const body = new FormData();
+    // The controller reads the first file part and ignores the rest.
+    body.append("file", file, file.name);
+    return request<SkillDetail>("/api/skills/import", { method: "POST", body });
+  },
+
+  promoteSkill: (name, version) =>
+    request<SkillPromoteResult>(`/api/skills/${encodeURIComponent(name)}/promote`, {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    }),
+
+  deleteSkill: (name) =>
+    request<void>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
+
+  skillGitLog: (name, options: SkillGitLogOptions = {}) =>
+    request<SkillGitLog>(
+      `/api/skills/${encodeURIComponent(name)}/git/log${queryString({ limit: options.limit })}`,
+    ),
+
+  skillGitDiff: (name, options: SkillGitDiffOptions = {}) =>
+    request<SkillGitDiff>(
+      `/api/skills/${encodeURIComponent(name)}/git/diff${queryString({
         from: options.from,
         to: options.to,
       })}`,

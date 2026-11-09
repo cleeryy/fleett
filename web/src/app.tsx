@@ -33,6 +33,8 @@ import { ProvidersPage } from "@/pages/providers";
 import { SchedulesPage } from "@/pages/schedules";
 import { SecurityPage } from "@/pages/security";
 import { SharesPage } from "@/pages/shares";
+import { SkillDetailPage } from "@/pages/skill-detail";
+import { SkillsPage } from "@/pages/skills";
 import { TemplatesPage } from "@/pages/templates";
 import { TokensPage } from "@/pages/tokens";
 
@@ -53,6 +55,8 @@ function titleFor(path: string): string {
   if (path === "/templates") return "Templates";
   if (path === "/personas") return "Personas";
   if (path.startsWith("/personas/")) return "Persona details";
+  if (path === "/skills") return "Skills";
+  if (path.startsWith("/skills/")) return "Skill details";
   if (path === "/tokens") return "Tokens";
   if (path === "/audit") return "Audit log";
   if (path === "/schedules") return "Schedules";
@@ -274,6 +278,7 @@ export default function App() {
   const detailMatch = /^\/instances\/([^/]+)$/.exec(path);
   const providerMatch = /^\/providers\/([^/]+)$/.exec(path);
   const personaMatch = /^\/personas\/([^/]+)$/.exec(path);
+  const skillMatch = /^\/skills\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
     crumbs = [{ label: "Instances" }];
@@ -312,6 +317,13 @@ export default function App() {
     const id = decodeURIComponent(personaMatch[1]);
     crumbs = [{ label: "Personas", href: "#/personas" }, { label: id, mono: true }];
     screen = <PersonaDetailPage key={id} id={id} />;
+  } else if (path === "/skills") {
+    crumbs = [{ label: "Skills" }];
+    screen = <SkillsPage />;
+  } else if (skillMatch) {
+    const name = decodeURIComponent(skillMatch[1]);
+    crumbs = [{ label: "Skills", href: "#/skills" }, { label: name, mono: true }];
+    screen = <SkillDetailPage key={name} name={name} />;
   } else if (path === "/schedules") {
     crumbs = [{ label: "Schedules" }];
     screen = admin ? (

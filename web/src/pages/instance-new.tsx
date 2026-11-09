@@ -3,7 +3,7 @@ import { Check, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvSuggestion, ShareRef } from "@/api/types";
+import type { ChannelType, EnvSuggestion, ShareRef, SkillRef } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -28,8 +28,10 @@ import { PersonaSelect } from "@/components/persona-select";
 import { PersonaVariableInputs } from "@/components/persona-vars";
 import { ProviderSelect } from "@/components/provider-select";
 import { SharePicker } from "@/components/share-picker";
+import { SkillPicker } from "@/components/skill-picker";
 import { envPayload, validateEnvRows, type EnvRow } from "@/lib/env";
 import { compactVariables } from "@/lib/personas";
+import { MAX_SKILLS_PER_INSTANCE, skillRefPayload, tooManySkills } from "@/lib/skills";
 import { isHttpUrl, isValidSlug, slugify } from "@/lib/validation";
 import { plural } from "@/lib/format";
 import { navigate, setRouteGuard, hrefFor, useRoute } from "@/lib/router";
@@ -43,6 +45,7 @@ const STEPS = [
   "Model & network",
   "Channel",
   "Shares",
+  "Skills",
   "Review",
 ] as const;
 const LAST_STEP = STEPS.length - 1;
@@ -69,6 +72,7 @@ interface Draft {
   channelTouched: boolean;
   token: string;
   shares: ShareRef[];
+  skills: SkillRef[];
   memLimit: string;
   allowLan: boolean;
   notes: string;
@@ -91,6 +95,7 @@ const DEFAULT_DRAFT: Draft = {
   channelTouched: false,
   token: "",
   shares: [],
+  skills: [],
   memLimit: "1536",
   allowLan: false,
   notes: "",
@@ -148,6 +153,10 @@ function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = [])
     errors.token = "Enter the bot token.";
   }
 
+  if (step === 6 && tooManySkills(draft.skills)) {
+    errors.skills = `An instance mounts at most ${MAX_SKILLS_PER_INSTANCE} skills.`;
+  }
+
   return errors;
 }
 
@@ -175,6 +184,7 @@ export function NewInstancePage() {
   const shares = useResource(() => api.listShares(), []);
   const providers = useResource(() => api.listProviders(), []);
   const personas = useResource(() => api.listPersonas(), []);
+  const skillRegistry = useResource(() => api.listSkills(), []);
 
   const [draft, setDraft] = useState<Draft>(DEFAULT_DRAFT);
   const [step, setStep] = useState(0);
@@ -343,6 +353,7 @@ export function NewInstancePage() {
         gate_token: draft.provider ? undefined : draft.providerToken.trim() || undefined,
         channel: draft.channel === "none" ? { type: "none" } : { type: draft.channel, token: draft.token },
         shares: draft.shares,
+        skills: skillRefPayload(draft.skills),
         mem_limit_mb: Number(draft.memLimit),
         allow_lan: draft.allowLan,
         notes: draft.notes.trim(),
@@ -953,6 +964,23 @@ export function NewInstancePage() {
 
             {step === 6 ? (
               <div className="space-y-4">
+                <SkillPicker
+                  skills={skillRegistry.data ?? []}
+                  value={draft.skills}
+                  onChange={(skills) => update("skills", skills)}
+                  loading={skillRegistry.loading && !skillRegistry.data}
+                  error={skillRegistry.error}
+                  onRetry={skillRegistry.reload}
+                  idPrefix="wizard-skill"
+                />
+                {showErrors && errors.skills ? (
+                  <p className="text-xs text-destructive">{errors.skills}</p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {step === 7 ? (
+              <div className="space-y-4">
                 <dl className="divide-y rounded-md border">
                   <ReviewRow label="Name" value={draft.name || "—"} />
                   <ReviewRow label="Id" value={<span className="font-mono">{draft.id || "—"}</span>} />
@@ -1072,6 +1100,29 @@ export function NewInstancePage() {
                             <Badge key={share.name} variant="outline" className="gap-1 font-mono text-xs font-normal">
                               {share.name}
                               <span className="text-muted-foreground">{share.mode}</span>
+                            </Badge>
+                          ))}
+                        </span>
+                      ) : (
+                        "None"
+                      )
+                    }
+                  />
+                  <ReviewRow
+                    label="Skills"
+                    value={
+                      draft.skills.length ? (
+                        <span className="flex flex-wrap gap-1">
+                          {draft.skills.map((skill) => (
+                            <Badge
+                              key={skill.name}
+                              variant="outline"
+                              className="gap-1 font-mono text-xs font-normal"
+                            >
+                              {skill.name}
+                              <span className="text-muted-foreground">
+                                {skill.version ?? "latest"}
+                              </span>
                             </Badge>
                           ))}
                         </span>
