@@ -36,10 +36,10 @@ use crate::driver::DriverError;
 use crate::envs::{self, EnvError, EnvWrite};
 use crate::models::{
     now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_env_key,
-    validate_env_value, validate_instance_id, validate_mem_limit, validate_model, validate_notes,
-    validate_provider_kind, validate_provider_name, validate_secret_name, validate_secret_value,
-    validate_share_name, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
-    DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    validate_env_raw_value, validate_instance_id, validate_mem_limit, validate_model,
+    validate_notes, validate_provider_kind, validate_provider_name, validate_secret_name,
+    validate_secret_value, validate_share_name, InstanceSpec, ProviderSpec, ShareMode, ShareRef,
+    Status, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
 };
 use crate::providers;
 use crate::render::{self, RenderError};
@@ -264,7 +264,7 @@ impl FleetDocument {
                     )));
                 }
                 match (&env.value, &env.secret_ref) {
-                    (Some(value), None) => validate_env_value(value).map_err(|message| {
+                    (Some(value), None) => validate_env_raw_value(value).map_err(|message| {
                         GitopsError::Invalid(format!("instance \"{}\": {message}", instance.id))
                     })?,
                     (None, Some(reference)) => {

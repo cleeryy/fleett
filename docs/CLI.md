@@ -351,10 +351,20 @@ Prints a checklist and exits non-zero when a check fails:
 - `secrets`: an encryption key is configured (`fleett secrets init`)
 - `egress`: `FLEETT_EGRESS=restrict` has a fresh firewall marker (`fleett egress install`);
   `FLEETT_EGRESS=off` is reported as a warning
+- instance warnings: one `warn` line per warning reported by `GET /api/instances/{id}`
+  (missing template allowlist, plaintext `secrets.env`, LAN access, …), prefixed with the
+  instance id. A clean fleet adds no line; warnings never change the exit code.
 
 ```bash
 fleett doctor
 fleett --json doctor
+```
+
+A `guest-discord` instance created without an allowlist therefore reads:
+
+```
+  warn  warnings alice: DISCORD_ALLOWED_USERS is required by the guest-discord template but is
+                       not set: the gateway will refuse every message until it is
 ```
 
 ## Output and exit codes

@@ -258,6 +258,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
             get(incidents::instance_incidents),
         )
         .route("/instances/{id}/heal", patch(incidents::patch_heal))
+        .route("/instances/{id}/check", get(instances::check))
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",

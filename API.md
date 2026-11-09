@@ -74,8 +74,42 @@ removal applies to the next call. Changes are audited as
 ```json
 [{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
   "default_model":"deepseek-v4.1-flash","channel":"telegram",
-  "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids"}]}]
+  "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids",
+          "secret":false,"example":"123456789","required":true,"format":"csv-of-ids"},
+         {"key":"GATEWAY_ALLOW_ALL_USERS","description":"Accept every user…",
+          "secret":false,"example":"false","required":false,"format":"bool"}]}]
 ```
+
+`example` is the value the console should pre-fill, `required` marks the
+allowlists that make the gateway refuse every message when unset, and `format`
+is enforced by the write endpoints (`csv-of-ids`, `bool`, `url`, `text`). The
+three fields are optional on input: a `templates/<id>/template.yaml` written for
+an older release still parses.
+
+### Instance check
+
+`GET /api/instances/{id}/check` compares the template `required` suggestions
+against the stored environment and the live container health:
+```json
+{"ok":false,
+ "warnings":[{"code":"allowlist_missing","key":"DISCORD_ALLOWED_USERS",
+              "message":"DISCORD_ALLOWED_USERS is required by the guest-discord template but is not set: …",
+              "field":"env.DISCORD_ALLOWED_USERS"}],
+ "template":"guest-discord"}
+```
+
+- `allowlist_missing`: a required key is absent or empty (warning for every
+  channel, stopped or running);
+- `gateway_may_refuse`: the container is `healthy` while a required key is
+  missing;
+- `ok` is `true` iff `warnings` is empty;
+- `field` is the console form field to focus (`env.<KEY>`);
+- `template` is the template id (`InstanceDetail.template`).
+
+The same messages are appended to `InstanceDetail.warnings` (after the
+egress/LAN and plaintext-secrets warnings), so the console does not need to call
+`/check` to display them. Read-only: no health/last_error write, no compose
+call.
 
 ## Providers
 
@@ -175,6 +209,12 @@ two differ while an upgrade is in flight or after a failed rollback.
 unhealthy, or the `docker inspect` cause (`State.Error`, `OOMKilled`, non-zero exit code) when
 the container is not healthy. It is `null` for a healthy container and for a clean stop.
 
+`warnings` is a list of human-readable strings. It starts with the host egress/LAN warnings and
+the plaintext-`secrets.env` warning, then carries one line per template warning (missing
+`required` allowlist, gateway healthy but refusing because of it). See "Instance check" above;
+the structured form (with `code`, `key` and `field`) comes from
+`GET /api/instances/{id}/check`.
+
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `provider` (`null` detaches), `channel` (`token` optional =
 rotation), `shares`, `mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the
@@ -234,7 +274,14 @@ To keep a stored secret in a full replace, resend `{"key":"TOKEN","secret":true}
 `value` (or with `null`). Keys match `^[A-Z_][A-Z0-9_]{0,63}$`; reserved names (`HERMES_UID`,
 `HERMES_GID`, `PATH`, `HOME`, `FLEETT_*`) are refused. `409 secrets_key_missing` means the host
 has no secrets key yet (`sudo fleett secrets init`). Templates expose suggested variables in
-their `env` field (Telegram/Discord allowlists).
+their `env` field (Telegram/Discord allowlists) with `example`, `required` and `format`.
+
+A value that does not match the `format` of its template suggestion is refused on create,
+clone, `PATCH` and `PUT .../env` with `400 invalid_env_format` and
+`details {key, expected, received}`. Unknown keys are never rejected. Formats:
+`csv-of-ids` (comma-separated ASCII digits, spaces allowed), `bool`
+(`true`/`false`/`1`/`0`/`yes`/`no`), `url` (absolute http(s) with a host), `text`
+(non-empty). See `docs/ENV.md`.
 
 #### Deprecated v0.4.0 object form
 

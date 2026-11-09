@@ -30,7 +30,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | | |
 |---|---|
 | **Lifecycle** | Create from a template, start, stop, restart, delete (data kept or purged), clone with fresh credentials. |
-| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions; per-key `secret` flag; encrypted at rest, values never returned. |
+| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions with `example`/`format`/`required`, pre-filled fields and API-validated ids; missing allowlist warning on the instance and in `fleett doctor`; per-key `secret` flag; encrypted at rest, values never returned. |
 | **Providers** | Share one credential across agents, test it, rotate once and restart every linked agent with a per-instance report. |
 | **Files** | Browse and edit `SOUL.md`, skills and notes from the console; ETag conflicts, timestamped backups, “save & restart”. |
 | **History** | One git repo per agent, actor-attributed commits, diff, restore. Readable while the agent is stopped. |

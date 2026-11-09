@@ -103,6 +103,22 @@ pub struct RenderedInstance {
     pub soul_md: Option<String>,
 }
 
+/// Map the compact built-in declarations onto the API type.
+fn builtin_suggestions(builtin: &templates_builtin::BuiltinTemplate) -> Vec<EnvSuggestion> {
+    builtin
+        .env
+        .iter()
+        .map(|entry| EnvSuggestion {
+            key: entry.key.to_string(),
+            description: entry.description.to_string(),
+            secret: false,
+            example: entry.example.map(str::to_string),
+            required: entry.required,
+            format: entry.format.map(str::to_string),
+        })
+        .collect()
+}
+
 /// Resolve a template: a directory under `$FLEETT_ROOT/templates/<id>` wins,
 /// then the built-ins.
 pub fn load_template(cfg: &Config, id: &str) -> Result<TemplateSource, RenderError> {
@@ -134,17 +150,7 @@ pub fn load_template(cfg: &Config, id: &str) -> Result<TemplateSource, RenderErr
                 description: Some(builtin.description.to_string()),
                 default_model: Some(builtin.default_model.to_string()),
                 channel: Some(builtin.channel.to_string()),
-                env: Some(
-                    builtin
-                        .env
-                        .iter()
-                        .map(|(key, description)| EnvSuggestion {
-                            key: (*key).to_string(),
-                            description: (*description).to_string(),
-                            secret: false,
-                        })
-                        .collect(),
-                ),
+                env: Some(builtin_suggestions(builtin)),
             },
         });
     }
@@ -167,15 +173,7 @@ pub fn list_templates(cfg: &Config) -> Vec<TemplateInfo> {
                 description: builtin.description.to_string(),
                 default_model: builtin.default_model.to_string(),
                 channel: builtin.channel.to_string(),
-                env: builtin
-                    .env
-                    .iter()
-                    .map(|(key, description)| EnvSuggestion {
-                        key: (*key).to_string(),
-                        description: (*description).to_string(),
-                        secret: false,
-                    })
-                    .collect(),
+                env: builtin_suggestions(builtin),
             },
         );
     }

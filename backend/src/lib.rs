@@ -6,6 +6,7 @@ pub mod auth;
 pub mod authz;
 pub mod backup;
 pub mod bus;
+pub mod checks;
 pub mod cli;
 pub mod config;
 pub mod cost;

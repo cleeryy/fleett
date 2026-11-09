@@ -36,7 +36,7 @@
 
 use crate::config::Config;
 use crate::db::{Db, DbError, InstanceEnvRecord};
-use crate::models::{now_iso, validate_env_key, validate_env_value, EnvEntry};
+use crate::models::{now_iso, validate_env_key, validate_env_raw_value, EnvEntry};
 use crate::secrets::{self, SecretsError, SecretsKey};
 use crate::store;
 use std::collections::{BTreeMap, BTreeSet};
@@ -290,7 +290,7 @@ pub fn validate_entries(entries: &[EnvWrite]) -> Result<(), EnvError> {
     let mut seen = BTreeSet::new();
     for entry in entries {
         validate_env_key(&entry.key).map_err(EnvError::Invalid)?;
-        validate_env_value(&entry.value).map_err(EnvError::Invalid)?;
+        validate_env_raw_value(&entry.value).map_err(EnvError::Invalid)?;
         if !seen.insert(entry.key.as_str()) {
             return Err(EnvError::Invalid(format!(
                 "environment variable \"{}\" is listed twice",

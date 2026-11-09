@@ -713,6 +713,12 @@ pub struct TemplateInfo {
     pub env: Vec<EnvSuggestion>,
 }
 
+/// Formats a template may attach to an environment variable.
+///
+/// An unknown format is accepted and not enforced, so a custom template can
+/// carry its own vocabulary without breaking an older control plane.
+pub const ENV_FORMATS: [&str; 4] = ["csv-of-ids", "bool", "url", "text"];
+
 /// One environment variable a template suggests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSuggestion {
@@ -722,6 +728,15 @@ pub struct EnvSuggestion {
     /// `true` when the value must be stored encrypted (default `false`).
     #[serde(default)]
     pub secret: bool,
+    /// Value the console can pre-fill (`274575374111866880` for an allowlist).
+    #[serde(default)]
+    pub example: Option<String>,
+    /// `true` when the agent refuses every message until the key is set.
+    #[serde(default)]
+    pub required: bool,
+    /// Value grammar enforced by the API (`csv-of-ids`, `bool`, `url`, `text`).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1231,7 +1246,7 @@ pub fn validate_env_key(key: &str) -> Result<(), String> {
 }
 
 /// Validate an instance environment variable value.
-pub fn validate_env_value(value: &str) -> Result<(), String> {
+pub fn validate_env_raw_value(value: &str) -> Result<(), String> {
     if value.len() > ENV_VALUE_MAX_BYTES {
         return Err(format!(
             "environment variable values must be at most {} KiB",
@@ -1244,6 +1259,55 @@ pub fn validate_env_value(value: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Validate a value against the format a template attaches to its key.
+///
+/// The four built-in formats are `csv-of-ids` (comma-separated ASCII digits,
+/// spaces around entries allowed), `bool` (`true`/`false`/`1`/`0`/`yes`/`no`,
+/// case-insensitive), `url` (`http`/`https` with a host) and `text` (non-empty).
+/// An unknown format is not enforced: the template may come from another
+/// release.
+pub fn validate_env_value(format: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    match format.trim() {
+        "csv-of-ids" => {
+            if trimmed.is_empty() {
+                return Err("must be a comma-separated list of numeric ids".to_string());
+            }
+            for part in trimmed.split(',') {
+                let id = part.trim();
+                if id.is_empty() {
+                    return Err("must not contain an empty id".to_string());
+                }
+                if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!(
+                        "\"{id}\" is not a numeric id: use comma-separated ASCII digits"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "bool" => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "false" | "1" | "0" | "yes" | "no" => Ok(()),
+            _ => Err("must be true, false, 1, 0, yes or no".to_string()),
+        },
+        "url" => {
+            let parsed = url::Url::parse(trimmed)
+                .map_err(|err| format!("must be an absolute http(s) URL: {err}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err("must be an absolute http(s) URL with a host".to_string());
+            }
+            Ok(())
+        }
+        "text" => {
+            if trimmed.is_empty() {
+                return Err("must not be empty".to_string());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn validate_notes(value: &str) -> Result<(), String> {
@@ -1339,13 +1403,73 @@ mod tests {
 
     #[test]
     fn env_values_are_bounded_and_single_line() {
-        assert!(validate_env_value("").is_ok());
-        assert!(validate_env_value("123,456").is_ok());
-        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES)).is_ok());
-        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES + 1)).is_err());
-        assert!(validate_env_value("a\nb").is_err());
-        assert!(validate_env_value("a\rb").is_err());
-        assert!(validate_env_value("a\0b").is_err());
+        assert!(validate_env_raw_value("").is_ok());
+        assert!(validate_env_raw_value("123,456").is_ok());
+        assert!(validate_env_raw_value(&"a".repeat(ENV_VALUE_MAX_BYTES)).is_ok());
+        assert!(validate_env_raw_value(&"a".repeat(ENV_VALUE_MAX_BYTES + 1)).is_err());
+        assert!(validate_env_raw_value("a\nb").is_err());
+        assert!(validate_env_raw_value("a\rb").is_err());
+        assert!(validate_env_raw_value("a\0b").is_err());
+    }
+
+    #[test]
+    fn env_suggestions_keep_template_yaml_backward_compatible() {
+        // A `template.yaml` written before #27 only has key/description.
+        let legacy: EnvSuggestion =
+            serde_yaml::from_str("key: DISCORD_ALLOWED_USERS\ndescription: ids\n")
+                .expect("legacy suggestion");
+        assert_eq!(legacy.key, "DISCORD_ALLOWED_USERS");
+        assert!(legacy.example.is_none());
+        assert!(legacy.format.is_none());
+        assert!(!legacy.required);
+        assert!(!legacy.secret);
+
+        let full: EnvSuggestion = serde_yaml::from_str(
+            "key: DISCORD_ALLOWED_USERS\n\
+             description: ids\n\
+             secret: false\n\
+             example: '274575374111866880'\n\
+             required: true\n\
+             format: csv-of-ids\n",
+        )
+        .expect("typed suggestion");
+        assert_eq!(full.example.as_deref(), Some("274575374111866880"));
+        assert!(full.required);
+        assert_eq!(full.format.as_deref(), Some("csv-of-ids"));
+    }
+
+    #[test]
+    fn env_formats_are_enforced() {
+        for valid in ["123", "123,456", " 123 , 456 ", "274575374111866880"] {
+            assert!(validate_env_value("csv-of-ids", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "  ", "12a", "123,", ",123", "123,,456", "123 456"] {
+            assert!(
+                validate_env_value("csv-of-ids", invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        for valid in ["true", "FALSE", "1", "0", "yes", "No"] {
+            assert!(validate_env_value("bool", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "maybe", "2", "on"] {
+            assert!(validate_env_value("bool", invalid).is_err(), "{invalid:?}");
+        }
+
+        for valid in ["https://example.test", "http://10.1.20.1:8090/api"] {
+            assert!(validate_env_value("url", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "example.test", "ftp://example.test", "https://"] {
+            assert!(validate_env_value("url", invalid).is_err(), "{invalid:?}");
+        }
+
+        assert!(validate_env_value("text", "hello").is_ok());
+        assert!(validate_env_value("text", "  ").is_err());
+        assert!(validate_env_value("text", "").is_err());
+
+        // An unknown format is not enforced (forward compatibility).
+        assert!(validate_env_value("number-of-ids", "").is_ok());
     }
 
     #[test]

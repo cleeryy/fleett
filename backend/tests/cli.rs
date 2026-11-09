@@ -44,6 +44,8 @@ impl Recorded {
 struct MockState {
     requests: Arc<Mutex<Vec<Recorded>>>,
     docker_ok: bool,
+    /// Report one extra instance (`warned`) whose detail carries a warning.
+    warned_instance: bool,
 }
 
 impl MockState {
@@ -62,9 +64,19 @@ struct MockServer {
 
 impl MockServer {
     async fn start(docker_ok: bool) -> Self {
+        Self::start_with(docker_ok, false).await
+    }
+
+    /// Same server with one instance (`warned`) whose detail carries a warning.
+    async fn start_with_warnings() -> Self {
+        Self::start_with(true, true).await
+    }
+
+    async fn start_with(docker_ok: bool, warned_instance: bool) -> Self {
         let state = MockState {
             requests: Arc::new(Mutex::new(Vec::new())),
             docker_ok,
+            warned_instance,
         };
         let app = app(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -216,14 +228,15 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-async fn list_instances() -> Json<Value> {
-    Json(json!([
-        summary("alice", "running"),
-        summary("bob", "stopped")
-    ]))
+async fn list_instances(State(state): State<MockState>) -> Json<Value> {
+    let mut instances = vec![summary("alice", "running"), summary("bob", "stopped")];
+    if state.warned_instance {
+        instances.push(summary("warned", "running"));
+    }
+    Json(Value::Array(instances))
 }
 
-async fn get_instance(Path(id): Path<String>) -> Response {
+async fn get_instance(State(state): State<MockState>, Path(id): Path<String>) -> Response {
     if id == "ghost" {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -231,7 +244,14 @@ async fn get_instance(Path(id): Path<String>) -> Response {
             "instance \"ghost\" not found",
         );
     }
-    Json(detail(&id, status_of(&id))).into_response()
+    let mut value = detail(&id, status_of(&id));
+    if state.warned_instance && id == "warned" {
+        value["warnings"] = json!([
+            "DISCORD_ALLOWED_USERS is required by the guest-discord template but is not set: \
+             the gateway will refuse every message until it is"
+        ]);
+    }
+    Json(value).into_response()
 }
 
 async fn create_instance(Json(body): Json<Value>) -> Response {
@@ -713,6 +733,35 @@ async fn doctor_prints_a_checklist() {
     let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
     assert_eq!(value["ok"], true);
     assert_eq!(value["checks"].as_array().expect("checks").len(), 5);
+}
+
+#[tokio::test]
+async fn doctor_surfaces_one_line_per_instance_warning() {
+    let server = MockServer::start_with_warnings().await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["doctor"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("warnings"), "{text}");
+    assert!(text.contains("warned"), "{text}");
+    assert!(text.contains("DISCORD_ALLOWED_USERS"), "{text}");
+
+    // A warning is not a failing check: `--json` keeps `ok: true` and adds the
+    // line after the five host checks.
+    let output = run_against(&server, home.path(), &["--json", "doctor"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["ok"], true);
+    let checks = value["checks"].as_array().expect("checks");
+    assert_eq!(checks.len(), 6);
+    let warning = checks
+        .iter()
+        .find(|check| check["name"] == "warnings")
+        .expect("warning check");
+    assert_eq!(warning["state"], "warn");
+    assert!(warning["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("DISCORD_ALLOWED_USERS")));
 }
 
 #[tokio::test]

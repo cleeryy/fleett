@@ -322,6 +322,40 @@ async fn lists_builtin_templates() {
         guest_env,
         ["TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"]
     );
+
+    // Every suggestion carries an example and a format, and the allowlists
+    // that gate the gateway are marked required (#27).
+    let telegram = guest["env"]
+        .as_array()
+        .expect("guest env")
+        .iter()
+        .find(|entry| entry["key"] == "TELEGRAM_ALLOWED_USERS")
+        .expect("Telegram allowlist");
+    assert_eq!(telegram["example"], "123456789");
+    assert_eq!(telegram["format"], "csv-of-ids");
+    assert_eq!(telegram["required"], true);
+
+    let users = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_USERS")
+        .expect("Discord allowlist");
+    assert_eq!(users["example"], "274575374111866880");
+    assert_eq!(users["format"], "csv-of-ids");
+    assert_eq!(users["required"], true);
+    let channel_ids = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_CHANNELS")
+        .expect("Discord channel allowlist");
+    assert_eq!(channel_ids["format"], "csv-of-ids");
+    assert_eq!(channel_ids["required"], false);
+    let allow_all = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOW_ALL_USERS")
+        .expect("Discord allow-all flag");
+    assert_eq!(allow_all["example"], "false");
+    assert_eq!(allow_all["format"], "bool");
+    assert_eq!(allow_all["required"], false);
+
     assert_eq!(
         templates
             .iter()
@@ -329,6 +363,253 @@ async fn lists_builtin_templates() {
             .expect("solo template")["env"],
         json!([])
     );
+}
+
+// ---------------------------------------------------------------------------
+// Template allowlist checks (issue #27)
+// ---------------------------------------------------------------------------
+
+async fn create_guest_discord(harness: &Harness, id: &str) -> Value {
+    let body = json!({
+        "id": id,
+        "name": format!("Agent {id}"),
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "api_key_env": "HERMES_GATE_PROFILE_TOKEN",
+        "channel": {"type": "discord", "token": "discord-token"},
+        "shares": [],
+        "mem_limit_mb": 1024,
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {response}");
+    parse(&response)
+}
+
+fn warning_codes(body: &Value) -> Vec<String> {
+    body["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(|warning| warning["code"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_guest_discord_instance_without_an_allowlist_warns_in_the_detail_and_check() {
+    let harness = Harness::new();
+    // LAN access adds its own warning: env warnings must append to it.
+    let body = json!({
+        "id": "alice",
+        "name": "Alice",
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "discord", "token": "discord-token"},
+        "allow_lan": true,
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let detail = parse(&response);
+    let messages: Vec<&str> = detail["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|warning| warning.contains("fleett-lan")),
+        "the egress warning must not be dropped: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|warning| warning.contains("DISCORD_ALLOWED_USERS")),
+        "{messages:?}"
+    );
+
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice/check", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let check = parse(&response);
+    assert_eq!(check["ok"], false);
+    assert_eq!(check["template"], "guest-discord");
+    let codes = warning_codes(&check);
+    assert!(
+        codes.contains(&"allowlist_missing".to_string()),
+        "{codes:?}"
+    );
+    assert!(
+        codes.contains(&"gateway_may_refuse".to_string()),
+        "{codes:?}"
+    );
+    let warning = check["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|warning| warning["code"] == "allowlist_missing")
+        .expect("allowlist warning");
+    assert_eq!(warning["key"], "DISCORD_ALLOWED_USERS");
+    assert_eq!(warning["field"], "env.DISCORD_ALLOWED_USERS");
+    assert!(warning["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("DISCORD_ALLOWED_USERS")));
+
+    // Setting the allowlist (and keeping the stored token) clears the warning.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "274575374111866880", "secret": false},
+                {"key": "DISCORD_BOT_TOKEN", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let detail = parse(&response);
+    assert!(
+        !detail["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|warning| warning.contains("DISCORD_ALLOWED_USERS")),
+        "{detail}"
+    );
+
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice/check", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let check = parse(&response);
+    assert_eq!(check["ok"], true, "{check}");
+    assert_eq!(check["warnings"], json!([]));
+}
+
+#[tokio::test]
+async fn template_formats_are_enforced_on_create_patch_and_put() {
+    let harness = Harness::new();
+
+    // Create.
+    let body = json!({
+        "id": "alice",
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "discord", "token": "discord-token"},
+        "env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice", "secret": false}],
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "invalid_env_format");
+    assert_eq!(error["details"]["key"], "DISCORD_ALLOWED_USERS");
+    assert_eq!(error["details"]["expected"], "csv-of-ids");
+    assert_eq!(error["details"]["received"], "alice");
+    assert!(!harness.instance_dir("alice").exists());
+
+    // A valid value (spaces around ids are allowed) is accepted, and unknown
+    // keys are not rejected.
+    let detail = create_guest_discord(&harness, "alice").await;
+    assert_eq!(detail["id"], "alice");
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"env": [{"key": "UNKNOWN_KEY", "value": "anything"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // PATCH and PUT refuse the same invalid value.
+    for (method, body) in [
+        (
+            Method::PATCH,
+            json!({"env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice"}]}),
+        ),
+        (
+            Method::PUT,
+            json!({"env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice", "secret": false}]}),
+        ),
+    ] {
+        let uri = if method == Method::PATCH {
+            "/api/instances/alice"
+        } else {
+            "/api/instances/alice/env"
+        };
+        let (status, response) = harness.request(method, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            parse(&response)["error"]["code"],
+            "invalid_env_format",
+            "{response}"
+        );
+    }
+
+    // PUT accepts a valid CSV, including spaces.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "274575374111866880, 123", "secret": false},
+                {"key": "DISCORD_ALLOW_ALL_USERS", "value": "no", "secret": false},
+                {"key": "DISCORD_BOT_TOKEN", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+}
+
+#[tokio::test]
+async fn a_clone_validates_the_values_it_inherits_from_its_template() {
+    let harness = Harness::new();
+    let _source = create_guest_discord(&harness, "source").await;
+
+    // A value can predate the validation (written by an older release): the
+    // clone still refuses to carry it.
+    let entries = vec![
+        fleett::envs::EnvWrite {
+            key: "DISCORD_ALLOWED_USERS".to_string(),
+            value: "not-an-id".to_string(),
+            secret: false,
+        },
+        fleett::envs::EnvWrite {
+            key: "DISCORD_BOT_TOKEN".to_string(),
+            value: "discord-token".to_string(),
+            secret: true,
+        },
+    ];
+    fleett::envs::replace(&harness.state.cfg, &harness.state.db, "source", &entries)
+        .expect("legacy environment");
+
+    let (status, response) = harness
+        .request(
+            Method::POST,
+            "/api/instances/source/clone",
+            Some(json!({
+                "new_id": "copy",
+                "channel_token": "new-token",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        parse(&response)["error"]["code"],
+        "invalid_env_format",
+        "{response}"
+    );
+    assert!(!harness.instance_dir("copy").exists());
 }
 
 // ---------------------------------------------------------------------------
