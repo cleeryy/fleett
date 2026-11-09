@@ -1289,6 +1289,99 @@ fn unquote(value: &str) -> String {
     out
 }
 
+fn resolve_security(get: &dyn Fn(&str) -> Option<String>) -> Result<SecurityConfig, ConfigError> {
+    fn env_u32(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u32,
+    ) -> Result<u32, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u32>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    fn env_u64(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u64,
+    ) -> Result<u64, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    let rate_limit_per_min = env_u32(
+        get,
+        "RATE_LIMIT_PER_MIN",
+        "FLEETT_RATE_LIMIT_PER_MIN",
+        DEFAULT_RATE_LIMIT_PER_MIN,
+    )?;
+    let rate_limit_auth_per_min = env_u32(
+        get,
+        "RATE_LIMIT_AUTH_PER_MIN",
+        "FLEETT_RATE_LIMIT_AUTH_PER_MIN",
+        DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
+    )?;
+    let rate_limit_heavy_per_min = env_u32(
+        get,
+        "RATE_LIMIT_HEAVY_PER_MIN",
+        "FLEETT_RATE_LIMIT_HEAVY_PER_MIN",
+        DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
+    )?;
+    let lockout_failures = env_u32(
+        get,
+        "AUTH_LOCKOUT_FAILURES",
+        "FLEETT_AUTH_LOCKOUT_FAILURES",
+        DEFAULT_AUTH_LOCKOUT_FAILURES,
+    )?;
+    let lockout_window_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_WINDOW_S",
+        "FLEETT_AUTH_LOCKOUT_WINDOW_S",
+        DEFAULT_AUTH_LOCKOUT_WINDOW_S,
+    )?;
+    let lockout_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_S",
+        "FLEETT_AUTH_LOCKOUT_S",
+        DEFAULT_AUTH_LOCKOUT_S,
+    )?;
+
+    for (var, value) in [
+        ("FLEETT_AUTH_LOCKOUT_WINDOW_S", lockout_window_s),
+        ("FLEETT_AUTH_LOCKOUT_S", lockout_s),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::Invalid {
+                var,
+                value: "0".to_string(),
+                detail: "expected a positive number of seconds".to_string(),
+            });
+        }
+    }
+
+    Ok(SecurityConfig {
+        rate_limit_per_min,
+        rate_limit_auth_per_min,
+        rate_limit_heavy_per_min,
+        lockout_failures,
+        lockout_window_s,
+        lockout_s,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2032,97 +2125,4 @@ FLEETT_NETWORK='fleett-net'
         assert!(!debug.contains("scrape-me"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
     }
-}
-
-fn resolve_security(get: &dyn Fn(&str) -> Option<String>) -> Result<SecurityConfig, ConfigError> {
-    fn env_u32(
-        get: &dyn Fn(&str) -> Option<String>,
-        suffix: &str,
-        var: &'static str,
-        default: u32,
-    ) -> Result<u32, ConfigError> {
-        match get(suffix) {
-            None => Ok(default),
-            Some(value) => value.parse::<u32>().map_err(|err| ConfigError::Invalid {
-                var,
-                value: value.clone(),
-                detail: err.to_string(),
-            }),
-        }
-    }
-
-    fn env_u64(
-        get: &dyn Fn(&str) -> Option<String>,
-        suffix: &str,
-        var: &'static str,
-        default: u64,
-    ) -> Result<u64, ConfigError> {
-        match get(suffix) {
-            None => Ok(default),
-            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
-                var,
-                value: value.clone(),
-                detail: err.to_string(),
-            }),
-        }
-    }
-
-    let rate_limit_per_min = env_u32(
-        get,
-        "RATE_LIMIT_PER_MIN",
-        "FLEETT_RATE_LIMIT_PER_MIN",
-        DEFAULT_RATE_LIMIT_PER_MIN,
-    )?;
-    let rate_limit_auth_per_min = env_u32(
-        get,
-        "RATE_LIMIT_AUTH_PER_MIN",
-        "FLEETT_RATE_LIMIT_AUTH_PER_MIN",
-        DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
-    )?;
-    let rate_limit_heavy_per_min = env_u32(
-        get,
-        "RATE_LIMIT_HEAVY_PER_MIN",
-        "FLEETT_RATE_LIMIT_HEAVY_PER_MIN",
-        DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
-    )?;
-    let lockout_failures = env_u32(
-        get,
-        "AUTH_LOCKOUT_FAILURES",
-        "FLEETT_AUTH_LOCKOUT_FAILURES",
-        DEFAULT_AUTH_LOCKOUT_FAILURES,
-    )?;
-    let lockout_window_s = env_u64(
-        get,
-        "AUTH_LOCKOUT_WINDOW_S",
-        "FLEETT_AUTH_LOCKOUT_WINDOW_S",
-        DEFAULT_AUTH_LOCKOUT_WINDOW_S,
-    )?;
-    let lockout_s = env_u64(
-        get,
-        "AUTH_LOCKOUT_S",
-        "FLEETT_AUTH_LOCKOUT_S",
-        DEFAULT_AUTH_LOCKOUT_S,
-    )?;
-
-    for (var, value) in [
-        ("FLEETT_AUTH_LOCKOUT_WINDOW_S", lockout_window_s),
-        ("FLEETT_AUTH_LOCKOUT_S", lockout_s),
-    ] {
-        if value == 0 {
-            return Err(ConfigError::Invalid {
-                var,
-                value: "0".to_string(),
-                detail: "expected a positive number of seconds".to_string(),
-            });
-        }
-    }
-
-    Ok(SecurityConfig {
-        rate_limit_per_min,
-        rate_limit_auth_per_min,
-        rate_limit_heavy_per_min,
-        lockout_failures,
-        lockout_window_s,
-        lockout_s,
-    })
 }
