@@ -201,9 +201,51 @@ pub fn render_instance_with_project_and_policy(
     env_keys: &[String],
     policy: Option<&EgressPolicy>,
 ) -> Result<RenderedInstance, RenderError> {
+    render_instance_with_mcp(cfg, spec, template, project, env_keys, policy, &[])
+}
+
+/// Same as [`render_instance_with_project_and_policy`] with the MCP servers
+/// attached to the instance (issue #62), rendered into `config.yaml`.
+pub fn render_instance_with_mcp(
+    cfg: &Config,
+    spec: &InstanceSpec,
+    template: &TemplateSource,
+    project: Option<&str>,
+    env_keys: &[String],
+    policy: Option<&EgressPolicy>,
+    servers: &[McpConfigEntry],
+) -> Result<RenderedInstance, RenderError> {
     Ok(RenderedInstance {
         compose_yaml: render_compose_with_project_and_policy(cfg, spec, project, env_keys, policy)?,
-        config_yaml: render_config(spec, &template.config_yaml)?,
+        config_yaml: render_config_with_mcp(spec, &template.config_yaml, servers)?,
+        soul_md: template.soul_md.as_ref().map(|soul| substitute(soul, spec)),
+    })
+}
+
+/// Same as [`render_instance_with_mcp`] with the operator entries of the
+/// instance's current `config.yaml`, which a PATCH must keep.
+///
+/// The argument list mirrors the render chain plus the on-disk document; the
+/// alternative (a builder struct) would not make the call sites clearer.
+#[allow(clippy::too_many_arguments)]
+pub fn render_instance_with_mcp_and_existing(
+    cfg: &Config,
+    spec: &InstanceSpec,
+    template: &TemplateSource,
+    project: Option<&str>,
+    env_keys: &[String],
+    policy: Option<&EgressPolicy>,
+    servers: &[McpConfigEntry],
+    existing_config: Option<&str>,
+) -> Result<RenderedInstance, RenderError> {
+    Ok(RenderedInstance {
+        compose_yaml: render_compose_with_project_and_policy(cfg, spec, project, env_keys, policy)?,
+        config_yaml: render_config_with_mcp_and_existing(
+            spec,
+            &template.config_yaml,
+            servers,
+            existing_config,
+        )?,
         soul_md: template.soul_md.as_ref().map(|soul| substitute(soul, spec)),
     })
 }
@@ -216,12 +258,76 @@ pub fn substitute(text: &str, spec: &InstanceSpec) -> String {
         .replace("{{API_KEY_ENV}}", &spec.api_key_env)
 }
 
+/// One MCP server as rendered into the managed `mcp_servers` block.
+///
+/// The caller (the API layer) resolves the attachment rows against the stored
+/// servers; the renderer only knows the wire shape of Hermes. The key of the
+/// block entry is managed: it always starts with [`MCP_MANAGED_PREFIX`], which
+/// lets a later render strip the previous entries without touching the ones an
+/// operator wrote by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpConfigEntry {
+    /// Server id, used as the entry key (`fleett-<id>`).
+    pub id: String,
+    /// `streamable-http`, `sse` or `stdio`.
+    pub transport: String,
+    /// HTTP endpoint (deployed servers only).
+    pub url: Option<String>,
+    /// Command and fixed arguments (stdio servers only).
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Environment keys of the server, referenced as `${KEY}`.
+    pub env: Vec<String>,
+    pub timeout_s: u64,
+    pub connect_timeout_s: u64,
+}
+
+/// Prefix of every `mcp_servers` key fleett manages.
+pub const MCP_MANAGED_PREFIX: &str = "fleett-";
+
+/// Key of one managed `mcp_servers` entry.
+pub fn mcp_config_key(id: &str) -> String {
+    format!("{MCP_MANAGED_PREFIX}{id}")
+}
+
 /// Render `data/config.yaml`.
 ///
 /// The template is parsed and re-serialised so the model block always matches
 /// the instance exactly and `platforms.<channel>.enabled` is always coherent,
 /// even for hand-written templates.
 pub fn render_config(spec: &InstanceSpec, template_yaml: &str) -> Result<String, RenderError> {
+    render_config_with_mcp(spec, template_yaml, &[])
+}
+
+/// Same as [`render_config`] with the MCP servers attached to the instance.
+///
+/// Managed entries are stripped from the template's `mcp_servers` mapping
+/// before the current attachments are inserted, so a config never accumulates
+/// stale entries and an operator-written entry survives every PATCH. When the
+/// resulting mapping is empty and this render removed every key, the whole
+/// `mcp_servers` key is dropped: an instance without attachments keeps the
+/// historical bytes of its template.
+pub fn render_config_with_mcp(
+    spec: &InstanceSpec,
+    template_yaml: &str,
+    servers: &[McpConfigEntry],
+) -> Result<String, RenderError> {
+    render_config_with_mcp_and_existing(spec, template_yaml, servers, None)
+}
+
+/// Same as [`render_config_with_mcp`] while preserving operator entries found
+/// in the current on-disk `config.yaml`.
+///
+/// A PATCH re-renders the template, so without this merge a hand-written
+/// `mcp_servers` entry of the instance would be lost even though the template
+/// never declared one. Managed (`fleett-*`) keys are never taken from
+/// `existing`: they always come from the current attachment list.
+pub fn render_config_with_mcp_and_existing(
+    spec: &InstanceSpec,
+    template_yaml: &str,
+    servers: &[McpConfigEntry],
+    existing: Option<&str>,
+) -> Result<String, RenderError> {
     let substituted = substitute(template_yaml, spec);
     let mut doc: Value = serde_yaml::from_str(&substituted)
         .map_err(|err| RenderError::InvalidYaml(err.to_string()))?;
@@ -255,8 +361,115 @@ pub fn render_config(spec: &InstanceSpec, template_yaml: &str) -> Result<String,
         }
     }
 
+    apply_mcp_servers(&mut doc, servers);
+    if let Some(existing) = existing {
+        merge_operator_mcp_entries(&mut doc, existing);
+    }
+
     let body = serde_yaml::to_string(&doc).map_err(|err| RenderError::Compose(err.to_string()))?;
     Ok(format!("{CONFIG_HEADER}{body}"))
+}
+
+/// Copy the non-managed `mcp_servers` entries of `existing` that the rendered
+/// document does not already carry.
+fn merge_operator_mcp_entries(doc: &mut Value, existing: &str) {
+    let Ok(existing) = serde_yaml::from_str::<Value>(existing) else {
+        return;
+    };
+    let Some(entries) = existing.get("mcp_servers").and_then(Value::as_mapping) else {
+        return;
+    };
+    let entries: Vec<(Value, Value)> = entries
+        .iter()
+        .filter(|(key, _)| {
+            !key.as_str()
+                .map(|key| key.starts_with(MCP_MANAGED_PREFIX))
+                .unwrap_or(false)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let target = child_mapping(doc, "mcp_servers");
+    if let Value::Mapping(map) = target {
+        for (key, value) in entries {
+            map.entry(key).or_insert(value);
+        }
+    }
+}
+
+/// Strip the managed `mcp_servers` entries, then insert the current ones.
+fn apply_mcp_servers(doc: &mut Value, servers: &[McpConfigEntry]) {
+    let mut removed_every_key = false;
+    let mut had_mapping = false;
+    if let Some(Value::Mapping(map)) = doc.get_mut("mcp_servers") {
+        had_mapping = true;
+        let before = map.len();
+        map.retain(|key, _| {
+            !key.as_str()
+                .map(|key| key.starts_with(MCP_MANAGED_PREFIX))
+                .unwrap_or(false)
+        });
+        removed_every_key = before > 0 && map.is_empty();
+    }
+    if had_mapping && removed_every_key && servers.is_empty() {
+        if let Value::Mapping(root) = doc {
+            root.remove(Value::from("mcp_servers"));
+        }
+        return;
+    }
+    if servers.is_empty() {
+        return;
+    }
+
+    let entry = child_mapping(doc, "mcp_servers");
+    let Value::Mapping(map) = entry else {
+        return;
+    };
+    for server in servers {
+        let mut definition = Mapping::new();
+        if server.transport == "stdio" {
+            if let Some(command) = server.command.as_deref() {
+                definition.insert(Value::from("command"), Value::from(command));
+            }
+            if !server.args.is_empty() {
+                definition.insert(
+                    Value::from("args"),
+                    Value::Sequence(
+                        server
+                            .args
+                            .iter()
+                            .map(|arg| Value::from(arg.as_str()))
+                            .collect(),
+                    ),
+                );
+            }
+            if !server.env.is_empty() {
+                let mut env = Mapping::new();
+                for key in &server.env {
+                    env.insert(
+                        Value::from(key.as_str()),
+                        Value::from(format!("${{{key}}}")),
+                    );
+                }
+                definition.insert(Value::from("env"), Value::Mapping(env));
+            }
+        } else {
+            if let Some(url) = server.url.as_deref() {
+                definition.insert(Value::from("url"), Value::from(url));
+            }
+            definition.insert(Value::from("timeout"), Value::from(server.timeout_s));
+            definition.insert(
+                Value::from("connect_timeout"),
+                Value::from(server.connect_timeout_s),
+            );
+        }
+        map.insert(
+            Value::from(mcp_config_key(&server.id)),
+            Value::Mapping(definition),
+        );
+    }
 }
 
 fn child_mapping<'a>(parent: &'a mut Value, key: &str) -> &'a mut Value {
@@ -660,6 +873,7 @@ mod tests {
                 },
             ],
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 1536,
             cpu_limit: DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -1453,5 +1667,96 @@ networks:
             merged.get("DISCORD_BOT_TOKEN").map(String::as_str),
             Some("discord-token")
         );
+    }
+
+    fn mcp_entry(id: &str) -> McpConfigEntry {
+        McpConfigEntry {
+            id: id.to_string(),
+            transport: "streamable-http".to_string(),
+            url: Some(format!("http://fleett-mcp-{id}:8000/mcp")),
+            command: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            timeout_s: 15,
+            connect_timeout_s: 5,
+        }
+    }
+
+    #[test]
+    fn the_managed_block_is_inserted_and_stripped() {
+        let template = templates_builtin::find("guest").expect("guest").config_yaml;
+        let instance = spec(ChannelKind::None);
+
+        let text =
+            render_config_with_mcp(&instance, template, &[mcp_entry("fetch")]).expect("render");
+        let doc: Value = serde_yaml::from_str(&text).expect("yaml");
+        let entry = &doc["mcp_servers"]["fleett-fetch"];
+        assert_eq!(entry["url"], "http://fleett-mcp-fetch:8000/mcp");
+        assert_eq!(entry["timeout"], 15);
+        assert_eq!(entry["connect_timeout"], 5);
+
+        // A second render replaces the managed key instead of duplicating it.
+        let text =
+            render_config_with_mcp(&instance, &text, &[mcp_entry("memory")]).expect("rerender");
+        let doc: Value = serde_yaml::from_str(&text).expect("yaml");
+        assert!(doc["mcp_servers"].get("fleett-fetch").is_none());
+        assert!(doc["mcp_servers"].get("fleett-memory").is_some());
+
+        // No attachment: the block disappears entirely (historical bytes).
+        let text = render_config_with_mcp(&instance, template, &[]).expect("render");
+        let doc: Value = serde_yaml::from_str(&text).expect("yaml");
+        assert!(doc.get("mcp_servers").is_none());
+        assert_eq!(
+            text,
+            render_config(&instance, template).expect("legacy signature"),
+            "the empty render must stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn operator_entries_survive_a_managed_rewrite() {
+        let template = templates_builtin::find("guest").expect("guest").config_yaml;
+        let instance = spec(ChannelKind::None);
+        let existing = format!(
+            "{template}\nmcp_servers:\n  mine:\n    url: http://example.test/mcp\n  fleett-stale:\n    url: http://stale.test/mcp\n"
+        );
+
+        let text = render_config_with_mcp_and_existing(
+            &instance,
+            template,
+            &[mcp_entry("fetch")],
+            Some(&existing),
+        )
+        .expect("render");
+        let doc: Value = serde_yaml::from_str(&text).expect("yaml");
+        assert_eq!(doc["mcp_servers"]["mine"]["url"], "http://example.test/mcp");
+        assert!(doc["mcp_servers"].get("fleett-fetch").is_some());
+        assert!(
+            doc["mcp_servers"].get("fleett-stale").is_none(),
+            "a stale managed entry is never taken from the existing file"
+        );
+    }
+
+    #[test]
+    fn a_stdio_entry_renders_command_args_and_env_references() {
+        let template = templates_builtin::find("guest").expect("guest").config_yaml;
+        let instance = spec(ChannelKind::None);
+        let entry = McpConfigEntry {
+            id: "fs".to_string(),
+            transport: "stdio".to_string(),
+            url: None,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "server-filesystem".to_string()],
+            env: vec!["FS_TOKEN".to_string()],
+            timeout_s: 15,
+            connect_timeout_s: 5,
+        };
+        let text = render_config_with_mcp(&instance, template, &[entry]).expect("render");
+        let doc: Value = serde_yaml::from_str(&text).expect("yaml");
+        let block = &doc["mcp_servers"]["fleett-fs"];
+        assert_eq!(block["command"], "npx");
+        assert_eq!(block["args"][0], "-y");
+        assert_eq!(block["env"]["FS_TOKEN"], "${FS_TOKEN}");
+        assert!(block.get("url").is_none());
     }
 }

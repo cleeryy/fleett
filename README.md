@@ -34,6 +34,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | **Providers** | Share one API credential across agents, test it, rotate once and restart every linked agent with a report. |
 | **Personas** | Reusable `SOUL.md` templates with variables; assign to any agent, track divergence, reapply in one click. |
 | **Skills** | Versioned, read-only skill registry; pin a version per agent or follow `latest`, promote with a rolling restart. |
+| **MCP marketplace** | Deploy MCP servers from a catalogue as hardened containers, discover their tools, attach them to agents, supervise health and incidents. |
 | **Assistant** | A context-aware panel on every page drafts `SKILL.md`, `SOUL.md`, env allowlists or YAML — with redaction, a token budget and a diff to apply, never a blind write. |
 | **Files** | Browse, edit, upload, download and zip; Markdown preview, coloured YAML/JSON, full-text search, ETag conflicts, backups. |
 | **History** | One git repo per agent, actor-attributed commits, diff, restore; readable while the agent is stopped. |
@@ -156,7 +157,7 @@ Every command accepts `--json`; the server URL and token come from
 |---|---|
 | [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | run it as a binary, a `.deb` or a container |
 | [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [policies](docs/EGRESS-POLICY.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
-| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) · [personas](docs/PERSONAS.md) · [skills](docs/SKILLS.md) · [assistant](docs/ASSISTANT.md) | the per-agent surface |
+| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) · [personas](docs/PERSONAS.md) · [skills](docs/SKILLS.md) · [MCP servers](docs/MCP-SERVERS.md) · [assistant](docs/ASSISTANT.md) | the per-agent surface |
 | [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [onboarding](docs/ONBOARDING.md) · [CI](docs/CI.md) | day-two operations |
 | [Console i18n](web/I18N.md) | FR/EN conventions and the hardcoded-copy gate |
 

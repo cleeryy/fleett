@@ -61,6 +61,10 @@ port must not go unnoticed.
 | `fleett_disk_used_bytes` | gauge | `instance` | Data directory size measured against the quota; `0` when the instance has no quota. |
 | `fleett_secrets_expiring_days` | gauge | `instance` | Days until the earliest secret of the instance expires. `-1` means the expiry is unknown (the current schema has no expiry column); instances without secrets are omitted. |
 | `fleett_incidents_open` | gauge | — | Incidents the watchdog registry still reports as open; `0` when the registry (issue #32) is not installed. |
+| `fleett_mcp_up` | gauge | `server` | `1` when an MCP server is running and its port answers the supervision probe, `0` otherwise. |
+| `fleett_mcp_tools` | gauge | `server` | Tools discovered on an MCP server by the last successful `tools/list` (`0` before the first probe). |
+| `fleett_mcp_servers` | gauge | `status`, `health` | Number of MCP servers per lifecycle status and recorded health; the instance status/health series are seeded at `0`. |
+| `fleett_mcp_probes_total` | counter | `result` | MCP supervision probes, per result (`ok`, `error`); both series always exist. |
 | `fleett_api_requests_total` | counter | `method`, `status` | HTTP requests served by the API, per method and status code. |
 | `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `recreate`, `upgrade`, `rollback`) and result (`ok`, `error`). |
 | `fleett_upgrade_jobs_total` | counter | `result` | Finished rolling upgrade jobs, per final result (`success`, `rolled_back`, `failed`). |

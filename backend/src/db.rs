@@ -22,6 +22,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Columns of `McpServerRecord`, in the order [`row_to_mcp_server`] expects.
+const MCP_SERVER_COLUMNS: &str = "id, name, description, kind, image, command, port, path, \
+     persist, cpu_limit, mem_limit_mb, host, status, health, last_error, last_probe_at, \
+     tools_json, tools_count, tools_hash, created_at, updated_at";
+
+/// Columns of `McpIncident`, in the order [`row_to_mcp_incident`] expects.
+const MCP_INCIDENT_COLUMNS: &str = "id, server_id, cause, status, opened_at, closed_at, detail, \
+     actions, restart_count, last_seen_at";
+
 /// Ordered schema migrations, applied at startup through `PRAGMA user_version`.
 ///
 /// Each entry is one transactional step. Append only: never edit, reorder or
@@ -677,6 +686,80 @@ CREATE INDEX IF NOT EXISTS idx_instance_skills_name ON instance_skills (name);
     r#"
 ALTER TABLE egress_policies ADD COLUMN proxy TEXT;
 "#,
+    // v30 — MCP server marketplace (issue #62). A server is a service, not a
+    // file: this table holds the deployment spec of one MCP container (or of a
+    // config-only stdio server), its discovery cache and its encrypted HTTP
+    // headers. `instance_mcp_servers` is the attachment table; `mcp_incidents`
+    // is the supervision journal (it cannot reuse `incidents`, whose API is
+    // keyed by real instance ids).
+    r#"
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id               TEXT PRIMARY KEY NOT NULL,
+    name             TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    kind             TEXT NOT NULL,
+    image            TEXT NOT NULL DEFAULT '',
+    command          TEXT NOT NULL DEFAULT '[]',
+    port             INTEGER NOT NULL DEFAULT 8000,
+    path             TEXT NOT NULL DEFAULT '/mcp',
+    persist          INTEGER NOT NULL DEFAULT 0,
+    cpu_limit        REAL NOT NULL DEFAULT 0.5,
+    mem_limit_mb     INTEGER NOT NULL DEFAULT 256,
+    host             TEXT NOT NULL DEFAULT 'local',
+    status           TEXT NOT NULL DEFAULT 'created',
+    health           TEXT NOT NULL DEFAULT 'unknown',
+    last_error       TEXT,
+    last_probe_at    TEXT,
+    tools_json       TEXT NOT NULL DEFAULT '[]',
+    tools_count      INTEGER NOT NULL DEFAULT 0,
+    tools_hash       TEXT NOT NULL DEFAULT '',
+    headers_nonce    BLOB,
+    headers_ciphertext BLOB,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_kind ON mcp_servers (kind);
+
+CREATE TABLE IF NOT EXISTS mcp_server_env (
+    server_id   TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    secret      INTEGER NOT NULL DEFAULT 0,
+    value       TEXT,
+    nonce       BLOB,
+    ciphertext  BLOB,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (server_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS instance_mcp_servers (
+    instance_id TEXT NOT NULL,
+    server_id   TEXT NOT NULL,
+    mode        TEXT NOT NULL DEFAULT 'rw',
+    PRIMARY KEY (instance_id, server_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instance_mcp_servers_server
+    ON instance_mcp_servers (server_id);
+
+CREATE TABLE IF NOT EXISTS mcp_incidents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id     TEXT NOT NULL,
+    cause         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    opened_at     TEXT NOT NULL,
+    closed_at     TEXT,
+    detail        TEXT,
+    actions       TEXT NOT NULL DEFAULT '[]',
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    last_seen_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_incidents_server
+    ON mcp_incidents (server_id, opened_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_incidents_status
+    ON mcp_incidents (status);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -988,7 +1071,8 @@ impl Db {
         };
         let shares = load_links(&conn, id)?;
         let skills = load_skills(&conn, id)?;
-        Ok(Some(stored.into_spec(shares, skills)))
+        let mcp_servers = load_instance_mcp_servers(&conn, id)?;
+        Ok(Some(stored.into_spec(shares, skills, mcp_servers)))
     }
 
     pub fn list(&self) -> Result<Vec<InstanceSpec>, DbError> {
@@ -1007,12 +1091,14 @@ impl Db {
 
         let mut links = load_all_links(&conn)?;
         let mut skill_links = load_all_skills(&conn)?;
+        let mut mcp_links = load_all_mcp_servers(&conn)?;
         Ok(stored
             .into_iter()
             .map(|row| {
                 let shares = links.remove(&row.id).unwrap_or_default();
                 let skills = skill_links.remove(&row.id).unwrap_or_default();
-                row.into_spec(shares, skills)
+                let mcp_servers = mcp_links.remove(&row.id).unwrap_or_default();
+                row.into_spec(shares, skills, mcp_servers)
             })
             .collect())
     }
@@ -1082,6 +1168,9 @@ impl Db {
         for skill in &spec.skills {
             insert_skill_link(&transaction, skill, &spec.id)?;
         }
+        for server in &spec.mcp_servers {
+            insert_mcp_link(&transaction, server, &spec.id)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1138,6 +1227,13 @@ impl Db {
         )?;
         for skill in &spec.skills {
             insert_skill_link(&transaction, skill, &spec.id)?;
+        }
+        transaction.execute(
+            "DELETE FROM instance_mcp_servers WHERE instance_id = ?1",
+            params![spec.id],
+        )?;
+        for server in &spec.mcp_servers {
+            insert_mcp_link(&transaction, server, &spec.id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -1352,6 +1448,10 @@ impl Db {
             params![id],
         )?;
         transaction.execute(
+            "DELETE FROM instance_mcp_servers WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
             "DELETE FROM instance_secrets WHERE instance_id = ?1",
             params![id],
         )?;
@@ -1529,6 +1629,466 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(count.max(0) as usize)
+    }
+
+    // -- MCP marketplace (issue #62) ---------------------------------------
+
+    /// Every MCP server, sorted by id.
+    pub fn list_mcp_servers(&self) -> Result<Vec<crate::models::McpServerRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {MCP_SERVER_COLUMNS} FROM mcp_servers ORDER BY id"
+        ))?;
+        let rows = statement
+            .query_map([], row_to_mcp_server)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One MCP server by id.
+    pub fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::models::McpServerRecord>, DbError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                &format!("SELECT {MCP_SERVER_COLUMNS} FROM mcp_servers WHERE id = ?1"),
+                params![id],
+                row_to_mcp_server,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Insert one MCP server deployment row.
+    pub fn insert_mcp_server(&self, spec: &crate::models::McpServerSpec) -> Result<(), DbError> {
+        let exists = self.get_mcp_server(&spec.id)?.is_some();
+        if exists {
+            return Err(DbError::Conflict(spec.id.clone()));
+        }
+        let now = now_iso();
+        self.lock().execute(
+            "INSERT INTO mcp_servers (id, name, description, kind, image, command, port, path, \
+             persist, cpu_limit, mem_limit_mb, host, status, health, last_error, last_probe_at, \
+             tools_json, tools_count, tools_hash, headers_nonce, headers_ciphertext, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                     '[]', 0, '', NULL, NULL, ?17, ?17)",
+            params![
+                spec.id,
+                spec.name,
+                spec.description,
+                spec.kind.as_str(),
+                spec.image,
+                serde_json::to_string(&spec.command).unwrap_or_else(|_| "[]".into()),
+                spec.port,
+                spec.path,
+                spec.persist,
+                spec.cpu_limit,
+                spec.mem_limit_mb,
+                spec.host,
+                spec.status.as_str(),
+                spec.health.as_str(),
+                spec.last_error,
+                spec.last_probe_at,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the mutable part of one MCP server spec (never its tools cache).
+    pub fn update_mcp_server(&self, spec: &crate::models::McpServerSpec) -> Result<(), DbError> {
+        let updated = self.lock().execute(
+            "UPDATE mcp_servers SET name = ?2, description = ?3, kind = ?4, image = ?5, \
+             command = ?6, port = ?7, path = ?8, persist = ?9, cpu_limit = ?10, \
+             mem_limit_mb = ?11, host = ?12, status = ?13, health = ?14, last_error = ?15, \
+             last_probe_at = ?16, updated_at = ?17 WHERE id = ?1",
+            params![
+                spec.id,
+                spec.name,
+                spec.description,
+                spec.kind.as_str(),
+                spec.image,
+                serde_json::to_string(&spec.command).unwrap_or_else(|_| "[]".into()),
+                spec.port,
+                spec.path,
+                spec.persist,
+                spec.cpu_limit,
+                spec.mem_limit_mb,
+                spec.host,
+                spec.status.as_str(),
+                spec.health.as_str(),
+                spec.last_error,
+                spec.last_probe_at,
+                now_iso(),
+            ],
+        )?;
+        if updated == 0 {
+            return Err(DbError::Conflict(spec.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Delete one MCP server, its environment rows and its incidents.
+    ///
+    /// The attachments are refused by the API before this call; deleting them
+    /// here keeps a forced removal from leaving dangling links.
+    pub fn delete_mcp_server(&self, id: &str) -> Result<bool, DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM mcp_server_env WHERE server_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM instance_mcp_servers WHERE server_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM mcp_incidents WHERE server_id = ?1",
+            params![id],
+        )?;
+        let deleted = transaction.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])?;
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
+
+    /// Record the observed lifecycle state of one server.
+    pub fn set_mcp_server_status(
+        &self,
+        id: &str,
+        status: Status,
+        health: crate::models::Health,
+        last_error: Option<&str>,
+        probed_at: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE mcp_servers SET status = ?2, health = ?3, last_error = ?4, \
+             last_probe_at = ?5, updated_at = ?6 WHERE id = ?1",
+            params![
+                id,
+                status.as_str(),
+                health.as_str(),
+                last_error,
+                probed_at,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the discovery cache of one server.
+    pub fn set_mcp_tools(
+        &self,
+        id: &str,
+        tools_json: &str,
+        count: u32,
+        hash: &str,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE mcp_servers SET tools_json = ?2, tools_count = ?3, tools_hash = ?4, \
+             updated_at = ?5 WHERE id = ?1",
+            params![id, tools_json, count, hash, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Encrypted HTTP headers of one server (`nonce`, `ciphertext`).
+    pub fn mcp_server_headers(&self, id: &str) -> Result<Option<crate::secrets::Sealed>, DbError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT headers_nonce, headers_ciphertext FROM mcp_servers WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(nonce), Some(ciphertext))) => {
+                Some(crate::secrets::Sealed { nonce, ciphertext })
+            }
+            _ => None,
+        })
+    }
+
+    /// Replace (or clear) the encrypted HTTP headers of one server.
+    pub fn set_mcp_server_headers(
+        &self,
+        id: &str,
+        sealed: Option<(&[u8], &[u8])>,
+    ) -> Result<(), DbError> {
+        let (nonce, ciphertext) = match sealed {
+            Some((nonce, ciphertext)) => (Some(nonce), Some(ciphertext)),
+            None => (None, None),
+        };
+        self.lock().execute(
+            "UPDATE mcp_servers SET headers_nonce = ?2, headers_ciphertext = ?3, \
+             updated_at = ?4 WHERE id = ?1",
+            params![id, nonce, ciphertext, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Environment rows of one server, sorted by key.
+    pub fn list_mcp_server_env(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::models::McpServerEnvRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT key, secret, value, nonce, ciphertext, updated_at FROM mcp_server_env \
+             WHERE server_id = ?1 ORDER BY key",
+        )?;
+        let rows = statement
+            .query_map(params![id], |row| {
+                Ok(crate::models::McpServerEnvRecord {
+                    key: row.get(0)?,
+                    secret: row.get::<_, i64>(1)? != 0,
+                    value: row.get(2)?,
+                    nonce: row.get(3)?,
+                    ciphertext: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace the whole environment of one server in one transaction.
+    pub fn replace_mcp_server_env(
+        &self,
+        id: &str,
+        records: &[crate::models::McpServerEnvRecord],
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM mcp_server_env WHERE server_id = ?1",
+            params![id],
+        )?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO mcp_server_env (server_id, key, secret, value, nonce, ciphertext, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    record.key,
+                    i64::from(record.secret),
+                    record.value,
+                    record.nonce,
+                    record.ciphertext,
+                    record.updated_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replace the MCP attachments of one instance in one transaction.
+    pub fn set_instance_mcp_servers(
+        &self,
+        instance_id: &str,
+        servers: &[crate::models::McpRef],
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM instance_mcp_servers WHERE instance_id = ?1",
+            params![instance_id],
+        )?;
+        for server in servers {
+            insert_mcp_link(&transaction, server, instance_id)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// MCP servers attached to one instance.
+    pub fn instance_mcp_servers(
+        &self,
+        instance_id: &str,
+    ) -> Result<Vec<crate::models::McpRef>, DbError> {
+        let conn = self.lock();
+        load_instance_mcp_servers(&conn, instance_id)
+    }
+
+    /// Ids of the instances that attach one server.
+    pub fn mcp_server_instances(&self, server_id: &str) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id FROM instance_mcp_servers WHERE server_id = ?1 \
+             ORDER BY instance_id",
+        )?;
+        let rows = statement
+            .query_map(params![server_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Open a supervision incident, unless one is already open for the same
+    /// server and cause.
+    pub fn open_mcp_incident(
+        &self,
+        server_id: &str,
+        cause: &str,
+        detail: Option<&str>,
+    ) -> Result<crate::models::McpIncident, DbError> {
+        let conn = self.lock();
+        let existing = conn
+            .query_row(
+                &format!(
+                    "SELECT {MCP_INCIDENT_COLUMNS} FROM mcp_incidents \
+                     WHERE server_id = ?1 AND cause = ?2 AND status = 'open' \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![server_id, cause],
+                row_to_mcp_incident,
+            )
+            .optional()?;
+        if let Some(incident) = existing {
+            return Ok(incident);
+        }
+        let now = now_iso();
+        conn.execute(
+            "INSERT INTO mcp_incidents (server_id, cause, status, opened_at, closed_at, detail, \
+             actions, restart_count, last_seen_at) \
+             VALUES (?1, ?2, 'open', ?3, NULL, ?4, '[]', 0, ?3)",
+            params![server_id, cause, now, detail],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(crate::models::McpIncident {
+            id,
+            server_id: server_id.to_string(),
+            cause: cause.to_string(),
+            status: "open".to_string(),
+            opened_at: now.clone(),
+            closed_at: None,
+            detail: detail.map(str::to_string),
+            actions: Vec::new(),
+            restart_count: 0,
+            last_seen_at: now,
+        })
+    }
+
+    /// Close one incident, when it is still open.
+    pub fn close_mcp_incident(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::models::McpIncident>, DbError> {
+        let conn = self.lock();
+        let now = now_iso();
+        let updated = conn.execute(
+            "UPDATE mcp_incidents SET status = 'closed', closed_at = ?2, last_seen_at = ?2 \
+             WHERE id = ?1 AND status = 'open'",
+            params![id, now],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        let incident = conn
+            .query_row(
+                &format!("SELECT {MCP_INCIDENT_COLUMNS} FROM mcp_incidents WHERE id = ?1"),
+                params![id],
+                row_to_mcp_incident,
+            )
+            .optional()?;
+        Ok(incident)
+    }
+
+    /// Close every open incident of one server (a healthy probe closes them).
+    pub fn close_open_mcp_incidents(&self, server_id: &str) -> Result<usize, DbError> {
+        let updated = self.lock().execute(
+            "UPDATE mcp_incidents SET status = 'closed', closed_at = ?2, last_seen_at = ?2 \
+             WHERE server_id = ?1 AND status = 'open'",
+            params![server_id, now_iso()],
+        )?;
+        Ok(updated)
+    }
+
+    /// Record that an open incident is still observed.
+    pub fn touch_mcp_incident(&self, id: i64, detail: Option<&str>) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE mcp_incidents SET last_seen_at = ?2, \
+             detail = COALESCE(?3, detail) WHERE id = ?1",
+            params![id, now_iso(), detail],
+        )?;
+        Ok(())
+    }
+
+    /// Append one action to an incident journal (bounded JSON array).
+    pub fn append_mcp_incident_action(
+        &self,
+        id: i64,
+        action: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        let actions: Option<String> = conn
+            .query_row(
+                "SELECT actions FROM mcp_incidents WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(actions) = actions else {
+            return Ok(());
+        };
+        let mut list: Vec<serde_json::Value> = serde_json::from_str(&actions).unwrap_or_default();
+        list.push(action.clone());
+        if list.len() > 50 {
+            let excess = list.len() - 50;
+            list.drain(0..excess);
+        }
+        conn.execute(
+            "UPDATE mcp_incidents SET actions = ?2 WHERE id = ?1",
+            params![
+                id,
+                serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Incidents of one server (or of every server), newest first.
+    pub fn list_mcp_incidents(
+        &self,
+        server_id: Option<&str>,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::models::McpIncident>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(&format!(
+            "SELECT {MCP_INCIDENT_COLUMNS} FROM mcp_incidents \
+             WHERE (?1 IS NULL OR server_id = ?1) AND (?2 IS NULL OR status = ?2) \
+             ORDER BY id DESC LIMIT ?3"
+        ))?;
+        let rows = statement
+            .query_map(
+                params![server_id, status, limit as i64],
+                row_to_mcp_incident,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One incident by id.
+    pub fn get_mcp_incident(&self, id: i64) -> Result<Option<crate::models::McpIncident>, DbError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                &format!("SELECT {MCP_INCIDENT_COLUMNS} FROM mcp_incidents WHERE id = ?1"),
+                params![id],
+                row_to_mcp_incident,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn share_exists(&self, name: &str) -> Result<bool, DbError> {
@@ -2272,6 +2832,19 @@ fn insert_skill_link(
     Ok(())
 }
 
+fn insert_mcp_link(
+    conn: &Connection,
+    server: &crate::models::McpRef,
+    instance_id: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO instance_mcp_servers (instance_id, server_id, mode) VALUES (?1, ?2, ?3) \
+         ON CONFLICT (instance_id, server_id) DO UPDATE SET mode = excluded.mode",
+        params![instance_id, server.server, server.mode.as_str()],
+    )?;
+    Ok(())
+}
+
 struct StoredRow {
     id: String,
     name: String,
@@ -2300,7 +2873,12 @@ struct StoredRow {
 }
 
 impl StoredRow {
-    fn into_spec(self, shares: Vec<ShareRef>, skills: Vec<SkillRef>) -> InstanceSpec {
+    fn into_spec(
+        self,
+        shares: Vec<ShareRef>,
+        skills: Vec<SkillRef>,
+        mcp_servers: Vec<crate::models::McpRef>,
+    ) -> InstanceSpec {
         InstanceSpec {
             id: self.id,
             name: self.name,
@@ -2312,6 +2890,7 @@ impl StoredRow {
             channel: ChannelKind::parse(&self.channel).unwrap_or(ChannelKind::None),
             shares,
             skills,
+            mcp_servers,
             mem_limit_mb: self.mem_limit_mb.clamp(0, u32::MAX as i64) as u32,
             cpu_limit: if crate::models::validate_cpu_limit(self.cpu_limit).is_ok() {
                 self.cpu_limit
@@ -2342,6 +2921,58 @@ impl StoredRow {
             updated_at: self.updated_at,
         }
     }
+}
+
+fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<crate::models::McpServerRecord> {
+    let command: String = row.get(5)?;
+    let tools_json: String = row.get(16)?;
+    let tools: Vec<serde_json::Value> = serde_json::from_str(&tools_json).unwrap_or_default();
+    let port: i64 = row.get(6)?;
+    let mem_limit_mb: i64 = row.get(10)?;
+    let tools_count: i64 = row.get(17)?;
+    Ok(crate::models::McpServerRecord {
+        spec: crate::models::McpServerSpec {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            kind: crate::models::McpKind::parse(&row.get::<_, String>(3)?)
+                .unwrap_or(crate::models::McpKind::Stdio),
+            image: row.get(4)?,
+            command: serde_json::from_str(&command).unwrap_or_default(),
+            port: u16::try_from(port).unwrap_or(crate::mcp_servers::DEFAULT_PORT),
+            path: row.get(7)?,
+            persist: row.get::<_, i64>(8)? != 0,
+            cpu_limit: row.get(9)?,
+            mem_limit_mb: mem_limit_mb.clamp(0, i64::from(u32::MAX)) as u32,
+            host: row.get(11)?,
+            status: Status::parse(&row.get::<_, String>(12)?).unwrap_or(Status::Unknown),
+            health: crate::models::Health::parse(&row.get::<_, String>(13)?),
+            last_error: row.get(14)?,
+            last_probe_at: row.get(15)?,
+        },
+        tools,
+        tools_count: tools_count.clamp(0, i64::from(u32::MAX)) as u32,
+        tools_hash: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
+    })
+}
+
+fn row_to_mcp_incident(row: &Row<'_>) -> rusqlite::Result<crate::models::McpIncident> {
+    let actions: String = row.get(7)?;
+    let restart_count: i64 = row.get(8)?;
+    Ok(crate::models::McpIncident {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        cause: row.get(2)?,
+        status: row.get(3)?,
+        opened_at: row.get(4)?,
+        closed_at: row.get(5)?,
+        detail: row.get(6)?,
+        actions: serde_json::from_str(&actions).unwrap_or_default(),
+        restart_count: restart_count.clamp(0, i64::from(u32::MAX)) as u32,
+        last_seen_at: row.get(9)?,
+    })
 }
 
 fn row_to_acl(row: &Row<'_>) -> rusqlite::Result<AclRecord> {
@@ -2509,6 +3140,52 @@ fn load_all_skills(conn: &Connection) -> Result<HashMap<String, Vec<SkillRef>>, 
     Ok(links)
 }
 
+fn load_instance_mcp_servers(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Vec<crate::models::McpRef>, DbError> {
+    let mut statement = conn.prepare(
+        "SELECT server_id, mode FROM instance_mcp_servers WHERE instance_id = ?1 \
+         ORDER BY server_id",
+    )?;
+    let rows = statement
+        .query_map(params![instance_id], |row| {
+            Ok(crate::models::McpRef {
+                server: row.get(0)?,
+                mode: crate::models::McpMode::parse(&row.get::<_, String>(1)?)
+                    .unwrap_or(crate::models::McpMode::Rw),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_all_mcp_servers(
+    conn: &Connection,
+) -> Result<HashMap<String, Vec<crate::models::McpRef>>, DbError> {
+    let mut statement = conn.prepare(
+        "SELECT instance_id, server_id, mode FROM instance_mcp_servers \
+         ORDER BY instance_id, server_id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::models::McpRef {
+                    server: row.get(1)?,
+                    mode: crate::models::McpMode::parse(&row.get::<_, String>(2)?)
+                        .unwrap_or(crate::models::McpMode::Rw),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut links: HashMap<String, Vec<crate::models::McpRef>> = HashMap::new();
+    for (instance_id, server) in rows {
+        links.entry(instance_id).or_default().push(server);
+    }
+    Ok(links)
+}
+
 /// Rebuild the index from the filesystem. Instances whose compose file
 /// disappeared are dropped from the index; new directories are adopted.
 ///
@@ -2570,6 +3247,7 @@ mod tests {
                 mode: ShareMode::Rw,
             }],
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -2662,6 +3340,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
+        assert_eq!(SCHEMA_VERSION, 30, "MCP marketplace is schema v30");
         let conn = db.lock();
         for table in [
             "instances",
@@ -2675,6 +3354,10 @@ mod tests {
             "providers",
             "incidents",
             "hosts",
+            "mcp_servers",
+            "mcp_server_env",
+            "instance_mcp_servers",
+            "mcp_incidents",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -2887,6 +3570,10 @@ mod tests {
         assert!(table_exists(&db.lock(), "share_links"));
         assert!(table_exists(&db.lock(), "instance_skills"));
         assert!(table_exists(&db.lock(), "disk_events"));
+        assert!(table_exists(&db.lock(), "mcp_servers"));
+        assert!(table_exists(&db.lock(), "mcp_server_env"));
+        assert!(table_exists(&db.lock(), "instance_mcp_servers"));
+        assert!(table_exists(&db.lock(), "mcp_incidents"));
 
         // Re-opening an up-to-date database applies nothing.
         drop(db);

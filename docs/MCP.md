@@ -4,6 +4,13 @@
 captain" agent) through the [Model Context Protocol](https://modelcontextprotocol.io):
 one tool per operation, no shell, no free-form command.
 
+> **`fleett mcp` vs `fleett mcp-server`.** This page documents fleett as an MCP
+> **server**. To deploy MCP servers as containers and attach them to agents, use
+> `fleett mcp-server` and see [MCP-SERVERS.md](MCP-SERVERS.md). The two commands
+> are independent: `fleett mcp` is a server-mode command with no bearer token of
+> its own beyond the client configuration, while `fleett mcp-server` is an
+> ordinary client of the marketplace API.
+
 The MCP server is a **client of the fleett HTTP API**. Every tool maps to one API call made
 with the token of `~/.config/fleett/config.toml` (or `FLEETT_URL` / `FLEETT_TOKEN`). It has no
 database access, no Docker access and no privilege of its own:

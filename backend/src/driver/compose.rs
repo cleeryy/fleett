@@ -7,8 +7,8 @@
 //! being recreated.
 
 use super::{
-    Driver, DriverError, DriverFuture, ExecResult, ImageRecord, InspectInfo, LogsOptions, PsResult,
-    UsageSample,
+    ComposeProject, Driver, DriverError, DriverFuture, ExecResult, ImageRecord, InspectInfo,
+    LogsOptions, PsResult, UsageSample,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -149,6 +149,41 @@ impl ComposeDriver {
     #[cfg(test)]
     fn command(&self, id: &str) -> Result<Command, DriverError> {
         self.command_for(id, &self.project(id), hosts::LOCAL_HOST)
+    }
+
+    /// Compose command for an arbitrary project: the environment of the
+    /// project is injected into the child process and never written to the
+    /// compose file.
+    fn command_for_project(&self, project: &ComposeProject) -> Result<Command, DriverError> {
+        let mut environment = project.env.clone();
+        // A project variable must never redirect the daemon selector: the host
+        // registry owns DOCKER_HOST / DOCKER_CONTEXT.
+        environment.remove("DOCKER_HOST");
+        environment.remove("DOCKER_CONTEXT");
+        let mut command = Command::new(&self.docker);
+        command
+            .arg("compose")
+            .arg("-f")
+            .arg(&project.file)
+            .arg("-p")
+            .arg(&project.project);
+        command.envs(environment);
+        self.apply_endpoint(&mut command, &project.host)?;
+        command.stdin(Stdio::null());
+        command.kill_on_drop(true);
+        Ok(command)
+    }
+
+    async fn project_compose(
+        &self,
+        project: &ComposeProject,
+        args: &[&str],
+        operation: &str,
+        timeout: Duration,
+    ) -> Result<String, DriverError> {
+        let mut command = self.command_for_project(project)?;
+        command.args(args);
+        run_command(command, operation, timeout).await
     }
 
     async fn compose(
@@ -669,6 +704,115 @@ impl Driver for ComposeDriver {
             Ok(parse_images(&stdout))
         })
     }
+
+    fn project_up<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.project_compose(project, &["up", "-d", "--remove-orphans"], "up", UP_TIMEOUT)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn project_down<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.project_compose(project, &["down", "--remove-orphans"], "down", DOWN_TIMEOUT)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn project_start<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.project_compose(project, &["start", &project.service], "start", CMD_TIMEOUT)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn project_stop<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.project_compose(project, &["stop", &project.service], "stop", CMD_TIMEOUT)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn project_restart<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.project_compose(
+                project,
+                &["restart", &project.service],
+                "restart",
+                CMD_TIMEOUT,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn project_ps<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<PsResult, DriverError>> {
+        Box::pin(async move {
+            let stdout = self
+                .project_compose(
+                    project,
+                    &["ps", "--all", "--format", "json"],
+                    "ps",
+                    PS_TIMEOUT,
+                )
+                .await?;
+            Ok(parse_ps(&stdout))
+        })
+    }
+
+    fn project_logs<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+        options: &'a LogsOptions,
+    ) -> DriverFuture<'a, Result<String, DriverError>> {
+        Box::pin(async move {
+            let args = logs_arguments(options.tail, options.since.as_deref());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.project_compose(project, &args, "logs", LOGS_TIMEOUT)
+                .await
+        })
+    }
+
+    fn project_inspect<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>> {
+        Box::pin(async move {
+            // A project-driven container names itself after the project, which
+            // is the convention `mcp_servers::render_compose` enforces.
+            let mut command = Command::new(&self.docker);
+            command
+                .args(["inspect", "--type", "container", &project.project])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            self.apply_endpoint(&mut command, &project.host)?;
+            let stdout = run_command(command, "inspect", INSPECT_TIMEOUT).await?;
+            parse_inspect(&stdout)
+                .ok_or_else(|| DriverError::new("inspect", "unparsable docker inspect output"))
+        })
+    }
 }
 
 /// One line of `docker stats --no-stream --format json`.
@@ -928,7 +1072,36 @@ fn parse_inspect(stdout: &str) -> Option<InspectInfo> {
             .unwrap_or(0),
         error: text(&["error"]).filter(|error| !error.trim().is_empty()),
         started_at,
+        ip_address: ip_address(&object),
     })
+}
+
+/// First non-empty IP of `NetworkSettings.Networks.*.IPAddress`.
+fn ip_address(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let networks = object
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("networksettings"))
+        .and_then(|(_, value)| value.as_object())?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("networks"))
+        .and_then(|(_, value)| value.as_object())?;
+    for network in networks.values() {
+        let Some(network) = network.as_object() else {
+            continue;
+        };
+        for (key, value) in network {
+            if key.eq_ignore_ascii_case("ipaddress") {
+                if let Some(text) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `docker inspect` reports this placeholder before the first start.
@@ -1524,6 +1697,7 @@ mod tests {
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 512,
             cpu_limit: 1.0,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -1645,7 +1819,8 @@ mod tests {
                 calls = calls.display()
             ),
         );
-        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
         driver
             .ensure_image(crate::hosts::LOCAL_HOST, "agent:1")
             .await
@@ -1663,7 +1838,8 @@ mod tests {
                 calls = calls.display()
             ),
         );
-        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
         driver
             .ensure_image(crate::hosts::LOCAL_HOST, "agent:2")
             .await
@@ -1680,7 +1856,8 @@ mod tests {
             dir.path(),
             "#!/bin/sh\nif [ \"$1\" = image ]; then exit 1; fi\necho 'manifest unknown' >&2\nexit 1\n",
         );
-        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
         let err = driver
             .ensure_image(crate::hosts::LOCAL_HOST, "agent:9")
             .await
@@ -1696,7 +1873,8 @@ mod tests {
             dir.path(),
             "#!/bin/sh\necho '{\"ID\":\"sha256:aaa\",\"Repository\":\"agent\",\"Tag\":\"2\",\"Size\":\"9MB\",\"CreatedAt\":\"now\"}'\n",
         );
-        let driver = driver_in(dir.path()).with_docker_binary(&docker);
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
         let images = driver
             .list_images(crate::hosts::LOCAL_HOST)
             .await
@@ -1704,5 +1882,120 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].tag, "agent:2");
         assert_eq!(images[0].size, "9MB");
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+    use crate::driver::ComposeProject;
+    use crate::models::Health;
+
+    #[tokio::test]
+    async fn project_commands_use_the_explicit_file_project_and_service() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let calls = dir.path().join("calls");
+        let compose = dir.path().join("compose.yaml");
+        std::fs::write(&compose, "name: fleett-mcp-fetch\nservices: {}\n").expect("compose");
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf 'args:%s\\n' \"$*\" >> {calls}\nprintf 'env:%s\\n' \"${{MCP_TOKEN:-}}\" >> {calls}\ncase \" $* \" in *\" ps \"*) printf '%s\\n' '{{\"State\":\"running\",\"Health\":\"healthy\"}}';; esac\nexit 0\n",
+                calls = calls.display()
+            ),
+        )
+        .expect("fake docker");
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("MCP_TOKEN".to_string(), "secret-value".to_string());
+        let project = ComposeProject {
+            host: crate::hosts::LOCAL_HOST.to_string(),
+            file: compose.clone(),
+            project: "fleett-mcp-fetch".to_string(),
+            service: "mcp".to_string(),
+            env,
+        };
+
+        Driver::project_up(&driver, &project).await.expect("up");
+        let ps = Driver::project_ps(&driver, &project).await.expect("ps");
+        assert_eq!(ps.status, Status::Running);
+        assert_eq!(ps.health, Health::Healthy);
+        Driver::project_stop(&driver, &project).await.expect("stop");
+        Driver::project_start(&driver, &project)
+            .await
+            .expect("start");
+        Driver::project_restart(&driver, &project)
+            .await
+            .expect("restart");
+        Driver::project_down(&driver, &project).await.expect("down");
+
+        let recorded = std::fs::read_to_string(&calls).expect("calls");
+        let file = compose.display().to_string();
+        assert!(
+            recorded.contains(&format!("args:compose -f {file} -p fleett-mcp-fetch up -d")),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains(&format!(
+                "args:compose -f {file} -p fleett-mcp-fetch stop mcp"
+            )),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("args:compose -f {file} -p fleett-mcp-fetch down")),
+            "{recorded}"
+        );
+        assert_eq!(
+            recorded.matches("env:secret-value").count(),
+            6,
+            "the environment must reach every child process exactly as provided"
+        );
+        assert!(
+            !recorded.contains("env:\n"),
+            "the variable is present in every call: {recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_project_logs_call_targets_the_service_project() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let compose = dir.path().join("compose.yaml");
+        std::fs::write(&compose, "name: fleett-mcp-memory\nservices: {}\n").expect("compose");
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\ncase \" $* \" in *\" inspect \"*) echo '{\"State\":{\"Status\":\"running\"}}';; *) echo 'mock-line';; esac\nexit 0\n",
+        )
+        .expect("fake docker");
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
+            .with_docker_binary(&docker);
+        let project = ComposeProject {
+            host: crate::hosts::LOCAL_HOST.to_string(),
+            file: compose,
+            project: "fleett-mcp-memory".to_string(),
+            service: "mcp".to_string(),
+            env: std::collections::BTreeMap::new(),
+        };
+        let options = LogsOptions {
+            tail: 5,
+            since: None,
+        };
+        let text = driver.project_logs(&project, &options).await.expect("logs");
+        assert_eq!(text.trim(), "mock-line");
+        let inspect = Driver::project_inspect(&driver, &project).await;
+        assert!(
+            inspect.is_ok(),
+            "the fake docker answers inspect with the ps body"
+        );
     }
 }

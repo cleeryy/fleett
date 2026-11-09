@@ -3758,6 +3758,7 @@ async fn the_detail_reports_the_docker_inspect_failure() {
             restart_count: 0,
             error: Some("task: non-zero exit (137)".to_string()),
             started_at: None,
+            ip_address: None,
         },
     );
 

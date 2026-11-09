@@ -52,6 +52,7 @@ impl Harness {
             channel: ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: 1.0,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -313,6 +314,7 @@ async fn a_crashloop_at_max_restarts_keeps_the_incident_open() {
             restart_count: 5,
             error: None,
             started_at: None,
+            ip_address: None,
         },
     );
 

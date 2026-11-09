@@ -11,6 +11,7 @@ use crate::hosts::{HostCapacity, HostSpec};
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 /// Result of `docker compose ps` for one instance.
@@ -70,6 +71,10 @@ pub struct InspectInfo {
     pub error: Option<String>,
     /// `State.StartedAt` as RFC 3339, when the container has ever started.
     pub started_at: Option<String>,
+    /// First non-empty `NetworkSettings.Networks.*.IPAddress`, when Docker
+    /// reports one. The MCP supervision loop uses it to probe a container that
+    /// publishes no port (issue #62).
+    pub ip_address: Option<String>,
 }
 
 impl InspectInfo {
@@ -184,6 +189,28 @@ pub struct ImageRecord {
     pub created: String,
 }
 
+/// One Compose project outside the instance tree.
+///
+/// Instance projects are derived from an [`InstanceSpec`]; the MCP marketplace
+/// (issue #62) needs arbitrary projects (`fleett-mcp-<id>`), with their own
+/// their own compose file, project name, service and decrypted environment.
+/// The environment is injected into the `docker compose` child process and is
+/// never written into the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeProject {
+    /// Host that runs the project (`hosts.id`, `local` by default).
+    pub host: String,
+    /// Absolute path of the compose file.
+    pub file: PathBuf,
+    /// Compose project name (`docker compose -p`).
+    pub project: String,
+    /// Service the lifecycle operations target; the container name is expected
+    /// to be the project name (which the MCP renderer enforces).
+    pub service: String,
+    /// Values interpolated by Compose for every `${KEY}` of the file.
+    pub env: BTreeMap<String, String>,
+}
+
 pub type DriverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Lifecycle operations the control plane needs.
@@ -290,6 +317,61 @@ pub trait Driver: Send + Sync {
         host: &'a str,
         image: &'a str,
     ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    // -- project-scoped operations (MCP marketplace, issue #62) ------------
+    //
+    // The instance methods above are hard-coded to `instances/<id>/compose.yaml`
+    // and the `agent` service. Those ones take a [`ComposeProject`] so any
+    // project can be driven without pretending it is an instance.
+
+    /// `docker compose up -d --remove-orphans` for one project.
+    fn project_up<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// `docker compose down --remove-orphans` for one project.
+    fn project_down<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// `docker compose start <service>` for one project.
+    fn project_start<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// `docker compose stop <service>` for one project.
+    fn project_stop<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// `docker compose restart <service>` for one project.
+    fn project_restart<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>>;
+
+    /// `docker compose ps --all --format json` for one project.
+    fn project_ps<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<PsResult, DriverError>>;
+
+    /// Tail of the project container logs.
+    fn project_logs<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+        options: &'a LogsOptions,
+    ) -> DriverFuture<'a, Result<String, DriverError>>;
+
+    /// `docker inspect` state of the project container.
+    fn project_inspect<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>>;
 
     /// Images present in the Docker image store of `host`.
     fn list_images<'a>(

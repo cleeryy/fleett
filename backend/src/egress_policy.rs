@@ -1232,6 +1232,7 @@ mod tests {
             channel: ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 512,
             cpu_limit: DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),

@@ -188,6 +188,7 @@ fn manifest_of(instance: &Value) -> ArchiveInstance {
             .to_string(),
         shares: Vec::new(),
         skills: Vec::new(),
+        mcp_servers: Vec::new(),
         notes: String::new(),
         host: fleett::hosts::LOCAL_HOST.to_string(),
     }

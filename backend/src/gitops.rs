@@ -779,6 +779,7 @@ impl DesiredInstance {
                 .unwrap_or(crate::models::ChannelKind::None),
             shares: self.shares,
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: self.mem_limit_mb,
             cpu_limit: self.cpu_limit,
             image: existing

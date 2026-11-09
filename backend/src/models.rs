@@ -251,6 +251,161 @@ pub struct SkillRefDetail {
     pub effective_version: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// MCP marketplace (issue #62)
+// ---------------------------------------------------------------------------
+
+/// Transport of one MCP server.
+///
+/// `streamable-http` and `sse` servers are containers deployed by fleett on the
+/// shared `fleett` network; a `stdio` server is a command the agent launches
+/// itself and is therefore config-only (no container, no supervision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpKind {
+    Stdio,
+    StreamableHttp,
+    Sse,
+}
+
+impl McpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::StreamableHttp => "streamable-http",
+            Self::Sse => "sse",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stdio" => Some(Self::Stdio),
+            "streamable-http" | "http" | "streamable_http" => Some(Self::StreamableHttp),
+            "sse" => Some(Self::Sse),
+            _ => None,
+        }
+    }
+
+    /// Whether fleett deploys and supervises a container for this kind.
+    pub fn is_deployed(self) -> bool {
+        matches!(self, Self::StreamableHttp | Self::Sse)
+    }
+}
+
+impl std::fmt::Display for McpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Access mode of one attachment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpMode {
+    Readonly,
+    #[default]
+    Rw,
+}
+
+impl McpMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Rw => "rw",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "readonly" | "read-only" | "ro" => Some(Self::Readonly),
+            "rw" | "readwrite" | "read-write" => Some(Self::Rw),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for McpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One MCP server attached to an instance (`instance_mcp_servers`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRef {
+    pub server: String,
+    #[serde(default)]
+    pub mode: McpMode,
+}
+
+/// Stored deployment spec of one MCP server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServerSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub kind: McpKind,
+    pub image: String,
+    /// Complete argv of a `stdio` server, or the container command when a
+    /// deployed image needs one (empty means "the image entrypoint").
+    pub command: Vec<String>,
+    /// Port the server listens on inside its container.
+    pub port: u16,
+    /// HTTP path of the MCP endpoint (`/mcp`, `/sse`, …).
+    pub path: String,
+    /// Mount `./data:/data` so the server can keep state between restarts.
+    pub persist: bool,
+    pub cpu_limit: f64,
+    pub mem_limit_mb: u32,
+    pub host: String,
+    pub status: Status,
+    /// Last recorded container/probe health.
+    pub health: Health,
+    /// Set when the last probe failed, cleared on success.
+    pub last_error: Option<String>,
+    pub last_probe_at: Option<String>,
+}
+
+/// One MCP server as stored, with its discovery cache.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServerRecord {
+    pub spec: McpServerSpec,
+    /// Tools reported by the last successful `tools/list`, as JSON objects
+    /// (`{name, description, input_schema}`).
+    pub tools: Vec<serde_json::Value>,
+    pub tools_count: u32,
+    /// SHA-256 of the canonical tools JSON, so a change is observable.
+    pub tools_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One `mcp_server_env` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerEnvRecord {
+    pub key: String,
+    pub secret: bool,
+    pub value: Option<String>,
+    pub nonce: Option<Vec<u8>>,
+    pub ciphertext: Option<Vec<u8>>,
+    pub updated_at: String,
+}
+
+/// One supervision incident of an MCP server.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct McpIncident {
+    pub id: i64,
+    pub server_id: String,
+    pub cause: String,
+    pub status: String,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub detail: Option<String>,
+    pub actions: Vec<serde_json::Value>,
+    pub restart_count: u32,
+    pub last_seen_at: String,
+}
+
 /// Lifecycle status of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -395,6 +550,10 @@ pub struct InstanceSpec {
     pub shares: Vec<ShareRef>,
     /// Shared skills mounted read-only into the container (issue #54).
     pub skills: Vec<SkillRef>,
+    /// MCP servers attached to the agent (issue #62). The manager renders them
+    /// into the managed `mcp_servers` block of `config.yaml`; the compose file
+    /// is untouched (the server is a separate project).
+    pub mcp_servers: Vec<McpRef>,
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     /// Container image the instance runs (`services.agent.image` of its

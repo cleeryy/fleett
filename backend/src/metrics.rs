@@ -54,6 +54,7 @@ struct Counters {
     compose_actions: BTreeMap<(String, String), u64>,
     upgrade_jobs: BTreeMap<String, u64>,
     rate_limited: BTreeMap<String, u64>,
+    mcp_probes: BTreeMap<String, u64>,
 }
 
 /// Last utilisation sample, with the instant it was taken.
@@ -111,6 +112,12 @@ impl Metrics {
         *counters.rate_limited.entry(class.to_string()).or_default() += 1;
     }
 
+    /// Count one MCP probe (`fleett_mcp_probes_total`).
+    pub fn record_mcp_probe(&self, result: &str) {
+        let mut counters = self.counters();
+        *counters.mcp_probes.entry(result.to_string()).or_default() += 1;
+    }
+
     /// Drop the cached utilisation sample.
     pub fn invalidate_usage(&self) {
         *self.usage() = None;
@@ -127,7 +134,8 @@ impl Metrics {
         };
         let samples = self.usage_samples(state, &specs).await;
         let live = LiveState::read(&state.db);
-        render(&self.snapshot(&specs, samples.as_ref(), &live))
+        let mcp = mcp_rows(&state.db);
+        render(&self.snapshot(&specs, samples.as_ref(), &live, &mcp))
     }
 
     /// Utilisation of the whole fleet, from the cache when it is fresh.
@@ -170,6 +178,7 @@ impl Metrics {
         specs: &[InstanceSpec],
         samples: Option<&BTreeMap<String, UsageSample>>,
         live: &LiveState,
+        mcp: &[McpRow],
     ) -> Snapshot {
         let rows = specs
             .iter()
@@ -211,6 +220,8 @@ impl Metrics {
             incidents_open: live.incidents_open,
             secret_expiry_days: live.secret_expiry_days.clone(),
             disk_quotas: live.disk_quotas.clone(),
+            mcp_servers: mcp.to_vec(),
+            mcp_probes: counters.mcp_probes.clone(),
         }
     }
 
@@ -371,8 +382,7 @@ fn secret_expiry_days(db: &Db) -> BTreeMap<String, i64> {
     }
 }
 
-/// Per-instance disk quota in bytes, when the quota feature exists.
-///
+/// Per-instance disk quota in bytes, when the quota feature exists.///
 /// Issue #47 introduces `instances.disk_quota_mb`; accepting
 /// `disk_quota_bytes` too keeps the scrape working whichever unit lands.
 fn disk_quotas(db: &Db) -> BTreeMap<String, u64> {
@@ -408,6 +418,34 @@ fn disk_quotas(db: &Db) -> BTreeMap<String, u64> {
         Err(err) => {
             tracing::debug!(%err, "cannot read the disk quotas for the metrics scrape");
             BTreeMap::new()
+        }
+    }
+}
+
+/// MCP servers and their last recorded state, read from `mcp_servers`.
+///
+/// An older database without the table (or a server row deleted between two
+/// queries) yields an empty list: the scrape never fails on a missing feature.
+fn mcp_rows(db: &Db) -> Vec<McpRow> {
+    match db.list_mcp_servers() {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| {
+                let status = record.spec.status.as_str().to_string();
+                let health = record.spec.health.as_str().to_string();
+                McpRow {
+                    server: record.spec.id,
+                    up: record.spec.status == Status::Running
+                        && record.spec.health == Health::Healthy,
+                    status,
+                    health,
+                    tools: record.tools_count,
+                }
+            })
+            .collect(),
+        Err(err) => {
+            tracing::debug!(%err, "cannot read the MCP servers for the metrics scrape");
+            Vec::new()
         }
     }
 }
@@ -460,6 +498,20 @@ pub struct Snapshot {
     pub secret_expiry_days: BTreeMap<String, i64>,
     /// Disk quota in bytes, per instance (empty when the feature is absent).
     pub disk_quotas: BTreeMap<String, u64>,
+    /// MCP servers and their last recorded state (issue #62).
+    pub mcp_servers: Vec<McpRow>,
+    /// MCP probes, per result (`ok`/`error`).
+    pub mcp_probes: BTreeMap<String, u64>,
+}
+
+/// One MCP server, flattened for the renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRow {
+    pub server: String,
+    pub status: String,
+    pub health: String,
+    pub tools: u32,
+    pub up: bool,
 }
 
 /// Series that always exist, so a dashboard query never has to guess whether a
@@ -670,6 +722,65 @@ pub fn render(snapshot: &Snapshot) -> String {
 
     block(
         &mut out,
+        "fleett_mcp_up",
+        "1 when an MCP server is running and its port answers the supervision probe.",
+        "gauge",
+    );
+    for row in &snapshot.mcp_servers {
+        let _ = writeln!(
+            out,
+            "fleett_mcp_up{{server=\"{}\"}} {}",
+            escape(&row.server),
+            u8::from(row.up)
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_mcp_tools",
+        "Tools discovered on an MCP server by the last successful tools/list.",
+        "gauge",
+    );
+    for row in &snapshot.mcp_servers {
+        let _ = writeln!(
+            out,
+            "fleett_mcp_tools{{server=\"{}\"}} {}",
+            escape(&row.server),
+            row.tools
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_mcp_servers",
+        "MCP servers per lifecycle status and recorded health.",
+        "gauge",
+    );
+    for ((status, health), count) in mcp_counts(&snapshot.mcp_servers) {
+        let _ = writeln!(
+            out,
+            "fleett_mcp_servers{{status=\"{}\",health=\"{}\"}} {count}",
+            escape(&status),
+            escape(&health)
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_mcp_probes_total",
+        "MCP supervision probes, per result.",
+        "counter",
+    );
+    for result in [RESULT_OK, RESULT_ERROR] {
+        let _ = writeln!(
+            out,
+            "fleett_mcp_probes_total{{result=\"{result}\"}} {}",
+            snapshot.mcp_probes.get(result).copied().unwrap_or_default()
+        );
+    }
+
+    block(
+        &mut out,
         "fleett_api_requests_total",
         "HTTP requests served by the API, per method and status.",
         "counter",
@@ -773,6 +884,20 @@ pub fn render(snapshot: &Snapshot) -> String {
 
 /// Count the rows, always emitting the [`SEEDED_SERIES`] first.
 fn instance_counts(rows: &[InstanceRow]) -> BTreeMap<(String, String), u64> {
+    let mut counts: BTreeMap<(String, String), u64> = SEEDED_SERIES
+        .iter()
+        .map(|(status, health)| ((status.to_string(), health.to_string()), 0))
+        .collect();
+    for row in rows {
+        *counts
+            .entry((row.status.clone(), row.health.clone()))
+            .or_default() += 1;
+    }
+    counts
+}
+
+/// Same as [`instance_counts`] for the MCP servers.
+fn mcp_counts(rows: &[McpRow]) -> BTreeMap<(String, String), u64> {
     let mut counts: BTreeMap<(String, String), u64> = SEEDED_SERIES
         .iter()
         .map(|(status, health)| ((status.to_string(), health.to_string()), 0))
@@ -898,6 +1023,7 @@ mod tests {
                 },
             )])),
             &LiveState::default(),
+            &[],
         );
         snapshot.rows = vec![row("alice", "running", "healthy")];
         snapshot
@@ -938,6 +1064,10 @@ mod tests {
             ("fleett_disk_used_bytes", "gauge"),
             ("fleett_secrets_expiring_days", "gauge"),
             ("fleett_incidents_open", "gauge"),
+            ("fleett_mcp_up", "gauge"),
+            ("fleett_mcp_tools", "gauge"),
+            ("fleett_mcp_servers", "gauge"),
+            ("fleett_mcp_probes_total", "counter"),
             ("fleett_api_requests_total", "counter"),
             ("fleett_compose_actions_total", "counter"),
             ("fleett_upgrade_jobs_total", "counter"),
@@ -970,8 +1100,9 @@ mod tests {
         // 6 instance series + 4 legacy per-instance series + 4 new
         // per-instance series + 2 API + 1 action + 1 upgrade job +
         // 3 seeded upgrade statuses + 1 rollback total + 1 incidents +
+        // 6 seeded MCP statuses + 2 seeded MCP probe results +
         // build_info + up + usage_ok.
-        assert_eq!(lines.len(), 6 + 4 + 4 + 2 + 1 + 1 + 3 + 1 + 1 + 3);
+        assert_eq!(lines.len(), 6 + 4 + 4 + 2 + 1 + 1 + 3 + 1 + 1 + 6 + 2 + 3);
     }
 
     #[test]
@@ -1019,7 +1150,7 @@ mod tests {
     #[test]
     fn counters_start_empty_and_increment() {
         let metrics = Metrics::new();
-        let empty = metrics.snapshot(&[], None, &LiveState::default());
+        let empty = metrics.snapshot(&[], None, &LiveState::default(), &[]);
         assert!(empty.api_requests.is_empty());
         assert!(empty.compose_actions.is_empty());
         assert!(empty.upgrade_jobs.is_empty());
@@ -1032,7 +1163,7 @@ mod tests {
         metrics.record_compose_action("start", RESULT_ERROR);
         metrics.record_upgrade_job("rolled_back");
 
-        let counters = metrics.snapshot(&[], None, &LiveState::default());
+        let counters = metrics.snapshot(&[], None, &LiveState::default(), &[]);
         assert_eq!(
             counters.api_requests.get(&("GET".into(), "200".into())),
             Some(&2)
@@ -1171,6 +1302,7 @@ mod tests {
                 incidents_open: 4,
                 ..LiveState::default()
             },
+            &[],
         );
         let text = render(&snapshot);
         assert!(
@@ -1274,6 +1406,7 @@ mod tests {
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 512,
             cpu_limit: 1.0,
             image: "agent:1".to_string(),

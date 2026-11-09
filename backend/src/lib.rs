@@ -30,6 +30,8 @@ pub mod logstore;
 pub mod maintenance;
 pub mod marketplace;
 pub mod mcp;
+pub mod mcp_client;
+pub mod mcp_servers;
 pub mod memory;
 pub mod metrics;
 pub mod migrate;

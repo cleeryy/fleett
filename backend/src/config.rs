@@ -29,6 +29,10 @@ pub const DEFAULT_EGRESS_PROXY: &str = "http://fleett-egress-proxy:3128";
 pub const DEFAULT_MIN_FREE_DISK_MB: u64 = 2048;
 /// Period of the disk quota tick (`FLEETT_QUOTA_INTERVAL_S`).
 pub const DEFAULT_QUOTA_INTERVAL_S: u64 = 60;
+/// Per-call timeout of an MCP discovery/probe (`FLEETT_MCP_CALL_TIMEOUT_S`).
+pub const DEFAULT_MCP_CALL_TIMEOUT_S: u64 = 15;
+/// Period of the MCP supervision loop (`FLEETT_MCP_SUPERVISE_INTERVAL_S`).
+pub const DEFAULT_MCP_SUPERVISE_INTERVAL_S: u64 = 60;
 /// Key file used to encrypt instance secrets at rest.
 ///
 /// Outside `FLEETT_ROOT` on purpose: a backup of the data root must never
@@ -539,6 +543,12 @@ pub struct Config {
     /// non-loopback hosts. Off by default: a skill archive is executable
     /// supply-chain content, it never travels in clear text unless asked.
     pub marketplace_insecure: bool,
+    /// Per-call timeout of an MCP discovery/probe request
+    /// (`FLEETT_MCP_CALL_TIMEOUT_S`, default 15).
+    pub mcp_call_timeout_s: u64,
+    /// Period of the MCP supervision tick (`FLEETT_MCP_SUPERVISE_INTERVAL_S`,
+    /// default 60; `0` disables the background loop).
+    pub mcp_supervise_interval_s: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -911,6 +921,23 @@ impl Config {
             get("MARKETPLACE_INSECURE").as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "on")
         );
+        let mcp_call_timeout_s = match get("MCP_CALL_TIMEOUT_S") {
+            None => DEFAULT_MCP_CALL_TIMEOUT_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_MCP_CALL_TIMEOUT_S",
+                value: value.clone(),
+                detail: format!("{err} (expected a number of seconds)"),
+            })?,
+        };
+        let mcp_call_timeout_s = mcp_call_timeout_s.clamp(1, 300);
+        let mcp_supervise_interval_s = match get("MCP_SUPERVISE_INTERVAL_S") {
+            None => DEFAULT_MCP_SUPERVISE_INTERVAL_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_MCP_SUPERVISE_INTERVAL_S",
+                value: value.clone(),
+                detail: format!("{err} (0 disables the supervision loop)"),
+            })?,
+        };
 
         Ok(Self {
             root,
@@ -955,6 +982,8 @@ impl Config {
             marketplace_api_base,
             marketplace_skills_sh_base,
             marketplace_insecure,
+            mcp_call_timeout_s,
+            mcp_supervise_interval_s,
         })
     }
 
@@ -1030,6 +1059,9 @@ impl Config {
             marketplace_api_base: DEFAULT_MARKETPLACE_API_BASE.to_string(),
             marketplace_skills_sh_base: DEFAULT_MARKETPLACE_SKILLS_SH_BASE.to_string(),
             marketplace_insecure: false,
+            mcp_call_timeout_s: DEFAULT_MCP_CALL_TIMEOUT_S,
+            // Tests drive `mcp_servers::tick` explicitly: no background loop.
+            mcp_supervise_interval_s: 0,
         }
     }
 
@@ -1153,6 +1185,29 @@ impl Config {
     /// Path of the local marketplace index written by `fleett marketplace sync`.
     pub fn marketplace_index_path(&self) -> PathBuf {
         self.marketplace_dir().join("index.json")
+    }
+
+    /// MCP servers deployed by fleett (issue #62): one directory per server,
+    /// holding its compose file and (when `persist`) its data directory.
+    pub fn mcp_dir(&self) -> PathBuf {
+        self.root.join("mcp")
+    }
+
+    pub fn mcp_server_dir(&self, id: &str) -> PathBuf {
+        self.mcp_dir().join(id)
+    }
+
+    pub fn mcp_compose_path(&self, id: &str) -> PathBuf {
+        self.mcp_server_dir(id).join("compose.yaml")
+    }
+
+    pub fn mcp_data_dir(&self, id: &str) -> PathBuf {
+        self.mcp_server_dir(id).join("data")
+    }
+
+    /// Local MCP catalogue, merged with the built-in entries.
+    pub fn mcp_index_path(&self) -> PathBuf {
+        self.root.join("marketplace").join("mcp").join("index.json")
     }
 
     pub fn template_config_path(&self, id: &str) -> PathBuf {

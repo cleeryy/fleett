@@ -394,6 +394,75 @@ pub enum Command {
         subject: String,
     },
     Egress(EgressCommand),
+    McpServer(McpServerCommand),
+}
+
+/// Sub-commands of `fleett mcp-server` (MCP marketplace, issue #62).
+///
+/// This is the *client* side of a deployed MCP server. `fleett mcp` (without
+/// `-server`) stays the MCP **server** mode that exposes the fleet.
+#[derive(Debug, Clone)]
+pub enum McpServerCommand {
+    /// `fleett mcp-server ls`.
+    List,
+    /// `fleett mcp-server get <id>`.
+    Get(String),
+    /// `fleett mcp-server catalog [--q TEXT]`.
+    Catalog {
+        q: Option<String>,
+    },
+    /// `fleett mcp-server import --file manifest.json`.
+    Import {
+        file: PathBuf,
+    },
+    /// `fleett mcp-server deploy …`.
+    Deploy(DeployMcpArgs),
+    Start(String),
+    Stop(String),
+    Restart(String),
+    /// `fleett mcp-server rm <id> [--purge]`.
+    Remove {
+        id: String,
+        purge: bool,
+    },
+    Logs {
+        id: String,
+        tail: u32,
+    },
+    /// `fleett mcp-server test <id>`.
+    Test(String),
+    /// `fleett mcp-server tools <id>`.
+    Tools(String),
+    Attach {
+        instance: String,
+        server: String,
+        mode: Option<String>,
+    },
+    Detach {
+        instance: String,
+        server: String,
+    },
+}
+
+/// Arguments of `fleett mcp-server deploy`.
+#[derive(Debug, Clone, Default)]
+pub struct DeployMcpArgs {
+    /// Server id (or catalogue id when `--catalog` is omitted).
+    pub id: String,
+    pub catalog: Option<String>,
+    pub image: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub port: Option<u16>,
+    pub persist: bool,
+    pub cpu: Option<f64>,
+    pub mem: Option<u32>,
+    /// `KEY=VALUE` pairs stored as non-secret variables.
+    pub env: Vec<String>,
+    /// `KEY=VALUE` pairs stored encrypted.
+    pub secret: Vec<String>,
+    /// `NAME=VALUE` HTTP headers, stored encrypted and never returned.
+    pub header: Vec<String>,
 }
 
 /// Arguments of `fleett egress policy|set|unset|blocks` (client mode).
@@ -822,6 +891,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
         Command::AclRm { id, subject } => acl_rm(&client, json, &id, &subject).await,
         Command::Egress(command) => egress(&client, json, &command).await,
+        Command::McpServer(command) => mcp_server(&client, json, &command).await,
         Command::Schedules { id } => schedules(&client, json, &id).await,
         Command::ScheduleAdd(args) => schedule_add(&client, json, &args).await,
         Command::ScheduleRm { schedule_id } => schedule_rm(&client, json, &schedule_id).await,
@@ -4696,6 +4766,415 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// MCP marketplace (issue #62)
+// ---------------------------------------------------------------------------
+
+/// `fleett mcp-server <action>`: catalogue, deployment, discovery and attach.
+async fn mcp_server(
+    client: &Client,
+    json: bool,
+    command: &McpServerCommand,
+) -> Result<(), CliError> {
+    match command {
+        McpServerCommand::List => {
+            let value = client
+                .value(Method::GET, "/api/mcp/servers", &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let servers: Vec<McpServerSummary> = decode(value)?;
+            let rows: Vec<Vec<String>> = servers
+                .iter()
+                .map(|server| {
+                    vec![
+                        server.id.clone(),
+                        server.kind.clone(),
+                        server.status.clone(),
+                        server.health.clone(),
+                        server.tools_count.to_string(),
+                        server.instances.join(","),
+                        server.endpoint.clone().unwrap_or_else(|| "-".to_string()),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(
+                    &[
+                        "ID",
+                        "KIND",
+                        "STATUS",
+                        "HEALTH",
+                        "TOOLS",
+                        "INSTANCES",
+                        "ENDPOINT"
+                    ],
+                    &rows
+                )
+            );
+            Ok(())
+        }
+        McpServerCommand::Get(id) => {
+            let path = format!("/api/mcp/servers/{}", encode_path_segment(id));
+            let value = client.value(Method::GET, &path, &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            let server: McpServerDetail = decode(value)?;
+            println!("{}  {}  {}", server.id, server.kind, server.status);
+            if !server.description.is_empty() {
+                println!("{}", server.description);
+            }
+            println!(
+                "health: {}  tools: {}  host: {}",
+                server.health, server.tools_count, server.host
+            );
+            if let Some(endpoint) = &server.endpoint {
+                println!("endpoint: {endpoint}");
+            }
+            if !server.env.is_empty() {
+                println!("env:");
+                for variable in &server.env {
+                    println!(
+                        "  {} ({}){}",
+                        variable.key,
+                        if variable.secret { "secret" } else { "plain" },
+                        if variable.set { " set" } else { " missing" }
+                    );
+                }
+            }
+            if !server.instances.is_empty() {
+                println!("instances: {}", server.instances.join(", "));
+            }
+            Ok(())
+        }
+        McpServerCommand::Catalog { q } => {
+            let query: Vec<(&str, String)> = q
+                .as_deref()
+                .map(|value| vec![("q", value.to_string())])
+                .unwrap_or_default();
+            let value = client
+                .value(Method::GET, "/api/mcp/catalog", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<CatalogSummary> = decode(value)?;
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.clone(),
+                        entry.kind.clone(),
+                        entry.image.clone(),
+                        entry.tags.join(","),
+                    ]
+                })
+                .collect();
+            print!("{}", render_table(&["ID", "KIND", "IMAGE", "TAGS"], &rows));
+            Ok(())
+        }
+        McpServerCommand::Import { file } => {
+            let text = std::fs::read_to_string(file).map_err(|err| {
+                CliError::Config(format!("cannot read {}: {err}", file.display()))
+            })?;
+            let body: Value = serde_json::from_str(&text).map_err(|err| {
+                CliError::Config(format!("{} is not valid JSON: {err}", file.display()))
+            })?;
+            let value = client
+                .value(Method::POST, "/api/mcp/catalog/import", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            println!(
+                "imported catalogue entry {}",
+                value["id"].as_str().unwrap_or_default()
+            );
+            Ok(())
+        }
+        McpServerCommand::Deploy(args) => deploy_mcp(client, json, args).await,
+        McpServerCommand::Start(id) => mcp_lifecycle(client, json, id, "start").await,
+        McpServerCommand::Stop(id) => mcp_lifecycle(client, json, id, "stop").await,
+        McpServerCommand::Restart(id) => mcp_lifecycle(client, json, id, "restart").await,
+        McpServerCommand::Remove { id, purge } => {
+            let path = format!("/api/mcp/servers/{}", encode_path_segment(id));
+            let query = if *purge {
+                vec![("purge", "true".to_string())]
+            } else {
+                Vec::new()
+            };
+            let _ = client.value(Method::DELETE, &path, &query, None).await?;
+            if json {
+                return print_json(&json!({ "id": id, "deleted": true }));
+            }
+            println!("deleted MCP server {id}");
+            Ok(())
+        }
+        McpServerCommand::Logs { id, tail } => {
+            let path = format!("/api/mcp/servers/{}/logs", encode_path_segment(id));
+            let query = vec![("tail", tail.to_string())];
+            let text = client.text(Method::GET, &path, &query, None).await?;
+            print!("{text}");
+            Ok(())
+        }
+        McpServerCommand::Test(id) => {
+            let path = format!("/api/mcp/servers/{}/test", encode_path_segment(id));
+            let value = client.value(Method::POST, &path, &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            println!(
+                "{id}: {} tools in {} ms (protocol {})",
+                value["tools_count"].as_u64().unwrap_or_default(),
+                value["latency_ms"].as_u64().unwrap_or_default(),
+                value["protocol_version"].as_str().unwrap_or("?"),
+            );
+            if let Some(tools) = value["tools"].as_array() {
+                for tool in tools {
+                    println!(
+                        "  {}{}",
+                        tool["name"].as_str().unwrap_or("?"),
+                        tool["description"]
+                            .as_str()
+                            .filter(|description| !description.is_empty())
+                            .map(|description| format!(" — {description}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            Ok(())
+        }
+        McpServerCommand::Tools(id) => {
+            let path = format!("/api/mcp/servers/{}/tools", encode_path_segment(id));
+            let value = client.value(Method::GET, &path, &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            for tool in value["tools"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}{}",
+                    tool["name"].as_str().unwrap_or("?"),
+                    tool["description"]
+                        .as_str()
+                        .filter(|description| !description.is_empty())
+                        .map(|description| format!(" — {description}"))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        McpServerCommand::Attach {
+            instance,
+            server,
+            mode,
+        } => {
+            let path = format!(
+                "/api/instances/{}/mcp-servers/{}",
+                encode_path_segment(instance),
+                encode_path_segment(server)
+            );
+            let body = mode.as_ref().map(|mode| json!({ "mode": mode }));
+            let value = client.value(Method::POST, &path, &[], body).await?;
+            if json {
+                return print_json(&value);
+            }
+            println!(
+                "{instance}: {} ({})",
+                value["status"].as_str().unwrap_or("?"),
+                server
+            );
+            Ok(())
+        }
+        McpServerCommand::Detach { instance, server } => {
+            let path = format!(
+                "/api/instances/{}/mcp-servers/{}",
+                encode_path_segment(instance),
+                encode_path_segment(server)
+            );
+            let value = client.value(Method::DELETE, &path, &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            println!(
+                "{instance}: {} (detached {server})",
+                value["status"].as_str().unwrap_or("?")
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn deploy_mcp(client: &Client, json: bool, args: &DeployMcpArgs) -> Result<(), CliError> {
+    // A bare id that exists in the catalogue deploys that entry; otherwise the
+    // explicit `--image` path builds a one-off server. This makes
+    // `fleett mcp-server deploy fetch` do the obvious thing.
+    let catalog = match args.catalog.as_deref() {
+        Some(id) => Some(id.to_string()),
+        None => {
+            let value = client
+                .value(Method::GET, "/api/mcp/catalog", &[], None)
+                .await?;
+            let known = value
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["id"].as_str() == Some(args.id.as_str()))
+                })
+                .unwrap_or(false);
+            known.then(|| args.id.clone())
+        }
+    };
+    let mut env: Vec<Value> = Vec::new();
+    for entry in &args.env {
+        let (key, value) = split_assignment(entry)?;
+        env.push(json!({ "key": key, "value": value, "secret": false }));
+    }
+    for entry in &args.secret {
+        let (key, value) = split_assignment(entry)?;
+        env.push(json!({ "key": key, "value": value, "secret": true }));
+    }
+    let mut headers = serde_json::Map::new();
+    for entry in &args.header {
+        let (key, value) = split_assignment(entry)?;
+        headers.insert(key, json!(value));
+    }
+    let mut body = json!({ "id": args.id });
+    if let Some(catalog) = catalog {
+        body["catalog"] = json!(catalog);
+    }
+    if let Some(image) = &args.image {
+        body["image"] = json!(image);
+        body["kind"] = json!("streamable-http");
+    }
+    if let Some(name) = &args.name {
+        body["name"] = json!(name);
+    }
+    if let Some(description) = &args.description {
+        body["description"] = json!(description);
+    }
+    if let Some(port) = args.port {
+        body["port"] = json!(port);
+    }
+    if args.persist {
+        body["persist"] = json!(true);
+    }
+    if let Some(cpu) = args.cpu {
+        body["cpu_limit"] = json!(cpu);
+    }
+    if let Some(mem) = args.mem {
+        body["mem_limit_mb"] = json!(mem);
+    }
+    if !env.is_empty() {
+        body["env"] = json!(env);
+    }
+    if !headers.is_empty() {
+        body["headers"] = Value::Object(headers);
+    }
+    let value = client
+        .value(Method::POST, "/api/mcp/servers", &[], Some(body))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    println!(
+        "deployed {} ({}, {} tools)",
+        value["id"].as_str().unwrap_or("?"),
+        value["status"].as_str().unwrap_or("?"),
+        value["tools_count"].as_u64().unwrap_or_default()
+    );
+    if let Some(error) = value["last_error"]
+        .as_str()
+        .filter(|error| !error.is_empty())
+    {
+        println!("last error: {error}");
+    }
+    Ok(())
+}
+
+async fn mcp_lifecycle(
+    client: &Client,
+    json: bool,
+    id: &str,
+    action: &str,
+) -> Result<(), CliError> {
+    let path = format!("/api/mcp/servers/{}/{action}", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    println!(
+        "{id}: {} ({})",
+        value["status"].as_str().unwrap_or("?"),
+        action
+    );
+    Ok(())
+}
+
+fn split_assignment(value: &str) -> Result<(String, String), CliError> {
+    value
+        .split_once('=')
+        .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+        .ok_or_else(|| CliError::Config(format!("expected KEY=VALUE, got {value:?}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct McpServerSummary {
+    id: String,
+    kind: String,
+    status: String,
+    health: String,
+    #[serde(default)]
+    tools_count: u32,
+    #[serde(default)]
+    instances: Vec<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpServerDetail {
+    id: String,
+    kind: String,
+    status: String,
+    health: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tools_count: u32,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    instances: Vec<String>,
+    #[serde(default)]
+    env: Vec<McpEnvSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpEnvSummary {
+    key: String,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    set: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogSummary {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[cfg(test)]

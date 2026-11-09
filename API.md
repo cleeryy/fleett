@@ -1293,3 +1293,40 @@ loopback (or front it with an authenticating proxy). SSE streaming is not implem
 
 See [docs/MCP.md](docs/MCP.md) for the tool catalog, the Hermes configuration and the
 limitations.
+
+## MCP marketplace
+
+MCP servers fleett deploys, discovers and attaches to agents (issue #62). See
+[docs/MCP-SERVERS.md](docs/MCP-SERVERS.md). Reads accept any authenticated role;
+every mutation requires `admin`. No endpoint ever returns an environment value,
+a header value, an image registry credential or a compose environment value.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/mcp/catalog?q=` | — | `[{id,name,description,kind,image,command,port,path,env:[{key,secret,required}],tags}]` merged from the built-ins and `$FLEETT_ROOT/marketplace/mcp/index.json` |
+| POST | `/api/mcp/catalog/import` | one catalogue entry | `201` entry; `409 mcp_duplicate`, `400 invalid_mcp_server`, admin only (`POST /api/mcp/catalog` is an alias) |
+| DELETE | `/api/mcp/catalog/{id}` | — | `204` for an imported entry; a built-in answers `400 invalid_mcp_server`, admin only |
+| GET | `/api/mcp/servers` | — | `[{id,name,description,kind,image,command,port,path,persist,cpu_limit,mem_limit_mb,host,status,health,last_error,last_probe_at,endpoint,tools,tools_count,tools_hash,env:[{key,secret,set}],headers:[name],instances,created_at,updated_at}]` |
+| POST | `/api/mcp/servers` | `{"catalog":"fetch"}` or a complete spec (`id`,`name`,`kind`,`image`,`command`,`port`,`path`,`persist`,`cpu_limit`,`mem_limit_mb`,`host`,`env`,`headers`) | `201` server view; deploy + discovery, `409 mcp_duplicate`, `502 mcp_upstream`, admin only |
+| GET | `/api/mcp/servers/{id}` | — | server view |
+| PATCH | `/api/mcp/servers/{id}` | `{name?,description?,image?,command?,port?,path?,persist?,cpu_limit?,mem_limit_mb?,host?,headers?:{…}\|null}` | server view; a spec change does not redeploy automatically, admin only |
+| DELETE | `/api/mcp/servers/{id}?purge=` | — | `204`; `409 mcp_server_in_use` with `details.instances`, admin only |
+| POST | `/api/mcp/servers/{id}/start\|stop\|restart` | — | server view after refresh (and discovery for start/restart), admin only |
+| POST | `/api/mcp/servers/{id}/test` | — | `{server,reachable,latency_ms,tools,tools_count,tools_hash,protocol_version,server_info}`; `422 mcp_unreachable` with the upstream detail, admin only |
+| GET | `/api/mcp/servers/{id}/logs?tail=&since=` | — | plain-text log tail |
+| GET | `/api/mcp/servers/{id}/tools` | — | `{server,tools,count,hash,probed_at}` |
+| PUT | `/api/mcp/servers/{id}/env` | `{"env":[{key,value,secret}]}` | server view; redeploys a running container to apply the values, admin only |
+| DELETE | `/api/mcp/servers/{id}/env/{key}` | — | server view; `404` when the variable is absent, admin only |
+| GET | `/api/mcp/servers/{id}/incidents?status=&limit=` | — | `[{id,server_id,cause,status,opened_at,closed_at,detail,actions,restart_count,last_seen_at}]` |
+| POST | `/api/mcp-incidents/{id}/close` | — | closed incident; `404` when unknown or already closed, admin only |
+| GET | `/api/instances/{id}/mcp-servers` | — | `{id,status,servers:[{server,mode,kind,status,health,tools_count,endpoint}]}` |
+| PUT | `/api/instances/{id}/mcp-servers` | `{"servers":[{server,mode?}]}` | replaces the list, rewrites `config.yaml` and recreates the agent, admin only |
+| POST | `/api/instances/{id}/mcp-servers/{server}` | `{"mode"?: "readonly\|rw"}` | attach one server, recreate the agent, admin only |
+| DELETE | `/api/instances/{id}/mcp-servers/{server}` | — | detach one server, recreate the agent, admin only |
+
+`mode` is stored in `instance_mcp_servers` and reported by the API. The managed
+`mcp_servers` block of `config.yaml` uses `fleett-<server>` keys: a
+`streamable-http` entry is `{url,timeout,connect_timeout}`, a `stdio` entry is
+`{command,args,env}` with `${KEY}` references. Attaching or detaching an agent
+never deploys a second container: the server is shared by Docker DNS on the
+`fleett` network.

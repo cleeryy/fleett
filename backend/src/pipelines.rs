@@ -1718,6 +1718,7 @@ mod tests {
             channel: ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: DEFAULT_CPU_LIMIT,
             image: "agent:1".to_string(),

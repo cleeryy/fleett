@@ -22,6 +22,7 @@ pub mod json;
 pub mod logcenter;
 pub mod maintenance;
 pub mod marketplace;
+pub mod mcp_servers;
 pub mod memory;
 pub mod notifications;
 pub mod openapi;
@@ -336,6 +337,46 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/upgrade", get(upgrade::status).post(upgrade::start))
         .route("/incidents", get(incidents::list))
         .route("/incidents/{id}/close", post(incidents::close))
+        .route(
+            "/mcp/catalog",
+            get(mcp_servers::catalog).post(mcp_servers::import),
+        )
+        .route("/mcp/catalog/import", post(mcp_servers::import))
+        .route("/mcp/catalog/{id}", delete(mcp_servers::delete_catalog))
+        .route(
+            "/mcp/servers",
+            get(mcp_servers::list).post(mcp_servers::create),
+        )
+        .route(
+            "/mcp/servers/{id}",
+            get(mcp_servers::get)
+                .patch(mcp_servers::patch)
+                .delete(mcp_servers::delete),
+        )
+        .route("/mcp/servers/{id}/start", post(mcp_servers::start))
+        .route("/mcp/servers/{id}/stop", post(mcp_servers::stop))
+        .route("/mcp/servers/{id}/restart", post(mcp_servers::restart))
+        .route("/mcp/servers/{id}/test", post(mcp_servers::test))
+        .route("/mcp/servers/{id}/logs", get(mcp_servers::logs))
+        .route("/mcp/servers/{id}/tools", get(mcp_servers::tools))
+        .route("/mcp/servers/{id}/env", put(mcp_servers::put_env))
+        .route(
+            "/mcp/servers/{id}/env/{key}",
+            delete(mcp_servers::delete_env),
+        )
+        .route("/mcp/servers/{id}/incidents", get(mcp_servers::incidents))
+        .route(
+            "/mcp-incidents/{id}/close",
+            post(mcp_servers::close_incident),
+        )
+        .route(
+            "/instances/{id}/mcp-servers",
+            get(mcp_servers::instance_list).put(mcp_servers::instance_put),
+        )
+        .route(
+            "/instances/{id}/mcp-servers/{server}",
+            post(mcp_servers::instance_attach).delete(mcp_servers::instance_detach),
+        )
         .route("/deployments", get(deployments::list))
         .route("/deployments/{id}", get(deployments::get))
         .route(

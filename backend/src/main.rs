@@ -304,6 +304,15 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         http: Option<String>,
     },
+    /// Deploy and attach MCP servers from the marketplace (client mode).
+    ///
+    /// Distinct from `fleett mcp`, which exposes *fleett itself* as an MCP
+    /// server. This one manages MCP servers as services. See
+    /// docs/MCP-SERVERS.md.
+    McpServer {
+        #[command(subcommand)]
+        action: McpServerCommands,
+    },
     /// Send a message to another instance over the fleet bus (client mode).
     Say {
         /// Recipient instance id.
@@ -384,6 +393,92 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum McpServerCommands {
+    /// List the deployed MCP servers.
+    Ls,
+    /// Show one MCP server, its tools and attached agents.
+    Get { id: String },
+    /// Browse the catalogue (built-in entries plus the local index).
+    Catalog {
+        /// Filter by id, name, description or tag.
+        #[arg(long)]
+        q: Option<String>,
+    },
+    /// Import one manifest into the local catalogue.
+    Import {
+        /// JSON file matching the catalogue entry schema.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Deploy an MCP server (from the catalogue or from an image).
+    Deploy {
+        /// Server id, or catalogue id when `--catalog` is omitted.
+        id: String,
+        /// Catalogue entry to deploy.
+        #[arg(long)]
+        catalog: Option<String>,
+        /// Container image of a one-off server.
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Keep the server state across restarts (`./data:/data`).
+        #[arg(long)]
+        persist: bool,
+        #[arg(long)]
+        cpu: Option<f64>,
+        #[arg(long)]
+        mem: Option<u32>,
+        /// Plain environment variable, `KEY=VALUE` (repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Secret environment variable, `KEY=VALUE` (repeatable).
+        #[arg(long = "secret", value_name = "KEY=VALUE")]
+        secret: Vec<String>,
+        /// Encrypted HTTP header, `NAME=VALUE` (repeatable).
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        header: Vec<String>,
+    },
+    /// Start a stopped MCP server.
+    Start { id: String },
+    /// Stop an MCP server without removing it.
+    Stop { id: String },
+    /// Restart an MCP server.
+    Restart { id: String },
+    /// Delete an MCP server (refused while attached).
+    Rm {
+        id: String,
+        /// Also remove its compose file and data directory.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Print the container logs of an MCP server.
+    Logs {
+        id: String,
+        #[arg(long, default_value_t = cli::DEFAULT_LOG_TAIL)]
+        tail: u32,
+    },
+    /// Run `tools/list` and report latency and tools.
+    Test { id: String },
+    /// Print the cached tools of a server.
+    Tools { id: String },
+    /// Attach an MCP server to an agent and recreate it.
+    Attach {
+        instance: String,
+        server: String,
+        /// `readonly` or `rw` (default).
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Detach an MCP server from an agent and recreate it.
+    Detach { instance: String, server: String },
 }
 
 #[derive(Subcommand)]
@@ -1137,6 +1232,61 @@ async fn main() -> anyhow::Result<()> {
             }
             0
         }
+        Commands::McpServer { action } => {
+            let command = match action {
+                McpServerCommands::Ls => cli::McpServerCommand::List,
+                McpServerCommands::Get { id } => cli::McpServerCommand::Get(id),
+                McpServerCommands::Catalog { q } => cli::McpServerCommand::Catalog { q },
+                McpServerCommands::Import { file } => cli::McpServerCommand::Import { file },
+                McpServerCommands::Deploy {
+                    id,
+                    catalog,
+                    image,
+                    name,
+                    description,
+                    port,
+                    persist,
+                    cpu,
+                    mem,
+                    env,
+                    secret,
+                    header,
+                } => cli::McpServerCommand::Deploy(cli::DeployMcpArgs {
+                    id,
+                    catalog,
+                    image,
+                    name,
+                    description,
+                    port,
+                    persist,
+                    cpu,
+                    mem,
+                    env,
+                    secret,
+                    header,
+                }),
+                McpServerCommands::Start { id } => cli::McpServerCommand::Start(id),
+                McpServerCommands::Stop { id } => cli::McpServerCommand::Stop(id),
+                McpServerCommands::Restart { id } => cli::McpServerCommand::Restart(id),
+                McpServerCommands::Rm { id, purge } => cli::McpServerCommand::Remove { id, purge },
+                McpServerCommands::Logs { id, tail } => cli::McpServerCommand::Logs { id, tail },
+                McpServerCommands::Test { id } => cli::McpServerCommand::Test(id),
+                McpServerCommands::Tools { id } => cli::McpServerCommand::Tools(id),
+                McpServerCommands::Attach {
+                    instance,
+                    server,
+                    mode,
+                } => cli::McpServerCommand::Attach {
+                    instance,
+                    server,
+                    mode,
+                },
+                McpServerCommands::Detach { instance, server } => {
+                    cli::McpServerCommand::Detach { instance, server }
+                }
+            };
+            cli::run(cli::Command::McpServer(command), json).await
+        }
         Commands::Say {
             to,
             body,
@@ -1445,6 +1595,13 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(fleett::watchdog::run(state.clone()));
     } else {
         tracing::info!("watchdog disabled (FLEETT_WATCHDOG_INTERVAL_S=0)");
+    }
+    // MCP supervision (issue #62): one loop, started once, next to the
+    // watchdog. A zero interval disables it; the `test` endpoint still probes.
+    if cfg.mcp_supervise_interval_s > 0 {
+        tokio::spawn(fleett::mcp_servers::run(state.clone()));
+    } else {
+        tracing::info!("MCP supervision disabled (FLEETT_MCP_SUPERVISE_INTERVAL_S=0)");
     }
     {
         let state = state.clone();

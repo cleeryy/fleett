@@ -1240,6 +1240,7 @@ mod tests {
             channel: ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 1024,
             cpu_limit: 1.0,
             image: image.to_string(),

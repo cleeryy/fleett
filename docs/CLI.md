@@ -584,6 +584,32 @@ is ignored: tool results are MCP `content` + `structuredContent`, and execution 
 `isError` results carrying the API code. A token without the required role is refused by the
 API and the refusal is returned as-is (for example `code: "forbidden", status: 403`).
 
+### `mcp-server`
+
+Manages MCP servers **as services** and attaches them to agents — the opposite direction of
+`fleett mcp`, which exposes fleett itself as an MCP server. See
+[docs/MCP-SERVERS.md](MCP-SERVERS.md).
+
+```bash
+fleett mcp-server ls
+fleett mcp-server catalog --q github
+fleett mcp-server deploy fetch
+fleett mcp-server deploy custom --image example/custom:1 --secret API_KEY=… --port 8000
+fleett mcp-server import --file manifest.json
+fleett mcp-server test fetch                 # tools/list, latency, tools
+fleett mcp-server attach alice fetch --mode readonly
+fleett mcp-server detach alice fetch
+fleett mcp-server logs fetch --tail 100
+fleett mcp-server rm fetch --purge
+```
+
+`deploy` treats its positional id as a catalogue id when the id exists in the catalogue,
+otherwise it needs `--image`. `--env` stores a plain variable, `--secret` an encrypted one and
+`--header` an encrypted HTTP header (`KEY=VALUE`, repeatable). `attach`/`detach` recreate the
+agent through the shared compose path and print the resulting status. Every command accepts
+`--json`; no output ever contains an environment value, a header value or a registry
+credential.
+
 ## Fleet operations (v0.6)
 
 The commands below are client-mode calls to the HTTP API. They all accept the global

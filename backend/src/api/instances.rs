@@ -263,8 +263,17 @@ pub async fn create(
     let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     crate::api::push_provider_key(&mut env_keys, &spec);
 
-    let mut rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &env_keys)
-        .map_err(ApiError::from)?;
+    let mut rendered = render::render_instance_with_mcp(
+        &state.cfg,
+        &spec,
+        &prepared.template,
+        None,
+        &env_keys,
+        None,
+        &crate::mcp_servers::config_entries(&state.cfg, &state.db, &spec.id)
+            .map_err(ApiError::from)?,
+    )
+    .map_err(ApiError::from)?;
     if let Some(persona) = &prepared.persona {
         rendered.soul_md = Some(persona.rendered.clone());
     }
@@ -492,6 +501,21 @@ pub async fn clone(
         .filter(|skill| crate::skills::effective_version(&state.cfg, skill).is_some())
         .cloned()
         .collect();
+    // MCP attachments are configuration, not secrets: the clone keeps the ones
+    // whose server still exists (the same server container is shared).
+    clone.mcp_servers = source
+        .mcp_servers
+        .iter()
+        .filter(|reference| {
+            state
+                .db
+                .get_mcp_server(&reference.server)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .cloned()
+        .collect();
     clone.status = Status::Created;
     clone.last_error = None;
     // The target image is inherited, but the clone has no upgrade history of
@@ -542,13 +566,15 @@ pub async fn clone(
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
     let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     crate::api::push_provider_key(&mut env_keys, &clone);
-    let rendered = render::render_instance_with_project_and_policy(
+    let rendered = render::render_instance_with_mcp(
         &state.cfg,
         &clone,
         &template,
         None,
         &env_keys,
         source_policy.as_ref(),
+        &crate::mcp_servers::config_entries_for_refs(&state.cfg, &state.db, &clone.mcp_servers)
+            .map_err(ApiError::from)?,
     )
     .map_err(ApiError::from)?;
 
@@ -827,6 +853,22 @@ async fn import_archive(
         warnings.push(format!(
             "share(s) {} are not present on this host; create them and attach them again",
             missing_shares.join(", ")
+        ));
+    }
+    let mut missing_servers = Vec::new();
+    spec.mcp_servers.retain(
+        |reference| match state.db.get_mcp_server(&reference.server) {
+            Ok(Some(_)) => true,
+            _ => {
+                missing_servers.push(reference.server.clone());
+                false
+            }
+        },
+    );
+    if !missing_servers.is_empty() {
+        warnings.push(format!(
+            "MCP server(s) {} are not present on this host; deploy them and attach them again",
+            missing_servers.join(", ")
         ));
     }
     let mut expected = vec![spec.api_key_env.clone()];
@@ -1591,14 +1633,20 @@ pub(crate) fn render_for_update(
     crate::api::hydrate_previous_image(state, &mut spec);
     let spec = &spec;
     let policy = egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
+    let mcp_entries = crate::mcp_servers::config_entries(&state.cfg, &state.db, &spec.id)
+        .map_err(ApiError::from)?;
+    let existing_config =
+        std::fs::read_to_string(state.cfg.data_dir(&spec.id).join("config.yaml")).ok();
     match render::load_template(&state.cfg, &spec.template) {
-        Ok(template) => render::render_instance_with_project_and_policy(
+        Ok(template) => render::render_instance_with_mcp_and_existing(
             &state.cfg,
             spec,
             &template,
             project.as_deref(),
             env_keys,
             policy.as_ref(),
+            &mcp_entries,
+            existing_config.as_deref(),
         )
         .map_err(ApiError::from),
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
@@ -1618,7 +1666,8 @@ pub(crate) fn render_for_update(
                     policy.as_ref(),
                 )
                 .map_err(ApiError::from)?,
-                config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
+                config_yaml: render::render_config_with_mcp(spec, &existing, &mcp_entries)
+                    .map_err(ApiError::from)?,
                 soul_md: None,
             })
         }
@@ -2279,6 +2328,7 @@ async fn prepare_create(
             channel,
             shares,
             skills,
+            mcp_servers: Vec::new(),
             mem_limit_mb,
             cpu_limit,
             image: state.cfg.image.clone(),

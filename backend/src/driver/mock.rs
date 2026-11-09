@@ -5,8 +5,8 @@
 //! Docker.
 
 use super::{
-    Driver, DriverError, DriverFuture, ExecOutput, ExecResult, ImageRecord, InspectInfo,
-    LogsOptions, PsResult, UsageSample,
+    ComposeProject, Driver, DriverError, DriverFuture, ExecOutput, ExecResult, ImageRecord,
+    InspectInfo, LogsOptions, PsResult, UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
 use crate::hosts::HostCapacity;
@@ -38,6 +38,23 @@ pub struct MockExecCall {
     pub instance: String,
     pub argv: Vec<String>,
     pub timeout_s: u64,
+}
+
+/// One recorded project-scoped lifecycle call (MCP marketplace, issue #62).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockProjectCall {
+    pub operation: &'static str,
+    pub project: String,
+    pub service: String,
+    pub host: String,
+}
+
+#[derive(Debug)]
+struct MockProjectState {
+    status: Status,
+    health: Health,
+    logs: String,
+    inspect: Option<InspectInfo>,
 }
 
 #[derive(Debug)]
@@ -102,6 +119,10 @@ pub struct MockDriver {
     exec_delay: Mutex<Option<Duration>>,
     in_flight_execs: AtomicUsize,
     max_in_flight_execs: AtomicUsize,
+    /// Simulated non-instance projects (`fleett-mcp-<id>`), issue #62.
+    projects: Mutex<HashMap<String, MockProjectState>>,
+    /// Every project-scoped lifecycle call, oldest first.
+    project_calls: Mutex<Vec<MockProjectCall>>,
 }
 
 impl Default for MockDriver {
@@ -150,6 +171,8 @@ impl MockDriver {
             exec_delay: Mutex::new(None),
             in_flight_execs: AtomicUsize::new(0),
             max_in_flight_execs: AtomicUsize::new(0),
+            projects: Mutex::new(HashMap::new()),
+            project_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -399,6 +422,109 @@ impl MockDriver {
         lock(&self.state).get(id).map(|entry| entry.status)
     }
 
+    /// Force the lifecycle state of one non-instance project (`fleett-mcp-<id>`).
+    pub fn force_project(&self, project: &str, status: Status, health: Health) {
+        let mut projects = lock(&self.projects);
+        let entry = projects
+            .entry(project.to_string())
+            .or_insert_with(|| MockProjectState {
+                status,
+                health,
+                logs: String::new(),
+                inspect: None,
+            });
+        entry.status = status;
+        entry.health = health;
+    }
+
+    /// Report a canned `docker inspect` payload for one project container.
+    pub fn force_project_inspect(&self, project: &str, info: InspectInfo) {
+        let mut projects = lock(&self.projects);
+        let entry = projects
+            .entry(project.to_string())
+            .or_insert_with(|| MockProjectState {
+                status: Status::Running,
+                health: Health::Healthy,
+                logs: String::new(),
+                inspect: None,
+            });
+        entry.inspect = Some(info);
+    }
+
+    /// Replace the log output of one project container.
+    pub fn set_project_logs(&self, project: &str, text: impl Into<String>) {
+        let mut projects = lock(&self.projects);
+        let entry = projects
+            .entry(project.to_string())
+            .or_insert_with(|| MockProjectState {
+                status: Status::Running,
+                health: Health::Healthy,
+                logs: String::new(),
+                inspect: None,
+            });
+        entry.logs = text.into();
+    }
+
+    /// Every project-scoped lifecycle call, oldest first.
+    pub fn project_calls(&self) -> Vec<MockProjectCall> {
+        lock(&self.project_calls).clone()
+    }
+
+    /// Simulated status of one project, when it exists.
+    pub fn project_status(&self, project: &str) -> Option<Status> {
+        lock(&self.projects).get(project).map(|entry| entry.status)
+    }
+
+    /// Whether one project is still simulated (a `down` drops it).
+    pub fn project_exists(&self, project: &str) -> bool {
+        lock(&self.projects).contains_key(project)
+    }
+
+    fn record_project(&self, operation: &'static str, project: &ComposeProject) {
+        lock(&self.project_calls).push(MockProjectCall {
+            operation,
+            project: project.project.clone(),
+            service: project.service.clone(),
+            host: project.host.clone(),
+        });
+    }
+
+    fn set_project_state(&self, project: &str, status: Status, health: Health) {
+        let mut projects = lock(&self.projects);
+        let entry = projects
+            .entry(project.to_string())
+            .or_insert_with(|| MockProjectState {
+                status,
+                health,
+                logs: String::new(),
+                inspect: None,
+            });
+        entry.status = status;
+        entry.health = health;
+    }
+
+    fn simulate_project_inspect(&self, project: &str) -> InspectInfo {
+        if let Some(info) = lock(&self.projects)
+            .get(project)
+            .and_then(|entry| entry.inspect.clone())
+        {
+            return info;
+        }
+        let projects = lock(&self.projects);
+        match projects.get(project) {
+            Some(entry) => InspectInfo {
+                state: entry.status.as_str().to_string(),
+                exit_code: Some(0),
+                ip_address: Some("127.0.0.1".to_string()),
+                ..InspectInfo::default()
+            },
+            None => InspectInfo {
+                state: "missing".to_string(),
+                ..InspectInfo::default()
+            },
+        }
+    }
+
     fn record_for(&self, operation: &'static str, id: &str, host: &str) {
         lock(&self.calls).push(MockCall {
             operation,
@@ -484,6 +610,7 @@ impl MockDriver {
                     chrono::DateTime::<chrono::Utc>::from(started)
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 }),
+                ip_address: None,
             },
             None => InspectInfo {
                 state: "missing".to_string(),
@@ -760,6 +887,125 @@ impl Driver for MockDriver {
         })
     }
 
+    fn project_up<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.record_project("up", project);
+            self.fail_if_requested("project_up")?;
+            self.set_project_state(&project.project, Status::Running, Health::Healthy);
+            Ok(())
+        })
+    }
+
+    fn project_down<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.record_project("down", project);
+            self.fail_if_requested("project_down")?;
+            lock(&self.projects).remove(&project.project);
+            Ok(())
+        })
+    }
+
+    fn project_start<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.record_project("start", project);
+            self.fail_if_requested("project_start")?;
+            self.set_project_state(&project.project, Status::Running, Health::Healthy);
+            Ok(())
+        })
+    }
+
+    fn project_stop<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.record_project("stop", project);
+            self.fail_if_requested("project_stop")?;
+            self.set_project_state(&project.project, Status::Stopped, Health::Unknown);
+            Ok(())
+        })
+    }
+
+    fn project_restart<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.record_project("restart", project);
+            self.fail_if_requested("project_restart")?;
+            self.set_project_state(&project.project, Status::Running, Health::Healthy);
+            Ok(())
+        })
+    }
+
+    fn project_ps<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<PsResult, DriverError>> {
+        Box::pin(async move {
+            self.record_project("ps", project);
+            self.fail_if_requested("project_ps")?;
+            let projects = lock(&self.projects);
+            let Some(entry) = projects.get(&project.project) else {
+                return Ok(PsResult {
+                    status: Status::Unknown,
+                    health: Health::Unknown,
+                    container: None,
+                });
+            };
+            Ok(PsResult {
+                status: entry.status,
+                health: entry.health,
+                container: Some(ContainerInfo {
+                    id: Some(format!("mock-{}", project.project)),
+                    image: Some("mock".to_string()),
+                    uptime_s: None,
+                }),
+            })
+        })
+    }
+
+    fn project_logs<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+        options: &'a LogsOptions,
+    ) -> DriverFuture<'a, Result<String, DriverError>> {
+        Box::pin(async move {
+            self.record_project("logs", project);
+            self.fail_if_requested("project_logs")?;
+            let text = lock(&self.projects)
+                .get(&project.project)
+                .map(|entry| entry.logs.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "[mock] {} is simulated by FLEETT_DRIVER=mock\n",
+                        project.project
+                    )
+                });
+            Ok(Self::tail_lines(&text, options.tail))
+        })
+    }
+
+    fn project_inspect<'a>(
+        &'a self,
+        project: &'a ComposeProject,
+    ) -> DriverFuture<'a, Result<InspectInfo, DriverError>> {
+        Box::pin(async move {
+            self.record_project("inspect", project);
+            self.fail_if_requested("project_inspect")?;
+            Ok(self.simulate_project_inspect(&project.project))
+        })
+    }
+
     fn exec<'a>(
         &'a self,
         spec: &'a InstanceSpec,
@@ -851,6 +1097,7 @@ mod tests {
             channel: crate::models::ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
             cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
             image: "hermes-agent:0.22.2-local".to_string(),
@@ -906,6 +1153,7 @@ mod tests {
                 restart_count: 0,
                 error: None,
                 started_at: None,
+                ip_address: None,
             },
         );
         let broken = driver.inspect(&instance).await.expect("inspect");

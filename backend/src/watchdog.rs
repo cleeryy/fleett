@@ -979,6 +979,7 @@ mod tests {
             channel: ChannelKind::None,
             shares: Vec::new(),
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: DEFAULT_MEM_LIMIT_MB,
             cpu_limit: 1.0,
             image: crate::config::DEFAULT_IMAGE.to_string(),
@@ -1266,6 +1267,7 @@ mod tests {
                 restart_count: 5,
                 error: None,
                 started_at: None,
+                ip_address: None,
             },
         );
 
@@ -1307,6 +1309,7 @@ mod tests {
                 restart_count: 1,
                 error: None,
                 started_at: None,
+                ip_address: None,
             },
         );
 
@@ -1333,6 +1336,7 @@ mod tests {
                 restart_count: 0,
                 error: None,
                 started_at: None,
+                ip_address: None,
             },
         );
 

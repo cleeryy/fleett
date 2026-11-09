@@ -95,6 +95,11 @@ pub struct ArchiveInstance {
     /// import rather than mounted as an empty directory.
     #[serde(default)]
     pub skills: Vec<crate::models::SkillRef>,
+    /// MCP servers attached when the archive was written (issue #62). Missing
+    /// in older archives; a server the receiving fleet does not know is dropped
+    /// on import rather than attached as a dangling reference.
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::models::McpRef>,
     #[serde(default)]
     pub notes: String,
     /// Host the instance ran on when the archive was written. Informational
@@ -129,6 +134,7 @@ impl ArchiveInstance {
             disk_policy: spec.disk_policy.as_str().to_string(),
             shares: spec.shares.clone(),
             skills: spec.skills.clone(),
+            mcp_servers: spec.mcp_servers.clone(),
             notes: spec.notes.clone(),
             host: spec.host.clone(),
         }
@@ -391,6 +397,13 @@ pub fn spec_from_manifest(
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
 
+    // MCP attachments are references: an archive carries them, but a server
+    // that does not exist on the receiving fleet is dropped with a warning
+    // (the import handler does the filtering, after the database is open).
+    let mut mcp_servers = manifest.mcp_servers.clone();
+    mcp_servers.sort_by(|left, right| left.server.cmp(&right.server));
+    mcp_servers.dedup_by(|left, right| left.server == right.server);
+
     let now = now_iso();
     Ok(InstanceSpec {
         id: id.to_string(),
@@ -403,6 +416,7 @@ pub fn spec_from_manifest(
         channel,
         shares,
         skills,
+        mcp_servers,
         mem_limit_mb,
         cpu_limit,
         image: String::new(),
@@ -520,6 +534,7 @@ mod tests {
                 mode: ShareMode::Ro,
             }],
             skills: Vec::new(),
+            mcp_servers: Vec::new(),
             mem_limit_mb: 2048,
             cpu_limit: 1.5,
             image: "hermes-agent:0.22.2-local".to_string(),

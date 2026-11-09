@@ -530,6 +530,7 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         channel,
         shares,
         skills,
+        mcp_servers: Vec::new(),
         mem_limit_mb,
         cpu_limit,
         image,
