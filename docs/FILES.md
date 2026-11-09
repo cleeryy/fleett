@@ -13,6 +13,10 @@ skill note or a provider list was an SSH session on the host plus a manual
 | PUT | `/api/instances/{id}/files/content` | admin | compare-and-swap write, `.bak`, optional restart |
 | DELETE | `/api/instances/{id}/files/content?path=/notes/old.md` | admin | delete a file or an empty directory |
 | POST | `/api/instances/{id}/files/mkdir` | admin | create one directory |
+| POST | `/api/instances/{id}/files/upload` | admin | multipart upload into one directory |
+| GET | `/api/instances/{id}/files/download?path=/capture.png` | viewer | exact bytes, binary allowed |
+| GET | `/api/instances/{id}/files/archive?path=/notes` | viewer | `.zip` of one directory |
+| GET | `/api/instances/{id}/files/search?q=&path=/` | viewer | full-text search of the tree |
 
 The web console uses exactly this order: tree, editor, save, then an explicit
 "Save and restart" choice. The API never restarts on its own when the flag is
@@ -82,6 +86,93 @@ between the check and the open.
 A file above the cap is still listed (with `editable:false`) but cannot be read
 or written; delete it and recreate a smaller one. Reading is UTF-8 strict: a
 Latin-1 or NUL-bearing file is `415` rather than mojibake.
+
+## Upload
+
+`POST /files/upload` is a multipart request: a `path` field naming the target
+directory (virtual, `/`-rooted) and one or more `file` parts.
+
+```sh
+curl -F path=/notes -F file=@notes.md \
+  https://fleett.example/api/instances/alice/files/upload?overwrite=true
+```
+
+| Limit | Value | Refusal |
+|---|---|---|
+| One file | 10 MiB | `413 file_too_large` |
+| One request | 32 MiB | `413 file_too_large` |
+| Executable extensions | `.exe .com .bat .cmd .msi .dll .so .dylib .bin .app .scr .ps1 .sh .bash .zsh` | `415 executable_file` |
+| Executable magic | ELF, Mach-O (32/64, both endiannesses, universal), PE | `415 executable_file` |
+| Existing target | requires `?overwrite=true` | `409 file_exists` |
+
+Every part is checked before the first byte is written: a refused request
+leaves the directory untouched. A file name is a single component (no `/`, no
+`\`, no `..`), so an upload can never land outside the target directory, and
+the target directory itself goes through the same confinement as every other
+path (`400 invalid_path` / `400 path_escape`). The type check is deliberately
+coarse: the extension blocklist catches the obvious cases, the magic bytes
+catch a renamed binary, and nothing here is a substitute for running untrusted
+agents in a container.
+
+Without `?overwrite=true`, an existing target is a `409 file_exists`. With it,
+the previous bytes are copied to the usual `.bak-YYYYMMDD-HHMMSS` sibling
+first and the mode of the file is preserved. A rendered `config.yaml` or
+`healthcheck.py` is still `409 file_regenerated`, at the root or through a
+symlinked directory.
+
+The response is `201` with the directory, the total and one entry per file:
+
+```json
+{"directory":"/notes","total":2048,
+ "files":[{"path":"/notes/notes.md","size":2048,"backup":"/notes/notes.md.bak-20261109-183512"}]}
+```
+
+## Download
+
+`GET /files/download?path=/capture.png` returns the exact bytes, binary
+included, with `Content-Disposition: attachment; filename="capture.png"` and a
+media type inferred from the extension (`application/octet-stream` when it is
+unknown). The cap is 50 MiB (`413 file_too_large`): the editor's 512 KiB and
+UTF-8 rules do not apply to a download. Only a regular file of the tree is
+served; the data directory or a folder is `400 not_a_file`, a socket is
+`400 unsupported_file_type`.
+
+## Archive
+
+`GET /files/archive?path=/notes` returns `application/zip` with
+`Content-Disposition: attachment; filename="alice-notes.zip"`. Archiving `/`
+names the file `alice-data.zip` (the directory is the instance data
+directory).
+
+The walk is recursive and skips sockets, FIFOs and devices. A symlink that
+resolves outside the data directory is skipped; a safe relative link is stored
+as a link entry, so `unzip` recreates it instead of copying its target. The
+uncompressed total is capped at 200 MiB (`413 file_too_large`); the archive is
+built in memory and returned in one response.
+
+## Search
+
+`GET /files/search?q=&path=/&regex=false&limit=200` walks the tree under `path`
+and returns every matching line:
+
+```json
+{"results":[{"path":"/notes/a.md","line":1,"preview":"Alpha beta"}],
+ "truncated":false,"scanned":4}
+```
+
+* `q` is required; an empty one is `400 invalid_query`. The search is literal
+  by default, so `.` and `*` are ordinary characters.
+* `regex=true` compiles `q` as a regular expression; an invalid pattern is
+  `400 invalid_regex`, never a `500`.
+* Matching is case-insensitive unless `case_sensitive=true`.
+* Files above 1 MiB, binary files (NUL byte or invalid UTF-8) and symlinks are
+  skipped, so `scanned` counts the regular files the walk considered.
+* At most 200 hits (`limit` can only lower that) and 50 000 files are scanned.
+  `truncated:true` says the scan stopped at one of those caps and more matches
+  may exist.
+
+Search reads the tree directly; it is bounded, synchronous work run off the
+request thread, so it never blocks another API call.
 
 ## Rendered files
 
@@ -169,28 +260,36 @@ Every mutation appends one row to `GET /api/audit`:
 | `instance.file.write` | instance id | `{path, size, backup, restart}` |
 | `instance.file.delete` | instance id | `{path}` |
 | `instance.file.mkdir` | instance id | `{path}` |
+| `instance.file.upload` | instance id | `{directory, overwrite, total, files: [{path, size, backup}]}` |
 
 The actor is the SSO email (or the token name), the role and the credential
-type as for every other mutation. Reads are not audited.
+type as for every other mutation. An upload appends one row for the whole
+request, with the path and size of every file: the trail never needs the
+multipart body to explain what landed on disk. Reads are not audited.
 
 ## Errors
 
 | Status | Code | Cause |
 |---|---|---|
-| 400 | `invalid_path` | `..`, NUL, relative path |
+| 400 | `invalid_path` | `..`, NUL, relative path, or a path in a file name |
 | 400 | `path_escape` | symlink or parent chain outside the data directory |
-| 400 | `not_a_file` | content endpoint on a directory (or on the root) |
+| 400 | `not_a_file` | content/download endpoint on a directory (or on the root) |
 | 400 | `not_a_directory` | listing a file |
 | 400 | `unsupported_file_type` | socket, FIFO, device |
+| 400 | `invalid_upload` | no `path` field, no file part, duplicate file name |
+| 400 | `invalid_query` | empty `q` |
+| 400 | `invalid_regex` | `regex=true` and `q` does not compile |
 | 403 | `forbidden` | viewer mutation, CSRF missing on a cookie session |
 | 404 | `not_found` | unknown instance, path or dangling link |
 | 409 | `etag_mismatch` | stale or missing etag (`details.current`) |
 | 409 | `file_regenerated` | rendered `config.yaml` / `healthcheck.py` |
 | 409 | `file_not_editable` | extension outside the allowlist |
 | 409 | `already_exists` | `mkdir` on an existing path |
+| 409 | `file_exists` | upload over an existing file without `?overwrite=true` |
 | 409 | `directory_not_empty` | `DELETE` on a non-empty directory |
-| 413 | `file_too_large` | above 512 KiB (`details {size, limit}`) |
-| 415 | `binary_file` | not UTF-8, or contains NUL |
+| 413 | `file_too_large` | 512 KiB read/write, 10 MiB per upload file, 32 MiB per upload, 50 MiB download, 200 MiB archive (`details {size, limit}`) |
+| 415 | `binary_file` | not UTF-8, or contains NUL (text editor only) |
+| 415 | `executable_file` | blocked extension or ELF/Mach-O/PE magic bytes |
 | 500 | `internal` | filesystem failure |
 | 502 | `driver_error` | the optional restart failed (the write stands) |
 
@@ -204,7 +303,9 @@ keep the agent's own home writable.
 
 ## Not in scope
 
-No recursive tree, no rename, no upload/binary transfer, no file content in the
-audit log, and no editing outside the data directory (compose file, secrets,
-`fleet.db`). Templates are edited through the template directory on the host,
-not through this API.
+No rename or move, no resumable/chunked upload, no archive extraction through
+the API, no file content in the audit log, and no editing outside the data
+directory (compose file, secrets, `fleet.db`). A download and an archive are
+read-only; the only write gestures are the editor, the upload, `mkdir` and
+`DELETE`. Templates are edited through the template directory on the host, not
+through this API.

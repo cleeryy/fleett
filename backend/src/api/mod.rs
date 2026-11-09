@@ -384,6 +384,13 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .delete(files::delete_file),
         )
         .route("/instances/{id}/files/mkdir", post(files::mkdir))
+        .route(
+            "/instances/{id}/files/upload",
+            post(files::upload).layer(axum::extract::DefaultBodyLimit::max(files::MAX_UPLOAD_BODY)),
+        )
+        .route("/instances/{id}/files/download", get(files::download))
+        .route("/instances/{id}/files/archive", get(files::archive))
+        .route("/instances/{id}/files/search", get(files::search))
         .route("/instances/{id}/git/log", get(git::log))
         .route("/instances/{id}/git/diff", get(git::diff))
         .route("/instances/{id}/git/status", get(git::status))

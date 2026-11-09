@@ -4628,6 +4628,639 @@ async fn file_mutations_are_audited() {
 }
 
 // ---------------------------------------------------------------------------
+// Instance files: upload, download, archive and search (#53)
+// ---------------------------------------------------------------------------
+
+const UPLOAD_BOUNDARY: &str = "----fleett-test-boundary";
+
+/// Send one raw request and keep the exact response bytes (binary endpoints).
+async fn send_raw(
+    harness: &Harness,
+    method: Method,
+    uri: &str,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+    token: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = builder.body(Body::from(body)).expect("valid request");
+    let response = api::router(harness.state.clone())
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+fn multipart_body(directory: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n\
+             {directory}\r\n"
+        )
+        .as_bytes(),
+    );
+    for (name, bytes) in files {
+        body.extend_from_slice(
+            format!(
+                "--{UPLOAD_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+                 filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{UPLOAD_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+async fn upload(
+    harness: &Harness,
+    id: &str,
+    directory: &str,
+    files: &[(&str, &[u8])],
+    overwrite: bool,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let query = if overwrite { "?overwrite=true" } else { "" };
+    let (status, _, bytes) = send_raw(
+        harness,
+        Method::POST,
+        &format!("/api/instances/{id}/files/upload{query}"),
+        Some(&format!("multipart/form-data; boundary={UPLOAD_BOUNDARY}")),
+        multipart_body(directory, files),
+        token,
+    )
+    .await;
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body)
+}
+
+#[tokio::test]
+async fn uploads_files_into_a_directory_and_audits_the_request() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let todo = b"- [ ] write the report\n";
+    let payload = b"{\"ok\":true}\n";
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/notes",
+        &[
+            ("todo.md", todo.as_slice()),
+            ("data.json", payload.as_slice()),
+        ],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["directory"], "/notes");
+    assert_eq!(body["files"].as_array().expect("files").len(), 2);
+    assert_eq!(body["files"][0]["path"], "/notes/todo.md");
+    assert_eq!(body["files"][0]["size"], todo.len());
+    assert!(body["files"][0].get("backup").is_none());
+    assert_eq!(body["total"], todo.len() + payload.len());
+
+    let data = data_dir(&harness, "alice");
+    assert_eq!(
+        std::fs::read_to_string(data.join("notes/todo.md")).expect("todo"),
+        "- [ ] write the report\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.join("notes/data.json")).expect("data"),
+        "{\"ok\":true}\n"
+    );
+
+    let entries = audit_entries(&harness, "instance.file.upload").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["target"], "alice");
+    assert_eq!(entries[0]["details"]["directory"], "/notes");
+    assert_eq!(entries[0]["details"]["overwrite"], false);
+    assert_eq!(entries[0]["details"]["total"], todo.len() + payload.len());
+    assert_eq!(entries[0]["details"]["files"][0]["path"], "/notes/todo.md");
+    assert_eq!(entries[0]["details"]["files"][0]["size"], todo.len());
+}
+
+#[tokio::test]
+async fn uploading_over_a_file_needs_overwrite_and_keeps_a_backup() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("notes.md", b"first version\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("notes.md", b"second version\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "file_exists");
+    assert_eq!(body["error"]["details"]["file"], "/notes.md");
+    let data = data_dir(&harness, "alice");
+    assert_eq!(
+        std::fs::read_to_string(data.join("notes.md")).expect("kept"),
+        "first version\n"
+    );
+
+    // The conflict is detected before the first write of the request.
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[
+            ("fresh.md", b"fresh\n".as_slice()),
+            ("notes.md", b"second version\n".as_slice()),
+        ],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(!data.join("fresh.md").exists(), "no partial upload");
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("notes.md", b"second version\n".as_slice())],
+        true,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let backup = body["files"][0]["backup"]
+        .as_str()
+        .expect("backup path")
+        .to_string();
+    assert!(backup.starts_with("/notes.md.bak-"), "{backup}");
+    assert_eq!(
+        std::fs::read_to_string(data.join("notes.md")).expect("new bytes"),
+        "second version\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.join(backup.trim_start_matches('/'))).expect("backup"),
+        "first version\n"
+    );
+}
+
+#[tokio::test]
+async fn upload_refuses_executables_by_extension_and_by_magic_bytes() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("setup.sh", b"#!/bin/sh\necho hi\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body["error"]["code"], "executable_file");
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("payload.md", b"\x7fELF\x02\x01\x01\x00binary".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body["error"]["code"], "executable_file");
+
+    let data = data_dir(&harness, "alice");
+    assert!(!data.join("setup.sh").exists());
+    assert!(!data.join("payload.md").exists());
+}
+
+#[tokio::test]
+async fn upload_refuses_a_file_above_the_per_file_cap() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let oversized = vec![b'a'; 10 * 1024 * 1024 + 1];
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("big.txt", oversized.as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "file_too_large");
+    assert!(!data_dir(&harness, "alice").join("big.txt").exists());
+}
+
+#[tokio::test]
+async fn upload_rejects_traversal_in_the_path_field_and_in_a_file_name() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/../outside",
+        &[("notes.md", b"nope\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_path");
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("../escape.md", b"nope\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_path");
+
+    assert!(!harness.instance_dir("alice").join("outside").exists());
+    assert!(!harness.instance_dir("alice").join("escape.md").exists());
+}
+
+#[tokio::test]
+async fn download_returns_exact_bytes_with_a_filename_and_a_media_type() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+    std::fs::write(data_dir(&harness, "alice").join("capture.png"), &png).expect("png");
+
+    let (status, headers, bytes) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/download?path=/capture.png",
+        None,
+        Vec::new(),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let disposition = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .expect("content disposition");
+    assert_eq!(
+        disposition, "attachment; filename=\"capture.png\"",
+        "{disposition}"
+    );
+
+    // A directory is not a download, and the 50 MiB cap is enforced.
+    let (status, _, body) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/download?path=/",
+        None,
+        Vec::new(),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        parse(&String::from_utf8_lossy(&body))["error"]["code"],
+        "not_a_file"
+    );
+
+    let big = data_dir(&harness, "alice").join("big.bin");
+    let file = std::fs::File::create(&big).expect("big file");
+    file.set_len(50 * 1024 * 1024 + 1).expect("sparse size");
+    drop(file);
+    let (status, _, body) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/download?path=/big.bin",
+        None,
+        Vec::new(),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        parse(&String::from_utf8_lossy(&body))["error"]["code"],
+        "file_too_large"
+    );
+}
+
+#[tokio::test]
+async fn archive_packages_a_directory_as_zip() {
+    use std::io::Read as _;
+
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes/sub"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/notes",
+        &[("a.md", b"# A\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/notes/sub",
+        &[("b.txt", b"deeper\n".as_slice())],
+        false,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, headers, bytes) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/archive?path=/notes",
+        None,
+        Vec::new(),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip")
+    );
+    let disposition = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .expect("content disposition");
+    assert!(
+        disposition.contains("filename=\"alice-notes.zip\""),
+        "{disposition}"
+    );
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid zip");
+    let mut names: Vec<String> = (0..archive.len())
+        .map(|index| archive.by_index(index).expect("entry").name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a.md", "sub/", "sub/b.txt"]);
+    let mut text = String::new();
+    archive
+        .by_name("a.md")
+        .expect("a.md")
+        .read_to_string(&mut text)
+        .expect("read");
+    assert_eq!(text, "# A\n");
+    let mut deeper = String::new();
+    archive
+        .by_name("sub/b.txt")
+        .expect("b.txt")
+        .read_to_string(&mut deeper)
+        .expect("read");
+    assert_eq!(deeper, "deeper\n");
+}
+
+#[tokio::test]
+async fn search_finds_literals_regexes_and_cases_and_skips_binaries() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+    std::fs::create_dir_all(data.join("notes/sub")).expect("notes");
+    std::fs::write(data.join("notes/a.md"), "Alpha beta\nsecond line deal\n").expect("a");
+    std::fs::write(data.join("notes/b.md"), "no match here\n").expect("b");
+    std::fs::write(data.join("notes/sub/c.md"), "alpha again\n").expect("c");
+    std::fs::write(data.join("notes/raw.dat"), b"alpha\x00binary\n").expect("raw");
+
+    // Literal, case-insensitive by default.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=alpha&path=/notes",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let found = parse(&body);
+    let hits = found["results"].as_array().expect("results");
+    assert_eq!(hits.len(), 2, "{found}");
+    assert_eq!(hits[0]["path"], "/notes/a.md");
+    assert_eq!(hits[0]["line"], 1);
+    assert_eq!(hits[0]["preview"], "Alpha beta");
+    assert_eq!(hits[1]["path"], "/notes/sub/c.md");
+    assert_eq!(found["truncated"], false);
+    assert_eq!(found["scanned"], 4);
+    assert!(
+        !hits.iter().any(|hit| hit["path"] == "/notes/raw.dat"),
+        "binary file leaked into the results: {found}"
+    );
+
+    // Case-sensitive: only the exact capitalisation.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=Alpha&path=/notes&case_sensitive=true",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let found = parse(&body);
+    let hits = found["results"].as_array().expect("results");
+    assert_eq!(hits.len(), 1, "{found}");
+    assert_eq!(hits[0]["path"], "/notes/a.md");
+
+    // A dot is literal unless regex=true, and regex matches the same line.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=de.l&path=/notes",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["results"].as_array().expect("hits").len(), 0);
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=de.l&path=/notes&regex=true",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let found = parse(&body);
+    let hits = found["results"].as_array().expect("results");
+    assert_eq!(hits.len(), 1, "{found}");
+    assert_eq!(hits[0]["line"], 2);
+    assert_eq!(hits[0]["preview"], "second line deal");
+
+    // limit=1 stops early and says so.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=alpha&path=/notes&limit=1",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let found = parse(&body);
+    assert_eq!(found["results"].as_array().expect("hits").len(), 1);
+    assert_eq!(found["truncated"], true);
+
+    // An invalid regular expression is a 400, never a 500.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files/search?q=%28&path=/notes&regex=true",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "invalid_regex");
+}
+
+#[tokio::test]
+async fn viewers_can_read_downloads_and_search_but_cannot_upload() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+
+    let (status, _, bytes) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/download?path=/SOUL.md",
+        None,
+        Vec::new(),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let (status, body) = harness
+        .request_as(
+            Method::GET,
+            "/api/instances/alice/files/search?q=a&path=/",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, bytes) = send_raw(
+        &harness,
+        Method::GET,
+        "/api/instances/alice/files/archive?path=/",
+        None,
+        Vec::new(),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let (status, body) = upload(
+        &harness,
+        "alice",
+        "/",
+        &[("nope.md", b"nope\n".as_slice())],
+        false,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+    assert!(!data_dir(&harness, "alice").join("nope.md").exists());
+}
+
+// ---------------------------------------------------------------------------
 // Exec (#36)
 // ---------------------------------------------------------------------------
 

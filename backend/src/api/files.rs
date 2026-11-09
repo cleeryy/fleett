@@ -11,13 +11,19 @@ use crate::api::error::ApiError;
 use crate::api::instances;
 use crate::api::AppState;
 use crate::auth::AuthContext;
-use crate::files::{self, Content, Entry, FileError, WriteResult};
+use crate::files::{self, Content, Entry, FileError, SearchResult, WriteResult};
 use crate::models::Status;
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::extract::{Extension, Multipart, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+/// Largest multipart body accepted by `POST .../files/upload`: the 32 MiB
+/// payload cap plus the multipart framing of a few dozen parts.
+pub const MAX_UPLOAD_BODY: usize = files::MAX_UPLOAD_TOTAL_BYTES as usize + 1024 * 1024;
 
 /// Query of the list and content endpoints.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -55,6 +61,44 @@ pub struct WriteRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MkdirRequest {
     pub path: String,
+}
+
+/// Query of `POST .../files/upload`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UploadQuery {
+    /// Replace an existing file (default `false`): the old bytes are backed up
+    /// as `.bak-YYYYMMDD-HHMMSS` first.
+    #[serde(default)]
+    pub overwrite: Option<bool>,
+}
+
+/// Query of `GET .../files/search`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SearchQuery {
+    /// Needle, or regular expression when `regex=true`.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Virtual directory to walk, `/` when omitted.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Treat `q` as a regular expression (default `false`, literal search).
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// Maximum number of hits (default and cap: 200).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Match case (default `false`, case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: Option<bool>,
+}
+
+/// Response of `POST .../files/upload`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadResponse {
+    pub directory: String,
+    pub files: Vec<files::UploadedFile>,
+    /// Sum of the bytes written.
+    pub total: u64,
 }
 
 /// Response of a successful write.
@@ -239,6 +283,269 @@ pub async fn mkdir(
     ))
 }
 
+/// `POST /api/instances/{id}/files/upload` — multipart upload.
+///
+/// Fields: `path` (the target directory, virtual and `/`-rooted) and one or
+/// more `file` parts. The whole request is checked before the first write:
+/// per-file 10 MiB, 32 MiB total, no executable extension or magic bytes, and
+/// an existing target needs `?overwrite=true` (which keeps a `.bak` copy).
+pub async fn upload(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    Query(query): Query<UploadQuery>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
+    instances::load(&state, &id)?;
+    let overwrite = query.overwrite.unwrap_or(false);
+
+    let mut directory: Option<String> = None;
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let field = multipart.next_field().await.map_err(multipart_error)?;
+        let Some(field) = field else {
+            break;
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "path" {
+            directory = Some(
+                field
+                    .text()
+                    .await
+                    .map_err(multipart_error)?
+                    .trim()
+                    .to_string(),
+            );
+            continue;
+        }
+        let Some(filename) = field.file_name().map(str::to_string) else {
+            continue;
+        };
+        let bytes = field.bytes().await.map_err(multipart_error)?;
+        let size = bytes.len();
+        if size as u64 > files::MAX_UPLOAD_FILE_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file_too_large",
+                format!(
+                    "each uploaded file must be at most {} bytes",
+                    files::MAX_UPLOAD_FILE_BYTES
+                ),
+            )
+            .with_details(json!({ "size": size, "limit": files::MAX_UPLOAD_FILE_BYTES })));
+        }
+        total += size;
+        if total as u64 > files::MAX_UPLOAD_TOTAL_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file_too_large",
+                format!(
+                    "one upload carries at most {} bytes",
+                    files::MAX_UPLOAD_TOTAL_BYTES
+                ),
+            )
+            .with_details(json!({ "size": total, "limit": files::MAX_UPLOAD_TOTAL_BYTES })));
+        }
+        uploads.push((filename, bytes.to_vec()));
+    }
+
+    let directory = directory.ok_or_else(|| {
+        ApiError::bad_request(
+            "invalid_upload",
+            "the request must carry a \"path\" field naming the target directory (e.g. \"/notes\")",
+        )
+    })?;
+
+    let lock = state.locks.for_id(&id);
+    let _guard = lock.lock().await;
+    let spec = instances::load(&state, &id)?;
+    let outcome =
+        files::upload(&state.cfg, &id, &directory, &uploads, overwrite).map_err(map_error)?;
+
+    // The first tracked path commits the whole batch (the diff already holds
+    // every file); the other calls are no-ops for the git tree. Then one audit
+    // row for the request.
+    for file in &outcome.files {
+        crate::history::record_ui_write(&state.cfg, &id, &context, &file.path);
+    }
+    audit::record(
+        &state,
+        &context,
+        "instance.file.upload",
+        &spec.id,
+        Some(json!({
+            "directory": outcome.directory,
+            "overwrite": overwrite,
+            "total": outcome.total,
+            "files": outcome
+                .files
+                .iter()
+                .map(|file| json!({
+                    "path": file.path,
+                    "size": file.size,
+                    "backup": file.backup,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(UploadResponse {
+            directory: outcome.directory,
+            files: outcome.files,
+            total: outcome.total,
+        }),
+    ))
+}
+
+/// `GET /api/instances/{id}/files/download?path=/notes/capture.png` — raw
+/// bytes, binary allowed, 50 MiB cap.
+pub async fn download(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    instances::load(&state, &id)?;
+    let cfg = state.cfg.clone();
+    let raw = query.path().to_string();
+    let file = tokio::task::spawn_blocking(move || files::download(&cfg, &id, &raw))
+        .await
+        .map_err(|err| ApiError::internal(format!("the download task failed: {err}")))?
+        .map_err(map_error)?;
+
+    let filename = header_filename(&file.name, "download");
+    let mut response = Response::new(Body::from(file.bytes));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(file.content_type),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .expect("the sanitized filename is a valid header value"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// `GET /api/instances/{id}/files/archive?path=/` — zip of one directory.
+pub async fn archive(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    instances::load(&state, &id)?;
+    let cfg = state.cfg.clone();
+    let raw = query.path().to_string();
+    let stored_id = id.clone();
+    let outcome = tokio::task::spawn_blocking(move || files::archive(&cfg, &stored_id, &raw))
+        .await
+        .map_err(|err| ApiError::internal(format!("the archive task failed: {err}")))?
+        .map_err(map_error)?;
+
+    let suffix = outcome.name.as_deref().unwrap_or("data");
+    let filename = header_filename(&format!("{id}-{suffix}.zip"), "instance-data.zip");
+    let mut response = Response::new(Body::from(outcome.bytes));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .expect("the sanitized filename is a valid header value"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// `GET /api/instances/{id}/files/search?q=…&path=/&regex=false&limit=200` —
+/// full-text search over one directory of the tree (viewer).
+pub async fn search(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<SearchResult>, ApiError> {
+    instances::load(&state, &id)?;
+    let needle = query
+        .q
+        .as_deref()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_query",
+                "the q parameter is required (a literal string, or a regular expression with regex=true)",
+            )
+        })?;
+    let limit = match query.limit {
+        Some(0) => {
+            return Err(ApiError::bad_request(
+                "invalid_limit",
+                "limit must be between 1 and 200",
+            ))
+        }
+        Some(limit) => limit.min(files::MAX_SEARCH_RESULTS),
+        None => files::MAX_SEARCH_RESULTS,
+    };
+    let directory = query.path.clone().unwrap_or_else(|| "/".to_string());
+    let regex = query.regex.unwrap_or(false);
+    let case_sensitive = query.case_sensitive.unwrap_or(false);
+
+    let cfg = state.cfg.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        files::search(&cfg, &id, &directory, &needle, regex, case_sensitive, limit)
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("the search task failed: {err}")))?
+    .map_err(map_error)?;
+    Ok(Json(result))
+}
+
+/// `Content-Disposition` filename: printable ASCII only, quotes and control
+/// characters replaced, never empty.
+fn header_filename(name: &str, fallback: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Turn a multipart read error into the shared envelope; a body above the
+/// route limit is a `413`, not an opaque axum rejection.
+fn multipart_error(err: axum::extract::multipart::MultipartError) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            format!("the upload is larger than the {MAX_UPLOAD_BODY}-byte multipart limit"),
+        )
+        .with_details(json!({ "limit": files::MAX_UPLOAD_TOTAL_BYTES }));
+    }
+    ApiError::bad_request(
+        "invalid_upload",
+        format!("cannot read the multipart body: {err}"),
+    )
+}
+
 /// Normalize `If-Match` (`W/"abc"`, `"abc"`) and the body etag into one value.
 ///
 /// The header wins: it is the standard way to express a conditional write, and
@@ -283,7 +590,7 @@ fn map_error(err: FileError) -> ApiError {
         FileError::TooLarge { size, limit } => ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
-            format!("the file is {size} bytes, above the {limit}-byte limit of the editor"),
+            format!("the file is {size} bytes, above the {limit}-byte limit"),
         )
         .with_details(json!({ "size": size, "limit": limit })),
         FileError::Binary(message) => {
@@ -317,6 +624,20 @@ fn map_error(err: FileError) -> ApiError {
             "extensions": files::EDITABLE_EXTENSIONS,
         })),
         FileError::AlreadyExists(message) => ApiError::conflict("already_exists", message),
+        FileError::Exists(path) => ApiError::conflict(
+            "file_exists",
+            format!("\"{path}\" already exists: send ?overwrite=true to replace it"),
+        )
+        .with_details(json!({ "file": path, "overwrite": false })),
+        FileError::Executable(message) => ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "executable_file",
+            message,
+        )
+        .with_details(json!({ "extensions": files::BLOCKED_EXTENSIONS })),
+        FileError::InvalidUpload(message) => ApiError::bad_request("invalid_upload", message),
+        FileError::InvalidQuery(message) => ApiError::bad_request("invalid_query", message),
+        FileError::InvalidRegex(message) => ApiError::bad_request("invalid_regex", message),
         FileError::DirectoryNotEmpty(message) => ApiError::conflict("directory_not_empty", message),
         FileError::EtagMismatch(current) => ApiError::conflict(
             "etag_mismatch",
