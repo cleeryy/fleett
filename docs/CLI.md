@@ -56,6 +56,12 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett pipelines
+fleett pipeline get <id>
+fleett pipeline run <id> [--wait] [--context JSON]
+fleett pipeline runs <id> [--limit N]
+fleett pipeline apply -f FILE
+fleett pipeline rm <id>
 fleett doctor
 ```
 
@@ -184,6 +190,28 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `pipelines` / `pipeline`
+
+DAG pipelines are documented in [docs/PIPELINES.md](PIPELINES.md):
+
+```bash
+fleett pipelines
+fleett pipeline get 3f2a…
+fleett pipeline run 3f2a… --wait
+fleett pipeline run 3f2a… --context '{"version":"0.6.0"}'
+fleett pipeline runs 3f2a… --limit 20
+fleett pipeline apply -f release.yaml
+fleett pipeline rm 3f2a…
+```
+
+`pipelines` lists every definition (id, name, trigger, cron, step count, enabled,
+updated). `pipeline get` prints the definition and each step. `pipeline run`
+starts a run and prints its id; `--wait` polls the run until it finishes and
+prints the step table, exiting `1` when the run is `failed` or `cancelled`.
+`pipeline runs` prints the history, newest first. `pipeline apply` reads a YAML
+(or JSON) definition and creates it, or replaces the pipeline with the same
+`name`. `pipeline rm` deletes the pipeline and its history.
 
 ### `doctor`
 

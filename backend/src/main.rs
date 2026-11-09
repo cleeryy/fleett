@@ -229,6 +229,52 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// List the DAG pipelines of the fleet (client mode).
+    Pipelines,
+    /// Manage one DAG pipeline (client mode). See docs/PIPELINES.md.
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineCommands,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum PipelineCommands {
+    /// Show one pipeline definition.
+    Get {
+        /// Pipeline id.
+        id: String,
+    },
+    /// Start a run; `--wait` follows it until it finishes.
+    Run {
+        /// Pipeline id.
+        id: String,
+        /// Follow the run until it reaches a terminal state.
+        #[arg(long)]
+        wait: bool,
+        /// Run context, as JSON, available as {{context}} in every prompt.
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// List the runs of one pipeline, newest first.
+    Runs {
+        /// Pipeline id.
+        id: String,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Create or update a pipeline from a YAML (or JSON) file.
+    Apply {
+        /// Definition file.
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+    },
+    /// Delete one pipeline and its run history.
+    Rm {
+        /// Pipeline id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -467,6 +513,28 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
         }
+        Commands::Pipelines => cli::run(cli::Command::Pipelines, json).await,
+        Commands::Pipeline { action } => match action {
+            PipelineCommands::Get { id } => cli::run(cli::Command::PipelineGet(id), json).await,
+            PipelineCommands::Run { id, wait, context } => {
+                cli::run(
+                    cli::Command::PipelineRun(cli::PipelineRunArgs { id, wait, context }),
+                    json,
+                )
+                .await
+            }
+            PipelineCommands::Runs { id, limit } => {
+                cli::run(
+                    cli::Command::PipelineRuns(cli::PipelineRunsArgs { id, limit }),
+                    json,
+                )
+                .await
+            }
+            PipelineCommands::Apply { file } => {
+                cli::run(cli::Command::PipelineApply(file), json).await
+            }
+            PipelineCommands::Rm { id } => cli::run(cli::Command::PipelineRm(id), json).await,
+        },
     };
 
     if code != 0 {

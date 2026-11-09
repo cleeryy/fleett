@@ -283,6 +283,39 @@ the path id). 16 KiB max, TTL 30 s … 30 days. A conversation that reaches 8 ho
 
 `DELETE /api/messages/expired` → `{"removed": N}` (admin only).
 
+## Pipelines
+
+DAG pipelines are documented in [docs/PIPELINES.md](docs/PIPELINES.md). Mutations require the
+admin role; reads accept any authenticated role.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/pipelines` | — | `PipelineView[]`, sorted by name |
+| POST | `/api/pipelines` | `{"name":"release","trigger":"manual\|cron\|webhook","cron":"0 3 * * *","enabled":true,"steps":[…]}` | `201 PipelineView`, admin only |
+| GET | `/api/pipelines/{id}` | — | `PipelineView` |
+| PATCH | `/api/pipelines/{id}` | any of `name`, `trigger`, `cron`, `steps`, `enabled` | `PipelineView`, admin only |
+| DELETE | `/api/pipelines/{id}` | — | `204` (run history included), admin only |
+| POST | `/api/pipelines/{id}/run` | `{"context":{…}}` (optional) | `202 PipelineRunDetail`, admin only |
+| GET | `/api/pipelines/{id}/runs?limit=50` | — | `PipelineRun[]`, newest first |
+| GET | `/api/pipelines/{id}/runs/{run}` | — | `PipelineRunDetail` |
+| POST | `/api/pipelines/{id}/runs/{run}/cancel` | — | `PipelineRunDetail`, admin only |
+
+A step is `{"id":"produce","instance":"alice","prompt":"draft","depends_on":[],
+"retries":0,"timeout_s":300,"on_failure":"stop|continue"}`. Validation failures
+are `400` with `invalid_name`, `no_steps`, `too_many_steps`, `duplicate_step_id`,
+`invalid_step_id`, `unknown_dependency`, `cycle_detected`, `empty_prompt`,
+`prompt_too_large`, `empty_instance`, `invalid_retries`, `invalid_timeout`,
+`invalid_trigger`, `invalid_cron` or `unknown_instance` (resolved at run time).
+A duplicate name is `409 pipeline_exists`; a disabled pipeline is
+`409 pipeline_disabled`; cancelling a finished run is `409 run_finished`.
+
+`PipelineRunDetail` is the run (`id`, `pipeline_id`, `status`, `trigger`,
+`context`, `started_at`, `finished_at`, `error`) plus `steps` rows (`step_id`,
+`instance_id`, `status`, `attempt`, `output`, `error`, `started_at`,
+`finished_at`). Statuses: run `pending|running|ok|failed|cancelled`, step
+`pending|running|ok|failed|skipped`. The run is executed in the background;
+`POST …/run` returns immediately and the detail endpoint is the report.
+
 ## Shares
 
 | Method | Route | Body | Response |

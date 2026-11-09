@@ -102,6 +102,47 @@ impl InspectInfo {
     }
 }
 
+/// Result of one non-interactive command inside an instance container.
+///
+/// A non-zero exit code is a *successful* driver call: the command ran, it
+/// simply answered with an error. Only a failure to start Docker or a timeout
+/// turns into a [`DriverError`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    /// Exit code of the command, when the process reported one.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// The timeout elapsed before the command returned.
+    pub timed_out: bool,
+}
+
+impl ExecOutput {
+    /// `true` when the command exited cleanly before its timeout.
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out && self.exit_code == Some(0)
+    }
+
+    /// Operator-facing failure detail for a non-zero exit or a timeout.
+    pub fn failure_detail(&self) -> Option<String> {
+        if self.succeeded() {
+            return None;
+        }
+        if self.timed_out {
+            return Some("the command timed out".to_string());
+        }
+        let stderr = self.stderr.trim();
+        let stdout = self.stdout.trim();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        Some(match self.exit_code {
+            Some(code) if detail.is_empty() => format!("the command exited with code {code}"),
+            Some(code) => format!("exited with code {code}: {detail}"),
+            None if detail.is_empty() => "the command was terminated".to_string(),
+            None => detail.to_string(),
+        })
+    }
+}
+
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("docker compose {operation} failed: {detail}")]
@@ -193,6 +234,27 @@ pub trait Driver: Send + Sync {
 
     /// Images present in the local Docker image store.
     fn list_images(&self) -> DriverFuture<'_, Result<Vec<ImageRecord>, DriverError>>;
+
+    /// Run `argv` non-interactively inside the instance container and capture
+    /// its output (pipelines, issue #31).
+    ///
+    /// The default implementation keeps every driver that predates pipelines
+    /// compiling: it reports the operation as unsupported instead of silently
+    /// doing nothing. A non-zero exit code is returned as an `Ok(ExecOutput)`;
+    /// only a driver-level failure is an `Err`.
+    fn exec<'a>(
+        &'a self,
+        _spec: &'a InstanceSpec,
+        _argv: &'a [String],
+        _timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
+        Box::pin(async move {
+            Err(DriverError::new(
+                "exec",
+                "this driver does not support running commands inside a container",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +328,39 @@ mod tests {
         let options = LogsOptions::default();
         assert_eq!(options.tail, 200);
         assert!(options.since.is_none());
+    }
+
+    #[test]
+    fn exec_outputs_distinguish_success_from_a_command_failure() {
+        let success = ExecOutput {
+            exit_code: Some(0),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(success.succeeded());
+        assert_eq!(success.failure_detail(), None);
+
+        let failed = ExecOutput {
+            exit_code: Some(2),
+            stdout: String::new(),
+            stderr: "boom".to_string(),
+            timed_out: false,
+        };
+        assert!(!failed.succeeded());
+        let detail = failed.failure_detail().expect("detail");
+        assert!(detail.contains("code 2"), "{detail}");
+        assert!(detail.contains("boom"), "{detail}");
+
+        let timed_out = ExecOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(!timed_out.succeeded());
+        assert!(timed_out
+            .failure_detail()
+            .is_some_and(|detail| detail.contains("timed out")));
     }
 }

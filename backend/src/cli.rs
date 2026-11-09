@@ -153,6 +153,10 @@ pub enum CliError {
     /// `fleett upgrade` already printed the per-instance results.
     #[error("one or more instances were not upgraded")]
     UpgradeIncomplete,
+    /// `fleett pipeline run --wait` already printed the run; only the exit
+    /// code carries the failure.
+    #[error("the pipeline run did not succeed")]
+    PipelineFailed,
 }
 
 impl CliError {
@@ -165,6 +169,7 @@ impl CliError {
             Self::Decode(_) => "decode_error",
             Self::ChecksFailed => "checks_failed",
             Self::UpgradeIncomplete => "upgrade_incomplete",
+            Self::PipelineFailed => "pipeline_failed",
         }
     }
 
@@ -315,6 +320,27 @@ pub enum Command {
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
+    Pipelines,
+    PipelineGet(String),
+    PipelineRun(PipelineRunArgs),
+    PipelineRuns(PipelineRunsArgs),
+    PipelineApply(PathBuf),
+    PipelineRm(String),
+}
+
+/// Arguments of `fleett pipeline run`.
+#[derive(Debug, Clone)]
+pub struct PipelineRunArgs {
+    pub id: String,
+    pub wait: bool,
+    pub context: Option<String>,
+}
+
+/// Arguments of `fleett pipeline runs`.
+#[derive(Debug, Clone)]
+pub struct PipelineRunsArgs {
+    pub id: String,
+    pub limit: usize,
 }
 
 /// Arguments of `fleett say`.
@@ -413,13 +439,22 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Pipelines => pipelines(&client, json).await,
+        Command::PipelineGet(id) => pipeline_get(&client, json, &id).await,
+        Command::PipelineRun(args) => pipeline_run(&client, json, &args).await,
+        Command::PipelineRuns(args) => pipeline_runs(&client, json, &args).await,
+        Command::PipelineApply(file) => pipeline_apply(&client, json, &file).await,
+        Command::PipelineRm(id) => pipeline_rm(&client, json, &id).await,
     }
 }
 
 fn print_error(err: &CliError, json: bool) {
     // The doctor checklist and the upgrade table already carry the failure
     // (and their exit code); repeating it would only add noise.
-    if matches!(err, CliError::ChecksFailed | CliError::UpgradeIncomplete) {
+    if matches!(
+        err,
+        CliError::ChecksFailed | CliError::UpgradeIncomplete | CliError::PipelineFailed
+    ) {
         return;
     }
     if json {
@@ -851,6 +886,349 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
     }
     println!("message {message_id} marked as read");
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PipelineStepView {
+    id: String,
+    instance: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    retries: u32,
+    #[serde(default)]
+    timeout_s: u64,
+    #[serde(default)]
+    on_failure: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PipelineView {
+    id: String,
+    name: String,
+    trigger: String,
+    #[serde(default)]
+    cron: Option<String>,
+    enabled: bool,
+    #[serde(default)]
+    steps: Vec<PipelineStepView>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PipelineRunSummary {
+    id: String,
+    status: String,
+    trigger: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PipelineStepRunView {
+    step_id: String,
+    instance_id: String,
+    status: String,
+    attempt: u32,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PipelineRunDetailView {
+    id: String,
+    status: String,
+    trigger: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    steps: Vec<PipelineStepRunView>,
+}
+
+impl PipelineRunDetailView {
+    fn finished(&self) -> bool {
+        matches!(self.status.as_str(), "ok" | "failed" | "cancelled")
+    }
+}
+
+async fn pipelines(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/pipelines", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let pipelines: Vec<PipelineView> = decode(value)?;
+    if pipelines.is_empty() {
+        println!("no pipelines");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = pipelines
+        .iter()
+        .map(|pipeline| {
+            vec![
+                pipeline.id.clone(),
+                pipeline.name.clone(),
+                pipeline.trigger.clone(),
+                pipeline.cron.clone().unwrap_or_else(|| "-".to_string()),
+                pipeline.steps.len().to_string(),
+                if pipeline.enabled { "yes" } else { "no" }.to_string(),
+                pipeline.updated_at.clone(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "NAME", "TRIGGER", "CRON", "STEPS", "ENABLED", "UPDATED"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn pipeline_get(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/pipelines/{}", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let pipeline: PipelineView = decode(value)?;
+    println!(
+        "{} ({}): trigger {}, enabled {}, cron {}",
+        pipeline.name,
+        pipeline.id,
+        pipeline.trigger,
+        pipeline.enabled,
+        pipeline.cron.as_deref().unwrap_or("-")
+    );
+    println!(
+        "created {}  updated {}",
+        pipeline.created_at, pipeline.updated_at
+    );
+    let rows: Vec<Vec<String>> = pipeline
+        .steps
+        .iter()
+        .map(|step| {
+            vec![
+                step.id.clone(),
+                step.instance.clone(),
+                if step.depends_on.is_empty() {
+                    "-".to_string()
+                } else {
+                    step.depends_on.join(",")
+                },
+                step.retries.to_string(),
+                format!("{}s", step.timeout_s),
+                if step.on_failure.is_empty() {
+                    "stop".to_string()
+                } else {
+                    step.on_failure.clone()
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "STEP",
+                "INSTANCE",
+                "DEPENDS ON",
+                "RETRIES",
+                "TIMEOUT",
+                "ON FAILURE"
+            ],
+            &rows
+        )
+    );
+    for step in &pipeline.steps {
+        println!("{}: {}", step.id, step.prompt.replace('\n', " "));
+    }
+    Ok(())
+}
+
+async fn pipeline_run(client: &Client, json: bool, args: &PipelineRunArgs) -> Result<(), CliError> {
+    let mut body = json!({});
+    if let Some(context) = &args.context {
+        let parsed: Value = serde_json::from_str(context)
+            .map_err(|err| CliError::Config(format!("--context must be valid JSON: {err}")))?;
+        body["context"] = parsed;
+    }
+    let path = format!("/api/pipelines/{}/run", encode_path_segment(&args.id));
+    let value = client.value(Method::POST, &path, &[], Some(body)).await?;
+    let mut detail: PipelineRunDetailView = decode(value)?;
+    if args.wait {
+        let detail_path = format!(
+            "/api/pipelines/{}/runs/{}",
+            encode_path_segment(&args.id),
+            encode_path_segment(&detail.id)
+        );
+        while !detail.finished() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let value = client.value(Method::GET, &detail_path, &[], None).await?;
+            detail = decode(value)?;
+        }
+    }
+    if json {
+        print_json(&detail)?;
+    } else {
+        print_pipeline_run(&detail);
+    }
+    if args.wait && detail.status != "ok" {
+        return Err(CliError::PipelineFailed);
+    }
+    Ok(())
+}
+
+async fn pipeline_runs(
+    client: &Client,
+    json: bool,
+    args: &PipelineRunsArgs,
+) -> Result<(), CliError> {
+    let path = format!("/api/pipelines/{}/runs", encode_path_segment(&args.id));
+    let query = vec![("limit", args.limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let runs: Vec<PipelineRunSummary> = decode(value)?;
+    if runs.is_empty() {
+        println!("no runs");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = runs
+        .iter()
+        .map(|run| {
+            vec![
+                run.id.clone(),
+                run.status.clone(),
+                run.trigger.clone(),
+                run.started_at.clone().unwrap_or_else(|| "-".to_string()),
+                run.finished_at.clone().unwrap_or_else(|| "-".to_string()),
+                run.error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "STATUS", "TRIGGER", "STARTED", "FINISHED", "ERROR"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn pipeline_apply(client: &Client, json: bool, file: &Path) -> Result<(), CliError> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|err| CliError::Config(format!("cannot read {}: {err}", file.display())))?;
+    let body: Value = serde_yaml::from_str(&text)
+        .map_err(|err| CliError::Config(format!("cannot parse {}: {err}", file.display())))?;
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            CliError::Config(format!(
+                "{} has no pipeline name (top-level `name:`)",
+                file.display()
+            ))
+        })?
+        .to_string();
+
+    let existing = client
+        .value(Method::GET, "/api/pipelines", &[], None)
+        .await?;
+    let existing: Vec<PipelineView> = decode(existing)?;
+    let value = match existing.iter().find(|pipeline| pipeline.name == name) {
+        Some(pipeline) => {
+            let path = format!("/api/pipelines/{}", encode_path_segment(&pipeline.id));
+            client.value(Method::PATCH, &path, &[], Some(body)).await?
+        }
+        None => {
+            client
+                .value(Method::POST, "/api/pipelines", &[], Some(body))
+                .await?
+        }
+    };
+    if json {
+        return print_json(&value);
+    }
+    let pipeline: PipelineView = decode(value)?;
+    println!(
+        "applied pipeline {} ({}, {} step(s), trigger {})",
+        pipeline.name,
+        pipeline.id,
+        pipeline.steps.len(),
+        pipeline.trigger
+    );
+    Ok(())
+}
+
+async fn pipeline_rm(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/pipelines/{}", encode_path_segment(id));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "id": id, "deleted": true }));
+    }
+    println!("deleted pipeline {id}");
+    Ok(())
+}
+
+fn print_pipeline_run(detail: &PipelineRunDetailView) {
+    println!(
+        "run {}: {} (trigger {}, started {})",
+        detail.id,
+        detail.status,
+        detail.trigger,
+        detail.started_at.as_deref().unwrap_or("-")
+    );
+    if let Some(error) = &detail.error {
+        println!("  {error}");
+    }
+    let rows: Vec<Vec<String>> = detail
+        .steps
+        .iter()
+        .map(|step| {
+            let detail_text = step
+                .error
+                .clone()
+                .or_else(|| step.output.clone())
+                .unwrap_or_default();
+            vec![
+                step.step_id.clone(),
+                step.instance_id.clone(),
+                step.status.clone(),
+                step.attempt.to_string(),
+                detail_text.lines().next().unwrap_or_default().to_string(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["STEP", "INSTANCE", "STATUS", "ATTEMPT", "OUTPUT"], &rows)
+    );
 }
 
 async fn create(client: &Client, json: bool, args: &CreateArgs) -> Result<(), CliError> {

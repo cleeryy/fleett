@@ -7,7 +7,8 @@
 //! being recreated.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecOutput, ImageRecord, InspectInfo, LogsOptions, PsResult,
+    UsageSample,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -499,6 +500,44 @@ impl Driver for ComposeDriver {
                 .kill_on_drop(true);
             let stdout = run_command(command, "images", IMAGES_TIMEOUT).await?;
             Ok(parse_images(&stdout))
+        })
+    }
+
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
+        Box::pin(async move {
+            if argv.is_empty() {
+                return Err(DriverError::new("exec", "no command to run"));
+            }
+            // `-T` keeps Docker from allocating a TTY: the output is captured,
+            // not rendered, and an agent waiting on a terminal would hang.
+            let mut command = self.command(&spec.id)?;
+            command.arg("exec").arg("-T").arg("agent").args(argv);
+            command.stdin(Stdio::null());
+            command.kill_on_drop(true);
+            let timeout = Duration::from_secs(timeout_s.max(1));
+            match tokio::time::timeout(timeout, command.output()).await {
+                Err(_) => Ok(ExecOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: format!("timed out after {}s", timeout.as_secs()),
+                    timed_out: true,
+                }),
+                Ok(Err(err)) => Err(DriverError::new(
+                    "exec",
+                    format!("could not run docker compose exec: {err}"),
+                )),
+                Ok(Ok(output)) => Ok(ExecOutput {
+                    exit_code: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    timed_out: false,
+                }),
+            }
         })
     }
 }

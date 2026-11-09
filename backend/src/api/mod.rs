@@ -8,6 +8,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod instances;
+pub mod pipelines;
 pub mod providers;
 pub mod shares;
 pub mod templates;
@@ -157,6 +158,17 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .delete(providers::delete),
         )
         .route("/providers/{id}/test", post(providers::test))
+        .route("/pipelines", get(pipelines::list).post(pipelines::create))
+        .route(
+            "/pipelines/{id}",
+            get(pipelines::get)
+                .patch(pipelines::patch)
+                .delete(pipelines::delete),
+        )
+        .route("/pipelines/{id}/run", post(pipelines::run))
+        .route("/pipelines/{id}/runs", get(pipelines::runs))
+        .route("/pipelines/{id}/runs/{run}", get(pipelines::run_detail))
+        .route("/pipelines/{id}/runs/{run}/cancel", post(pipelines::cancel))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(
