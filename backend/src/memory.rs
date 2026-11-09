@@ -357,21 +357,30 @@ pub fn get_by_key(db: &Db, namespace: &str, key: &str) -> Result<Option<MemoryEn
 pub fn list(
     db: &Db,
     namespace: Option<&str>,
+    tag: Option<&str>,
     include_expired: bool,
     limit: usize,
 ) -> Result<Vec<MemoryEntry>, MemoryError> {
     let limit = limit.clamp(1, MAX_LIMIT);
     let now = now_iso();
+    let tag_pattern = tag.map(|tag| format!("%,{},%", tag.trim().to_ascii_lowercase()));
     let entries = db.with_conn(|conn| {
         let mut statement = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM memory_entries \
              WHERE deleted = 0 \
                AND (?1 IS NULL OR namespace = ?1) \
-               AND (?2 = 1 OR expires_at IS NULL OR expires_at > ?3) \
-             ORDER BY updated_at DESC LIMIT ?4"
+               AND (?2 IS NULL OR ',' || tags || ',' LIKE ?2) \
+               AND (?3 = 1 OR expires_at IS NULL OR expires_at > ?4) \
+             ORDER BY updated_at DESC LIMIT ?5"
         ))?;
         let rows = statement.query_map(
-            params![namespace, include_expired as i64, now, limit as i64],
+            params![
+                namespace,
+                tag_pattern,
+                include_expired as i64,
+                now,
+                limit as i64
+            ],
             row_to_entry,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

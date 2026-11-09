@@ -149,7 +149,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/memory/search", get(memory::search))
         .route("/memory/by-key", get(memory::get_by_key))
         .route("/memory/expired", delete(memory::purge))
-        .route("/memory/{id}", get(memory::get).put(memory::update).delete(memory::delete))
+        .route(
+            "/memory/{id}",
+            get(memory::get).put(memory::update).delete(memory::delete),
+        )
         .route("/memory/{id}/history", get(memory::history))
         .route("/memory/{id}/rollback", post(memory::rollback))
         .route("/memory/{id}/promote", post(memory::promote))
