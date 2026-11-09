@@ -323,6 +323,41 @@ ALTER TABLE instances ADD COLUMN unhealthy_after INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE instances ADD COLUMN max_restarts INTEGER NOT NULL DEFAULT 5;
 ALTER TABLE instances ADD COLUMN heal_backoff_s INTEGER NOT NULL DEFAULT 30;
 "#,
+    // v14 — outbound alert channels and their delivery journal (issue #33).
+    // A channel secret is optional (a plain webhook needs none) and, when
+    // present, encrypted exactly like a provider secret. Deliveries are kept
+    // after the channel is deleted: they are the audit trail of what was sent.
+    r#"
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    nonce       BLOB,
+    ciphertext  BLOB,
+    events      TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id   TEXT NOT NULL,
+    event        TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    delivered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
+    ON notification_deliveries (channel_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_event
+    ON notification_deliveries (event, created_at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -405,6 +440,55 @@ pub struct ProviderRecord {
     /// AES-GCM nonce of the stored secret.
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
+}
+
+/// One outbound alert channel (`notification_channels`).
+///
+/// `nonce` and `ciphertext` are both `None` for a channel without a secret
+/// (a plain webhook or Discord URL); when set they hold the AES-256-GCM blob
+/// of the channel secret, never its plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationChannelRecord {
+    pub id: String,
+    pub name: String,
+    /// `webhook`, `discord`, `telegram` or `smtp`.
+    pub kind: String,
+    pub target: String,
+    pub nonce: Option<Vec<u8>>,
+    pub ciphertext: Option<Vec<u8>>,
+    /// Comma-separated event subscriptions (`*`, `incident.*` or one event).
+    pub events: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One row of `notification_deliveries`: the journal of an alert attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationDeliveryRecord {
+    pub id: i64,
+    pub channel_id: String,
+    pub event: String,
+    pub subject: String,
+    /// `pending`, `sent`, `failed` or `suppressed`.
+    pub status: String,
+    pub attempts: usize,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+}
+
+/// A delivery row to insert (the id is allocated by SQLite).
+#[derive(Debug, Clone)]
+pub struct NewNotificationDelivery {
+    pub channel_id: String,
+    pub event: String,
+    pub subject: String,
+    pub status: String,
+    pub attempts: usize,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
 }
 
 /// A named API token. The secret is never stored, only its digest.
@@ -1934,4 +2018,242 @@ mod tests {
         let err = Db::open(&path).expect_err("newer schema is refused");
         assert!(matches!(err, DbError::SchemaNewer { found: 99, .. }));
     }
+}
+
+impl Db {
+    /// Insert one notification channel and its optional encrypted secret.
+    pub fn insert_notification_channel(
+        &self,
+        record: &NotificationChannelRecord,
+        secret: Option<(&[u8], &[u8])>,
+    ) -> Result<(), DbError> {
+        let (nonce, ciphertext) = match secret {
+            Some((nonce, ciphertext)) => (Some(nonce), Some(ciphertext)),
+            None => (None, None),
+        };
+        self.lock().execute(
+            "INSERT INTO notification_channels (id, name, kind, target, nonce, ciphertext, \
+             events, enabled, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.name,
+                record.kind,
+                record.target,
+                nonce,
+                ciphertext,
+                record.events,
+                record.enabled,
+                record.created_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update one channel. `secret` carries a fresh nonce and ciphertext to
+    /// rotate the secret, `Some(None)` clears it, `None` keeps the stored one.
+    pub fn update_notification_channel(
+        &self,
+        record: &NotificationChannelRecord,
+        secret: Option<Option<(&[u8], &[u8])>>,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        let updated = match secret {
+            Some(Some((nonce, ciphertext))) => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 nonce = ?5, ciphertext = ?6, events = ?7, enabled = ?8, updated_at = ?9 \
+                 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    nonce,
+                    ciphertext,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+            Some(None) => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 nonce = NULL, ciphertext = NULL, events = ?5, enabled = ?6, updated_at = ?7 \
+                 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 events = ?5, enabled = ?6, updated_at = ?7 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+        };
+        if updated == 0 {
+            return Err(DbError::Conflict(record.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// One notification channel, secret blobs included.
+    pub fn notification_channel(
+        &self,
+        id: &str,
+    ) -> Result<Option<NotificationChannelRecord>, DbError> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, name, kind, target, nonce, ciphertext, events, enabled, \
+                 created_at, updated_at FROM notification_channels WHERE id = ?1",
+                params![id],
+                notification_channel_record,
+            )
+            .optional()?)
+    }
+
+    /// Every notification channel, sorted by name. Used by the delivery loop,
+    /// so the encrypted blobs are read in the same round trip.
+    pub fn list_notification_channels(&self) -> Result<Vec<NotificationChannelRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, name, kind, target, nonce, ciphertext, events, enabled, \
+             created_at, updated_at FROM notification_channels ORDER BY name, id",
+        )?;
+        let rows = statement
+            .query_map([], notification_channel_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete one channel. Deliveries stay in the journal.
+    pub fn delete_notification_channel(&self, id: &str) -> Result<bool, DbError> {
+        let deleted = self.lock().execute(
+            "DELETE FROM notification_channels WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Append one delivery row and return its id.
+    pub fn insert_notification_delivery(
+        &self,
+        delivery: &NewNotificationDelivery,
+    ) -> Result<i64, DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO notification_deliveries (channel_id, event, subject, status, attempts, \
+             error, created_at, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                delivery.channel_id,
+                delivery.event,
+                delivery.subject,
+                delivery.status,
+                delivery.attempts as i64,
+                delivery.error,
+                delivery.created_at,
+                delivery.delivered_at,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update the outcome of one delivery row.
+    pub fn update_notification_delivery(
+        &self,
+        id: i64,
+        status: &str,
+        attempts: usize,
+        error: Option<&str>,
+        delivered_at: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE notification_deliveries SET status = ?2, attempts = ?3, error = ?4, \
+             delivered_at = ?5 WHERE id = ?1",
+            params![id, status, attempts as i64, error, delivered_at],
+        )?;
+        Ok(())
+    }
+
+    /// Deliveries, newest first, optionally filtered by channel.
+    pub fn list_notification_deliveries(
+        &self,
+        channel: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<NotificationDeliveryRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, channel_id, event, subject, status, attempts, error, created_at, \
+             delivered_at FROM notification_deliveries \
+             WHERE (?1 IS NULL OR channel_id = ?1) ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![channel, limit as i64], notification_delivery_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Id of the most recent delivery for one channel and event at or after
+    /// `since` (RFC 3339, same format as [`now_iso`]). Used to coalesce alerts.
+    pub fn recent_notification_delivery(
+        &self,
+        channel_id: &str,
+        event: &str,
+        since: &str,
+    ) -> Result<Option<i64>, DbError> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM notification_deliveries \
+                 WHERE channel_id = ?1 AND event = ?2 AND created_at >= ?3 \
+                 AND status != 'suppressed' \
+                 ORDER BY id DESC LIMIT 1",
+                params![channel_id, event, since],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+fn notification_channel_record(row: &Row<'_>) -> rusqlite::Result<NotificationChannelRecord> {
+    Ok(NotificationChannelRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        target: row.get(3)?,
+        nonce: row.get(4)?,
+        ciphertext: row.get(5)?,
+        events: row.get(6)?,
+        enabled: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn notification_delivery_record(row: &Row<'_>) -> rusqlite::Result<NotificationDeliveryRecord> {
+    let attempts: i64 = row.get(5)?;
+    Ok(NotificationDeliveryRecord {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        event: row.get(2)?,
+        subject: row.get(3)?,
+        status: row.get(4)?,
+        attempts: attempts.max(0) as usize,
+        error: row.get(6)?,
+        created_at: row.get(7)?,
+        delivered_at: row.get(8)?,
+    })
 }

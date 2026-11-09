@@ -11,6 +11,7 @@ pub mod incidents;
 pub mod instances;
 pub mod json;
 pub mod memory;
+pub mod notifications;
 pub mod pipelines;
 pub mod providers;
 pub mod schedules;
@@ -43,6 +44,9 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tower_http::trace::TraceLayer;
 
+/// Timeout of one outbound notification HTTP call.
+pub const NOTIFY_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Shared state of every handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +61,9 @@ pub struct AppState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Watchdog sampling state (streaks, heal attempts, backoff).
     pub watchdog: Arc<crate::watchdog::WatchdogState>,
+    /// Shared HTTP client of the outbound notifications (and nothing else):
+    /// one connection pool, one timeout, no per-alert client.
+    pub http: reqwest::Client,
     pub started_at: Instant,
 }
 
@@ -100,6 +107,10 @@ impl AppState {
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             watchdog: Arc::new(crate::watchdog::WatchdogState::default()),
+            http: reqwest::Client::builder()
+                .timeout(NOTIFY_HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             started_at: Instant::now(),
         })
     }
@@ -148,6 +159,18 @@ fn api_routes(state: AppState) -> Router<AppState> {
     let protected: Router<AppState> = Router::new()
         .route("/auth/check", get(auth::check))
         .route("/auth/me", get(auth::me))
+        .route(
+            "/notifications",
+            get(notifications::list).post(notifications::create),
+        )
+        .route("/notifications/deliveries", get(notifications::deliveries))
+        .route(
+            "/notifications/{id}",
+            get(notifications::get)
+                .patch(notifications::patch)
+                .delete(notifications::delete),
+        )
+        .route("/notifications/{id}/test", post(notifications::test))
         .route("/audit", get(audit::list))
         .route("/messages", get(bus::list))
         .route("/messages/expired", delete(bus::purge))

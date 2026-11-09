@@ -8,6 +8,7 @@ Instance secrets are provider API keys and messaging bot tokens:
 | `<api_key_env>` when it differs from the gate token | `api_key_env` / `gate_token` |
 | `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN` | `channel.token` |
 | `env` entries with `secret: true` | the API caller (`POST`, `PATCH`, `PUT .../env`) |
+| notification channel secret | `POST`/`PATCH /api/notifications` (see [NOTIFICATIONS.md](NOTIFICATIONS.md)) |
 
 Environment variables with `secret: false` are stored in clear and returned by
 the API; see [ENV.md](ENV.md).
@@ -171,6 +172,7 @@ curl -X PATCH https://fleett.example/api/instances/alice \
 |---|---|
 | New instance with tokens, no key, no legacy file | `409 secrets_key_missing` — run `sudo fleett secrets init` |
 | New instance with no token at all | created |
+| Notification channel with a secret, no key | `409 secrets_key_missing`; a webhook without a secret is created (see [NOTIFICATIONS.md](NOTIFICATIONS.md)) |
 | Instance with a legacy `secrets.env`, no key | keeps running (the driver reads the file) and a warning is reported, but API env writes need the key |
 | Instance with encrypted values, key missing | every compose call fails with `docker compose … failed: secrets … fleett secrets init`; the API returns `409 secrets_key_missing` on patch |
 
