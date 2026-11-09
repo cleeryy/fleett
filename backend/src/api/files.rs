@@ -137,6 +137,7 @@ pub async fn write(
 
     // The write already happened: audit it before a restart can fail, so the
     // trail never loses a mutation.
+    crate::history::record_ui_write(&state.cfg, &id, &context, &outcome.path);
     audit::record(
         &state,
         &context,
@@ -197,6 +198,7 @@ pub async fn delete_file(
 
     let spec = instances::load(&state, &id)?;
     let path = files::delete(&state.cfg, &id, query.path()).map_err(map_error)?;
+    crate::history::record_ui_write(&state.cfg, &id, &context, &path);
     audit::record(
         &state,
         &context,

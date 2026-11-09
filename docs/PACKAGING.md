@@ -30,8 +30,9 @@ docker build -t fleett:test .
 ```
 
 Three stages: `node:22-alpine` builds `web/` (`pnpm install --frozen-lockfile`,
-`pnpm build`), `rust:1-slim-trixie` builds the backend with
-`--release --locked --features embed-web` after copying `web/dist` to
+`pnpm build`), `rust:1-slim-trixie` + `cmake` (libgit2 is vendored and compiled
+from source by the `git2` crate used for instance history) builds the backend
+with `--release --locked --features embed-web` after copying `web/dist` to
 `../web/dist` (where `rust-embed` looks), and `debian:trixie-slim` is the
 runtime: `ca-certificates`, `curl` (healthcheck), `docker-cli` and
 `docker-compose` — the compose driver shells out to `docker compose`, so the
@@ -135,6 +136,10 @@ The script builds `web/` and the backend (`--features embed-web`), stages
 `conffiles` and the maintainer scripts, then runs `dpkg-deb --build`. The
 result lands in `dist/` with a `.sha256`. `FLEETT_BINARY=/path/to/fleett`
 reuses an existing build (it must be an `embed-web` build).
+
+Build host: a C toolchain and `cmake` are required — the `git2` crate vendors
+libgit2 and compiles it. The library is linked statically into `/usr/bin/fleett`,
+so the `.deb` keeps zero runtime dependency and never calls a host `git`.
 
 Contents:
 

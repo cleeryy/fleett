@@ -150,6 +150,27 @@ and `data/healthcheck.py` are rendered by fleett on every PATCH: they are
 readable with `editable:false`/`rendered:true`, and any write returns
 `409 file_regenerated`.
 
+### Instance history
+
+Every instance keeps a git repository at `instances/<id>/.git` (libgit2, no
+host `git` needed) versioning a whitelist: `data/SOUL.md`, `data/config.yaml`,
+`data/skills/**` and the other editor files under `data/` — never a database, a
+`.bak`, `healthcheck.py` or `secrets.env`. Reads need any role, the revert needs
+`admin`. `docs/GIT.md` documents the layout, authors and limits.
+
+| Method | Route | Body | Effect |
+|---|---|---|---|
+| GET | `/api/instances/{id}/git/log?path=/SOUL.md&limit=50` | — | `{commits:[{id,short,author,email,at,message,paths}]}`, newest first |
+| GET | `/api/instances/{id}/git/diff?from=&to=` | — | `{from,to,diff}`; `to` defaults to `HEAD`, `from` to its first parent |
+| GET | `/api/instances/{id}/git/status` | — | `{modified:[…],untracked:[…]}`, whitelist only |
+| POST | `/api/instances/{id}/git/revert` | `{"commit","paths?","restart?"}` | restores the files of one commit (`.bak` first), commits the restore, audits `instance.git.revert`, optional restart; `404` for an unknown commit, `400 untracked_path` outside the whitelist |
+
+A save through the file API is a `ui: data/SOUL.md` commit attributed to the
+signed-in identity (`name <email>` for SSO, `<actor> <actor@fleett.local>` for a
+bearer token). A change made outside the API is recorded as `sync: …` by
+`fleett <fleett@localhost>` at startup and after every compose apply. Nothing
+here talks to Docker: a stopped instance still serves its log, diff and revert.
+
 ### LAN access and egress enforcement
 
 `allow_lan` is `false` by default: the instance only joins the restricted `fleett` network.

@@ -31,6 +31,12 @@ FROM rust:1-slim-trixie AS backend
 
 WORKDIR /src
 
+# cmake: libgit2 is vendored and built from source by `git2` (instance history),
+# so the build stage needs a C toolchain; the runtime image stays untouched.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY backend/Cargo.toml backend/Cargo.lock ./backend/
 COPY backend/src ./backend/src
 

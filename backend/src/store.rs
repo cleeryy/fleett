@@ -264,6 +264,12 @@ pub fn remove_instance(cfg: &Config, id: &str, purge: bool) -> io::Result<()> {
         if data.exists() {
             fs::remove_dir_all(&data)?;
         }
+        // The history dies with the data: a purged instance is forgotten, and
+        // the directory must be empty for `remove_dir` below to succeed.
+        let git = dir.join(crate::history::GIT_DIR);
+        if git.exists() {
+            fs::remove_dir_all(&git)?;
+        }
         // Only removes the directory when nothing else is left in it.
         let _ = fs::remove_dir(&dir);
     }

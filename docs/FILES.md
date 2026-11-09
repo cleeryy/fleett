@@ -141,6 +141,10 @@ Backups are ordinary data files: they are browsable, they are not editable
 (the extension is not in the allowlist), and they are removed with the instance
 directory when the instance is deleted with `?purge=true`.
 
+The backups cover a single generation only. The durable record of every save is
+the per-instance git history (`docs/GIT.md`): each write commits the new bytes
+as `ui: data/SOUL.md`, with the author of the request.
+
 ## Restart semantics
 
 A file write changes bytes on disk only. Hermes reads `config.yaml` and

@@ -499,7 +499,7 @@ pub fn read(cfg: &Config, id: &str, raw: &str) -> Result<Content, FileError> {
 }
 
 /// Path of the backup written before an overwrite, never colliding.
-fn backup_path(path: &Path) -> PathBuf {
+pub(crate) fn backup_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
