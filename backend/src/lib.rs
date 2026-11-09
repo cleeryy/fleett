@@ -22,6 +22,7 @@ pub mod history;
 pub mod instance_archive;
 pub mod logs;
 pub mod maintenance;
+pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod migrate;
