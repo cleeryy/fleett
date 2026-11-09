@@ -70,6 +70,9 @@ FLEETT_NETWORK=fleett
 FLEETT_EGRESS=restrict                      # off = no firewall check, with a warning
 FLEETT_SECRETS_KEY_FILE=/etc/fleett/secrets.key  # AES-256 key, outside FLEETT_ROOT
 FLEETT_TOKEN=<long token, generate with: openssl rand -hex 32>
+# Audit: signed export key and retention (see docs/AUDIT.md)
+FLEETT_AUDIT_HMAC_KEY=<64 hex characters, generate with: openssl rand -hex 32>
+FLEETT_AUDIT_RETENTION=90d
 ```
 
 `/etc/systemd/system/fleett.service`:

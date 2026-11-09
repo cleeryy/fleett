@@ -869,6 +869,109 @@ async fn bearer_mutations_need_no_csrf_and_are_audited() {
     assert_eq!(entry["method"], "bearer");
 }
 
+#[tokio::test]
+async fn logins_logouts_and_refusals_are_audited() {
+    let harness = Harness::oidc(&[ADMIN_GROUP]);
+    let cookies = harness.sign_in().await;
+
+    let (status, body) = harness
+        .get("/api/audit?action=auth.login", Some(TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entry = entries.as_array().expect("array")[0].clone();
+    assert_eq!(entry["actor"], "cleeryy@example.test");
+    assert_eq!(entry["role"], "admin");
+    assert_eq!(entry["method"], "session");
+    assert_eq!(entry["result"], "ok");
+    assert_eq!(entry["details"]["provider"], "https://idp.test");
+
+    // A callback with no state cookie is a failed login, recorded as such.
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/auth/callback?code=the-code&state=forged",
+            None,
+            None,
+            &BTreeMap::new(),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = harness
+        .get("/api/audit?action=auth.login&result=failed", Some(TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entry = entries.as_array().expect("array")[0].clone();
+    assert_eq!(entry["actor"], "anonymous");
+    assert_eq!(entry["result"], "failed");
+    assert_eq!(entry["details"]["reason"], "cookie_missing");
+
+    // Logout identifies the session before the cookie is cleared.
+    let (status, _, body) = harness
+        .send(Method::POST, "/auth/logout", None, None, &cookies, &[])
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = harness
+        .get("/api/audit?action=auth.logout", Some(TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entry = entries.as_array().expect("array")[0].clone();
+    assert_eq!(entry["actor"], "cleeryy@example.test");
+    assert_eq!(entry["result"], "ok");
+}
+
+#[tokio::test]
+async fn refused_mutations_are_audited_as_refused() {
+    // A viewer attempting a mutation.
+    let viewer = Harness::oidc(&[VIEWER_GROUP]);
+    let cookies = viewer.sign_in().await;
+    let (status, _, _) = viewer
+        .send(
+            Method::POST,
+            "/api/shares",
+            Some(json!({"name": "findings"})),
+            None,
+            &cookies,
+            &csrf(&cookies),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = viewer
+        .get("/api/audit?action=auth.mutation_refused", Some(TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entry = entries.as_array().expect("array")[0].clone();
+    assert_eq!(entry["result"], "refused");
+    assert_eq!(entry["details"]["reason"], "viewer_read_only");
+
+    // An admin cookie missing the CSRF header.
+    let admin = Harness::oidc(&[ADMIN_GROUP]);
+    let cookies = admin.sign_in().await;
+    let (status, _, _) = admin
+        .send(
+            Method::POST,
+            "/api/shares",
+            Some(json!({"name": "findings"})),
+            None,
+            &cookies,
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = admin
+        .get("/api/audit?action=auth.mutation_refused", Some(TOKEN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entry = entries.as_array().expect("array")[0].clone();
+    assert_eq!(entry["result"], "refused");
+    assert_eq!(entry["details"]["reason"], "csrf_required");
+}
+
 // ---------------------------------------------------------------------------
 // Named API tokens
 // ---------------------------------------------------------------------------

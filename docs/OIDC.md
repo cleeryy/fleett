@@ -215,11 +215,22 @@ Every successful mutation appends to `audit_log`:
 | `share.attach`, `share.detach` | share name (`details.instance`) |
 | `token.create`, `token.revoke` | token id |
 
-Each row stores `at`, `actor`, `role`, `method` (`session`/`bearer`), `ip` and
-JSON `details`. `GET /api/audit?limit=200` returns the newest first (1–1000).
-Failed requests are not recorded. The table is never pruned automatically;
-delete old rows with `sqlite3 fleet.db "DELETE FROM audit_log WHERE at < date('now','-180 days')"`
-if the database grows.
+Each row stores `at`, `actor`, `role`, `method` (`session`/`bearer`), `ip`,
+`user_agent`, `result` (`ok`, `failed` or `refused`), an optional `request_id`
+and JSON `details`. The OIDC flow itself is audited: a successful callback
+appends `auth.login` with the email and the issuer, a rejected callback appends
+`auth.login` with `result=failed` and `details.reason` (`cookie_missing`,
+`state_mismatch`, `expired`, …), and `POST /auth/logout` appends `auth.logout`.
+Refused mutations (viewer role, missing CSRF header) are recorded as
+`auth.mutation_refused` with `result=refused`.
+
+`GET /api/audit` returns the newest first with filters (`actor`, `action`,
+`target`, `from`, `to`, `result`, `limit`, `offset`); the legacy
+`?limit=200` call is unchanged (1–1000). See [AUDIT.md](AUDIT.md) for the
+signed JSONL export (`GET /api/audit/export?from=&to=`,
+`X-Fleett-Signature`, `FLEETT_AUDIT_HMAC_KEY`) and the configurable retention
+(`FLEETT_AUDIT_RETENTION`, default `90d`, applied daily and by
+`DELETE /api/audit/expired`, which leaves an `audit.purge` entry).
 
 ## Testing
 

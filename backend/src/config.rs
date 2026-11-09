@@ -458,6 +458,10 @@ pub struct Config {
     /// API hardening: rate limits and auth lockout (`FLEETT_RATE_LIMIT_*`,
     /// `FLEETT_AUTH_LOCKOUT_*`). See docs/HARDENING.md.
     pub security: SecurityConfig,
+    /// Key signing `GET /api/audit/export` (`FLEETT_AUDIT_HMAC_KEY`), decoded.
+    pub audit_hmac_key: Option<crate::audit::AuditKey>,
+    /// Rows older than this are pruned (`FLEETT_AUDIT_RETENTION`, default 90d).
+    pub audit_retention: chrono::Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -682,6 +686,27 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
         let security = resolve_security(&get)?;
+        let audit_hmac_key = match get("AUDIT_HMAC_KEY") {
+            None => None,
+            Some(value) => Some(crate::audit::AuditKey::new(
+                crate::audit::parse_key(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_HMAC_KEY",
+                    value: "<redacted>".to_string(),
+                    detail,
+                })?,
+            )),
+        };
+        let audit_retention = match get("AUDIT_RETENTION") {
+            None => crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("the default retention is valid"),
+            Some(value) => {
+                crate::audit::parse_retention(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_RETENTION",
+                    value: value.clone(),
+                    detail,
+                })?
+            }
+        };
         let public_url = get("PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
         let exec_allowlist = get("EXEC_ALLOWLIST");
 
@@ -760,6 +785,8 @@ impl Config {
             log_retention,
             log_max_rows,
             security,
+            audit_hmac_key,
+            audit_retention,
         })
     }
 
@@ -815,6 +842,9 @@ impl Config {
                 lockout_failures: 0,
                 ..SecurityConfig::default()
             },
+            audit_hmac_key: None,
+            audit_retention: crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("valid default"),
         }
     }
 

@@ -354,6 +354,7 @@ pub(crate) async fn run_scheduled(state: AppState, request: UpgradeRequest, depl
         ip: None,
         subject: "scheduler".to_string(),
         scope: None,
+        user_agent: None,
     };
     let prepared = match prepare(&state, &request) {
         Ok(prepared) => prepared,

@@ -227,6 +227,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/webhooks/{id}/test", post(webhooks::test))
         .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
         .route("/audit", get(audit::list))
+        .route("/audit/export", get(audit::export))
+        .route("/audit/expired", delete(audit::purge))
         .route("/logs", get(logcenter::search))
         .route("/logs/stream", get(logcenter::stream))
         .route("/logs/export", get(logcenter::export))

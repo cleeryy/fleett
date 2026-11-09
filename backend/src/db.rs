@@ -559,6 +559,15 @@ CREATE INDEX IF NOT EXISTS idx_egress_blocks_instance
 CREATE INDEX IF NOT EXISTS idx_egress_blocks_at
     ON egress_blocks (at);
 "#,
+    // correlation id. Existing rows keep NULL/`ok`.
+    r#"
+ALTER TABLE audit_log ADD COLUMN user_agent TEXT;
+ALTER TABLE audit_log ADD COLUMN result TEXT NOT NULL DEFAULT 'ok';
+ALTER TABLE audit_log ADD COLUMN request_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -618,6 +627,12 @@ pub struct AuditRecord {
     pub action: String,
     pub target: String,
     pub ip: Option<String>,
+    /// Client `User-Agent`, bounded by the middleware before it is stored.
+    pub user_agent: Option<String>,
+    /// Outcome: `ok`, `failed` or `refused`.
+    pub result: String,
+    /// Correlation id, when the caller supplied one.
+    pub request_id: Option<String>,
     /// JSON text, when the action carries structured details.
     pub details: Option<String>,
 }
@@ -632,7 +647,57 @@ pub struct NewAuditRecord {
     pub action: String,
     pub target: String,
     pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    /// `ok` for a successful mutation, `failed`/`refused` otherwise.
+    pub result: String,
+    pub request_id: Option<String>,
     pub details: Option<String>,
+}
+
+impl NewAuditRecord {
+    /// A successful entry, the shape used by [`crate::api::audit::record`].
+    pub fn ok(
+        at: impl Into<String>,
+        actor: impl Into<String>,
+        role: impl Into<String>,
+        method: impl Into<String>,
+        action: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            at: at.into(),
+            actor: actor.into(),
+            role: role.into(),
+            method: method.into(),
+            action: action.into(),
+            target: target.into(),
+            ip: None,
+            user_agent: None,
+            result: "ok".to_string(),
+            request_id: None,
+            details: None,
+        }
+    }
+}
+
+/// Filters accepted by [`Db::query_audit`], newest first.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// Exact actor match.
+    pub actor: Option<String>,
+    /// Exact action match (`instance.create`).
+    pub action: Option<String>,
+    /// Exact target match (an instance id, a token id…).
+    pub target: Option<String>,
+    /// Inclusive lower bound, RFC 3339 (normalised by the HTTP layer).
+    pub from: Option<String>,
+    /// Inclusive upper bound, RFC 3339 (normalised by the HTTP layer).
+    pub to: Option<String>,
+    /// Exact outcome (`ok`, `failed`, `refused`).
+    pub result: Option<String>,
+    /// Page size; `None` returns every match (export).
+    pub limit: Option<usize>,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1491,8 +1556,9 @@ impl Db {
     pub fn record_audit(&self, entry: &NewAuditRecord) -> Result<i64, DbError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO audit_log (at, actor, role, method, action, target, ip, details) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO audit_log \
+             (at, actor, role, method, action, target, ip, user_agent, result, request_id, details) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.at,
                 entry.actor,
@@ -1501,6 +1567,9 @@ impl Db {
                 entry.action,
                 entry.target,
                 entry.ip,
+                entry.user_agent,
+                entry.result,
+                entry.request_id,
                 entry.details,
             ],
         )?;
@@ -1509,13 +1578,62 @@ impl Db {
 
     /// Most recent entries first.
     pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditRecord>, DbError> {
+        self.query_audit(&AuditFilter {
+            limit: Some(limit),
+            ..AuditFilter::default()
+        })
+    }
+
+    /// Filtered audit entries, newest first (id descending).
+    ///
+    /// `limit = None` returns every match: the export must contain the whole
+    /// range it signs. Callers that serve a page always pass a bound.
+    pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT id, at, actor, role, method, action, target, ip, user_agent, result, \
+             request_id, details FROM audit_log",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(actor) = &filter.actor {
+            clauses.push("actor = ?");
+            values.push(rusqlite::types::Value::Text(actor.clone()));
+        }
+        if let Some(action) = &filter.action {
+            clauses.push("action = ?");
+            values.push(rusqlite::types::Value::Text(action.clone()));
+        }
+        if let Some(target) = &filter.target {
+            clauses.push("target = ?");
+            values.push(rusqlite::types::Value::Text(target.clone()));
+        }
+        if let Some(from) = &filter.from {
+            clauses.push("at >= ?");
+            values.push(rusqlite::types::Value::Text(from.clone()));
+        }
+        if let Some(to) = &filter.to {
+            clauses.push("at <= ?");
+            values.push(rusqlite::types::Value::Text(to.clone()));
+        }
+        if let Some(result) = &filter.result {
+            clauses.push("result = ?");
+            values.push(rusqlite::types::Value::Text(result.clone()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        // SQLite reads a negative LIMIT as "no limit".
+        values.push(rusqlite::types::Value::Integer(
+            filter.limit.map_or(-1, |limit| limit as i64),
+        ));
+        values.push(rusqlite::types::Value::Integer(filter.offset as i64));
+
         let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT id, at, actor, role, method, action, target, ip, details \
-             FROM audit_log ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut statement = conn.prepare(&sql)?;
         let rows = statement
-            .query_map(params![limit as i64], |row| {
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
                 Ok(AuditRecord {
                     id: row.get(0)?,
                     at: row.get(1)?,
@@ -1525,11 +1643,22 @@ impl Db {
                     action: row.get(5)?,
                     target: row.get(6)?,
                     ip: row.get(7)?,
-                    details: row.get(8)?,
+                    user_agent: row.get(8)?,
+                    result: row.get(9)?,
+                    request_id: row.get(10)?,
+                    details: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Delete every row strictly older than `cutoff` (RFC 3339), returning the
+    /// number of rows removed.
+    pub fn purge_audit_before(&self, cutoff: &str) -> Result<usize, DbError> {
+        let conn = self.lock();
+        let removed = conn.execute("DELETE FROM audit_log WHERE at < ?1", params![cutoff])?;
+        Ok(removed)
     }
 
     pub fn insert_api_token(&self, token: &NewApiToken) -> Result<(), DbError> {
@@ -2221,6 +2350,9 @@ mod tests {
                 action: action.to_string(),
                 target: "alice".to_string(),
                 ip: Some("10.1.20.50".to_string()),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                result: "ok".to_string(),
+                request_id: Some(format!("req-{index}")),
                 details: None,
             })
             .expect("record");
@@ -2232,7 +2364,102 @@ mod tests {
         assert_eq!(entries[1].action, "instance.create");
         assert_eq!(entries[0].actor, "cleeryy@example.test");
         assert_eq!(entries[0].ip.as_deref(), Some("10.1.20.50"));
+        assert_eq!(entries[0].user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(entries[0].result, "ok");
+        assert_eq!(entries[0].request_id.as_deref(), Some("req-1"));
         assert_eq!(db.list_audit(1).expect("limit").len(), 1);
+    }
+
+    #[test]
+    fn audit_entries_are_filtered_paginated_and_purged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        let actions = [
+            (
+                "2026-09-01T00:00:00Z",
+                "alice@example.test",
+                "instance.create",
+                "alice",
+                "ok",
+            ),
+            (
+                "2026-09-02T00:00:00Z",
+                "alice@example.test",
+                "instance.start",
+                "alice",
+                "ok",
+            ),
+            (
+                "2026-09-03T00:00:00Z",
+                "bob@example.test",
+                "instance.create",
+                "bob",
+                "failed",
+            ),
+            (
+                "2026-09-04T00:00:00Z",
+                "bob@example.test",
+                "token.revoke",
+                "tok-1",
+                "refused",
+            ),
+        ];
+        for (at, actor, action, target, result) in actions {
+            let mut entry = NewAuditRecord::ok(at, actor, "admin", "session", action, target);
+            entry.result = result.to_string();
+            db.record_audit(&entry).expect("record");
+        }
+
+        let filter = |configure: &dyn Fn(&mut AuditFilter)| {
+            let mut filter = AuditFilter {
+                limit: Some(100),
+                ..AuditFilter::default()
+            };
+            configure(&mut filter);
+            db.query_audit(&filter).expect("query")
+        };
+
+        assert_eq!(filter(&|_| {}).len(), 4);
+        assert_eq!(
+            filter(&|f| f.actor = Some("alice@example.test".to_string())).len(),
+            2
+        );
+        assert_eq!(
+            filter(&|f| f.action = Some("instance.create".to_string())).len(),
+            2
+        );
+        assert_eq!(filter(&|f| f.target = Some("bob".to_string())).len(), 1);
+        assert_eq!(filter(&|f| f.result = Some("failed".to_string())).len(), 1);
+        assert_eq!(
+            filter(&|f| {
+                f.from = Some("2026-09-02T00:00:00Z".to_string());
+                f.to = Some("2026-09-03T00:00:00Z".to_string());
+            })
+            .len(),
+            2,
+            "bounds are inclusive"
+        );
+        assert_eq!(
+            filter(&|f| {
+                f.limit = Some(1);
+                f.offset = 1;
+            })
+            .len(),
+            1
+        );
+
+        // The newest match comes first even with a filter.
+        let newest = filter(&|f| f.target = Some("bob".to_string()));
+        assert_eq!(newest[0].action, "instance.create");
+
+        let removed = db
+            .purge_audit_before("2026-09-03T00:00:00Z")
+            .expect("purge");
+        assert_eq!(removed, 2);
+        let remaining = filter(&|_| {});
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].action, "token.revoke");
     }
 
     #[test]

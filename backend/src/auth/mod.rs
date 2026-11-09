@@ -23,6 +23,11 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+/// Upper bound of the `User-Agent` stored in the audit log. Long enough to
+/// identify a browser or client, short enough that a hostile header cannot
+/// bloat a row.
+pub const MAX_USER_AGENT_CHARS: usize = 512;
+
 /// `bytes` random bytes as lowercase hex (2 chars per byte).
 pub fn random_hex(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
@@ -208,6 +213,8 @@ pub struct AuthContext {
     pub scope: Option<TokenScope>,
     /// Client address, best effort (`X-Forwarded-For`, then the peer).
     pub ip: Option<String>,
+    /// Client `User-Agent`, bounded by the middleware before it is stored.
+    pub user_agent: Option<String>,
 }
 
 /// Profile of the signed-in user.

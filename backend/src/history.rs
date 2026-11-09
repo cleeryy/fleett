@@ -1005,6 +1005,7 @@ mod tests {
             user: None,
             scope: None,
             ip: None,
+            user_agent: None,
         }
     }
 
@@ -1021,6 +1022,7 @@ mod tests {
             }),
             scope: None,
             ip: None,
+            user_agent: None,
         }
     }
 

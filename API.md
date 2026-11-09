@@ -40,6 +40,7 @@ clients are exempt.
 
 | Method | Route | Body | Response |
 |---|---|---|---|
+<<<<<<< HEAD
 | GET | `/api/audit?limit=200` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","details":{…}}]`, newest first, admin only |
 | GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null,"scope":{"instances":["probe"],"actions":["read"]}}]`, never the secret, admin only |
 | POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin","scope"?}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
@@ -102,6 +103,23 @@ API, errors — also carries the security headers (`Content-Security-Policy`,
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
 `X-Content-Type-Options: nosniff`, and `Strict-Transport-Security` only when
 `FLEETT_PUBLIC_URL` is https).
+=======
+| GET | `/api/audit` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","user_agent":"…","result":"ok","request_id":null,"details":{…}}]`, newest first, admin only |
+| GET | `/api/audit/export?from=&to=` | — | `200 application/x-ndjson`, one JSON object per line, `Content-Disposition: attachment; filename="fleett-audit-<ts>.jsonl"`, `X-Fleett-Signature: sha256=<hex HMAC-SHA256 of the exact body>`; `409 audit_key_missing` without `FLEETT_AUDIT_HMAC_KEY`, `400 missing_range` without both bounds, admin only |
+| DELETE | `/api/audit/expired` | — | `{"removed":12,"cutoff":"…","retention":"90d"}` deletes rows older than `FLEETT_AUDIT_RETENTION` and appends an `audit.purge` row, admin only |
+| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null}]`, never the secret, admin only |
+| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin"}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
+| DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
+
+`GET /api/audit` filters: `limit` (default 200, max 1000), `offset`, `actor`,
+`action`, `target`, `from`, `to`, `result` (`ok|failed|refused`). `actor`,
+`action`, `target` and `result` are exact matches; `from`/`to` accept RFC 3339
+or `YYYY-MM-DD` (a date-only `to` covers the whole day). The legacy `?limit=`
+behaviour is unchanged.
+
+`role` defaults to `viewer`. Revoking is idempotent. Tokens are stored as a
+SHA-256 digest only. Full audit documentation: [docs/AUDIT.md](docs/AUDIT.md).
+>>>>>>> issue-44
 
 ## Templates
 

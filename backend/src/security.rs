@@ -500,6 +500,9 @@ fn record_lockout(state: &AppState, ip: &str, shape: &'static str) {
         action: "auth.lockout".to_string(),
         target: ip.to_string(),
         ip: Some(ip.to_string()),
+        user_agent: None,
+        result: "refused".to_string(),
+        request_id: None,
         details: Some(
             json!({
                 "failures": cfg.lockout_failures,
