@@ -48,6 +48,29 @@ Read-only diagnostics and first-run state, available to every authenticated role
 `fix` is either a copyable command or a UI link; a failing check is reported inline and never
 turns the response into a 500. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
+## Assistant
+
+A contextual drafting copilot available on every page. It borrows the secret and
+base URL of the provider named by `FLEETT_ASSISTANT_PROVIDER` and never stores a
+credential of its own. The context is redacted server-side before it leaves the
+process: secret environment values, the provider key and known token shapes
+(`sk-…`, `ghp_…`, `xoxb-…`, `Bearer …`, PEM blocks) are withheld or replaced.
+Proposals are applied by the console through the regular file/env routes, so
+they keep their ETag, `.bak`, git commit and audit row (`via: "assistant"`).
+`FLEETT_ASSISTANT=off` removes both routes (generic `404`) and hides the panel.
+Full semantics: [docs/ASSISTANT.md](docs/ASSISTANT.md).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,model,budget_tokens,used_tokens}`; `provider` is `null` when unset |
+| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured`, `422 invalid_messages`, `429 assistant_budget_exceeded` |
+
+`task` is `freeform` (default), `skill`, `soul`, `env`, `pipeline`, `fleet_yaml`,
+`explain` or `config`. A proposal is `{kind:"file"|"yaml",path,content}` or
+`{kind:"env",env:[{key,value?,secret}]}`; a secret env entry never carries a
+value. `redaction` lists what was sent and what was withheld, so the operator can
+audit the exact prompt context.
+
 ## Audit and tokens
 
 | Method | Route | Body | Response |
@@ -554,6 +577,10 @@ See `docs/FILES.md` for the full security model.
 | PUT | `/api/instances/{id}/files/content[?restart=true]` | `{"path","content","etag"}` | compare-and-swap write; `409 etag_mismatch` on a stale/missing etag; timestamped `.bak` before overwrite; `restart=true` restarts and returns `{restarted,status}` |
 | DELETE | `/api/instances/{id}/files/content?path=/notes/old.md` | — | `204`; files and empty directories only (`409 directory_not_empty`), never a rendered file |
 | POST | `/api/instances/{id}/files/mkdir` | `{"path":"/profiles"}` | `201 {path,type:"dir"}`, parent must exist |
+| POST | `/api/instances/{id}/files/upload?path=/&overwrite=false` | multipart: `path` field + one or more `file` fields | `201 {directory,files:[{path,size,backup?}],total}`; 10 MiB per file, 32 MiB per request, executables refused |
+| GET | `/api/instances/{id}/files/download?path=/capture.png` | — | exact bytes with `Content-Disposition: attachment`; binary allowed |
+| GET | `/api/instances/{id}/files/archive?path=/notes` | — | `application/zip` of one directory; `409 archive_too_large` above the cap |
+| GET | `/api/instances/{id}/files/search?q=&path=/&regex=false&limit=200` | — | `{results:[{path,line,preview}],truncated,scanned}`; literal by default, `regex=true` for a pattern |
 
 `etag` is the lowercase SHA-256 of the bytes on disk. The `If-Match` header is
 accepted instead of the body field (`*` = the file must exist). Editing is

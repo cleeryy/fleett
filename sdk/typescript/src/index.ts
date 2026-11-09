@@ -332,6 +332,77 @@ export interface LogEntry {
   message?: string;
 }
 
+export type AssistantTask =
+  | "freeform"
+  | "skill"
+  | "soul"
+  | "env"
+  | "pipeline"
+  | "fleet_yaml"
+  | "explain"
+  | "config";
+
+export interface AssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AssistantContext {
+  page: string;
+  instance?: string;
+  path?: string;
+  selection?: string;
+  file_content?: string;
+  schema?: string;
+}
+
+export interface AssistantChatRequest {
+  session_id: string;
+  context: AssistantContext;
+  messages: AssistantMessage[];
+  task?: AssistantTask;
+}
+
+export interface AssistantEnvEntry {
+  key: string;
+  value?: string;
+  secret: boolean;
+}
+
+export interface AssistantProposal {
+  kind: "file" | "yaml" | "env";
+  path?: string;
+  content?: string;
+  env?: AssistantEnvEntry[];
+}
+
+export interface AssistantUsage {
+  prompt: number;
+  completion: number;
+  total: number;
+}
+
+export interface AssistantRedaction {
+  sent: string[];
+  omitted: string[];
+  redacted: number;
+}
+
+export interface AssistantChatResponse {
+  message: string;
+  proposal?: AssistantProposal;
+  usage: AssistantUsage;
+  redaction: AssistantRedaction;
+}
+
+export interface AssistantConfig {
+  enabled: boolean;
+  provider?: ProviderSummary | null;
+  model: string;
+  budget_tokens: number;
+  used_tokens: number;
+}
+
 type Query = Record<string, string | number | boolean | undefined>;
 
 function encode(value: string): string {
@@ -348,6 +419,7 @@ export class FleettClient {
   readonly instances: InstancesApi;
   readonly providers: ProvidersApi;
   readonly webhooks: WebhooksApi;
+  readonly assistant: AssistantApi;
 
   constructor(options: FleettClientOptions) {
     this.base = options.url.replace(/\/+$/, "");
@@ -357,6 +429,7 @@ export class FleettClient {
     this.instances = new InstancesApi(this);
     this.providers = new ProvidersApi(this);
     this.webhooks = new WebhooksApi(this);
+    this.assistant = new AssistantApi(this);
   }
 
   /** Low-level request; every typed method delegates to it. */
@@ -596,5 +669,28 @@ export class WebhooksApi {
     return this.client.request("GET", `/api/webhooks/${encode(id)}/deliveries`, {
       query: { limit },
     });
+  }
+}
+
+/**
+ * Contextual assistant (issue #56): configuration and draft requests.
+ *
+ * The client never holds the provider credential; the control plane decrypts
+ * it per request. The context sent from here is redacted server-side, and a
+ * proposal is applied through `instances.putEnv` or `instances.writeFile` (the
+ * console adds the `X-Fleett-Assistant: 1` marker so the audit row says
+ * `via: "assistant"`).
+ */
+export class AssistantApi {
+  constructor(private readonly client: FleettClient) {}
+
+  config(sessionId?: string): Promise<AssistantConfig> {
+    return this.client.request("GET", "/api/assistant/config", {
+      query: { session_id: sessionId },
+    });
+  }
+
+  chat(body: AssistantChatRequest): Promise<AssistantChatResponse> {
+    return this.client.request("POST", "/api/assistant/chat", { body });
   }
 }

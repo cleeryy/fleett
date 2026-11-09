@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "fleett API",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "description": "Control plane for fleet-managed Hermes agents. Every /api route except GET /api/health, GET /api/auth/config and GET /api/openapi.json requires a bearer token (Authorization: Bearer <token>) or a fleett_session cookie. Mutations require the admin role. Browser-facing /auth/login, /auth/callback and /auth/logout are outside /api and are intentionally omitted from this document.",
     "license": {
       "name": "Private"
@@ -90,6 +90,116 @@
           }
         },
         "security": []
+      }
+    },
+    "/api/assistant/config": {
+      "get": {
+        "summary": "Assistant configuration and live session usage",
+        "tags": [
+          "Assistant"
+        ],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Assistant configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantConfig"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/assistant/chat": {
+      "post": {
+        "summary": "Draft a file, YAML or environment proposal from the redacted console context",
+        "tags": [
+          "Assistant"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssistantChatRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Draft and redaction report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantChatResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No provider configured, or the configured provider was deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid session, message or context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Session token budget exhausted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/openapi.json": {
@@ -7059,6 +7169,217 @@
             "type": "boolean"
           },
           "scanned": {
+            "type": "integer"
+          }
+        }
+      },
+      "AssistantMessage": {
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "description": "At most 16 KiB; redacted before it reaches the provider."
+          }
+        }
+      },
+      "AssistantContext": {
+        "type": "object",
+        "required": [
+          "page"
+        ],
+        "properties": {
+          "page": {
+            "type": "string",
+            "description": "Console page (files, env, pipelines, providers, ...)."
+          },
+          "instance": {
+            "type": "string",
+            "description": "Instance in scope; read access is checked again on the route."
+          },
+          "path": {
+            "type": "string",
+            "description": "Virtual path of the open file, confined to the instance data directory."
+          },
+          "selection": {
+            "type": "string",
+            "description": "Selected text, capped at 8 KiB and redacted."
+          },
+          "file_content": {
+            "type": "string",
+            "description": "Open editor content, capped at 32 KiB and redacted."
+          },
+          "schema": {
+            "type": "string",
+            "description": "Schema hint of the edited object, capped at 8 KiB."
+          }
+        }
+      },
+      "AssistantChatRequest": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "context",
+          "messages"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Console-side conversation id; the token budget is per session."
+          },
+          "context": {
+            "$ref": "#/components/schemas/AssistantContext"
+          },
+          "messages": {
+            "type": "array",
+            "maxItems": 40,
+            "items": {
+              "$ref": "#/components/schemas/AssistantMessage"
+            }
+          },
+          "task": {
+            "type": "string",
+            "description": "freeform, skill, soul, env, pipeline, fleet_yaml, explain or config."
+          }
+        }
+      },
+      "AssistantEnvEntry": {
+        "type": "object",
+        "required": [
+          "key",
+          "secret"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string",
+            "description": "Absent when secret is true."
+          },
+          "secret": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AssistantProposal": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "yaml",
+              "env"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "Always starts with /, never config.yaml or healthcheck.py."
+          },
+          "content": {
+            "type": "string"
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssistantEnvEntry"
+            }
+          }
+        }
+      },
+      "AssistantUsage": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "integer"
+          },
+          "completion": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          }
+        }
+      },
+      "AssistantRedaction": {
+        "type": "object",
+        "properties": {
+          "sent": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "omitted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "redacted": {
+            "type": "integer"
+          }
+        }
+      },
+      "AssistantChatResponse": {
+        "type": "object",
+        "required": [
+          "message",
+          "usage",
+          "redaction"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/AssistantProposal"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AssistantUsage"
+          },
+          "redaction": {
+            "$ref": "#/components/schemas/AssistantRedaction"
+          }
+        }
+      },
+      "AssistantConfig": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "budget_tokens",
+          "used_tokens"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderSummary"
+          },
+          "model": {
+            "type": "string"
+          },
+          "budget_tokens": {
+            "type": "integer",
+            "description": "0 disables the per-session cap."
+          },
+          "used_tokens": {
             "type": "integer"
           }
         }
