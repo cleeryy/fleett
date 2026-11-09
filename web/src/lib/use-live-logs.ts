@@ -4,7 +4,7 @@ import { toApiError, type ApiError } from "@/api/errors";
 import type { LogEntry } from "@/api/types";
 import {
   compareLogEntries,
-  latestLogAt,
+  latestLogId,
   mergeLogEntries,
 } from "@/lib/logs";
 
@@ -58,7 +58,7 @@ export function useLiveLogs(instanceId: string, options: LiveLogsOptions = {}): 
   const linesRef = useRef<LogEntry[]>([]);
   const knownRef = useRef<Set<number>>(new Set());
   const pendingRef = useRef<LogEntry[]>([]);
-  const cursorRef = useRef<string | null>(null);
+  const cursorRef = useRef<number | null>(null);
   const receivedRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const pollBusyRef = useRef(false);
@@ -78,7 +78,7 @@ export function useLiveLogs(instanceId: string, options: LiveLogsOptions = {}): 
     const merged = mergeLogEntries(linesRef.current, pending, maxLines);
     linesRef.current = merged;
     knownRef.current = new Set(merged.map((entry) => entry.id));
-    cursorRef.current = latestLogAt(merged, cursorRef.current);
+    cursorRef.current = latestLogId(merged, cursorRef.current);
     receivedRef.current += pending.length;
     setLinesState(merged);
     setReceived(receivedRef.current);
@@ -103,7 +103,7 @@ export function useLiveLogs(instanceId: string, options: LiveLogsOptions = {}): 
   );
 
   // The first page. A retry starts here again; the stream only runs once this
-  // page has landed, so `since` always has a cursor to resume from.
+  // page has landed, so the poll has a cursor to resume from.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -131,7 +131,7 @@ export function useLiveLogs(instanceId: string, options: LiveLogsOptions = {}): 
         const merged = mergeLogEntries([], sorted, maxLines);
         linesRef.current = merged;
         knownRef.current = new Set(merged.map((entry) => entry.id));
-        cursorRef.current = latestLogAt(merged);
+        cursorRef.current = latestLogId(merged);
         setLinesState(merged);
         setLoading(false);
         setLoadedId(instanceId);
@@ -191,9 +191,9 @@ export function useLiveLogs(instanceId: string, options: LiveLogsOptions = {}): 
       if (stopped || pollBusyRef.current) return;
       pollBusyRef.current = true;
       try {
-        const since = cursorRef.current;
+        const after = cursorRef.current;
         const page = await api.instanceLogs(instanceId, {
-          ...(since ? { since } : {}),
+          ...(after !== null ? { after_id: after } : {}),
           limit: POLL_LIMIT,
         });
         if (stopped) return;

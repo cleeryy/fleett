@@ -84,7 +84,7 @@ export function LogsPage() {
   const [followError, setFollowError] = useState<ApiError | null>(null);
   const [exporting, setExporting] = useState<"json" | "csv" | null>(null);
   const [exportError, setExportError] = useState<ApiError | null>(null);
-  const cursor = useRef<string | null>(null);
+  const cursor = useRef<number | null>(null);
 
   const params: LogQueryParams = useMemo(
     () => ({
@@ -107,26 +107,31 @@ export function LogsPage() {
 
   // The SSE endpoint authenticates with the session cookie or a bearer header,
   // and EventSource cannot send the header. Rather than break bearer-only
-  // deployments, `follow` polls every second and resumes from the newest line.
+  // deployments, `follow` polls every second and resumes from the newest entry
+  // id, so a burst larger than the page cannot silently drop lines.
   useEffect(() => {
     if (!follow) return;
     setLive([]);
     setFollowError(null);
-    cursor.current = new Date().toISOString();
+    cursor.current = null;
     let alive = true;
     let busy = false;
     const tick = async () => {
       if (busy) return;
       busy = true;
       try {
+        const after = cursor.current;
         const result = await api.searchLogs({
           ...paramsRef.current,
-          ...(cursor.current ? { since: cursor.current } : {}),
+          ...(after !== null ? { after_id: after } : {}),
           limit: 200,
         });
         if (!alive) return;
         if (result.entries.length > 0) {
-          cursor.current = result.entries[0].at;
+          cursor.current = result.entries.reduce(
+            (max, entry) => (entry.id > max ? entry.id : max),
+            after ?? 0,
+          );
           setLive((previous) => mergeEntries(previous, result.entries));
         }
         setFollowError(null);
@@ -137,7 +142,7 @@ export function LogsPage() {
       }
     };
     void tick();
-    const timer = window.setInterval(() => void tick(), 2_000);
+    const timer = window.setInterval(() => void tick(), 1_000);
     return () => {
       alive = false;
       window.clearInterval(timer);

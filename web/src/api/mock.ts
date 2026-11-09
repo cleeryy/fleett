@@ -4550,12 +4550,20 @@ function searchLogEntries(params: LogQueryParams = {}): LogEntry[] {
   if (since !== undefined && until !== undefined && since > until) {
     fail(400, "invalid_window", "since must be before until");
   }
+  if (
+    params.after_id !== undefined &&
+    (!Number.isInteger(params.after_id) || params.after_id < 0)
+  ) {
+    fail(400, "invalid_after_id", "after_id must be a non-negative integer");
+  }
+  const afterId = params.after_id;
   const limit = Math.min(Math.max(params.limit ?? 100, 1), 500);
   const rank: Record<LogLevel, number> = { info: 0, warn: 1, error: 2 };
   const needle = params.q?.trim().toLowerCase();
   return logEntries
     .filter((entry) => {
       if (params.instances?.length && !params.instances.includes(entry.instance)) return false;
+      if (afterId !== undefined && entry.id <= afterId) return false;
       if (params.level && rank[entry.level] < rank[params.level]) return false;
       const at = Date.parse(entry.at);
       if (since !== undefined && at < since) return false;

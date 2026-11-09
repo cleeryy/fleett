@@ -75,6 +75,22 @@ export function latestLogAt(entries: LogEntry[], fallback: string | null = null)
   return latest;
 }
 
+/**
+ * Largest entry id in `entries`, or `fallback` when there is none.
+ *
+ * This is the live-follow cursor: ids are monotonic, so every line written
+ * between two polls is picked up — a timestamp cursor skips every line that
+ * shares the newest second.
+ */
+export function latestLogId(entries: LogEntry[], fallback: number | null = null): number | null {
+  let latest = fallback;
+  for (const entry of entries) {
+    if (!Number.isFinite(entry.id)) continue;
+    if (latest === null || entry.id > latest) latest = entry.id;
+  }
+  return latest;
+}
+
 export interface SseFrame {
   event: string;
   data: string;

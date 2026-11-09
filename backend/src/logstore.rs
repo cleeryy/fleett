@@ -101,6 +101,8 @@ pub struct LogQuery {
     pub since: Option<String>,
     /// RFC 3339 upper bound (inclusive).
     pub until: Option<String>,
+    /// Only rows whose id is strictly greater, used as the live-follow cursor.
+    pub after_id: Option<i64>,
     /// Page size, `1..=MAX_SEARCH_LIMIT`.
     pub limit: usize,
 }
@@ -380,6 +382,10 @@ pub fn search(db: &Db, query: &LogQuery) -> Result<Vec<LogEntry>, LogStoreError>
     if let Some(until) = &query.until {
         clauses.push("e.at <= ?".to_string());
         values.push(SqlValue::Text(until.clone()));
+    }
+    if let Some(after_id) = query.after_id {
+        clauses.push("e.id > ?".to_string());
+        values.push(SqlValue::Integer(after_id));
     }
 
     let has_clauses = !clauses.is_empty();
@@ -893,6 +899,99 @@ mod tests {
         )
         .expect("search");
         assert_eq!(infos.len(), 3);
+    }
+
+    #[test]
+    fn after_id_returns_only_newer_rows_and_combines_with_filters() {
+        let (_dir, db) = temp_db();
+        let store = store();
+        store
+            .ingest(
+                &db,
+                "alice",
+                "2026-11-09T10:00:00Z INFO one\n\
+                 2026-11-09T10:01:00Z WARN two\n\
+                 2026-11-09T10:02:00Z ERROR three",
+            )
+            .expect("alice");
+        store
+            .ingest(&db, "bob", "2026-11-09T10:03:00Z ERROR four")
+            .expect("bob");
+
+        let all = search(
+            &db,
+            &LogQuery {
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("all");
+        assert_eq!(all.len(), 4);
+
+        let after_newest = search(
+            &db,
+            &LogQuery {
+                after_id: Some(all[0].id),
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("after the newest row");
+        assert!(after_newest.is_empty());
+
+        let oldest = all[all.len() - 1].id;
+        let newer = search(
+            &db,
+            &LogQuery {
+                after_id: Some(oldest),
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("after the oldest row");
+        assert_eq!(newer.len(), all.len() - 1);
+        assert!(newer.iter().all(|entry| entry.id > oldest));
+
+        let alice_newer = search(
+            &db,
+            &LogQuery {
+                instances: vec!["alice".to_string()],
+                after_id: Some(oldest),
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("alice after the cursor");
+        assert_eq!(alice_newer.len(), 2);
+        assert!(alice_newer.iter().all(|entry| entry.instance == "alice"));
+
+        let errors_newer = search(
+            &db,
+            &LogQuery {
+                level: Some(LogLevel::Error),
+                after_id: Some(oldest),
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("errors after the cursor");
+        assert_eq!(errors_newer.len(), 2);
+        assert!(errors_newer
+            .iter()
+            .all(|entry| entry.level == LogLevel::Error));
+
+        let fts_newer = search(
+            &db,
+            &LogQuery {
+                q: Some("three".to_string()),
+                after_id: Some(oldest),
+                limit: 10,
+                ..LogQuery::default()
+            },
+        )
+        .expect("FTS after the cursor");
+        assert_eq!(fts_newer.len(), 1);
+        assert_eq!(fts_newer[0].message, "ERROR three");
     }
 
     #[test]

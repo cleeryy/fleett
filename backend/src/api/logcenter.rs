@@ -48,12 +48,34 @@ pub struct LogsQuery {
     /// RFC 3339 timestamp or a relative window.
     #[serde(default)]
     pub until: Option<String>,
+    /// Only rows newer than this entry id (live-follow resume cursor).
+    #[serde(default, deserialize_with = "deserialize_after_id")]
+    pub after_id: Option<i64>,
     /// Page size, `1..=500`.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Export only: `json` (default) or `csv`.
     #[serde(default)]
     pub format: Option<String>,
+}
+
+/// Read `?after_id=`.
+///
+/// A malformed value is normalised to `-1` instead of failing the extractor,
+/// so [`build_query`] can answer the documented `invalid_after_id` error rather
+/// than an opaque axum query rejection.
+fn deserialize_after_id<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(raw.parse::<i64>().unwrap_or(-1)))
 }
 
 /// Search response envelope.
@@ -177,12 +199,19 @@ fn build_query(query: &LogsQuery) -> Result<LogQuery, ApiError> {
             ));
         }
     }
+    if query.after_id.is_some_and(|value| value < 0) {
+        return Err(ApiError::bad_request(
+            "invalid_after_id",
+            "after_id must be a non-negative integer",
+        ));
+    }
     Ok(LogQuery {
         instances: parse_instances(query.instances.as_deref())?,
         q,
         level,
         since,
         until,
+        after_id: query.after_id,
         limit,
     })
 }
@@ -206,7 +235,7 @@ fn respond(entries: Vec<LogEntry>, limit: usize) -> LogsResponse {
     }
 }
 
-/// `GET /api/logs?instances=&q=&level=&since=&until=&limit=`
+/// `GET /api/logs?instances=&q=&level=&since=&until=&after_id=&limit=`
 pub async fn search(
     State(state): State<AppState>,
     Query(query): Query<LogsQuery>,
@@ -245,7 +274,10 @@ pub async fn stream(
                         {
                             let data = serde_json::to_string(&entry).unwrap_or_default();
                             return Some((
-                                Ok(Event::default().event("log").data(data)),
+                                Ok(Event::default()
+                                    .id(entry.id.to_string())
+                                    .event("log")
+                                    .data(data)),
                                 (receiver, instances),
                             ));
                         }
@@ -366,5 +398,22 @@ mod tests {
         assert_eq!(instances, ["alice", "bob"]);
         assert!(parse_instances(Some("Not An Id")).is_err());
         assert!(parse_instances(None).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn after_id_must_be_non_negative() {
+        let negative = LogsQuery {
+            after_id: Some(-1),
+            ..LogsQuery::default()
+        };
+        let err = build_query(&negative).expect_err("negative cursor");
+        assert_eq!(err.code, "invalid_after_id");
+
+        let cursor = build_query(&LogsQuery {
+            after_id: Some(0),
+            ..LogsQuery::default()
+        })
+        .expect("zero is a valid cursor");
+        assert_eq!(cursor.after_id, Some(0));
     }
 }

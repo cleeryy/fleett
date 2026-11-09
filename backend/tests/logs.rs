@@ -335,6 +335,73 @@ async fn tick_tails_the_mock_driver_and_deduplicates() {
 }
 
 #[tokio::test]
+async fn after_id_resumes_a_search_without_losing_lines() {
+    let harness = Harness::new();
+    harness.create_instance("alice").await;
+    harness.create_instance("bob").await;
+    harness.ingest(
+        "alice",
+        "2026-11-09T10:00:00Z INFO one\n\
+         2026-11-09T10:01:00Z WARN two\n\
+         2026-11-09T10:02:00Z ERROR three",
+    );
+    harness.ingest("bob", "2026-11-09T10:03:00Z ERROR four");
+
+    let (status, body) = harness.request(Method::GET, "/api/logs", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all = parse_entries(&body);
+    assert_eq!(all.len(), 4, "{body}");
+    let oldest = all[3]["id"].as_i64().expect("id");
+
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/logs?after_id={oldest}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let newer = parse_entries(&body);
+    assert_eq!(newer.len(), 3, "{body}");
+    assert!(newer
+        .iter()
+        .all(|entry| entry["id"].as_i64().unwrap() > oldest));
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            &format!("/api/logs/instances/alice?after_id={oldest}&level=error"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let filtered = parse_entries(&body);
+    assert_eq!(filtered.len(), 1, "{body}");
+    assert_eq!(filtered[0]["message"], "ERROR three");
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            &format!("/api/logs/export?format=json&after_id={oldest}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 3);
+
+    for value in ["-1", "abc", ""] {
+        let uri = format!("/api/logs?after_id={value}");
+        let (status, body) = harness.request(Method::GET, &uri, None).await;
+        if value.is_empty() {
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(
+            parse(&body)["error"]["code"],
+            "invalid_after_id",
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sse_stream_delivers_a_new_line_in_under_a_second() {
     let harness = Harness::new();
     let request = Request::builder()
@@ -365,6 +432,10 @@ async fn sse_stream_delivers_a_new_line_in_under_a_second() {
     let data = frame.into_data().expect("data frame");
     let text = String::from_utf8_lossy(&data);
     assert!(text.contains("event: log"), "{text}");
+    assert!(
+        text.contains("id: 1"),
+        "the SSE id field mirrors the entry id: {text}"
+    );
     assert!(text.contains("allowlist live"), "{text}");
 }
 

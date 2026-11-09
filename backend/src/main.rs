@@ -1371,10 +1371,6 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     // Token accounting (issue #35): one scan at startup, then every
     // `FLEETT_COST_SCAN_INTERVAL_S` seconds. `0` disables the scanner; the
     // ingest endpoint stays available either way.
-    {
-        let state = state.clone();
-        tokio::spawn(fleett::logstore::run(state));
-    }
     if cfg.cost_scan_interval_s > 0 {
         fleett::cost::spawn_scanner(
             state.clone(),

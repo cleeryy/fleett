@@ -94,6 +94,11 @@ GET /api/logs?instances=alice,bob&q=allowlist&level=warn&since=24h&until=2026-11
 - `level`: `info` (everything), `warn` (warnings **and** errors) or `error`.
 - `since` / `until`: RFC 3339 timestamp or relative window (`30m`, `24h`, `7d`)
   meaning "now minus the window". `since` must be before `until`.
+- `after_id`: only rows whose `id` is strictly greater than this cursor. The
+  live follow uses it to resume: ids are monotonic, so a burst that is larger
+  than one page cannot silently lose the lines in between (a timestamp cursor
+  would). It combines with every other filter and never changes the ordering.
+  A negative or non-numeric value answers `400 invalid_after_id`.
 - `limit`: `1..=500`, default 100.
 
 Rows are sorted by `at` **descending**, then by id descending for lines sharing
@@ -116,11 +121,15 @@ event per newly inserted line:
 
 ```
 event: log
+id: 42
 data: {"id":42,"instance":"alice","at":"2026-11-09T10:00:00.000Z","level":"error","message":"gateway died"}
 
 : heartbeat
 ```
 
+- The SSE `id:` field mirrors the JSON `id`. It is informational: the server
+  does not replay from `Last-Event-ID`; resume a gap with `after_id` on the
+  search endpoint.
 - Latency after ingestion is immediate; the 10 s tail cadence is the only
   delay between the container writing and the line reaching a connected console.
 - A `:` comment heartbeat is sent every 15 s when idle, so proxies do not close
@@ -130,6 +139,26 @@ data: {"id":42,"instance":"alice","at":"2026-11-09T10:00:00.000Z","level":"error
   behind`) and keeps streaming. Re-run a search to recover the gap.
 - The stream is authenticated like every `/api/*` route. Browsers connect with
   the `fleett_session` cookie; scripts use `Authorization: Bearer`.
+
+## Live follow in the console
+
+The per-instance log panel opens the SSE stream and, whenever the stream is
+down or reconnecting, falls back to a **1-second poll** of
+`GET /api/logs/instances/{id}`. Both paths feed the same buffer:
+
+- the first page loads `limit` rows; afterwards the poll sends the newest entry
+  id as `after_id`, so the lines written between two ticks are picked up even
+  when they share the newest timestamp (one tick still returns at most 500
+  rows);
+- every line is deduplicated by id, because the stream and the poll overlap on
+  purpose (that overlap is what closes the reconnect gap);
+- the buffer keeps the newest 2000 lines, "N new lines" counts what arrived
+  while the operator was scrolled up, and a hidden tab pauses both paths.
+
+The fleet-wide **Follow** toggle on the Logs page polls `/api/logs` every
+second with the same `after_id` cursor and the current filters. The log-center
+read routes belong to the ordinary `api` rate-limit bucket for that reason;
+only the legacy `/api/instances/{id}/logs` (a real `docker logs`) is `heavy`.
 
 ## Export
 

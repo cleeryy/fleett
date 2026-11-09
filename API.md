@@ -145,8 +145,11 @@ would reveal whether an instance exists.
 setting every limit to `0` disables rate limiting.
 
 `/api/health` and `/api/auth/config` are exempt. `/auth/login` and
-`/auth/callback` use the `auth` bucket; routes containing an `exec`, `logs`,
-`files` or `export` segment use the `heavy` bucket. Every response — console,
+`/auth/callback` use the `auth` bucket; routes containing an `exec`, `files` or
+`export` segment — and the legacy per-instance `/api/instances/{id}/logs` —
+use the `heavy` bucket. The log-center read routes under `/api/logs` use the
+ordinary `api` bucket, so the console's one-second polling fallback fits the
+default limit. Every response — console,
 API, errors — also carries the security headers (`Content-Security-Policy`,
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
 `X-Content-Type-Options: nosniff`, and `Strict-Transport-Security` only when
@@ -974,10 +977,24 @@ Persistent searchable logs; see [docs/LOGS.md](docs/LOGS.md).
 
 | Method | Path | Query | Result |
 |---|---|---|---|
-| GET | `/api/logs` | `instances=a,b&q=&level=info|warn|error&since=&until=&limit=500` | `LogEntry[]`, newest first |
-| GET | `/api/logs/instances/{id}` | same filters | `LogEntry[]` |
-| GET | `/api/logs/stream` | `instances=` | SSE `log` events, 15 s heartbeat |
-| GET | `/api/logs/export` | `format=json|csv` + filters | downloadable file |
+| GET | `/api/logs` | filters below | `{"entries":[…],"count":n,"limit":n}`, newest first |
+| GET | `/api/logs/instances/{id}` | filters below | same envelope, restricted to one instance |
+| GET | `/api/logs/stream` | `instances=` | SSE `log` events carrying an `id:` field, 15 s heartbeat |
+| GET | `/api/logs/export` | `format=json\|csv` + filters | downloadable file (`json` or `csv`) |
+
+| Parameter | Meaning |
+|---|---|
+| `instances` | Comma-separated ids, at most 100; empty means every instance. |
+| `q` | FTS5 query, with a substring `LIKE` fallback for partial words. |
+| `level` | `info`, `warn` (warnings **and** errors) or `error`. |
+| `since` / `until` | RFC 3339 timestamp or relative window (`30m`, `24h`, `7d`). `since` must be before `until`. |
+| `after_id` | Only entries with a strictly greater id; the live-follow cursor. |
+| `limit` | `1..=500`, default 100. |
+| `format` | Export only: `json` (default) or `csv`. |
+
+`400` error codes: `invalid_limit`, `invalid_level`, `invalid_since`,
+`invalid_until`, `invalid_window`, `invalid_instance`, `too_many_instances`,
+`invalid_query`, `invalid_after_id`, `invalid_format`.
 
 Secrets are redacted at ingestion (`flt_`, `sk-`, `Bot`, `Bearer`, `token=`). Retention is
 `FLEETT_LOG_RETENTION` (default `7d`) and `FLEETT_LOG_MAX_ROWS` (default 500000).

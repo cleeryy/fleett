@@ -107,6 +107,14 @@ pub fn classify(path: &str) -> RouteClass {
         return RouteClass::Auth;
     }
     if path.starts_with("/api/") {
+        // The log center read routes (`/api/logs`, `/api/logs/stream`,
+        // `/api/logs/export`, `/api/logs/instances/{id}`) back the console's
+        // one-second live fallback, so they use the ordinary `api` bucket.
+        // Only the legacy on-demand `/api/instances/{id}/logs`, which runs
+        // `docker logs`, stays expensive.
+        if path == "/api/logs" || path.starts_with("/api/logs/") {
+            return RouteClass::Api;
+        }
         // Any segment, not just the last one: `/instances/{id}/files/content`
         // and `/instances/{id}/export` are as expensive as `/files` itself.
         if path
@@ -591,6 +599,16 @@ mod tests {
         );
         assert_eq!(classify("/api/instances/alice/export"), RouteClass::Heavy);
         assert_eq!(classify("/api/instances/alice/exec"), RouteClass::Heavy);
+    }
+
+    #[test]
+    fn log_center_reads_use_the_api_bucket() {
+        assert_eq!(classify("/api/logs"), RouteClass::Api);
+        assert_eq!(classify("/api/logs/"), RouteClass::Api);
+        assert_eq!(classify("/api/logs/stream"), RouteClass::Api);
+        assert_eq!(classify("/api/logs/export"), RouteClass::Api);
+        assert_eq!(classify("/api/logs/instances/alice"), RouteClass::Api);
+        assert_eq!(classify("/api/instances/alice/logs"), RouteClass::Heavy);
     }
 
     #[test]

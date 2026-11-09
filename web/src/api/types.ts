@@ -1242,6 +1242,12 @@ export interface LogQueryParams {
   /** RFC 3339 timestamp or a relative window (`30m`, `24h`, `7d`). */
   since?: string;
   until?: string;
+  /**
+   * Only rows with a strictly greater id. The live follow uses it as a cursor:
+   * ids are monotonic, unlike timestamps, so no line is skipped when several
+   * share the newest second.
+   */
+  after_id?: number;
   limit?: number;
 }
 
