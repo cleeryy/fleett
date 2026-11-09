@@ -512,7 +512,7 @@ pub fn rollback(db: &Db, id: i64, version: u32, actor: &str) -> Result<MemoryEnt
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE memory_entries SET value = ?1, tags = ?2, owner = ?3, version = ?4, \
-             updated_at = ?5, deleted = 0 WHERE id = ?6",
+             updated_at = ?5, expires_at = NULL, deleted = 0 WHERE id = ?6",
             params![
                 entry.value,
                 tags_to_string(&entry.tags),
@@ -677,7 +677,7 @@ mod tests {
         let (entry, _) = upsert(&db, "shared", "gone", "v1", &[], "probe", None).expect("create");
         assert!(delete(&db, entry.id, "probe").expect("delete"));
         assert!(get(&db, entry.id).expect("get").is_none());
-        assert!(list(&db, None, false, 10).expect("list").is_empty());
+        assert!(list(&db, None, None, false, 10).expect("list").is_empty());
         let versions = history(&db, entry.id).expect("history");
         assert_eq!(versions[0].action, "delete");
         rollback(&db, entry.id, 1, "probe").expect("restore");

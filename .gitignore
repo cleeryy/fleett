@@ -8,3 +8,4 @@ templates-reference/
 instances/
 shares/
 data/
+.playwright-mcp/

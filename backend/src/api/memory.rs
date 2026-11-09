@@ -36,6 +36,8 @@ pub struct ListQuery {
     #[serde(default)]
     pub namespace: Option<String>,
     #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
     pub include_expired: Option<bool>,
     #[serde(default)]
     pub limit: Option<usize>,
@@ -187,6 +189,7 @@ pub async fn list(
     let entries = memory::list(
         &state.db,
         query.namespace.as_deref(),
+        query.tag.as_deref(),
         query.include_expired.unwrap_or(false),
         limit,
     )?;
