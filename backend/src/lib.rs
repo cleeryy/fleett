@@ -25,6 +25,7 @@ pub mod providers;
 pub mod render;
 pub mod scheduler;
 pub mod secrets;
+pub mod snapshots;
 pub mod store;
 pub mod templates_builtin;
 pub mod watchdog;

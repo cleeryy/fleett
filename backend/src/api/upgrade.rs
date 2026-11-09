@@ -240,6 +240,20 @@ async fn run_job(state: AppState, context: AuthContext, job_id: String) {
     };
     let image = job.image.clone();
     let timeout = Duration::from_secs(job.timeout_s);
+
+    // Restore point before any image moves. Taken as one phase so the rolling
+    // operation itself is not perturbed by disk I/O: every snapshot is written
+    // before the first instance changes image.
+    let mut snapshots = JoinSet::new();
+    for result in &job.results {
+        let state = state.clone();
+        let id = result.id.clone();
+        snapshots.spawn(async move {
+            crate::snapshots::auto_before(&state, &id, "upgrade").await;
+        });
+    }
+    while snapshots.join_next().await.is_some() {}
+
     let permits = std::sync::Arc::new(Semaphore::new(job.parallel.max(1)));
 
     let mut tasks = JoinSet::new();

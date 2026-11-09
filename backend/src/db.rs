@@ -358,6 +358,26 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_event
     ON notification_deliveries (event, created_at);
 "#,
+    // v15 — per-instance restore points (issue #38). A snapshot archives the
+    // instance data, its rendered compose/config/SOUL and the *encrypted* env
+    // rows; the row tracks the archive file, its retention and the outcome of
+    // the last restore. Files live in `<root>/snapshots/<id>/<ts>.tgz`.
+    r#"
+CREATE TABLE IF NOT EXISTS snapshots (
+    id           TEXT PRIMARY KEY NOT NULL,
+    instance_id  TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'ok',
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_instance
+    ON snapshots (instance_id, created_at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

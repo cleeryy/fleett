@@ -259,6 +259,63 @@ bearer token). A change made outside the API is recorded as `sync: …` by
 `fleett <fleett@localhost>` at startup and after every compose apply. Nothing
 here talks to Docker: a stopped instance still serves its log, diff and revert.
 
+### Snapshots (restore points)
+
+Per-instance restore points for the data of one agent: `data/`, compose,
+rendered config, `SOUL.md` and the `instance_env` rows (secrets stay
+encrypted). Reads need any role, every mutation needs `admin`. The full
+semantics are in [docs/SNAPSHOTS.md](docs/SNAPSHOTS.md).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/snapshots` | `{"label":"before upgrade","ttl_s":604800}` (both optional) | `201 Snapshot`, `400 invalid_snapshot` for a bad label/TTL |
+| GET | `/api/instances/{id}/snapshots` | — | `Snapshot[]`, newest first |
+| POST | `/api/instances/{id}/snapshots/compare` | `{"a":"<id>","b":"<id>"}` | `SnapshotDiff` |
+| GET | `/api/snapshots/{sid}` | — | `Snapshot`, `404` unknown |
+| DELETE | `/api/snapshots/{sid}` | — | `204`, files removed too |
+| POST | `/api/snapshots/{sid}/restore` | — | `200 RestoreReport`, `409 restore_failed` (already rolled back) |
+| DELETE | `/api/snapshots/expired` | — | `{"removed":N,"failed":M}` |
+
+```json
+{"id":"0f0e…","instance_id":"alice",
+ "path":"/opt/fleett/snapshots/0f0e…/20261109-183512.tgz",
+ "label":"before upgrade","created_at":"2026-11-09T18:35:12Z",
+ "expires_at":"2026-11-16T18:35:12Z","size_bytes":1048576,
+ "status":"ok","error":null}
+```
+
+`status`: `ok`, `restoring` (a restore is in progress) or `failed` (the last
+restore was rolled back; `error` carries the reason). `ttl_s` is
+`1..=7776000` (90 days), default 7 days.
+
+`SnapshotDiff`:
+
+```json
+{"instance_id":"alice","a":"<id>","b":"<id>",
+ "added":[{"path":"data/NEW.md","size":12,"sha256":"…"}],
+ "removed":[{"path":"data/OLD.md","size":8,"sha256":"…"}],
+ "changed":[{"path":"data/SOUL.md","size_a":210,"size_b":212,
+             "sha256_a":"…","sha256_b":"…"}],
+ "unchanged":42}
+```
+
+`RestoreReport`:
+
+```json
+{"snapshot":{…},"instance_id":"alice","files":37,"status":"running",
+ "env_restored":true,"compose_restored":true,
+ "previous_data_dir":"/opt/fleett/instances/alice/data.pre-restore-20261109-184001"}
+```
+
+A restore stops the instance, moves `data/` to a `.pre-restore-<ts>` sibling
+(kept, never deleted), extracts the archive, restores the compose file and env
+rows, starts the instance and waits up to 180 s for a healthy container. On any
+failure it puts the previous data directory, compose file and env rows back,
+restarts the instance and answers `409 restore_failed` with
+`error.details {"snapshot","rolled_back":true}`. An `auto:` snapshot is taken
+before upgrades, environment writes and git reverts (best effort: a failed
+snapshot never blocks the operation).
+
 ### LAN access and egress enforcement
 
 `allow_lan` is `false` by default: the instance only joins the restricted `fleett` network.

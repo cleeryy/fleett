@@ -8,6 +8,11 @@ gzipped tars you can inspect with `tar -tzf`:
 |---|---|---|---|
 | `fleett backup` | the whole fleet (index + instances + shares) | `manifest.json`, `fleet.db`, `instances/`, `shares/` | `fleett backups restore` |
 | `GET /api/instances/{id}/export` | one instance | `manifest.json`, `compose.yaml`, `data/` | `POST /api/instances/import` |
+| snapshot (`fleett snapshot create`) | one instance, in place | `snapshot.json`, `compose.yaml`, `config.yaml`, `soul.md`, `env.json`, `data/` | `POST /api/snapshots/{id}/restore` |
+
+A snapshot is the lightweight, per-instance restore point documented in
+[docs/SNAPSHOTS.md](SNAPSHOTS.md): take one before a risky change and restore
+it in place. It is not a substitute for a backup of the host.
 
 A backup restores a **host**; an instance archive moves **one agent** to another host. They
 are deliberately different formats: `fleett backups restore` never feeds
