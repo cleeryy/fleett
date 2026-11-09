@@ -8,6 +8,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod instances;
+pub mod json;
 pub mod memory;
 pub mod providers;
 pub mod shares;
