@@ -30,20 +30,18 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | | |
 |---|---|
 | **Lifecycle** | Create from a template, start, stop, restart, delete (data kept or purged), clone with fresh credentials. |
-| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions with `example`/`format`/`required`, pre-filled fields and API-validated ids; missing allowlist warning on the instance and in `fleett doctor`; per-key `secret` flag; encrypted at rest, values never returned. |
-| **Providers** | Share one credential across agents, test it, rotate once and restart every linked agent with a per-instance report. |
-| **Files** | Browse and edit `SOUL.md`, skills and notes from the console; ETag conflicts, timestamped backups, “save & restart”. |
-| **History** | One git repo per agent, actor-attributed commits, diff, restore. Readable while the agent is stopped. |
-| **Logs** | `tail`, `since`, `grep`, `level`, JSON; error summary; `docker inspect` cause (`OOMKilled`, exit code, `State.Error`). |
-| **Backups** | Rotating host backups, portable instance export/import, restore into a fresh root. |
-| **Upgrades** | Move the whole fleet to a new image: one at a time, health-checked, automatic rollback to the previous tag. |
-| **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit log, named revocable tokens, encrypted secrets, LAN egress firewall, opt-in strict hardening. |
-| **Orchestration** | Persistent agent-to-agent bus (`say`/`messages`/`ack`), shared fleet memory with FTS5 search and history, per-agent cron schedules with run history, DAG pipelines with retries/cancellation. |
-| **Ops** | Watchdog with `off|restart|recreate` healing and an incident registry, per-instance snapshots/rollback, maintenance windows, canary upgrades with soak, deployment journal, disk quotas. |
-| **Observability** | Persistent searchable log center with SSE, token/cost accounting with budgets and versioned pricing, Prometheus `/metrics` with an importable Grafana dashboard and alert rules. |
-| **Integrations** | Signed outbound webhooks + OpenAPI 3.0 + TypeScript SDK, `fleett mcp` (stdio/HTTP), declarative `fleet.yaml` plan/apply with drift detection. |
-| **Security** | Per-instance RBAC and scoped tokens, allowlisted exec with audit, API rate limiting/lockout/security headers, signed audit export with retention, per-instance egress policy. |
-| **Reliability** | Real healthcheck, compose integration in CI, automatic rollback on failed upgrades, restore points before risky operations, `fleett doctor`. |
+| **Templates & env** | `guest`, `guest-discord`, `solo`; per-key `secret` flag; encrypted at rest, values never returned; allowlist suggestions. |
+| **Providers** | Share one API credential across agents, test it, rotate once and restart every linked agent with a report. |
+| **Personas** | Reusable `SOUL.md` templates with variables; assign to any agent, track divergence, reapply in one click. |
+| **Skills** | Versioned, read-only skill registry; pin a version per agent or follow `latest`, promote with a rolling restart. |
+| **Assistant** | A context-aware panel on every page drafts `SKILL.md`, `SOUL.md`, env allowlists or YAML — with redaction, a token budget and a diff to apply, never a blind write. |
+| **Files** | Browse, edit, upload, download and zip; Markdown preview, coloured YAML/JSON, full-text search, ETag conflicts, backups. |
+| **History** | One git repo per agent, actor-attributed commits, diff, restore; readable while the agent is stopped. |
+| **Logs** | Live SSE follow (with 1 s polling fallback), scroll-pause, filters, 2 000-line buffer, copy/export. |
+| **Day two** | Health checks, rolling upgrades with rollback, rotating backups, export/import, usage and quotas. |
+| **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit, named tokens, encrypted secrets, egress firewall and destination policies, per-agent LAN opt-in. |
+| **Ops** | Doctor + onboarding, Prometheus `/metrics`, `fleett doctor`, compose integration in CI, `.deb`, OCI image. |
+| **Console** | Installable PWA, `Ctrl/Cmd+K` palette, full EN/FR, mobile-first at 390 px. |
 
 ## Quick start
 
@@ -61,8 +59,8 @@ release: a `.deb` (systemd unit, UID 10000, secrets key) and the image
 <summary><strong>Debian / Ubuntu</strong></summary>
 
 ```bash
-curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.6.0_amd64.deb
-sudo dpkg -i fleett_0.6.0_amd64.deb
+curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.7.0_amd64.deb
+sudo dpkg -i fleett_0.7.0_amd64.deb
 sudoedit /etc/fleett/fleett.env   # set FLEETT_TOKEN
 sudo systemctl enable --now fleett
 ```
@@ -79,26 +77,24 @@ docker run -d --name fleett \
   -e FLEETT_TOKEN=change-me \
   -e FLEETT_DRIVER=compose \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-  ghcr.io/cleeryy/fleett:0.6.0
+  ghcr.io/cleeryy/fleett:0.7.0
 ```
 </details>
 
-Three things before the first agent:
-
-1. `sudo fleett egress install` — otherwise restricted agents are refused
-   (`409 egress_not_enforced`).
-2. Build the agent image and set `FLEETT_IMAGE`:
-   `docker build -t hermes-agent:0.22.2-local /path/to/hermes-official`.
-3. Create a provider (or paste a token on the instance), then create the instance.
+The console's **Setup** page walks through the three prerequisites: Docker reachable, the
+agent image built (`docker build -t hermes-agent:0.22.2-local /path/to/hermes-official`),
+a provider created. The **Doctor** checks the rest.
 
 ## A look inside
 
+![Instance](docs/screenshots/detail.png)
+
 | | |
 |---|---|
-| ![Create](docs/screenshots/create.png) | ![Files](docs/screenshots/files.png) |
-| **Create** — template, provider, model, LAN policy. | **Files** — edit the soul, keep every version. |
-| ![History](docs/screenshots/history.png) | ![Providers](docs/screenshots/providers.png) |
-| **History** — who changed what, restore in one click. | **Providers** — one credential, many agents. |
+| ![Personas](docs/screenshots/personas.png) | ![Skills](docs/screenshots/skills.png) |
+| **Personas** — one voice, many agents. | **Skills** — versions, pins, rolling promote. |
+| ![Setup](docs/screenshots/setup.png) | ![Assistant](docs/screenshots/assistant.png) |
+| **Setup** — doctor and first-run guide. | **Assistant** — drafts, diffs, audited apply. |
 
 ## How it fits together
 
@@ -126,16 +122,16 @@ it — the agents keep running. The SQLite database is a rebuildable index; `ins
 ## Security model
 
 - **Agents are contained**: no host network, no Docker socket, one data mount, `NET_RAW`
-  dropped, `pids_limit`, memory and CPU limits.
-- **Egress**: agents only reach the restricted `fleett` network. `fleett egress install`
-  drops RFC1918 destinations with tagged `DOCKER-USER` rules; `allow_lan` is an explicit
-  per-instance exception.
-- **Secrets**: AES-256-GCM at rest, the key lives outside `FLEETT_ROOT`, Compose only sees
-  `${KEY}`, and no endpoint returns a secret value.
+  dropped, `pids_limit`, memory and CPU limits, optional strict hardening profile.
+- **Egress**: the restricted `fleett` network, host `DOCKER-USER` firewall for RFC1918,
+  optional per-agent destination policies. A policy that adds nothing over the host firewall
+  never renders a proxy; an unreachable proxy is reported, not silently enforced.
+- **Secrets**: AES-256-GCM at rest, key outside `FLEETT_ROOT`, Compose only sees `${KEY}`,
+  no endpoint returns a secret value. The assistant redacts provider and instance secrets
+  before sending context to the model.
 - **Humans**: OIDC/Authentik, signed session cookies, `admin`/`viewer`, CSRF double-submit,
-  named tokens stored as digests, every mutation in the audit log.
-- **API**: sliding-window rate limits per IP and credential, a progressive lockout after
-  failed logins, and CSP/HSTS/framing headers on every response (`fleett security`).
+  named tokens stored as digests, every mutation in the audit log — including
+  “via assistant”.
 
 ## CLI
 
@@ -143,13 +139,12 @@ it — the agents keep running. The SQLite database is a rebuildable index; `ins
 fleett ls
 fleett create --template guest-discord --id tchouniz
 fleett logs tchouniz --since 30m --grep error --level error
-fleett usage --detail
-fleett quota alice --set 2048 --policy freeze
-fleett quota cleanup alice
+fleett usage
 fleett upgrade --image hermes-agent:0.23.0-local
 fleett backup --keep 7
+fleett egress policy tchouniz
+fleett egress unset tchouniz
 fleett doctor
-fleett security
 ```
 
 Every command accepts `--json`; the server URL and token come from
@@ -159,12 +154,11 @@ Every command accepts `--json`; the server URL and token come from
 
 | | |
 |---|---|
-| [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | how to run it, as a binary, a `.deb` or a container |
-| [Onboarding and doctor](docs/ONBOARDING.md) | the four first-run steps, the host checklist and its fixes |
-| [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
-| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [templates](docs/TEMPLATES.md) · [personas](docs/PERSONAS.md) · [providers](docs/PROVIDERS.md) · [schedules](docs/SCHEDULES.md) | the per-agent surface |
-| [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [quota](docs/QUOTA.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
-| [MCP](docs/MCP.md) | the fleet as tools for an orchestrating agent |
+| [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | run it as a binary, a `.deb` or a container |
+| [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [policies](docs/EGRESS-POLICY.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
+| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [providers](docs/PROVIDERS.md) · [personas](docs/PERSONAS.md) · [skills](docs/SKILLS.md) · [assistant](docs/ASSISTANT.md) | the per-agent surface |
+| [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [onboarding](docs/ONBOARDING.md) · [CI](docs/CI.md) | day-two operations |
+| [Console i18n](web/I18N.md) | FR/EN conventions and the hardcoded-copy gate |
 
 ## Development
 
@@ -180,9 +174,9 @@ cd web && pnpm build
 cd ../backend && cargo build --release --features embed-web
 ```
 
-`cargo test` (433 tests), `cargo clippy --all-targets -- -D warnings` and `pnpm build` are
-the gates. The compose-driver job runs the real `docker compose` lifecycle against a
-stand-in agent image on every push.
+The gates are `cargo test` (923 tests), `cargo clippy --all-targets -- -D warnings`,
+`pnpm build` and `node scripts/check-i18n.mjs --strict`. The compose-driver job runs the
+real `docker compose` lifecycle against a stand-in agent image on every push.
 
 ## Upgrading from `hermes-fleet`
 
