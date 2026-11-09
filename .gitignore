@@ -9,3 +9,6 @@ instances/
 shares/
 data/
 .playwright-mcp/
+
+# parallel agent worktrees
+.worktrees/
