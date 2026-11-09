@@ -98,6 +98,131 @@ export interface Template {
 }
 
 /* --------------------------------------------------------------------------
+ * Personas (issue #55)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * One variable a persona exposes to its SOUL.md as `{{key}}`. Values live on
+ * the instance (`persona_vars`), never on the persona itself.
+ */
+export interface PersonaVariable {
+  key: string;
+  description: string;
+  /** Used when the instance supplies no value. */
+  default?: string;
+}
+
+/** One reusable personality: a SOUL.md template plus its variables. */
+export interface PersonaSummary {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  variables: PersonaVariable[];
+  /** Instances whose `persona` is this id. */
+  instances_count: number;
+  /** First meaningful line of the template, for the gallery. */
+  excerpt?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `GET /api/personas/{id}`: the summary plus the Markdown template. */
+export interface PersonaDetail extends PersonaSummary {
+  /** Markdown; `{{key}}` placeholders are rendered when the persona is applied. */
+  soul_md: string;
+  /** Ids of the instances applying this persona, sorted. */
+  instances?: string[];
+}
+
+/**
+ * Drift of the instance's `data/SOUL.md` against its persona: `applied` when
+ * the file still matches, `diverged` after a manual edit, `none` without a
+ * persona.
+ */
+export type PersonaState = "applied" | "diverged" | "none";
+
+/** `POST /api/personas/{id}/preview`. */
+export interface PersonaPreview {
+  rendered: string;
+  /** Placeholders with no value and no default, still visible in the text. */
+  missing: string[];
+}
+
+export interface PersonaPreviewInput {
+  variables?: Record<string, string>;
+  /** Use the values stored on this instance instead of `variables`. */
+  instance?: string;
+}
+
+export interface PersonaApplyInput {
+  instances: string[];
+  /** Overrides merged over each instance's stored values. */
+  variables?: Record<string, string>;
+}
+
+/** One instance in an apply report. */
+export interface PersonaApplyEntry {
+  id: string;
+  /** `applied` when the SOUL.md was rewritten, `failed` otherwise. */
+  status: string;
+  error?: string;
+}
+
+/** `POST /api/personas/{id}/apply`: one outcome per instance. */
+export interface PersonaApplyResult {
+  results: PersonaApplyEntry[];
+}
+
+/** `409 persona_in_use`: ids of the instances that still reference the persona. */
+export interface PersonaInUseDetails {
+  persona?: string;
+  instances?: string[];
+}
+
+/** `GET /api/personas/{id}/git/log`. */
+export interface PersonaGitLog {
+  commits: CommitInfo[];
+}
+
+/** `GET /api/personas/{id}/git/diff`: unified patch of the persona files. */
+export interface PersonaGitDiff {
+  from: string;
+  to: string;
+  diff: string;
+}
+
+export interface PersonaGitLogOptions {
+  /** 1..500, defaults to 50. */
+  limit?: number;
+}
+
+export interface PersonaGitDiffOptions {
+  /** Defaults to the first parent of `to`. */
+  from?: string;
+  /** Defaults to `HEAD`. */
+  to?: string;
+}
+
+export interface CreatePersonaInput {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  variables: PersonaVariable[];
+  soul_md: string;
+}
+
+/** `PATCH /api/personas/{id}`: a missing field is left untouched. */
+export interface PatchPersonaInput {
+  name?: string;
+  description?: string;
+  tags?: string[];
+  variables?: PersonaVariable[];
+  soul_md?: string;
+}
+
+/* --------------------------------------------------------------------------
  * Providers (docs/PROVIDERS.md)
  * -------------------------------------------------------------------------- */
 
@@ -211,6 +336,12 @@ export interface InstanceSummary {
   allow_lan: boolean;
   /** Provider the instance draws its API key from; absent for a legacy instance. */
   provider?: string;
+  /** Persona assigned to this instance, when one is. */
+  persona?: string;
+  /** Values rendered into the persona's `{{key}}` placeholders. */
+  persona_vars?: Record<string, string>;
+  /** Drift of the instance's SOUL.md against its persona. */
+  persona_state?: PersonaState;
   created_at: string;
 }
 
@@ -234,6 +365,12 @@ export interface InstanceDetail {
   api_key_env: string;
   /** Provider the instance draws its API key from; absent for a legacy instance. */
   provider?: string;
+  /** Persona assigned to this instance, when one is. */
+  persona?: string;
+  /** Values rendered into the persona's `{{key}}` placeholders. */
+  persona_vars?: Record<string, string>;
+  /** Drift of the instance's SOUL.md against its persona. */
+  persona_state?: PersonaState;
   /** API.md returns the channel type as a string on read. */
   channel: string;
   status: InstanceStatus;
@@ -283,6 +420,10 @@ export interface CreateInstanceInput {
   api_key_env: string;
   /** Reusable provider credential. `base_url`/`api_key_env` default to its values. */
   provider?: string;
+  /** Optional persona; its SOUL.md is rendered into `data/SOUL.md` at creation. */
+  persona?: string | null;
+  /** Values for the persona's `{{key}}` placeholders. */
+  persona_vars?: Record<string, string>;
   /** Write-only. Encrypted at rest as HERMES_GATE_PROFILE_TOKEN. */
   gate_token?: string;
   channel: ChannelInput;
@@ -334,6 +475,10 @@ export interface PatchInstanceInput {
   api_key_env?: string;
   /** `null` detaches the provider; a missing field leaves it in place. */
   provider?: string | null;
+  /** `null` detaches the persona; a missing field leaves it in place. */
+  persona?: string | null;
+  /** Merge semantics: a value sets, `null` deletes one key. */
+  persona_vars?: Record<string, string | null>;
   /** Write-only. Rotates the provider key written as HERMES_GATE_PROFILE_TOKEN. */
   gate_token?: string;
   channel?: ChannelInput;
@@ -1273,6 +1418,19 @@ export interface FleetApi {
   /** Clears the session cookies. Harmless when there is no session. */
   logout(): Promise<void>;
   listTemplates(): Promise<Template[]>;
+  /* Personas */
+  listPersonas(): Promise<PersonaSummary[]>;
+  createPersona(input: CreatePersonaInput): Promise<PersonaDetail>;
+  getPersona(id: string): Promise<PersonaDetail>;
+  patchPersona(id: string, input: PatchPersonaInput): Promise<PersonaDetail>;
+  /** 409 `persona_in_use` carries the instances that still reference it. */
+  deletePersona(id: string): Promise<void>;
+  /** Render the saved SOUL.md; `instance` uses that instance's stored values. */
+  previewPersona(id: string, input?: PersonaPreviewInput): Promise<PersonaPreview>;
+  /** Rewrite `data/SOUL.md` on every listed instance and restart it. */
+  applyPersona(id: string, input: PersonaApplyInput): Promise<PersonaApplyResult>;
+  personaGitLog(id: string, options?: PersonaGitLogOptions): Promise<PersonaGitLog>;
+  personaGitDiff(id: string, options?: PersonaGitDiffOptions): Promise<PersonaGitDiff>;
   listProviders(): Promise<ProviderSummary[]>;
   createProvider(input: CreateProviderInput): Promise<ProviderSummary>;
   getProvider(id: string): Promise<ProviderDetail>;

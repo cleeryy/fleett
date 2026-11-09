@@ -4,6 +4,18 @@ export function isValidSlug(value: string): boolean {
   return SLUG_RE.test(value);
 }
 
+/** Derive an id from a display name: accents dropped, lowercase, single hyphens. */
+export function slugify(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+}
+
 /**
  * Provider names follow the controller grammar (`[a-z0-9-]{2,63}`, starting
  * with a letter or digit). Unlike an instance id, a trailing hyphen is allowed.

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { CopyPlus, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
 import type { CloneInstanceInput, CloneTokenDetails, InstanceDetail } from "@/api/types";
@@ -16,7 +17,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ErrorAlert } from "@/components/error-alert";
+import { PersonaPreviewPanel } from "@/components/persona-preview";
+import { PersonaSelect } from "@/components/persona-select";
+import { PersonaVariableInputs } from "@/components/persona-vars";
 import { ProviderSelect } from "@/components/provider-select";
+import { compactVariables } from "@/lib/personas";
 import { isValidSlug } from "@/lib/validation";
 import { useResource } from "@/lib/use-resource";
 
@@ -87,6 +92,8 @@ export function DuplicateInstanceDialog({
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
   const [providerId, setProviderId] = useState("");
+  const [personaId, setPersonaId] = useState("");
+  const [personaVars, setPersonaVars] = useState<Record<string, string>>({});
   const [gateToken, setGateToken] = useState("");
   const [channelToken, setChannelToken] = useState("");
   const [copyData, setCopyData] = useState(true);
@@ -97,6 +104,7 @@ export function DuplicateInstanceDialog({
   const [missing, setMissing] = useState<string[]>([]);
   const [idConflict, setIdConflict] = useState<string | null>(null);
   const providers = useResource(() => api.listProviders(), []);
+  const personas = useResource(() => api.listPersonas(), []);
 
   // The page refreshes the source while the dialog is open; only the props
   // captured when it opened may seed the draft.
@@ -110,6 +118,14 @@ export function DuplicateInstanceDialog({
     setName(defaultCloneName(current.name));
     setModel("");
     setProviderId(current.provider ?? "");
+    // A diverged SOUL.md is hand-written: default to keeping it rather than
+    // silently replacing it with the persona render.
+    setPersonaId(current.persona && current.persona_state !== "diverged" ? current.persona : "");
+    setPersonaVars(
+      current.persona && current.persona_state !== "diverged"
+        ? { ...(current.persona_vars ?? {}) }
+        : {},
+    );
     setGateToken("");
     setChannelToken("");
     setCopyData(true);
@@ -129,6 +145,8 @@ export function DuplicateInstanceDialog({
   const providerSelected = providerId !== "";
   const selectedProvider = (providers.data ?? []).find((provider) => provider.id === providerId) ?? null;
   const providerLabel = selectedProvider?.name ?? providerId;
+  const personaList = personas.data ?? [];
+  const selectedPersona = personaList.find((persona) => persona.id === personaId) ?? null;
 
   const missingProvider = missing.filter((key) => key !== botKey);
   const missingChannel = botKey ? missing.filter((key) => key === botKey) : [];
@@ -187,6 +205,18 @@ export function DuplicateInstanceDialog({
     }
   }
 
+  function selectPersona(next: string) {
+    const persona = personaList.find((candidate) => candidate.id === next) ?? null;
+    setPersonaId(next);
+    setPersonaVars((current) => {
+      const kept: Record<string, string> = {};
+      for (const variable of persona?.variables ?? []) {
+        if (current[variable.key] !== undefined) kept[variable.key] = current[variable.key];
+      }
+      return kept;
+    });
+  }
+
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setAttempted(true);
@@ -212,8 +242,21 @@ export function DuplicateInstanceDialog({
     setError(null);
     try {
       const clone = await api.cloneInstance(source.id, input);
+      // The clone endpoint has no persona field: assigning one is a normal PATCH
+      // on the new instance, which renders SOUL.md once and restarts it.
+      let created = clone;
+      if (personaId) {
+        try {
+          created = await api.patchInstance(clone.id, {
+            persona: personaId,
+            persona_vars: compactVariables(personaVars),
+          });
+        } catch (cause) {
+          toast.error(`Clone created, but the persona was not applied: ${toApiError(cause).message}`);
+        }
+      }
       onOpenChange(false);
-      onCloned(clone);
+      onCloned(created);
     } catch (cause) {
       const failure = toApiError(cause);
       if (failure.status === 409 && failure.code === "instance_exists") {
@@ -464,6 +507,75 @@ export function DuplicateInstanceDialog({
                   </p>
                 </div>
               ) : null}
+            </div>
+
+            <div className="space-y-4 rounded-md border p-4">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  Persona <span className="font-normal text-muted-foreground">(optional)</span>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Replaces the copied <span className="font-mono">SOUL.md</span> with a rendered
+                  persona. The clone keeps its own variable values, so the same persona can read
+                  differently here.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <PersonaSelect
+                  id="duplicate-persona"
+                  value={personaId}
+                  onChange={selectPersona}
+                  personas={personaList}
+                  loading={personas.loading && !personas.data}
+                  describedBy="duplicate-persona-help"
+                />
+                <p id="duplicate-persona-help" className="text-xs text-muted-foreground">
+                  {source.persona
+                    ? source.persona_state === "diverged"
+                      ? "The source SOUL.md was edited by hand, so None is selected by default: the copy's SOUL.md is not replaced. Picking a persona overwrites it with the rendered template."
+                      : personaId === source.persona
+                        ? "Inherited from the source. Choose None to keep the copied SOUL.md instead."
+                        : "The source persona is replaced; the rendered template is written after the copy."
+                    : "The source has no persona. Pick one to render its SOUL.md into the clone."}
+                </p>
+                {personas.error ? (
+                  <p className="text-xs text-destructive">
+                    Personas could not be loaded: {personas.error.message}{" "}
+                    <button
+                      type="button"
+                      className="underline underline-offset-4"
+                      onClick={personas.reload}
+                    >
+                      Retry
+                    </button>
+                  </p>
+                ) : null}
+              </div>
+
+              {selectedPersona ? (
+                <>
+                  <PersonaVariableInputs
+                    variables={selectedPersona.variables}
+                    values={personaVars}
+                    onChange={setPersonaVars}
+                    idPrefix="duplicate-persona-var"
+                    disabled={pending}
+                  />
+                  <PersonaPreviewPanel
+                    personaId={selectedPersona.id}
+                    variables={personaVars}
+                    description="Rendered from the saved persona; then stored on the clone."
+                    maxHeight="26vh"
+                  />
+                </>
+              ) : (
+                <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
+                  No persona: the clone keeps{" "}
+                  <span className="font-mono">data/SOUL.md</span> from the copy, or the template
+                  default when data is not copied.
+                </p>
+              )}
             </div>
 
             <div className="space-y-4 rounded-md border p-4">

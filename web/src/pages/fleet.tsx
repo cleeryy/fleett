@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes,
   ExternalLink,
+  Fingerprint,
   Loader2,
   Minus,
   MoreHorizontal,
@@ -57,6 +58,7 @@ import { formatClock, formatUptime, plural } from "@/lib/format";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
+import { cn } from "@/lib/utils";
 
 const FILTERS = ["all", "running", "stopped", "created", "error", "unknown"] as const;
 type Filter = (typeof FILTERS)[number];
@@ -80,6 +82,30 @@ function LanBadge() {
     >
       <Network aria-hidden />
       LAN
+    </Badge>
+  );
+}
+
+/** Persona name plus drift, shown next to the instance name. */
+function PersonaBadge({ row, name }: { row: InstanceSummary; name?: string }) {
+  if (!row.persona) return null;
+  const diverged = row.persona_state === "diverged";
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "max-w-40 gap-1 px-1.5 font-mono text-[11px] font-normal",
+        diverged && "border-amber-600/40 text-amber-700 dark:text-amber-400",
+      )}
+      title={
+        diverged
+          ? `Persona ${name ?? row.persona}: SOUL.md was edited by hand`
+          : `Persona ${name ?? row.persona}`
+      }
+    >
+      <Fingerprint aria-hidden />
+      <span className="truncate">{name ?? row.persona}</span>
+      {diverged ? <span className="shrink-0">· diverged</span> : null}
     </Badge>
   );
 }
@@ -150,6 +176,11 @@ export function FleetPage() {
   const searchRef = useRef<HTMLInputElement>(null);
 
   const list = useResource(() => api.listInstances(), [nonce]);
+  const personas = useResource(() => api.listPersonas(), []);
+  const personaNames = useMemo(
+    () => new Map((personas.data ?? []).map((persona) => [persona.id, persona.name])),
+    [personas.data],
+  );
   const openIncidents = useResource(
     () => api.listIncidents({ status: "open", limit: 100 }),
     [nonce],
@@ -475,6 +506,10 @@ export function FleetPage() {
                                 {row.name}
                               </span>
                               {row.allow_lan ? <LanBadge /> : null}
+                              <PersonaBadge
+                                row={row}
+                                name={row.persona ? personaNames.get(row.persona) : undefined}
+                              />
                             </span>
                             <span className="block truncate font-mono text-xs text-muted-foreground">
                               {row.id}
@@ -559,6 +594,10 @@ export function FleetPage() {
                             {row.name}
                           </a>
                           {row.allow_lan ? <LanBadge /> : null}
+                          <PersonaBadge
+                            row={row}
+                            name={row.persona ? personaNames.get(row.persona) : undefined}
+                          />
                         </div>
                         <p className="truncate font-mono text-xs text-muted-foreground">
                           {row.id}

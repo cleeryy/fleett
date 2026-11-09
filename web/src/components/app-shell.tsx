@@ -5,6 +5,7 @@ import {
   CalendarClock,
   CircleDollarSign,
   FileClock,
+  Fingerprint,
   FolderTree,
   KeyRound,
   LayoutTemplate,
@@ -64,6 +65,7 @@ const NAV: NavItem[] = [
   { key: "providers", label: "Providers", href: "#/providers", icon: Plug },
   { key: "shares", label: "Shares", href: "#/shares", icon: FolderTree },
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
+  { key: "personas", label: "Personas", href: "#/personas", icon: Fingerprint },
   { key: "tokens", label: "Tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
   { key: "audit", label: "Audit log", href: "#/audit", icon: FileClock, adminOnly: true },
 ];
@@ -79,6 +81,7 @@ function activeKey(path: string): string {
   if (path.startsWith("/providers")) return "providers";
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/templates")) return "templates";
+  if (path.startsWith("/personas")) return "personas";
   if (path.startsWith("/tokens")) return "tokens";
   if (path.startsWith("/audit")) return "audit";
   if (path.startsWith("/messages")) return "messages";

@@ -136,6 +136,7 @@ export function InstanceFiles({
   canEdit,
   active,
   onRestarted,
+  onFileSaved,
 }: {
   id: string;
   canEdit: boolean;
@@ -143,6 +144,8 @@ export function InstanceFiles({
   active: boolean;
   /** A save with `restart` changed the instance status: refresh the header. */
   onRestarted?: () => void;
+  /** Any successful write or delete; lets the page refresh persona drift badges. */
+  onFileSaved?: () => void;
 }) {
   const [cwd, setCwd] = useState("/");
   const listing = useResource(() => api.listFiles(id, cwd), [id, cwd]);
@@ -421,6 +424,7 @@ export function InstanceFiles({
       setPreview(false);
       listing.reload();
       if (result.restarted) onRestarted?.();
+      onFileSaved?.();
       const message = options.force
         ? `Overwrote ${name}.`
         : options.restart
@@ -457,6 +461,7 @@ export function InstanceFiles({
       setDraft("");
       setPreview(false);
       listing.reload();
+      onFileSaved?.();
       closeDialog();
     } catch (cause) {
       setDialogError(toApiError(cause));

@@ -23,15 +23,28 @@ import { Textarea } from "@/components/ui/textarea";
 import { EnvironmentRows } from "@/components/env-rows";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
+import { PersonaPreviewPanel } from "@/components/persona-preview";
+import { PersonaSelect } from "@/components/persona-select";
+import { PersonaVariableInputs } from "@/components/persona-vars";
 import { ProviderSelect } from "@/components/provider-select";
 import { SharePicker } from "@/components/share-picker";
 import { envPayload, validateEnvRows, type EnvRow } from "@/lib/env";
-import { isHttpUrl, isValidSlug } from "@/lib/validation";
+import { compactVariables } from "@/lib/personas";
+import { isHttpUrl, isValidSlug, slugify } from "@/lib/validation";
+import { plural } from "@/lib/format";
 import { navigate, setRouteGuard, hrefFor, useRoute } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
-const STEPS = ["Identity", "Template", "Model & network", "Channel", "Shares", "Review"] as const;
+const STEPS = [
+  "Identity",
+  "Template",
+  "Persona",
+  "Model & network",
+  "Channel",
+  "Shares",
+  "Review",
+] as const;
 const LAST_STEP = STEPS.length - 1;
 
 const CHANNELS: { value: ChannelType; label: string; hint: string }[] = [
@@ -47,6 +60,8 @@ interface Draft {
   template: string;
   model: string;
   provider: string;
+  persona: string;
+  personaVars: Record<string, string>;
   baseUrl: string;
   apiKeyEnv: string;
   providerToken: string;
@@ -67,6 +82,8 @@ const DEFAULT_DRAFT: Draft = {
   template: "",
   model: "",
   provider: "",
+  persona: "",
+  personaVars: {},
   baseUrl: "https://opencode.ai/inference/go/openai/v1",
   apiKeyEnv: "HERMES_GATE_PROFILE_TOKEN",
   providerToken: "",
@@ -95,17 +112,6 @@ function templateChannel(value: string | undefined): ChannelType | null {
   return value === "telegram" || value === "discord" || value === "none" ? value : null;
 }
 
-function slugify(value: string): string {
-  return value
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32)
-    .replace(/-+$/g, "");
-}
-
 function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = []): Record<string, string> {
   const errors: Record<string, string> = {};
 
@@ -119,7 +125,7 @@ function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = [])
 
   if (step === 1 && !draft.template) errors.template = "Select a template.";
 
-  if (step === 2) {
+  if (step === 3) {
     if (!draft.model.trim()) errors.model = "Enter a model.";
     if (!draft.baseUrl.trim()) errors.baseUrl = "Enter a base URL.";
     else if (!isHttpUrl(draft.baseUrl.trim())) errors.baseUrl = "Use an absolute http or https URL.";
@@ -138,7 +144,7 @@ function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = [])
     }
   }
 
-  if (step === 3 && draft.channel !== "none" && !draft.token.trim()) {
+  if (step === 4 && draft.channel !== "none" && !draft.token.trim()) {
     errors.token = "Enter the bot token.";
   }
 
@@ -168,6 +174,7 @@ export function NewInstancePage() {
   const templates = useResource(() => api.listTemplates(), []);
   const shares = useResource(() => api.listShares(), []);
   const providers = useResource(() => api.listProviders(), []);
+  const personas = useResource(() => api.listPersonas(), []);
 
   const [draft, setDraft] = useState<Draft>(DEFAULT_DRAFT);
   const [step, setStep] = useState(0);
@@ -293,6 +300,20 @@ export function NewInstancePage() {
     }));
   }
 
+  function selectPersona(id: string) {
+    const persona = (personas.data ?? []).find((candidate) => candidate.id === id) ?? null;
+    setDraft((current) => {
+      // Keep only the values that still exist on the new persona.
+      const kept: Record<string, string> = {};
+      for (const variable of persona?.variables ?? []) {
+        if (current.personaVars[variable.key] !== undefined) {
+          kept[variable.key] = current.personaVars[variable.key];
+        }
+      }
+      return { ...current, persona: id, personaVars: kept };
+    });
+  }
+
   async function create() {
     for (let index = 0; index < LAST_STEP; index += 1) {
       const stepErrors = validate(draft, index, draftTemplateEnv);
@@ -317,6 +338,8 @@ export function NewInstancePage() {
         base_url: draft.baseUrl.trim(),
         api_key_env: draft.apiKeyEnv.trim(),
         provider: draft.provider || undefined,
+        persona: draft.persona || null,
+        persona_vars: draft.persona ? compactVariables(draft.personaVars) : undefined,
         gate_token: draft.provider ? undefined : draft.providerToken.trim() || undefined,
         channel: draft.channel === "none" ? { type: "none" } : { type: draft.channel, token: draft.token },
         shares: draft.shares,
@@ -337,11 +360,16 @@ export function NewInstancePage() {
         window.requestAnimationFrame(() => document.getElementById("id")?.focus());
       } else {
         setSubmitError(error);
-        if (error.code === "egress_not_enforced" || error.code === "secrets_key_missing") {
+        if (error.code === "missing_persona_variables") {
+          // The error names every unresolved placeholder; the fields that set
+          // them live on the Persona step.
+          setStep(2);
+          setAttempted(null);
+        } else if (error.code === "egress_not_enforced" || error.code === "secrets_key_missing") {
           // Host prerequisites live on the "Model & network" step: put the
           // user on the field that needs the command to be run. A secret env
           // row also needs the secrets key, so anchor that panel instead.
-          setStep(2);
+          setStep(3);
           setAttempted(null);
           const secretEnv = draft.env.some((row) => row.secret);
           const egress = error.code === "egress_not_enforced";
@@ -384,14 +412,16 @@ export function NewInstancePage() {
   const selectedTemplate = templateList.find((template) => template.id === draft.template);
   const providerList = providers.data ?? [];
   const selectedProvider = providerList.find((provider) => provider.id === draft.provider) ?? null;
+  const personaList = personas.data ?? [];
+  const selectedPersona = personaList.find((persona) => persona.id === draft.persona) ?? null;
   const envSuggestions = (selectedTemplate?.env ?? []).filter(
     (suggestion) => !draft.env.some((row) => row.key.trim() === suggestion.key),
   );
   const envErrors =
-    showErrors && step === 2 ? validateEnvRows(draft.env, "create", selectedTemplate?.env ?? []).rows : {};
+    showErrors && step === 3 ? validateEnvRows(draft.env, "create", selectedTemplate?.env ?? []).rows : {};
   const envHasSecrets = draft.env.some((row) => row.secret);
   const secretsErrorShownInline =
-    secretsError !== null && step === 2 && (!draft.provider || envHasSecrets);
+    secretsError !== null && step === 3 && (!draft.provider || envHasSecrets);
 
   return (
     <>
@@ -438,7 +468,7 @@ export function NewInstancePage() {
         </nav>
 
         <div className="min-w-0 max-w-2xl space-y-6">
-          {submitError && !(egressError && step === 2) && !secretsErrorShownInline ? (
+          {submitError && !(egressError && step === 3) && !secretsErrorShownInline ? (
             <ErrorAlert error={submitError} />
           ) : null}
 
@@ -573,6 +603,80 @@ export function NewInstancePage() {
             ) : null}
 
             {step === 2 ? (
+              <div className="space-y-5">
+                {personas.error ? (
+                  <ErrorAlert error={personas.error} onRetry={personas.reload} />
+                ) : null}
+
+                <div className="space-y-2">
+                  <Label htmlFor="wizard-persona">
+                    Persona <span className="font-normal text-muted-foreground">(optional)</span>
+                  </Label>
+                  <PersonaSelect
+                    id="wizard-persona"
+                    value={draft.persona}
+                    onChange={selectPersona}
+                    personas={personaList}
+                    loading={personas.loading && !personas.data}
+                    describedBy="wizard-persona-help"
+                  />
+                  <p id="wizard-persona-help" className="text-xs text-muted-foreground">
+                    Renders a reusable SOUL.md into{" "}
+                    <span className="font-mono">data/SOUL.md</span>. Values stay on this instance, so
+                    the same persona reads differently per agent.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    <a href={hrefFor("/personas")} className="underline underline-offset-4">
+                      Manage personas
+                    </a>
+                  </p>
+                </div>
+
+                {selectedPersona ? (
+                  <>
+                    <div className="space-y-1 rounded-md border p-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-medium">{selectedPersona.name}</span>
+                        {selectedPersona.tags.map((tag) => (
+                          <Badge
+                            key={tag}
+                            variant="secondary"
+                            className="font-mono text-[11px] font-normal"
+                          >
+                            {tag}
+                          </Badge>
+                        ))}
+                      </div>
+                      <p className="text-sm text-muted-foreground">{selectedPersona.description}</p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <p className="text-sm font-medium">Values for this instance</p>
+                      <PersonaVariableInputs
+                        variables={selectedPersona.variables}
+                        values={draft.personaVars}
+                        onChange={(personaVars) => update("personaVars", personaVars)}
+                        idPrefix="wizard-persona-var"
+                      />
+                    </div>
+
+                    <PersonaPreviewPanel
+                      personaId={selectedPersona.id}
+                      variables={draft.personaVars}
+                      description="Rendered from the saved persona; then stored on the instance."
+                      maxHeight="32vh"
+                    />
+                  </>
+                ) : (
+                  <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
+                    No persona: the instance keeps the SOUL.md its template provides. You can assign one
+                    later in Configuration.
+                  </p>
+                )}
+              </div>
+            ) : null}
+
+            {step === 3 ? (
               <div className="space-y-5">
                 <div className="space-y-2">
                   <Label htmlFor="wizard-provider">
@@ -783,7 +887,7 @@ export function NewInstancePage() {
               </div>
             ) : null}
 
-            {step === 3 ? (
+            {step === 4 ? (
               <div className="space-y-5">
                 <RadioGroup
                   aria-label="Channel"
@@ -836,7 +940,7 @@ export function NewInstancePage() {
               </div>
             ) : null}
 
-            {step === 4 ? (
+            {step === 5 ? (
               <SharePicker
                 shares={shareList}
                 value={draft.shares}
@@ -847,12 +951,41 @@ export function NewInstancePage() {
               />
             ) : null}
 
-            {step === 5 ? (
+            {step === 6 ? (
               <div className="space-y-4">
                 <dl className="divide-y rounded-md border">
                   <ReviewRow label="Name" value={draft.name || "—"} />
                   <ReviewRow label="Id" value={<span className="font-mono">{draft.id || "—"}</span>} />
                   <ReviewRow label="Template" value={<span className="font-mono">{draft.template || "—"}</span>} />
+                  <ReviewRow
+                    label="Persona"
+                    value={
+                      selectedPersona ? (
+                        <span className="space-y-1">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <a
+                              href={hrefFor(`/personas/${selectedPersona.id}`)}
+                              className="font-mono underline-offset-4 hover:underline"
+                            >
+                              {selectedPersona.name}
+                            </a>
+                            <Badge variant="outline" className="font-mono text-xs font-normal">
+                              {Object.keys(compactVariables(draft.personaVars)).length}{" "}
+                              {plural(
+                                Object.keys(compactVariables(draft.personaVars)).length,
+                                "override",
+                              )}
+                            </Badge>
+                          </span>
+                          <span className="block text-xs text-muted-foreground">
+                            Rendered into <span className="font-mono">data/SOUL.md</span> at creation.
+                          </span>
+                        </span>
+                      ) : (
+                        "None — keeps the template SOUL.md"
+                      )
+                    }
+                  />
                   <ReviewRow label="Model" value={<span className="font-mono break-all">{draft.model}</span>} />
                   <ReviewRow
                     label="Base URL"

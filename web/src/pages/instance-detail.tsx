@@ -15,7 +15,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, ProviderSummary, ShareRef } from "@/api/types";
+import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -58,6 +58,9 @@ import {
 import { InstanceSchedules } from "@/components/schedules";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
+import { PersonaStateBadge } from "@/components/persona-state-badge";
+import { PersonaSelect } from "@/components/persona-select";
+import { PersonaVariableInputs } from "@/components/persona-vars";
 import { SharePicker } from "@/components/share-picker";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -68,6 +71,7 @@ import {
 } from "@/lib/assistant";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
+import { applySucceeded, compactVariables } from "@/lib/personas";
 import { navigate, hrefFor } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -110,11 +114,13 @@ function hasEnv(detail: InstanceDetail, key: string): boolean {
 function OverviewTab({
   detail,
   provider,
+  persona,
   canEdit,
   onConfigure,
 }: {
   detail: InstanceDetail;
   provider: ProviderSummary | null;
+  persona: PersonaSummary | null;
   canEdit: boolean;
   onConfigure: () => void;
 }) {
@@ -231,6 +237,65 @@ function OverviewTab({
               },
             ]}
           />
+        </Section>
+
+        <Section
+          title="Persona"
+          action={
+            canEdit ? (
+              <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
+                Manage
+              </Button>
+            ) : (
+              <Button asChild variant="ghost" size="sm">
+                <a href="#/personas">Browse</a>
+              </Button>
+            )
+          }
+        >
+          {detail.persona ? (
+            <div className="space-y-3 rounded-md border p-4">
+              <div className="flex flex-wrap items-center gap-2">
+                {persona ? (
+                  <a
+                    href={hrefFor(`/personas/${persona.id}`)}
+                    className="text-sm font-medium underline-offset-4 hover:underline"
+                  >
+                    {persona.name}
+                  </a>
+                ) : (
+                  <span className="font-mono text-sm">{detail.persona}</span>
+                )}
+                <PersonaStateBadge state={detail.persona_state} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {detail.persona_state === "diverged"
+                  ? "data/SOUL.md was edited by hand after the persona was applied. Reapply the persona in Configuration to take it back over, or keep the manual text."
+                  : "data/SOUL.md is rendered from this persona; applying it rewrites the file and restarts the instance."}
+              </p>
+              <dl className="grid grid-cols-2 gap-2 text-xs">
+                <div className="min-w-0">
+                  <dt className="text-muted-foreground">Values set</dt>
+                  <dd className="font-mono">
+                    {Object.keys(compactVariables(detail.persona_vars ?? {})).length}{" "}
+                    {plural(
+                      Object.keys(compactVariables(detail.persona_vars ?? {})).length,
+                      "override",
+                    )}
+                  </dd>
+                </div>
+                <div className="min-w-0">
+                  <dt className="text-muted-foreground">Persona id</dt>
+                  <dd className="truncate font-mono">{detail.persona}</dd>
+                </div>
+              </dl>
+            </div>
+          ) : (
+            <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
+              No persona. The instance keeps the SOUL.md its template provides; assign one in
+              Configuration to render a shared personality.
+            </p>
+          )}
         </Section>
 
         <Section title="Container">
@@ -382,11 +447,34 @@ interface ConfigDraft {
   allow_lan: boolean;
   channel: ChannelType;
   token: string;
+  persona: string;
+  personaVars: Record<string, string>;
   notes: string;
   shares: ShareRef[];
 }
 
 const CHANNEL_TYPES: ChannelType[] = ["none", "telegram", "discord"];
+
+/**
+ * `PATCH` merges persona values: a value sets the key, `null` deletes it. Send
+ * one for every stored key the form cleared, so an emptied override really
+ * disappears.
+ */
+function personaVariablesPatch(
+  stored: Record<string, string>,
+  next: Record<string, string>,
+): Record<string, string | null> {
+  const patch: Record<string, string | null> = {};
+  const kept = new Map<string, string>();
+  for (const [key, value] of Object.entries(next)) {
+    if (value.trim()) kept.set(key, value.trim());
+  }
+  for (const [key, value] of kept) patch[key] = value;
+  for (const key of Object.keys(stored)) {
+    if (!kept.has(key)) patch[key] = null;
+  }
+  return patch;
+}
 
 function toConfigDraft(detail: InstanceDetail): ConfigDraft {
   return {
@@ -399,6 +487,8 @@ function toConfigDraft(detail: InstanceDetail): ConfigDraft {
     allow_lan: detail.allow_lan,
     channel: (CHANNEL_TYPES.includes(detail.channel as ChannelType) ? detail.channel : "none") as ChannelType,
     token: "",
+    persona: detail.persona ?? "",
+    personaVars: { ...(detail.persona_vars ?? {}) },
     notes: detail.notes,
     shares: detail.shares.map((share) => ({ ...share })),
   };
@@ -451,14 +541,28 @@ function ConfigurationTab({
   onEnvApplied: () => void;
 }) {
   const sharesResource = useResource(() => api.listShares(), []);
+  const personas = useResource(() => api.listPersonas(), []);
   const [attempted, setAttempted] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
+  const [reapplying, setReapplying] = useState(false);
+  const [reapplyError, setReapplyError] = useState<string | null>(null);
 
   const errors = validateConfig(draft, detail.channel);
   const showErrors = attempted;
   const providerKeySet = hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
   const dirty = JSON.stringify(draft) !== JSON.stringify(toConfigDraft(detail));
+  const personaChanged = draft.persona !== (detail.persona ?? "");
+  const varsDirty =
+    JSON.stringify(compactVariables(draft.personaVars)) !==
+    JSON.stringify(compactVariables(detail.persona_vars ?? {}));
+  const personaDirty = personaChanged || varsDirty;
+  const selectedPersona =
+    (personas.data ?? []).find((persona) => persona.id === draft.persona) ?? null;
+  const divergedActive =
+    !!draft.persona &&
+    detail.persona === draft.persona &&
+    detail.persona_state === "diverged";
   // Host prerequisites sit on the field that needs them, like egress on the
   // network checkbox: the provider token needs the secrets key.
   const egressError = error?.code === "egress_not_enforced" ? error : null;
@@ -466,6 +570,50 @@ function ConfigurationTab({
 
   function update<K extends keyof ConfigDraft>(key: K, value: ConfigDraft[K]) {
     onDraftChange({ ...draft, [key]: value } as ConfigDraft);
+  }
+
+  function selectPersona(id: string) {
+    const persona = (personas.data ?? []).find((candidate) => candidate.id === id) ?? null;
+    const kept: Record<string, string> = {};
+    for (const variable of persona?.variables ?? []) {
+      if (draft.personaVars[variable.key] !== undefined) {
+        kept[variable.key] = draft.personaVars[variable.key];
+      }
+    }
+    onDraftChange({ ...draft, persona: id, personaVars: kept });
+    setReapplyError(null);
+  }
+
+  async function reapplyPersona() {
+    if (!draft.persona) return;
+    setReapplying(true);
+    setReapplyError(null);
+    try {
+      const variables = compactVariables(draft.personaVars);
+      // Start from what is on screen: a pending variable edit must not be
+      // silently dropped by a reapply.
+      if (personaDirty) {
+        await api.patchInstance(detail.id, {
+          ...(personaChanged ? { persona: draft.persona || null } : {}),
+          persona_vars: personaVariablesPatch(detail.persona_vars ?? {}, draft.personaVars),
+        });
+      }
+      const result = await api.applyPersona(draft.persona, {
+        instances: [detail.id],
+        variables,
+      });
+      const entry = result.results.find((candidate) => candidate.id === detail.id) ?? result.results[0];
+      if (!entry || !applySucceeded(entry.status)) {
+        setReapplyError(entry?.error ?? "The controller did not apply the persona.");
+      } else {
+        toast.success("Persona reapplied: SOUL.md rewritten and the instance restarted.");
+      }
+      onSaved();
+    } catch (cause) {
+      setReapplyError(toApiError(cause).message);
+    } finally {
+      setReapplying(false);
+    }
   }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -489,6 +637,12 @@ function ConfigurationTab({
         mem_limit_mb: Number(draft.mem_limit_mb),
         allow_lan: draft.allow_lan,
         notes: draft.notes,
+        ...(personaDirty
+          ? {
+              ...(personaChanged ? { persona: draft.persona || null } : {}),
+              persona_vars: personaVariablesPatch(detail.persona_vars ?? {}, draft.personaVars),
+            }
+          : {}),
         channel:
           draft.channel === "none"
             ? { type: "none" }
@@ -742,6 +896,99 @@ function ConfigurationTab({
         </fieldset>
 
         <fieldset className="min-w-0 space-y-3">
+          <legend className="text-sm font-medium">Persona</legend>
+          <div className="space-y-2">
+            <PersonaSelect
+              id="cfg-persona"
+              value={draft.persona}
+              onChange={selectPersona}
+              personas={personas.data ?? []}
+              loading={personas.loading && !personas.data}
+              describedBy="cfg-persona-help"
+            />
+            <p id="cfg-persona-help" className="text-xs text-muted-foreground">
+              Renders a shared SOUL.md into{" "}
+              <span className="font-mono">data/SOUL.md</span>. Values stay on this instance; saving
+              rewrites the file and restarts the container.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              <a href="#/personas" className="underline underline-offset-4">
+                Manage personas
+              </a>
+            </p>
+            {personas.error ? (
+              <p className="text-xs text-destructive">
+                Personas could not be loaded: {personas.error.message}{" "}
+                <button
+                  type="button"
+                  className="underline underline-offset-4"
+                  onClick={personas.reload}
+                >
+                  Retry
+                </button>
+              </p>
+            ) : null}
+          </div>
+
+          {selectedPersona ? (
+            <>
+              <div className="rounded-md border p-4">
+                <p className="text-sm font-medium">
+                  {selectedPersona.name}{" "}
+                  <PersonaStateBadge state={detail.persona === selectedPersona.id ? detail.persona_state : undefined} />
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {selectedPersona.description}
+                </p>
+              </div>
+              <PersonaVariableInputs
+                variables={selectedPersona.variables}
+                values={draft.personaVars}
+                onChange={(personaVars) => update("personaVars", personaVars)}
+                idPrefix="cfg-persona-var"
+                disabled={pending || reapplying}
+              />
+            </>
+          ) : (
+            <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
+              No persona: the SOUL.md currently on disk stays untouched.
+            </p>
+          )}
+
+          {divergedActive ? (
+            <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
+              <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
+              <AlertTitle>SOUL.md was edited by hand</AlertTitle>
+              <AlertDescription>
+                <p className="text-sm text-muted-foreground">
+                  The file on disk no longer matches this persona. Reapplying rewrites{" "}
+                  <span className="font-mono">data/SOUL.md</span> from the persona and restarts the
+                  instance; unsaved variable values above are saved first.
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="mt-2"
+                  onClick={() => void reapplyPersona()}
+                  disabled={pending || reapplying}
+                >
+                  {reapplying ? (
+                    <Loader2 aria-hidden className="animate-spin" />
+                  ) : (
+                    <RotateCw aria-hidden />
+                  )}
+                  Reapply persona
+                </Button>
+                {reapplyError ? (
+                  <p className="mt-2 text-xs text-destructive">{reapplyError}</p>
+                ) : null}
+              </AlertDescription>
+            </Alert>
+          ) : null}
+        </fieldset>
+
+        <fieldset className="min-w-0 space-y-3">
           <legend className="text-sm font-medium">Shares</legend>
           <SharePicker
             shares={sharesResource.data ?? []}
@@ -919,6 +1166,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
 
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
   const providers = useResource(() => api.listProviders(), []);
+  const personas = useResource(() => api.listPersonas(), []);
   const templatesResource = useResource(() => api.listTemplates(), []);
 
   // The assistant sees the tab, the instance and its last error. The Files tab
@@ -1025,6 +1273,9 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const provider = data.provider
     ? (providers.data?.find((candidate) => candidate.id === data.provider) ?? null)
     : null;
+  const persona = data.persona
+    ? (personas.data?.find((candidate) => candidate.id === data.persona) ?? null)
+    : null;
   const templateEnv =
     templatesResource.data?.find((candidate) => candidate.id === data.template)?.env ?? [];
   const uptime =
@@ -1049,6 +1300,9 @@ export function InstanceDetailPage({ id }: { id: string }) {
           <span className="flex flex-wrap items-center gap-3">
             {data.name}
             <StatusBadge status={data.status} />
+            {data.persona && data.persona_state === "diverged" ? (
+              <PersonaStateBadge state="diverged" />
+            ) : null}
           </span>
         }
         description={
@@ -1180,6 +1434,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
           <OverviewTab
             detail={data}
             provider={provider}
+            persona={persona}
             canEdit={canEdit}
             onConfigure={() => setTab("configuration")}
           />
@@ -1230,6 +1485,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
               canEdit={canEdit}
               active={tab === "files"}
               onRestarted={() => setNonce((value) => value + 1)}
+              onFileSaved={() => setNonce((value) => value + 1)}
             />
           ) : null}
         </TabsContent>

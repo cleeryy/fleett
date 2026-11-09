@@ -24,6 +24,8 @@ import { LoginPage } from "@/pages/login";
 import { LogsPage } from "@/pages/logs";
 import { MemoryPage } from "@/pages/memory";
 import { MessagesPage } from "@/pages/messages";
+import { PersonaDetailPage } from "@/pages/persona-detail";
+import { PersonasPage } from "@/pages/personas";
 import { PipelinesPage } from "@/pages/pipelines";
 import { ProviderDetailPage } from "@/pages/provider-detail";
 import { ProvidersPage } from "@/pages/providers";
@@ -48,6 +50,8 @@ function titleFor(path: string): string {
   if (path.startsWith("/providers/")) return "Provider details";
   if (path === "/shares") return "Shares";
   if (path === "/templates") return "Templates";
+  if (path === "/personas") return "Personas";
+  if (path.startsWith("/personas/")) return "Persona details";
   if (path === "/tokens") return "Tokens";
   if (path === "/audit") return "Audit log";
   if (path === "/schedules") return "Schedules";
@@ -261,6 +265,7 @@ export default function App() {
 
   const detailMatch = /^\/instances\/([^/]+)$/.exec(path);
   const providerMatch = /^\/providers\/([^/]+)$/.exec(path);
+  const personaMatch = /^\/personas\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
     crumbs = [{ label: "Instances" }];
@@ -292,6 +297,13 @@ export default function App() {
   } else if (path === "/templates") {
     crumbs = [{ label: "Templates" }];
     screen = <TemplatesPage />;
+  } else if (path === "/personas") {
+    crumbs = [{ label: "Personas" }];
+    screen = <PersonasPage />;
+  } else if (personaMatch) {
+    const id = decodeURIComponent(personaMatch[1]);
+    crumbs = [{ label: "Personas", href: "#/personas" }, { label: id, mono: true }];
+    screen = <PersonaDetailPage key={id} id={id} />;
   } else if (path === "/schedules") {
     crumbs = [{ label: "Schedules" }];
     screen = admin ? (

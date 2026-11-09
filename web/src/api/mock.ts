@@ -25,6 +25,7 @@ import type {
   CostTotals,
   CreateInstanceInput,
   CreateMemoryInput,
+  CreatePersonaInput,
   CreatePipelineInput,
   CreateProviderInput,
   CreateScheduleInput,
@@ -78,8 +79,19 @@ import type {
   MkdirResult,
   PatchInstanceInput,
   PatchPipelineInput,
+  PatchPersonaInput,
   PatchProviderInput,
   PatchScheduleInput,
+  PersonaApplyInput,
+  PersonaApplyResult,
+  PersonaDetail,
+  PersonaGitDiff,
+  PersonaGitLog,
+  PersonaGitLogOptions,
+  PersonaPreview,
+  PersonaState,
+  PersonaSummary,
+  PersonaVariable,
   Pipeline,
   PipelineRun,
   PipelineRunDetail,
@@ -213,6 +225,12 @@ interface Stored {
   api_key_env: string;
   /** Provider credential this instance draws its key from. */
   provider: string | null;
+  /** Persona assigned to the instance, when one is. */
+  persona: string | null;
+  /** Values rendered into the persona's `{{key}}` placeholders. */
+  persona_vars: Record<string, string>;
+  /** Drift of `data/SOUL.md` against the persona. */
+  persona_state: PersonaState;
   /** Write-only secret; only its presence is exposed through the env list. */
   gate_token: string | null;
   /** Write-only secret for the platform bot; never returned. */
@@ -244,6 +262,18 @@ interface StoredProvider {
   base_url: string;
   api_key_env: string;
   secret: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One reusable personality (issue #55). */
+interface StoredPersona {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  variables: PersonaVariable[];
+  soul_md: string;
   created_at: string;
   updated_at: string;
 }
@@ -289,6 +319,9 @@ let templates: Template[] = [];
 let tokens: TokenInfo[] = [];
 let audit: AuditEntry[] = [];
 let providerStore: StoredProvider[] = [];
+let personaStore: StoredPersona[] = [];
+/** Seeded persona history; a save unshifts a new entry. */
+let personaHistory: Record<string, CommitInfo[]> = {};
 let busMessages: Message[] = [];
 let memoryStore: MemoryEntry[] = [];
 /** Soft-deleted entries stay addressable by history and rollback. */
@@ -508,6 +541,204 @@ function assertProviderKeyEnv(value: string): void {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Personas (issue #55)
+ *
+ * A persona is a Markdown SOUL.md template plus named `{{variables}}`. The
+ * values live on the instance (`persona_vars`), so one persona renders
+ * differently per agent. `persona_state` reports drift against `data/SOUL.md`.
+ * ------------------------------------------------------------------------- */
+
+const PERSONA_VAR_RE = /\{\{\s*([a-z][a-z0-9_]{0,31})\s*\}\}/g;
+const PERSONA_VARIABLE_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
+const PERSONA_MAX_VARIABLES = 64;
+const PERSONA_MAX_TAGS = 32;
+const PERSONA_MAX_TAG_CHARS = 32;
+
+/** The soul as it was before the latest persona save, for the history diff. */
+const personaPreviousSoul: Record<string, string> = {};
+
+function findPersona(id: string): StoredPersona {
+  const persona = personaStore.find((candidate) => candidate.id === id);
+  if (!persona) fail(404, "not_found", `persona "${id}" not found`);
+  return persona;
+}
+
+function assertPersonaId(id: string): void {
+  if (!isValidSlug(id)) {
+    fail(400, "invalid_id", "Id must be 2-32 characters: lowercase letters, digits, hyphens.");
+  }
+}
+
+function assertPersonaName(name: string): void {
+  const value = name.trim();
+  if (!value) fail(400, "invalid_name", "Name is required.");
+  if (value.length > 128) fail(400, "invalid_name", "Name must be 128 characters or fewer.");
+}
+
+function normalizePersonaTags(raw: string[] | undefined): string[] {
+  const tags: string[] = [];
+  for (const candidate of raw ?? []) {
+    const tag = candidate.trim();
+    if (!tag) continue;
+    if (tag.length > PERSONA_MAX_TAG_CHARS) {
+      fail(400, "invalid_tag", `tag "${tag}" must be at most ${PERSONA_MAX_TAG_CHARS} characters`);
+    }
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  if (tags.length > PERSONA_MAX_TAGS) {
+    fail(400, "invalid_tag", `at most ${PERSONA_MAX_TAGS} tags are accepted`);
+  }
+  return tags.sort((left, right) => left.localeCompare(right));
+}
+
+function normalizePersonaVariables(raw: PersonaVariable[] | undefined): PersonaVariable[] {
+  const variables: PersonaVariable[] = [];
+  for (const variable of raw ?? []) {
+    const key = variable.key.trim();
+    if (!PERSONA_VARIABLE_KEY_RE.test(key)) {
+      fail(
+        400,
+        "invalid_variable",
+        `variable key "${key}" must match ^[a-z][a-z0-9_]{0,31}$`,
+      );
+    }
+    if (variables.some((candidate) => candidate.key === key)) {
+      fail(400, "duplicate_variable", `variable "{{${key}}}" is listed twice`);
+    }
+    const description = variable.description.trim();
+    if (description.length > 1024) {
+      fail(400, "invalid_variable", `variable "${key}" description must be 1024 characters or fewer`);
+    }
+    const fallback = variable.default?.trim();
+    variables.push({
+      key,
+      description,
+      ...(fallback ? { default: fallback.slice(0, 4096) } : {}),
+    });
+  }
+  if (variables.length > PERSONA_MAX_VARIABLES) {
+    fail(400, "invalid_variable", `at most ${PERSONA_MAX_VARIABLES} variables are accepted`);
+  }
+  return variables;
+}
+
+function personaInstances(persona: StoredPersona): { id: string; name: string }[] {
+  return rows
+    .filter((row) => row.persona === persona.id)
+    .map((row) => ({ id: row.id, name: row.name }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function personaExcerpt(persona: StoredPersona): string {
+  const line = persona.soul_md
+    .split("\n")
+    .map((value) => value.replace(/^[#>*\-\s]+/, "").trim())
+    .find((value) => value.length > 0);
+  return (line ?? "").slice(0, 180);
+}
+
+function personaSummary(persona: StoredPersona): PersonaSummary {
+  return {
+    id: persona.id,
+    name: persona.name,
+    description: persona.description,
+    tags: [...persona.tags].sort((left, right) => left.localeCompare(right)),
+    variables: persona.variables.map((variable) => ({ ...variable })),
+    instances_count: personaInstances(persona).length,
+    excerpt: personaExcerpt(persona),
+    created_at: persona.created_at,
+    updated_at: persona.updated_at,
+  };
+}
+
+function personaDetail(persona: StoredPersona): PersonaDetail {
+  return {
+    ...personaSummary(persona),
+    soul_md: persona.soul_md,
+    instances: personaInstances(persona).map((instance) => instance.id),
+  };
+}
+
+/** Instance values merged over the persona defaults, `agent_name` taking the instance name. */
+function personaValuesFor(
+  _persona: StoredPersona,
+  row: Stored,
+  override?: Record<string, string>,
+): Record<string, string> {
+  const values: Record<string, string> = { ...row.persona_vars, ...(override ?? {}) };
+  // `agent_name` is implicit: the controller fills it whenever an instance is
+  // known, whether or not the persona declares it.
+  if (!values.agent_name) values.agent_name = row.name;
+  return values;
+}
+
+/** Replace `{{key}}` placeholders; unknown or empty ones stay visible and are listed. */
+function renderPersona(
+  persona: StoredPersona,
+  values: Record<string, string>,
+): PersonaPreview {
+  const missing = new Set<string>();
+  const rendered = persona.soul_md.replace(
+    PERSONA_VAR_RE,
+    (match: string, key: string) => {
+      const value = values[key];
+      if (value !== undefined && value !== "") return value;
+      const fallback = persona.variables.find((variable) => variable.key === key)?.default;
+      if (fallback !== undefined && fallback !== "") return fallback;
+      missing.add(key);
+      return match;
+    },
+  );
+  return { rendered, missing: [...missing].sort() };
+}
+
+function writePersonaFile(persona: StoredPersona, row: Stored, identity: Identity): void {
+  const fs = fsFor(row.id);
+  const { rendered } = renderPersona(persona, personaValuesFor(persona, row));
+  putFile(fs, "/SOUL.md", rendered, Date.now());
+  recordUiWrite(row.id, fs, identity, "/SOUL.md");
+  row.persona_state = "applied";
+}
+
+/** Seed the history of a persona: newest commit first, one deleted paragraph in the diff. */
+function seedPersonaHistory(
+  persona: StoredPersona,
+  previousSoul: string,
+  commits: { message: string; at: number; author: string; email: string }[],
+): void {
+  personaStore.push(persona);
+  personaPreviousSoul[persona.id] = previousSoul;
+  personaHistory[persona.id] = commits.map((commit) => {
+    const id = commitId(`${persona.id}:${commit.message}:${commit.at}`);
+    return {
+      id,
+      short: id.slice(0, 7),
+      author: commit.author,
+      email: commit.email,
+      at: isoSecond(commit.at),
+      message: commit.message,
+      paths: ["SOUL.md"],
+    };
+  });
+}
+
+function recordPersonaCommit(persona: StoredPersona, identity: Identity, message: string): void {
+  const at = Date.now();
+  const id = commitId(`${persona.id}:${message}:${at}`);
+  const list = personaHistory[persona.id] ?? [];
+  list.unshift({
+    id,
+    short: id.slice(0, 7),
+    author: identity.user?.name ?? identity.actor,
+    email: identity.user?.email ?? "fleett@localhost",
+    at: isoSecond(at),
+    message,
+    paths: ["SOUL.md"],
+  });
+  personaHistory[persona.id] = list.slice(0, 100);
+}
+
 function composeYaml(row: Stored): string {
   const mounts = [`      - ./data:/opt/data`];
   for (const share of row.shares) {
@@ -605,6 +836,9 @@ function toDetail(row: Stored): InstanceDetail {
     base_url: row.base_url,
     api_key_env: row.api_key_env,
     provider: row.provider ?? undefined,
+    persona: row.persona ?? undefined,
+    persona_vars: row.persona ? { ...row.persona_vars } : undefined,
+    persona_state: row.persona_state,
     channel: row.channel,
     status: row.status,
     shares: row.shares.map((share) => ({ ...share })),
@@ -639,6 +873,9 @@ function toSummary(row: Stored): InstanceSummary {
     shares: row.shares.map((share) => share.name),
     allow_lan: row.allow_lan,
     provider: row.provider ?? undefined,
+    persona: row.persona ?? undefined,
+    persona_vars: row.persona ? { ...row.persona_vars } : undefined,
+    persona_state: row.persona_state,
     created_at: row.created_at,
   };
 }
@@ -779,6 +1016,9 @@ function seedRow(input: {
     base_url: provider?.base_url ?? "https://opencode.ai/inference/go/openai/v1",
     api_key_env: provider?.api_key_env ?? "HERMES_GATE_PROFILE_TOKEN",
     provider: provider?.id ?? null,
+    persona: null,
+    persona_vars: {},
+    persona_state: "none",
     gate_token: input.gate_token ?? null,
     channel_token: input.channel === "none" ? null : `seed-${input.id}-channel-token`,
     channel: input.channel,
@@ -2685,6 +2925,177 @@ export function resetMock(): void {
     },
   ];
 
+  personaStore = [];
+  personaHistory = {};
+  for (const id of Object.keys(personaPreviousSoul)) delete personaPreviousSoul[id];
+
+  const operatorSoul = [
+    "# SOUL",
+    "",
+    "You are {{agent_name}}, a {{tone}} operations assistant.",
+    "",
+    "## Identity",
+    "- You work for one operator on a small self-hosted fleet.",
+    "- Admit uncertainty before guessing; name what you checked.",
+    "",
+    "## Voice",
+    "- Answer in {{language}}. Short paragraphs, no filler, no flattery.",
+    "- Facts first, then the command or the next step.",
+    "",
+    "## Scope",
+    "- Web search, memory, the files in this home. No shell and no Docker unless the instance grants them.",
+    "- Read shared folders read-only unless the share is mounted read-write.",
+    "",
+    "## Refusals",
+    "- Never print a token, a key or a private URL.",
+    "- Refuse a destructive command until the operator confirms it.",
+    "",
+    "## Response format",
+    "- First line: the answer. Then at most three bullets of evidence.",
+    "- End with the next concrete step when something is left to do.",
+    "",
+  ].join("\n");
+  const operatorOlder = operatorSoul.replace(
+    "## Refusals\n- Never print a token, a key or a private URL.\n- Refuse a destructive command until the operator confirms it.\n\n",
+    "",
+  );
+
+  const familySoul = [
+    "# SOUL",
+    "",
+    "You are {{agent_name}}, a patient {{tone}} helper for the family.",
+    "",
+    "## Identity",
+    "- People talk to you on chat, often from a phone, sometimes in a hurry.",
+    "- You are not a technician: explain only when asked.",
+    "",
+    "## Voice",
+    "- Answer in {{language}}, in plain words. One idea per paragraph.",
+    "- Be warm without being sugary. No emoji unless the person uses them first.",
+    "",
+    "## Scope",
+    "- Family calendar, shared notes and the photo archive (read-only).",
+    "- No purchases, no account changes, no shell.",
+    "",
+    "## Refusals",
+    "- Never share one family member's private note with another.",
+    "- Do not give medical, legal or financial advice: point to a professional.",
+    "",
+    "## Response format",
+    "- Two or three sentences, then a short list only when it helps.",
+    "- Ask one clarifying question when the request is ambiguous.",
+    "",
+  ].join("\n");
+  const familyOlder = familySoul.replace(
+    "## Refusals\n- Never share one family member's private note with another.\n- Do not give medical, legal or financial advice: point to a professional.\n\n",
+    "",
+  );
+
+  const tutorSoul = [
+    "# SOUL",
+    "",
+    "You are {{agent_name}}, a {{tone}} study partner for {{subject}} at {{level}} level.",
+    "",
+    "## Identity",
+    "- You teach by questions, not by dumping answers.",
+    "- You know the course outline and the exam format.",
+    "",
+    "## Voice",
+    "- Answer in {{language}}. Define a term the first time you use it.",
+    "- One concept at a time, with a concrete example.",
+    "",
+    "## Scope",
+    "- Course notes, past papers and the shared study folder.",
+    "- No writing outside this home; no shell.",
+    "",
+    "## Refusals",
+    "- Never invent a citation, a dosage or a date: say the source is missing.",
+    "- Refuse to write an assignment that is meant to be graded.",
+    "",
+    "## Response format",
+    "- A one-line recap, then the explanation, then one practice question.",
+    "- End by asking the student to explain it back in their own words.",
+    "",
+  ].join("\n");
+  const tutorOlder = tutorSoul
+    .replace(
+      "## Response format\n- A one-line recap, then the explanation, then one practice question.\n- End by asking the student to explain it back in their own words.\n\n",
+      "",
+    )
+    .replace("study partner for {{subject}} at {{level}} level", "study partner");
+
+  seedPersonaHistory(
+    {
+      id: "concise-operator",
+      name: "Concise operator",
+      description:
+        "Direct, factual replies for infrastructure work: the answer first, evidence after, no filler.",
+      tags: ["ops", "tone", "infra"],
+      variables: [
+        { key: "agent_name", description: "How the agent introduces itself.", default: "the operator" },
+        { key: "language", description: "Language of every answer.", default: "English" },
+        { key: "tone", description: "Adjective used for the voice.", default: "direct" },
+      ],
+      soul_md: operatorSoul,
+      created_at: iso(SEEDED_AT - 26 * DAY),
+      updated_at: iso(SEEDED_AT - 2 * DAY),
+    },
+    operatorOlder,
+    [
+      { message: "Clarify refusals and response format", at: SEEDED_AT - 2 * DAY, author: "Cleeryy", email: "cleeryy@example.com" },
+      { message: "Add the response format section", at: SEEDED_AT - 8 * DAY, author: "Cleeryy", email: "cleeryy@example.com" },
+      { message: "Create persona from the ops SOUL.md", at: SEEDED_AT - 26 * DAY, author: "fleett", email: "fleett@localhost" },
+    ],
+  );
+
+  seedPersonaHistory(
+    {
+      id: "family-companion",
+      name: "Family companion",
+      description:
+        "Warm, plain-language helper for the family calendar, notes and photos. Never technical unless asked.",
+      tags: ["family", "tone"],
+      variables: [
+        { key: "agent_name", description: "Name the person sees in the chat.", default: "the assistant" },
+        { key: "language", description: "Language of every answer.", default: "French" },
+        { key: "tone", description: "Adjective used for the voice.", default: "warm" },
+      ],
+      soul_md: familySoul,
+      created_at: iso(SEEDED_AT - 19 * DAY),
+      updated_at: iso(SEEDED_AT - 6 * DAY),
+    },
+    familyOlder,
+    [
+      { message: "Add privacy refusals", at: SEEDED_AT - 6 * DAY, author: "Cleeryy", email: "cleeryy@example.com" },
+      { message: "Create persona from the family SOUL.md", at: SEEDED_AT - 19 * DAY, author: "fleett", email: "fleett@localhost" },
+    ],
+  );
+
+  seedPersonaHistory(
+    {
+      id: "tutor",
+      name: "Study partner",
+      description:
+        "Socratic tutor for one subject and level: recaps, explains one concept, then asks the student to explain it back.",
+      tags: ["school", "teaching"],
+      variables: [
+        { key: "agent_name", description: "Name the student sees in the chat.", default: "the tutor" },
+        { key: "subject", description: "Course or topic being studied.", default: "the course" },
+        { key: "level", description: "Year or level, used to pitch the explanations.", default: "first year" },
+        { key: "language", description: "Language of every answer.", default: "French" },
+        { key: "tone", description: "Adjective used for the voice.", default: "encouraging" },
+      ],
+      soul_md: tutorSoul,
+      created_at: iso(SEEDED_AT - 12 * DAY),
+      updated_at: iso(SEEDED_AT - 3 * DAY),
+    },
+    tutorOlder,
+    [
+      { message: "Add the practice-question format", at: SEEDED_AT - 3 * DAY, author: "Cleeryy", email: "cleeryy@example.com" },
+      { message: "Create persona for the immunology course", at: SEEDED_AT - 12 * DAY, author: "fleett", email: "fleett@localhost" },
+    ],
+  );
+
   shares = [
     {
       name: "findings",
@@ -2817,6 +3228,42 @@ export function resetMock(): void {
     }),
   ];
 
+  // Personas are assigned after the rows exist: two applied, one diverged on
+  // purpose so the console can show both badges, and the error instance left
+  // without one for the apply report.
+  const personaAssignments: Record<
+    string,
+    { id: string; vars: Record<string, string>; state: PersonaState }
+  > = {
+    alice: {
+      id: "family-companion",
+      vars: { agent_name: "Alice", language: "English" },
+      state: "applied",
+    },
+    margaret: {
+      id: "family-companion",
+      vars: { agent_name: "Margaret", language: "French" },
+      state: "diverged",
+    },
+    ops: {
+      id: "concise-operator",
+      vars: { language: "French", tone: "precise" },
+      state: "applied",
+    },
+    school: {
+      id: "tutor",
+      vars: { subject: "immunology", level: "L2", language: "French" },
+      state: "applied",
+    },
+  };
+  for (const row of rows) {
+    const assignment = personaAssignments[row.id];
+    if (!assignment) continue;
+    row.persona = assignment.id;
+    row.persona_vars = { ...assignment.vars };
+    row.persona_state = assignment.state;
+  }
+
   tokens = [
     {
       id: "tok_seed_ci",
@@ -2896,7 +3343,20 @@ export function resetMock(): void {
 
   filesystems.clear();
   repositories.clear();
-  for (const row of rows) seedInstanceData(row, "demo");
+  for (const row of rows) {
+    seedInstanceData(row, "demo");
+    if (!row.persona) continue;
+    const persona = findPersona(row.persona);
+    const { rendered } = renderPersona(persona, personaValuesFor(persona, row));
+    // A diverged instance keeps a manual section that the persona does not
+    // contain, so the badge and the "Reapply persona" flow have something real
+    // to show.
+    const content =
+      row.persona_state === "diverged"
+        ? `${rendered}\n## House rules\n- Reply after 9 a.m. and before midnight.\n`
+        : rendered;
+    putFile(filesystems.get(row.id) as MockFs, "/SOUL.md", content, SEEDED_AT - 2 * DAY);
+  }
 }
 
 resetMock();
@@ -3785,6 +4245,211 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     return { ok: true, status: 200, latency_ms };
   },
 
+  /* Personas */
+
+  async listPersonas(): Promise<PersonaSummary[]> {
+    requireAuth();
+    await delay();
+    return [...personaStore]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(personaSummary);
+  },
+
+  async createPersona(input: CreatePersonaInput): Promise<PersonaDetail> {
+    requireWrite();
+    await delay(320);
+    const id = input.id.trim();
+    assertPersonaId(id);
+    if (personaStore.some((persona) => persona.id === id)) {
+      fail(409, "persona_exists", `a persona with the id "${id}" already exists`);
+    }
+    const name = input.name.trim();
+    assertPersonaName(name);
+    const soul = input.soul_md ?? "";
+    if (!soul.trim()) fail(400, "invalid_soul", "SOUL.md must not be empty");
+    const created = Date.now();
+    const persona: StoredPersona = {
+      id,
+      name,
+      description: input.description.trim(),
+      tags: normalizePersonaTags(input.tags),
+      variables: normalizePersonaVariables(input.variables),
+      soul_md: soul,
+      created_at: iso(created),
+      updated_at: iso(created),
+    };
+    personaStore.push(persona);
+    personaPreviousSoul[id] = "";
+    personaHistory[id] = [];
+    recordPersonaCommit(persona, requireAuth(), "Create persona");
+    recordAudit(requireAuth(), "persona.create", persona.id, { name });
+    return personaDetail(persona);
+  },
+
+  async getPersona(id: string): Promise<PersonaDetail> {
+    requireAuth();
+    await delay();
+    return personaDetail(findPersona(id));
+  },
+
+  async patchPersona(id: string, input: PatchPersonaInput): Promise<PersonaDetail> {
+    requireWrite();
+    await delay(300);
+    const persona = findPersona(id);
+    const before = persona.soul_md;
+    const renderSignature = () =>
+      JSON.stringify(persona.variables.map((variable) => [variable.key, variable.default ?? ""]));
+    const beforeVariables = renderSignature();
+    const touchesSoul =
+      input.soul_md !== undefined || input.variables !== undefined;
+
+    if (input.name !== undefined) {
+      const name = input.name.trim();
+      assertPersonaName(name);
+      persona.name = name;
+    }
+    if (input.description !== undefined) persona.description = input.description.trim();
+    if (input.tags !== undefined) persona.tags = normalizePersonaTags(input.tags);
+    if (input.variables !== undefined) {
+      persona.variables = normalizePersonaVariables(input.variables);
+    }
+    if (input.soul_md !== undefined) {
+      if (!input.soul_md.trim()) fail(400, "invalid_soul", "SOUL.md must not be empty");
+      persona.soul_md = input.soul_md;
+    }
+    persona.updated_at = nowIso();
+    if (touchesSoul) {
+      if (before !== persona.soul_md) personaPreviousSoul[id] = before;
+      recordPersonaCommit(persona, requireAuth(), "Update persona from the console");
+      const renderChanged =
+        before !== persona.soul_md || beforeVariables !== renderSignature();
+      if (renderChanged) {
+        // Their data/SOUL.md is the previous render: it no longer matches.
+        for (const row of rows) {
+          if (row.persona === id && row.persona_state === "applied") {
+            row.persona_state = "diverged";
+          }
+        }
+      }
+    }
+    recordAudit(requireAuth(), "persona.update", id, { name: persona.name });
+    return personaDetail(persona);
+  },
+
+  async deletePersona(id: string): Promise<void> {
+    requireWrite();
+    await delay(300);
+    const persona = findPersona(id);
+    const attached = personaInstances(persona);
+    if (attached.length > 0) {
+      fail(
+        409,
+        "persona_in_use",
+        `persona "${persona.name}" is still assigned to ${attached.length} instance(s)`,
+        { persona: id, instances: attached.map((instance) => instance.id) },
+      );
+    }
+    personaStore = personaStore.filter((candidate) => candidate.id !== id);
+    delete personaHistory[id];
+    delete personaPreviousSoul[id];
+    recordAudit(requireAuth(), "persona.delete", id, { name: persona.name });
+  },
+
+  async previewPersona(id: string, input = {}): Promise<PersonaPreview> {
+    requireAuth();
+    await delay(120);
+    const persona = findPersona(id);
+    let values = { ...(input.variables ?? {}) };
+    if (input.instance) {
+      const row = findRow(input.instance);
+      values = { ...personaValuesFor(persona, row), ...values };
+    }
+    return renderPersona(persona, values);
+  },
+
+  async applyPersona(id: string, input: PersonaApplyInput): Promise<PersonaApplyResult> {
+    const identity = requireWrite();
+    await delay(420);
+    const persona = findPersona(id);
+    const requested = [...new Set(input.instances ?? [])];
+    if (requested.length === 0) {
+      fail(400, "invalid_instances", "select at least one instance");
+    }
+    const overrides = input.variables ?? {};
+    const results: PersonaApplyResult["results"] = [];
+    for (const instanceId of requested) {
+      const row = rows.find((candidate) => candidate.id === instanceId);
+      if (!row) {
+        results.push({ id: instanceId, status: "failed", error: "unknown instance" });
+        continue;
+      }
+      if (row.status === "error") {
+        results.push({
+          id: row.id,
+          status: "failed",
+          error: row.last_error ?? "the instance is in error and was not touched",
+        });
+        continue;
+      }
+      const preview = renderPersona(persona, personaValuesFor(persona, row, overrides));
+      if (preview.missing.length > 0) {
+        results.push({
+          id: row.id,
+          status: "failed",
+          error: `the persona template needs value(s) for: ${preview.missing.join(", ")}`,
+        });
+        continue;
+      }
+      row.persona = persona.id;
+      row.persona_vars = { ...row.persona_vars, ...overrides };
+      writePersonaFile(persona, row, identity);
+      row.container_id = row.container_id ?? containerId();
+      row.started_at = Date.now();
+      row.status = row.status === "created" ? "created" : "running";
+      row.last_error = null;
+      row.updated_at = nowIso();
+      recordAudit(identity, "persona.apply", row.id, { persona: persona.id });
+      results.push({ id: row.id, status: "applied" });
+    }
+    return { results };
+  },
+
+  async personaGitLog(id: string, options: PersonaGitLogOptions = {}): Promise<PersonaGitLog> {
+    requireAuth();
+    await delay(160);
+    findPersona(id);
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      fail(400, "invalid_limit", "limit must be between 1 and 500");
+    }
+    return {
+      commits: (personaHistory[id] ?? []).slice(0, limit).map(copyCommit),
+    };
+  },
+
+  async personaGitDiff(id: string, options = {}): Promise<PersonaGitDiff> {
+    requireAuth();
+    await delay(160);
+    const persona = findPersona(id);
+    const commits = personaHistory[id] ?? [];
+    if (commits.length === 0) return { from: "", to: "", diff: "" };
+    const head = commits[0];
+    const to = options.to?.trim() || head.id;
+    const target = commits.find(
+      (commit) => commit.id === to || commit.id.startsWith(to) || commit.short === to,
+    );
+    if (!target) fail(404, "not_found", `commit "${to}" was not found in the persona history`);
+    if (target.id !== head.id) {
+      // The mock only keeps the previous soul, not one snapshot per commit.
+      return { from: commits[1]?.id ?? "", to: target.id, diff: "" };
+    }
+    return {
+      from: commits[1]?.id ?? "",
+      to: target.id,
+      diff: toPatch("SOUL.md", personaPreviousSoul[id] ?? "", persona.soul_md),
+    };
+  },
+
   async listInstances(): Promise<InstanceSummary[]> {
     requireAuth();
     await delay();
@@ -3892,6 +4557,21 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
         fail(400, "unknown_provider", `provider "${requested}" does not exist`);
       }
     }
+    let persona: StoredPersona | null = null;
+    if (input.persona?.trim()) {
+      persona = findPersona(input.persona.trim());
+      const values = { ...(input.persona_vars ?? {}) };
+      if (!values.agent_name) values.agent_name = input.name.trim();
+      const preview = renderPersona(persona, values);
+      if (preview.missing.length > 0) {
+        fail(
+          400,
+          "missing_persona_variables",
+          `the persona template needs value(s) for: ${preview.missing.join(", ")}`,
+          { missing: preview.missing },
+        );
+      }
+    }
     const baseUrl = input.base_url.trim() || provider?.base_url || "";
     if (!baseUrl) fail(400, "invalid_base_url", "base_url is required");
     const apiKeyEnv = input.api_key_env.trim() || provider?.api_key_env || GATE_ENV;
@@ -3915,6 +4595,9 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       base_url: baseUrl,
       api_key_env: apiKeyEnv,
       provider: provider?.id ?? null,
+      persona: persona?.id ?? null,
+      persona_vars: persona ? { ...(input.persona_vars ?? {}) } : {},
+      persona_state: persona ? "applied" : "none",
       gate_token: gateToken,
       channel_token: channelToken,
       channel: input.channel.type,
@@ -3947,6 +4630,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     rows.unshift(row);
     for (const share of row.shares) attachToShare(share.name, id, share.mode);
     seedInstanceData(row, "fresh");
+    if (persona) writePersonaFile(persona, row, requireAuth());
     return toDetail(row);
   },
 
@@ -4028,6 +4712,9 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       base_url: cloneProvider ? cloneProvider.base_url : source.base_url,
       api_key_env: cloneProvider ? cloneProvider.api_key_env : source.api_key_env,
       provider: cloneProvider?.id ?? null,
+      persona: null,
+      persona_vars: {},
+      persona_state: "none",
       // Only the replacement token: the source secret is never copied.
       gate_token: gateToken || null,
       channel_token: source.channel === "none" ? null : channelToken || null,
@@ -4069,7 +4756,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
   },
 
   async patchInstance(id: string, input: PatchInstanceInput): Promise<InstanceDetail> {
-    requireWrite();
+    const identity = requireWrite();
     await delay(300);
     const row = findRow(id);
 
@@ -4096,6 +4783,19 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
         }
       }
     }
+    let nextPersona: StoredPersona | null = null;
+    if (input.persona !== undefined) {
+      const requested = (input.persona ?? "").trim();
+      if (requested) {
+        nextPersona = personaStore.find((candidate) => candidate.id === requested) ?? null;
+        if (!nextPersona) {
+          fail(400, "unknown_persona", `persona "${requested}" does not exist`);
+        }
+      }
+    }
+    const personaChanged =
+      input.persona !== undefined && (nextPersona?.id ?? null) !== row.persona;
+    const personaVarsChanged = input.persona_vars !== undefined;
     // Only a transition to restricted needs the host firewall; a stale
     // allow_lan=false in a full form save must not block unrelated edits.
     if (input.allow_lan === false && row.allow_lan) assertEgress(false);
@@ -4157,6 +4857,24 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
 
     if (input.name !== undefined) row.name = input.name.trim();
     if (input.model !== undefined) row.model = input.model.trim();
+    if (input.persona !== undefined) {
+      row.persona = nextPersona?.id ?? null;
+      if (!nextPersona) {
+        row.persona_vars = {};
+        row.persona_state = "none";
+      }
+    }
+    if (input.persona_vars !== undefined) {
+      if (!(nextPersona ?? (row.persona ? findPersona(row.persona) : null))) {
+        fail(400, "invalid_persona", "persona_vars requires an assigned persona");
+      }
+      const next = { ...row.persona_vars };
+      for (const [key, value] of Object.entries(input.persona_vars)) {
+        if (value === null) delete next[key];
+        else next[key] = value;
+      }
+      row.persona_vars = next;
+    }
     if (input.provider !== undefined) {
       // The provider comes first: its endpoint and variable name apply unless
       // the same request sets them explicitly.
@@ -4185,6 +4903,25 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     if (input.env) {
       applyEnvChange(row);
     } else {
+      row.updated_at = nowIso();
+    }
+    // A persona assignment or a variable change rewrites data/SOUL.md and
+    // restarts the instance, which is what `applied` reports.
+    if (row.persona && (personaChanged || personaVarsChanged)) {
+      const persona = findPersona(row.persona);
+      const preview = renderPersona(persona, personaValuesFor(persona, row));
+      if (preview.missing.length > 0) {
+        fail(
+          400,
+          "missing_persona_variables",
+          `the persona template needs value(s) for: ${preview.missing.join(", ")}`,
+          { missing: preview.missing },
+        );
+      }
+      writePersonaFile(persona, row, identity);
+      row.container_id = row.container_id ?? containerId();
+      row.started_at = Date.now();
+      row.status = row.status === "error" ? "error" : "running";
       row.updated_at = nowIso();
     }
     row.last_error = row.status === "error" ? row.last_error : null;
@@ -4354,6 +5091,12 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       restart: input.restart === true,
     });
 
+    // A hand edit of SOUL.md after a persona was applied is exactly the drift
+    // the `diverged` badge reports.
+    if (target === "/SOUL.md" && row.persona) {
+      row.persona_state = "diverged";
+    }
+
     const result: WriteFileResult = {
       path: target,
       etag: mockEtag(input.content),
@@ -4380,6 +5123,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
   async deleteFile(id: string, path: string): Promise<void> {
     const identity = requireWrite();
     await delay(200);
+    const row = findRow(id);
     const fs = fsFor(id);
     const target = normalizeVirtual(path);
     if (target === "/") {
@@ -4398,6 +5142,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       fs.files.delete(target);
       recordUiWrite(id, fs, identity, target);
       recordAudit(identity, "instance.file.delete", id, { path: target });
+      if (target === "/SOUL.md" && row.persona) row.persona_state = "diverged";
       return;
     }
 

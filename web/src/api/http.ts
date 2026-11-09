@@ -16,6 +16,7 @@ import type {
   CostReportParams,
   CreateInstanceInput,
   CreateMemoryInput,
+  CreatePersonaInput,
   CreatePipelineInput,
   CreateProviderInput,
   CreateScheduleInput,
@@ -66,6 +67,17 @@ import type {
   PatchPipelineInput,
   PatchProviderInput,
   PatchScheduleInput,
+  PersonaApplyInput,
+  PersonaApplyResult,
+  PersonaDetail,
+  PersonaGitDiff,
+  PersonaGitDiffOptions,
+  PersonaGitLog,
+  PersonaGitLogOptions,
+  PersonaPreview,
+  PersonaPreviewInput,
+  PersonaSummary,
+  PatchPersonaInput,
   Pipeline,
   PipelineRun,
   PipelineRunDetail,
@@ -244,6 +256,47 @@ export const httpApi: FleetApi = {
   logout: () => request<void>("/auth/logout", { method: "POST" }, { signalUnauthorized: false }),
 
   listTemplates: () => request<Template[]>("/api/templates"),
+
+  listPersonas: () => request<PersonaSummary[]>("/api/personas"),
+
+  createPersona: (input: CreatePersonaInput) =>
+    request<PersonaDetail>("/api/personas", { method: "POST", body: JSON.stringify(input) }),
+
+  getPersona: (id) => request<PersonaDetail>(`/api/personas/${encodeURIComponent(id)}`),
+
+  patchPersona: (id, input: PatchPersonaInput) =>
+    request<PersonaDetail>(`/api/personas/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deletePersona: (id) =>
+    request<void>(`/api/personas/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  previewPersona: (id, input: PersonaPreviewInput = {}) =>
+    request<PersonaPreview>(`/api/personas/${encodeURIComponent(id)}/preview`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  applyPersona: (id, input: PersonaApplyInput) =>
+    request<PersonaApplyResult>(`/api/personas/${encodeURIComponent(id)}/apply`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  personaGitLog: (id, options: PersonaGitLogOptions = {}) =>
+    request<PersonaGitLog>(
+      `/api/personas/${encodeURIComponent(id)}/git/log${queryString({ limit: options.limit })}`,
+    ),
+
+  personaGitDiff: (id, options: PersonaGitDiffOptions = {}) =>
+    request<PersonaGitDiff>(
+      `/api/personas/${encodeURIComponent(id)}/git/diff${queryString({
+        from: options.from,
+        to: options.to,
+      })}`,
+    ),
 
   listProviders: () => request<ProviderSummary[]>("/api/providers"),
 
