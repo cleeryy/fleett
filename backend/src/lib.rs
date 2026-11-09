@@ -4,6 +4,7 @@ pub mod api;
 pub mod archive;
 pub mod auth;
 pub mod backup;
+pub mod bus;
 pub mod cli;
 pub mod config;
 pub mod db;

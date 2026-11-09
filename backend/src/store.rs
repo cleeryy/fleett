@@ -28,6 +28,7 @@ pub fn ensure_layout(cfg: &Config) -> io::Result<()> {
         cfg.instances_dir(),
         cfg.shares_dir(),
         cfg.templates_dir(),
+        cfg.root.join("bus"),
     ] {
         create_dir_private(&dir)?;
     }

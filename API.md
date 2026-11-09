@@ -259,6 +259,30 @@ Secrets are not restored: `warnings` lists the variables to PATCH
 attached only when they already exist on this host. Nothing is started unless `start=true`.
 See `docs/BACKUP.md`.
 
+## Agent-to-agent messages
+
+The bus is persistent (SQLite) and documented in [docs/BUS.md](docs/BUS.md).
+
+`POST /api/instances/{id}/messages` → `201 Message`. The path id is the sender.
+
+```json
+{"to":"tchouniz","kind":"ask","body":"what changed?","correlation_id":"deploy-42","ttl_s":3600}
+```
+
+`kind`: `ask`, `tell` (default) or `result`. `from` is optional and admin-only (defaults to
+the path id). 16 KiB max, TTL 30 s … 30 days. A conversation that reaches 8 hops answers
+`409 message_loop`.
+
+`GET /api/instances/{id}/messages?view=inbox|outbox|all&status=queued|delivered|read&limit=100`
+→ `Message[]`, newest first, expired rows excluded. Reading the inbox stamps `delivered_at`.
+
+`POST /api/instances/{id}/messages/{message_id}/ack` → `{"message": Message}`; stamps
+`read_at`. Only the recipient can ack.
+
+`GET /api/messages?instance=&from=&to=&kind=&limit=` → `Message[]` (admin only).
+
+`DELETE /api/messages/expired` → `{"removed": N}` (admin only).
+
 ## Shares
 
 | Method | Route | Body | Response |

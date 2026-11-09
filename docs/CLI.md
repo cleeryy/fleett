@@ -53,6 +53,9 @@ fleett delete <id> [--purge]
 fleett usage
 fleett images
 fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
+fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
+fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
+fleett ack <id> <message-id>
 fleett doctor
 ```
 
@@ -167,6 +170,20 @@ each instance that did not keep the new image. `--dry-run` only prints the plan
 (`id  from -> to`), the server writes nothing. Exit code `1` when at least one instance ends
 `rolled_back` or `failed`; the table is still printed. `--json` prints the final job and
 nothing intermediate.
+
+### `say` / `messages` / `ack`
+
+Talk to another instance over the persistent bus ([docs/BUS.md](BUS.md)):
+
+```bash
+fleett say tchouniz "summarize today's incidents" --kind ask --correlation incidents-1
+fleett messages tchouniz
+fleett messages tchouniz --view outbox --status delivered
+fleett ack tchouniz 3f2a…
+```
+
+The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
+`Message` objects.
 
 ### `doctor`
 

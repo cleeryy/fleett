@@ -3876,3 +3876,85 @@ async fn file_mutations_are_audited() {
     let delete = find("instance.file.delete");
     assert_eq!(delete["details"]["path"], "/notes");
 }
+
+// ---------------------------------------------------------------------------
+// Agent-to-agent bus (#28)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn messages_are_queued_delivered_and_acknowledged() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/probe/messages",
+            Some(json!({
+                "to": "tchouniz",
+                "kind": "ask",
+                "body": "what is the weather?",
+                "correlation_id": "conv-1",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let sent = parse(&body);
+    assert_eq!(sent["from"], "probe");
+    assert_eq!(sent["to"], "tchouniz");
+    assert_eq!(sent["status"], "queued");
+    assert_eq!(sent["hops"], 0);
+    let message_id = sent["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/tchouniz/messages", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let inbox = parse(&body);
+    assert_eq!(inbox.as_array().expect("array").len(), 1);
+    assert_eq!(inbox[0]["status"], "delivered");
+    assert!(inbox[0]["delivered_at"].is_string());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/instances/tchouniz/messages/{message_id}/ack"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["message"]["status"], "read");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/messages?kind=ask", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+}
+
+#[tokio::test]
+async fn a_message_loop_is_stopped_by_hops() {
+    let harness = Harness::new();
+    create_instance(&harness, "aa").await;
+    create_instance(&harness, "bb").await;
+    for _ in 0..fleett::bus::DEFAULT_MAX_HOPS {
+        let (status, body) = harness
+            .request(
+                Method::POST,
+                "/api/instances/aa/messages",
+                Some(json!({"to": "bb", "body": "ping", "correlation_id": "loop"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/aa/messages",
+            Some(json!({"to": "bb", "body": "ping", "correlation_id": "loop"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "message_loop");
+}

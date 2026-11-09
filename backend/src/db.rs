@@ -138,6 +138,32 @@ CREATE TABLE IF NOT EXISTS providers (
 ALTER TABLE instances ADD COLUMN provider TEXT;
 CREATE INDEX IF NOT EXISTS idx_instances_provider ON instances (provider);
 "#,
+    // v9 — agent-to-agent message bus (issue #28). Messages are persisted so a
+    // message addressed to a stopped instance waits for its next start. `hops`
+    // bounds request/reply loops; `expires_at` bounds the queue lifetime.
+    r#"
+CREATE TABLE IF NOT EXISTS messages (
+    id             TEXT PRIMARY KEY NOT NULL,
+    from_instance  TEXT NOT NULL,
+    to_instance    TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    body           TEXT NOT NULL,
+    correlation_id TEXT,
+    hops           INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    delivered_at   TEXT,
+    read_at        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_inbox
+    ON messages (to_instance, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_outbox
+    ON messages (from_instance, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_correlation
+    ON messages (correlation_id);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -285,6 +311,31 @@ impl Db {
     pub fn schema_version(&self) -> Result<i64, DbError> {
         let conn = self.lock();
         Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    /// Run a read-only closure against the shared connection.
+    ///
+    /// Feature modules that own their tables keep their SQL next to their
+    /// models instead of growing this file; the lock is held for the duration
+    /// of the closure, so it must not await.
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, DbError> {
+        let conn = self.lock();
+        f(&conn).map_err(DbError::from)
+    }
+
+    /// Run a write closure inside one transaction, committing on success.
+    pub fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        let value = f(&transaction)?;
+        transaction.commit()?;
+        Ok(value)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<InstanceSpec>, DbError> {

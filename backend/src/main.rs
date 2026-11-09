@@ -189,6 +189,46 @@ enum Commands {
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
+    /// Send a message to another instance over the fleet bus (client mode).
+    Say {
+        /// Recipient instance id.
+        to: String,
+        /// Message body (16 KiB max).
+        body: String,
+        /// `ask`, `tell` or `result`.
+        #[arg(long, default_value = "tell")]
+        kind: String,
+        /// Sending instance (defaults to FLEETT_INSTANCE).
+        #[arg(long)]
+        from: Option<String>,
+        /// Conversation id; the bus uses it to stop request/reply loops.
+        #[arg(long)]
+        correlation: Option<String>,
+        /// Time the message stays queued, in seconds (30..2592000).
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Read the message inbox or outbox of an instance (client mode).
+    Messages {
+        /// Instance id.
+        id: String,
+        /// `inbox`, `outbox` or `all`.
+        #[arg(long, default_value = "inbox")]
+        view: String,
+        /// `queued`, `delivered` or `read`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Mark one message as read (client mode).
+    Ack {
+        /// Recipient instance id.
+        id: String,
+        /// Message id.
+        message_id: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -386,6 +426,47 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+        Commands::Say {
+            to,
+            body,
+            kind,
+            from,
+            correlation,
+            ttl,
+        } => {
+            cli::run(
+                cli::Command::Say(cli::SayArgs {
+                    to,
+                    body,
+                    kind,
+                    from,
+                    correlation,
+                    ttl_s: ttl,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Messages {
+            id,
+            view,
+            status,
+            limit,
+        } => {
+            cli::run(
+                cli::Command::Messages(cli::MessagesArgs {
+                    id,
+                    view,
+                    status,
+                    limit,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Ack { id, message_id } => {
+            cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
     };
 
     if code != 0 {

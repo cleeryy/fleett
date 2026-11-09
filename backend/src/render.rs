@@ -440,6 +440,9 @@ pub fn render_compose_with_project(
         .map(str::to_string)
         .unwrap_or_else(|| project_name(&spec.id));
     let mut volumes = vec!["./data:/opt/data".to_string()];
+    // The message bus mirrors every message as a JSON file; agents that cannot
+    // call HTTP can read their inbox from `/opt/data/shared/bus/<id>/`.
+    volumes.push("../../bus:/opt/data/shared/bus".to_string());
     for share in &spec.shares {
         let read_only = if share.mode == ShareMode::Ro {
             ":ro"
@@ -811,6 +814,7 @@ services:
       HERMES_UID: '10000'
     volumes:
     - ./data:/opt/data
+    - ../../bus:/opt/data/shared/bus
     - ../../shares/findings:/opt/data/shared/findings
     - ../../shares/archive:/opt/data/shared/archive:ro
     networks:

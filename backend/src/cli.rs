@@ -312,6 +312,29 @@ pub enum Command {
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
+    Say(SayArgs),
+    Messages(MessagesArgs),
+    Ack { id: String, message_id: String },
+}
+
+/// Arguments of `fleett say`.
+#[derive(Debug, Clone)]
+pub struct SayArgs {
+    pub to: String,
+    pub body: String,
+    pub kind: String,
+    pub from: Option<String>,
+    pub correlation: Option<String>,
+    pub ttl_s: Option<u64>,
+}
+
+/// Arguments of `fleett messages`.
+#[derive(Debug, Clone)]
+pub struct MessagesArgs {
+    pub id: String,
+    pub view: String,
+    pub status: Option<String>,
+    pub limit: usize,
 }
 
 /// Arguments of `fleett upgrade`.
@@ -387,6 +410,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
+        Command::Say(args) => say(&client, json, &args).await,
+        Command::Messages(args) => messages(&client, json, &args).await,
+        Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
     }
 }
 
@@ -702,6 +728,128 @@ async fn logs(client: &Client, json: bool, args: &LogsArgs) -> Result<(), CliErr
             println!();
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MessageView {
+    id: String,
+    from: String,
+    to: String,
+    kind: String,
+    body: String,
+    #[serde(default)]
+    correlation_id: Option<String>,
+    hops: u32,
+    status: String,
+    created_at: String,
+    expires_at: String,
+    #[serde(default)]
+    delivered_at: Option<String>,
+    #[serde(default)]
+    read_at: Option<String>,
+}
+
+async fn say(client: &Client, json: bool, args: &SayArgs) -> Result<(), CliError> {
+    let from = args
+        .from
+        .clone()
+        .or_else(|| std::env::var("FLEETT_INSTANCE").ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::Config(
+                "the sending instance is unknown: pass --from <id> or set FLEETT_INSTANCE"
+                    .to_string(),
+            )
+        })?;
+    let mut body = json!({
+        "to": args.to,
+        "from": from,
+        "kind": args.kind,
+        "body": args.body,
+    });
+    if let Some(correlation) = &args.correlation {
+        body["correlation_id"] = json!(correlation);
+    }
+    if let Some(ttl) = args.ttl_s {
+        body["ttl_s"] = json!(ttl);
+    }
+    let path = format!("/api/instances/{}/messages", encode_path_segment(&from));
+    let value = client.value(Method::POST, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let message: MessageView = decode(value)?;
+    println!(
+        "sent {} to {} (id {}, hops {})",
+        message.kind, message.to, message.id, message.hops
+    );
+    Ok(())
+}
+
+async fn messages(client: &Client, json: bool, args: &MessagesArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![
+        ("view", args.view.clone()),
+        ("limit", args.limit.to_string()),
+    ];
+    if let Some(status) = &args.status {
+        query.push(("status", status.clone()));
+    }
+    let path = format!("/api/instances/{}/messages", encode_path_segment(&args.id));
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let messages: Vec<MessageView> = decode(value)?;
+    if messages.is_empty() {
+        println!("no messages");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = messages
+        .iter()
+        .map(|message| {
+            vec![
+                message.created_at.clone(),
+                message.kind.clone(),
+                if args.view == "outbox" {
+                    message.to.clone()
+                } else {
+                    message.from.clone()
+                },
+                message.status.clone(),
+                message.hops.to_string(),
+                message.body.replace('\n', " "),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "AT",
+                "KIND",
+                if args.view == "outbox" { "TO" } else { "FROM" },
+                "STATUS",
+                "HOPS",
+                "BODY"
+            ],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<(), CliError> {
+    let path = format!(
+        "/api/instances/{}/messages/{}/ack",
+        encode_path_segment(id),
+        encode_path_segment(message_id)
+    );
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    println!("message {message_id} marked as read");
     Ok(())
 }
 

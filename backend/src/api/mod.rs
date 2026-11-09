@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod bus;
 pub mod error;
 pub mod files;
 pub mod git;
@@ -140,6 +141,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/auth/check", get(auth::check))
         .route("/auth/me", get(auth::me))
         .route("/audit", get(audit::list))
+        .route("/messages", get(bus::list))
+        .route("/messages/expired", delete(bus::purge))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
@@ -182,6 +185,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/instances/{id}/restart", post(instances::restart))
         .route("/instances/{id}/clone", post(instances::clone))
         .route("/instances/{id}/logs", get(instances::logs))
+        .route("/instances/{id}/messages", get(bus::inbox).post(bus::send))
+        .route("/instances/{id}/messages/{message_id}/ack", post(bus::ack))
         .route("/instances/{id}/errors", get(instances::errors))
         .route("/shares", get(shares::list).post(shares::create))
         .route("/shares/{name}", delete(shares::delete))
