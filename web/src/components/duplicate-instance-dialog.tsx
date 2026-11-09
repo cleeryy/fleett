@@ -38,6 +38,10 @@ function channelKey(source: InstanceDetail): string | null {
   return null;
 }
 
+function holdsEnv(source: InstanceDetail, key: string): boolean {
+  return source.env.some((entry) => entry.key === key);
+}
+
 /** Same defaults as the controller: `<id>-copy`, `<name> copy`, both within limits. */
 function defaultCloneId(id: string): string {
   const suffix = "-copy";
@@ -113,8 +117,8 @@ export function DuplicateInstanceDialog({
 
   const providerKeys = gateKeys(source);
   const botKey = channelKey(source);
-  const providerRequired = providerKeys.some((key) => source.env_keys.includes(key));
-  const botRequired = botKey !== null && source.env_keys.includes(botKey);
+  const providerRequired = providerKeys.some((key) => holdsEnv(source, key));
+  const botRequired = botKey !== null && holdsEnv(source, botKey);
 
   const missingProvider = missing.filter((key) => key !== botKey);
   const missingChannel = botKey ? missing.filter((key) => key === botKey) : [];
@@ -331,7 +335,7 @@ export function DuplicateInstanceDialog({
                     <>
                       The source holds{" "}
                       <span className="font-mono break-all">
-                        {providerKeys.filter((key) => source.env_keys.includes(key)).join(", ")}
+                        {providerKeys.filter((key) => holdsEnv(source, key)).join(", ")}
                       </span>
                       .{" "}
                     </>

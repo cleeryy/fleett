@@ -74,12 +74,43 @@ export interface AuditEntry {
   details?: unknown;
 }
 
+/** One variable a template suggests, mostly an allowlist. Never a credential. */
+export interface EnvSuggestion {
+  key: string;
+  description: string;
+  /** `true` when the value has to be stored encrypted. The controller defaults to false. */
+  secret?: boolean;
+}
+
 export interface Template {
   id: string;
   name: string;
   description: string;
   default_model: string;
   channel: string;
+  env: EnvSuggestion[];
+}
+
+/** One variable of an instance, as returned by the API. */
+export interface EnvEntry {
+  key: string;
+  /** Encrypted at rest: the value never leaves the controller. */
+  secret: boolean;
+  updated_at: string;
+  /** Only present when `secret` is false. */
+  value?: string;
+}
+
+/**
+ * One variable in a write request. On a full replace, omitting `value` (or
+ * sending `null`) keeps the stored value of a secret entry, which is the only
+ * way a console can round-trip a secret it never received.
+ */
+export interface EnvInput {
+  key: string;
+  value?: string | null;
+  /** Required on create and full replace; optional on PATCH, which keeps the flag. */
+  secret?: boolean;
 }
 
 export interface InstanceSummary {
@@ -125,7 +156,8 @@ export interface InstanceDetail {
   updated_at: string;
   last_error: string | null;
   data_dir: string;
-  env_keys: string[];
+  /** Sorted by key. Values are only present on non-secret entries. */
+  env: EnvEntry[];
   container: ContainerInfo | null;
   compose_yaml: string;
 }
@@ -162,6 +194,8 @@ export interface CreateInstanceInput {
   /** false keeps the agent on the restricted `fleett` network only. */
   allow_lan: boolean;
   notes: string;
+  /** Extra variables. Gate and platform tokens always win over an entry with the same key. */
+  env?: EnvInput[];
 }
 
 /**
@@ -204,6 +238,8 @@ export interface PatchInstanceInput {
   /** Turning LAN access off fails with 409 `egress_not_enforced` until the host firewall is installed. */
   allow_lan?: boolean;
   notes?: string;
+  /** Merge semantics: `value:null` deletes, `""` keeps an empty value, a missing `secret` keeps the flag. */
+  env?: EnvInput[];
 }
 
 export interface LifecycleResult {
@@ -224,6 +260,10 @@ export interface FleetApi {
   listTemplates(): Promise<Template[]>;
   listInstances(): Promise<InstanceSummary[]>;
   getInstance(id: string): Promise<InstanceDetail>;
+  /** Replaces the whole environment and applies it: rewrites compose and runs `up -d`. */
+  putInstanceEnv(id: string, env: EnvInput[]): Promise<InstanceDetail>;
+  /** Removes one variable and applies it. */
+  deleteInstanceEnv(id: string, key: string): Promise<void>;
   createInstance(input: CreateInstanceInput): Promise<InstanceDetail>;
   cloneInstance(id: string, input: CloneInstanceInput): Promise<InstanceDetail>;
   patchInstance(id: string, input: PatchInstanceInput): Promise<InstanceDetail>;

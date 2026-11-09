@@ -14,7 +14,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, InstanceDetail, PatchInstanceInput, ShareRef } from "@/api/types";
+import type { ChannelType, EnvEntry, InstanceDetail, PatchInstanceInput, ShareRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -43,11 +43,13 @@ import { DataList, Section } from "@/components/data-list";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
 import { EmptyState } from "@/components/empty-state";
+import { InstanceEnvironment } from "@/components/instance-env";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { SharePicker } from "@/components/share-picker";
 import { StatusBadge } from "@/components/status-badge";
-import { formatClock, formatDateTime, formatRelative, formatUptime } from "@/lib/format";
+import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
+import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
 import { navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -80,7 +82,11 @@ function tokenEnv(detail: InstanceDetail): string | null {
         ? "DISCORD_BOT_TOKEN"
         : null;
   if (!env) return null;
-  return detail.env_keys.includes(env) ? env : null;
+  return detail.env.some((entry) => entry.key === env) ? env : null;
+}
+
+function hasEnv(detail: InstanceDetail, key: string): boolean {
+  return detail.env.some((entry) => entry.key === key);
 }
 
 function OverviewTab({
@@ -93,7 +99,8 @@ function OverviewTab({
   onConfigure: () => void;
 }) {
   const env = tokenEnv(detail);
-  const providerKeySet = detail.env_keys.includes("HERMES_GATE_PROFILE_TOKEN");
+  const providerKeySet = hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
+  const secretCount = detail.env.filter((entry) => entry.secret).length;
 
   return (
     <div className="space-y-6">
@@ -213,6 +220,32 @@ function OverviewTab({
                     {detail.channel === "none" ? "No channel" : "No token stored"}
                   </span>
                 ),
+              },
+            ]}
+          />
+        </Section>
+
+        <Section
+          title="Environment"
+          action={
+            canEdit ? (
+              <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
+                Manage
+              </Button>
+            ) : null
+          }
+        >
+          <DataList
+            items={[
+              {
+                label: "Variables",
+                value: detail.env.length
+                  ? `${detail.env.length} ${plural(detail.env.length, "variable")}`
+                  : "None",
+              },
+              {
+                label: "Secrets",
+                value: secretCount ? `${secretCount} encrypted` : "None",
               },
             ]}
           />
@@ -345,12 +378,18 @@ function ConfigurationTab({
   detail,
   draft,
   onDraftChange,
+  envRows,
+  onEnvRowsChange,
   onSaved,
+  onEnvApplied,
 }: {
   detail: InstanceDetail;
   draft: ConfigDraft;
   onDraftChange: (next: ConfigDraft) => void;
+  envRows: EnvRow[];
+  onEnvRowsChange: (rows: EnvRow[]) => void;
   onSaved: () => void;
+  onEnvApplied: () => void;
 }) {
   const sharesResource = useResource(() => api.listShares(), []);
   const [attempted, setAttempted] = useState(false);
@@ -359,7 +398,7 @@ function ConfigurationTab({
 
   const errors = validateConfig(draft, detail.channel);
   const showErrors = attempted;
-  const providerKeySet = detail.env_keys.includes("HERMES_GATE_PROFILE_TOKEN");
+  const providerKeySet = hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
   const dirty = JSON.stringify(draft) !== JSON.stringify(toConfigDraft(detail));
   // Host prerequisites sit on the field that needs them, like egress on the
   // network checkbox: the provider token needs the secrets key.
@@ -413,254 +452,263 @@ function ConfigurationTab({
   }
 
   return (
-    <form onSubmit={onSubmit} noValidate className="max-w-2xl space-y-6">
-      {error && !egressError && !secretsError ? <ErrorAlert error={error} /> : null}
+    <div className="max-w-2xl space-y-8">
+      <form onSubmit={onSubmit} noValidate className="space-y-6">
+        {error && !egressError && !secretsError ? <ErrorAlert error={error} /> : null}
 
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2">
-          <Label htmlFor="cfg-name">Name</Label>
-          <Input
-            id="cfg-name"
-            value={draft.name}
-            autoComplete="off"
-            aria-invalid={showErrors && !!errors.name}
-            aria-describedby={showErrors && errors.name ? "cfg-name-error" : undefined}
-            onChange={(event) => update("name", event.target.value)}
-          />
-          {showErrors && errors.name ? (
-            <p id="cfg-name-error" className="text-xs text-destructive">
-              {errors.name}
-            </p>
-          ) : null}
-        </div>
-
-        <div className="space-y-2">
-          <Label htmlFor="cfg-model">Model</Label>
-          <Input
-            id="cfg-model"
-            value={draft.model}
-            autoComplete="off"
-            spellCheck={false}
-            className="font-mono"
-            aria-invalid={showErrors && !!errors.model}
-            aria-describedby={showErrors && errors.model ? "cfg-model-error" : undefined}
-            onChange={(event) => update("model", event.target.value)}
-          />
-          {showErrors && errors.model ? (
-            <p id="cfg-model-error" className="text-xs text-destructive">
-              {errors.model}
-            </p>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="cfg-base-url">Base URL</Label>
-        <Input
-          id="cfg-base-url"
-          value={draft.base_url}
-          autoComplete="off"
-          spellCheck={false}
-          className="font-mono"
-          aria-invalid={showErrors && !!errors.base_url}
-          aria-describedby={showErrors && errors.base_url ? "cfg-base-url-error" : undefined}
-          onChange={(event) => update("base_url", event.target.value)}
-        />
-        {showErrors && errors.base_url ? (
-          <p id="cfg-base-url-error" className="text-xs text-destructive">
-            {errors.base_url}
-          </p>
-        ) : null}
-      </div>
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2">
-          <Label htmlFor="cfg-api-key-env">API key env</Label>
-          <Input
-            id="cfg-api-key-env"
-            value={draft.api_key_env}
-            autoComplete="off"
-            spellCheck={false}
-            className="font-mono"
-            aria-invalid={showErrors && !!errors.api_key_env}
-            aria-describedby={showErrors && errors.api_key_env ? "cfg-api-key-env-error" : undefined}
-            onChange={(event) => update("api_key_env", event.target.value)}
-          />
-          {showErrors && errors.api_key_env ? (
-            <p id="cfg-api-key-env-error" className="text-xs text-destructive">
-              {errors.api_key_env}
-            </p>
-          ) : null}
-        </div>
-
-        <div className="space-y-2">
-          <Label htmlFor="cfg-mem-limit">Memory limit (MB)</Label>
-          <Input
-            id="cfg-mem-limit"
-            type="number"
-            min={128}
-            max={8192}
-            step={128}
-            value={draft.mem_limit_mb}
-            className="font-mono"
-            aria-invalid={showErrors && !!errors.mem_limit_mb}
-            aria-describedby={showErrors && errors.mem_limit_mb ? "cfg-mem-limit-error" : undefined}
-            onChange={(event) => update("mem_limit_mb", event.target.value)}
-          />
-          {showErrors && errors.mem_limit_mb ? (
-            <p id="cfg-mem-limit-error" className="text-xs text-destructive">
-              {errors.mem_limit_mb}
-            </p>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="cfg-gate-token">Provider token</Label>
-        <Input
-          id="cfg-gate-token"
-          type="password"
-          autoComplete="off"
-          spellCheck={false}
-          className="font-mono"
-          value={draft.gate_token}
-          placeholder={providerKeySet ? "Keep current token" : "Not set"}
-          aria-describedby="cfg-gate-token-help"
-          onChange={(event) => update("gate_token", event.target.value)}
-        />
-        <p id="cfg-gate-token-help" className="text-xs text-muted-foreground">
-          {providerKeySet
-            ? "A provider key is stored. Leave empty to keep it."
-            : "No provider key stored. The agent cannot call the model without one."}{" "}
-          Encrypted at rest and never returned by the API. The host needs its secrets key
-          (<span className="font-mono">sudo fleett secrets init</span>).
-        </p>
-        {secretsError ? <ErrorAlert error={secretsError} /> : null}
-      </div>
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2">
-          <Label htmlFor="cfg-channel">Channel</Label>
-          <Select value={draft.channel} onValueChange={(value) => update("channel", value as ChannelType)}>
-            <SelectTrigger id="cfg-channel" className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {CHANNEL_TYPES.map((type) => (
-                <SelectItem key={type} value={type}>
-                  {type}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {draft.channel !== "none" ? (
+        <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="cfg-token">Bot token</Label>
+            <Label htmlFor="cfg-name">Name</Label>
             <Input
-              id="cfg-token"
-              type="password"
+              id="cfg-name"
+              value={draft.name}
               autoComplete="off"
-              placeholder="Keep current token"
-              className="font-mono"
-              aria-invalid={showErrors && !!errors.token}
-              aria-describedby={
-                showErrors && errors.token ? "cfg-token-error" : "cfg-token-help"
-              }
-              onChange={(event) => update("token", event.target.value)}
+              aria-invalid={showErrors && !!errors.name}
+              aria-describedby={showErrors && errors.name ? "cfg-name-error" : undefined}
+              onChange={(event) => update("name", event.target.value)}
             />
-            <p id="cfg-token-help" className="text-xs text-muted-foreground">
-              {detail.channel !== "none" && detail.channel === draft.channel
-                ? "Empty keeps the stored token. A new value rotates it."
-                : "Required when switching channel type."}
-            </p>
-            {showErrors && errors.token ? (
-              <p id="cfg-token-error" className="text-xs text-destructive">
-                {errors.token}
+            {showErrors && errors.name ? (
+              <p id="cfg-name-error" className="text-xs text-destructive">
+                {errors.name}
               </p>
             ) : null}
           </div>
-        ) : null}
-      </div>
 
-      <fieldset className="min-w-0 space-y-3">
-        <legend className="text-sm font-medium">Network</legend>
-        <div className="flex items-start gap-3 rounded-md border p-4">
-          <Checkbox
-            id="cfg-allow-lan"
-            className="mt-0.5"
-            checked={draft.allow_lan}
-            aria-describedby="cfg-allow-lan-help"
-            onCheckedChange={(value) => {
-              update("allow_lan", value === true);
-              if (egressError) setError(null);
-            }}
-          />
-          <div className="min-w-0 space-y-1">
-            <Label htmlFor="cfg-allow-lan" className="cursor-pointer">
-              Allow LAN access
-            </Label>
-            <p id="cfg-allow-lan-help" className="text-xs text-muted-foreground">
-              The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense and
-              Infisical. Only enable for agents you trust.
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {draft.allow_lan ? (
-                <>
-                  Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
-                  <span className="font-mono">fleett</span> network.
-                </>
-              ) : (
-                <>
-                  Stays on the restricted <span className="font-mono">fleett</span> network. No route to
-                  the LAN.
-                </>
-              )}
-            </p>
+          <div className="space-y-2">
+            <Label htmlFor="cfg-model">Model</Label>
+            <Input
+              id="cfg-model"
+              value={draft.model}
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              aria-invalid={showErrors && !!errors.model}
+              aria-describedby={showErrors && errors.model ? "cfg-model-error" : undefined}
+              onChange={(event) => update("model", event.target.value)}
+            />
+            {showErrors && errors.model ? (
+              <p id="cfg-model-error" className="text-xs text-destructive">
+                {errors.model}
+              </p>
+            ) : null}
           </div>
         </div>
-        {egressError ? <ErrorAlert error={egressError} /> : null}
-      </fieldset>
 
-      <fieldset className="min-w-0 space-y-3">
-        <legend className="text-sm font-medium">Shares</legend>
-        <SharePicker
-          shares={sharesResource.data ?? []}
-          value={draft.shares}
-          onChange={(next) => update("shares", next)}
-          loading={sharesResource.loading && !sharesResource.data}
-          error={sharesResource.error}
-          onRetry={sharesResource.reload}
-        />
-      </fieldset>
+        <div className="space-y-2">
+          <Label htmlFor="cfg-base-url">Base URL</Label>
+          <Input
+            id="cfg-base-url"
+            value={draft.base_url}
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono"
+            aria-invalid={showErrors && !!errors.base_url}
+            aria-describedby={showErrors && errors.base_url ? "cfg-base-url-error" : undefined}
+            onChange={(event) => update("base_url", event.target.value)}
+          />
+          {showErrors && errors.base_url ? (
+            <p id="cfg-base-url-error" className="text-xs text-destructive">
+              {errors.base_url}
+            </p>
+          ) : null}
+        </div>
 
-      <div className="space-y-2">
-        <Label htmlFor="cfg-notes">Notes</Label>
-        <Textarea id="cfg-notes" rows={3} value={draft.notes} onChange={(event) => update("notes", event.target.value)} />
-      </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="cfg-api-key-env">API key env</Label>
+            <Input
+              id="cfg-api-key-env"
+              value={draft.api_key_env}
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              aria-invalid={showErrors && !!errors.api_key_env}
+              aria-describedby={showErrors && errors.api_key_env ? "cfg-api-key-env-error" : undefined}
+              onChange={(event) => update("api_key_env", event.target.value)}
+            />
+            {showErrors && errors.api_key_env ? (
+              <p id="cfg-api-key-env-error" className="text-xs text-destructive">
+                {errors.api_key_env}
+              </p>
+            ) : null}
+          </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-t pt-4">
-        <Button type="submit" disabled={!dirty || pending}>
-          {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-          Save changes
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={!dirty || pending}
-          onClick={() => {
-            onDraftChange(toConfigDraft(detail));
-            setAttempted(false);
-          }}
-        >
-          Discard
-        </Button>
-        <p className="text-xs text-muted-foreground sm:ml-auto">
-          Saving rewrites <span className="font-mono">compose.yaml</span> and recreates the container.
-        </p>
-      </div>
-    </form>
+          <div className="space-y-2">
+            <Label htmlFor="cfg-mem-limit">Memory limit (MB)</Label>
+            <Input
+              id="cfg-mem-limit"
+              type="number"
+              min={128}
+              max={8192}
+              step={128}
+              value={draft.mem_limit_mb}
+              className="font-mono"
+              aria-invalid={showErrors && !!errors.mem_limit_mb}
+              aria-describedby={showErrors && errors.mem_limit_mb ? "cfg-mem-limit-error" : undefined}
+              onChange={(event) => update("mem_limit_mb", event.target.value)}
+            />
+            {showErrors && errors.mem_limit_mb ? (
+              <p id="cfg-mem-limit-error" className="text-xs text-destructive">
+                {errors.mem_limit_mb}
+              </p>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="cfg-gate-token">Provider token</Label>
+          <Input
+            id="cfg-gate-token"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono"
+            value={draft.gate_token}
+            placeholder={providerKeySet ? "Keep current token" : "Not set"}
+            aria-describedby="cfg-gate-token-help"
+            onChange={(event) => update("gate_token", event.target.value)}
+          />
+          <p id="cfg-gate-token-help" className="text-xs text-muted-foreground">
+            {providerKeySet
+              ? "A provider key is stored. Leave empty to keep it."
+              : "No provider key stored. The agent cannot call the model without one."}{" "}
+            Encrypted at rest and never returned by the API. The host needs its secrets key
+            (<span className="font-mono">sudo fleett secrets init</span>).
+          </p>
+          {secretsError ? <ErrorAlert error={secretsError} /> : null}
+        </div>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="cfg-channel">Channel</Label>
+            <Select value={draft.channel} onValueChange={(value) => update("channel", value as ChannelType)}>
+              <SelectTrigger id="cfg-channel" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {CHANNEL_TYPES.map((type) => (
+                  <SelectItem key={type} value={type}>
+                    {type}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {draft.channel !== "none" ? (
+            <div className="space-y-2">
+              <Label htmlFor="cfg-token">Bot token</Label>
+              <Input
+                id="cfg-token"
+                type="password"
+                autoComplete="off"
+                placeholder="Keep current token"
+                className="font-mono"
+                aria-invalid={showErrors && !!errors.token}
+                aria-describedby={
+                  showErrors && errors.token ? "cfg-token-error" : "cfg-token-help"
+                }
+                onChange={(event) => update("token", event.target.value)}
+              />
+              <p id="cfg-token-help" className="text-xs text-muted-foreground">
+                {detail.channel !== "none" && detail.channel === draft.channel
+                  ? "Empty keeps the stored token. A new value rotates it."
+                  : "Required when switching channel type."}
+              </p>
+              {showErrors && errors.token ? (
+                <p id="cfg-token-error" className="text-xs text-destructive">
+                  {errors.token}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        <fieldset className="min-w-0 space-y-3">
+          <legend className="text-sm font-medium">Network</legend>
+          <div className="flex items-start gap-3 rounded-md border p-4">
+            <Checkbox
+              id="cfg-allow-lan"
+              className="mt-0.5"
+              checked={draft.allow_lan}
+              aria-describedby="cfg-allow-lan-help"
+              onCheckedChange={(value) => {
+                update("allow_lan", value === true);
+                if (egressError) setError(null);
+              }}
+            />
+            <div className="min-w-0 space-y-1">
+              <Label htmlFor="cfg-allow-lan" className="cursor-pointer">
+                Allow LAN access
+              </Label>
+              <p id="cfg-allow-lan-help" className="text-xs text-muted-foreground">
+                The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense and
+                Infisical. Only enable for agents you trust.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {draft.allow_lan ? (
+                  <>
+                    Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
+                    <span className="font-mono">fleett</span> network.
+                  </>
+                ) : (
+                  <>
+                    Stays on the restricted <span className="font-mono">fleett</span> network. No route to
+                    the LAN.
+                  </>
+                )}
+              </p>
+            </div>
+          </div>
+          {egressError ? <ErrorAlert error={egressError} /> : null}
+        </fieldset>
+
+        <fieldset className="min-w-0 space-y-3">
+          <legend className="text-sm font-medium">Shares</legend>
+          <SharePicker
+            shares={sharesResource.data ?? []}
+            value={draft.shares}
+            onChange={(next) => update("shares", next)}
+            loading={sharesResource.loading && !sharesResource.data}
+            error={sharesResource.error}
+            onRetry={sharesResource.reload}
+          />
+        </fieldset>
+
+        <div className="space-y-2">
+          <Label htmlFor="cfg-notes">Notes</Label>
+          <Textarea id="cfg-notes" rows={3} value={draft.notes} onChange={(event) => update("notes", event.target.value)} />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t pt-4">
+          <Button type="submit" disabled={!dirty || pending}>
+            {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
+            Save changes
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={!dirty || pending}
+            onClick={() => {
+              onDraftChange(toConfigDraft(detail));
+              setAttempted(false);
+            }}
+          >
+            Discard
+          </Button>
+          <p className="text-xs text-muted-foreground sm:ml-auto">
+            Saving rewrites <span className="font-mono">compose.yaml</span> and recreates the container.
+          </p>
+        </div>
+      </form>
+
+      <InstanceEnvironment
+        detail={detail}
+        rows={envRows}
+        onRowsChange={onEnvRowsChange}
+        onApplied={onEnvApplied}
+      />
+    </div>
   );
 }
 
@@ -771,22 +819,41 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
+  const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);
   const configDraftFor = useRef<string | null>(null);
   const configResetPending = useRef(false);
+  const envResetPending = useRef(false);
+  const envServerRef = useRef<EnvEntry[] | null>(null);
 
   useEffect(() => {
     const data = detail.data;
     if (!data) return;
     // Keep edits across tab switches and background reloads, but take the
-    // server copy after a save.
-    if (configDraftFor.current === data.id && !configResetPending.current) return;
+    // server copy after a save. A config save must not drop unsaved variable
+    // edits, and an env apply must not drop unsaved config edits. An untouched
+    // variable list follows the server, so a rotated gate key shows up.
+    const newInstance = configDraftFor.current !== data.id;
+    const serverChanged = envServerRef.current !== data.env;
+    const envClean =
+      envRows === null || (envServerRef.current !== null && envRowsMatch(envServerRef.current, envRows));
+    const resetDraft = newInstance || configResetPending.current;
+    const resetEnv = newInstance || envResetPending.current || (serverChanged && envClean);
+    if (!resetDraft && !resetEnv) return;
+    if (resetDraft) setConfigDraft(toConfigDraft(data));
+    if (resetEnv) setEnvRows(envRowsFromDetail(data.env));
     configDraftFor.current = data.id;
     configResetPending.current = false;
-    setConfigDraft(toConfigDraft(data));
-  }, [detail.data]);
+    envResetPending.current = false;
+    envServerRef.current = data.env;
+  }, [detail.data, envRows]);
 
-  function handleConfigSaved() {
+  function handleSaved() {
     configResetPending.current = true;
+    setNonce((value) => value + 1);
+  }
+
+  function handleEnvApplied() {
+    envResetPending.current = true;
     setNonce((value) => value + 1);
   }
 
@@ -941,12 +1008,15 @@ export function InstanceDetailPage({ id }: { id: string }) {
 
         {canEdit ? (
           <TabsContent value="configuration" className="mt-4">
-            {configDraft ? (
+            {configDraft && envRows ? (
               <ConfigurationTab
                 detail={data}
                 draft={configDraft}
                 onDraftChange={setConfigDraft}
-                onSaved={handleConfigSaved}
+                envRows={envRows}
+                onEnvRowsChange={setEnvRows}
+                onSaved={handleSaved}
+                onEnvApplied={handleEnvApplied}
               />
             ) : (
               <Skeleton className="h-64 w-full rounded-md" />

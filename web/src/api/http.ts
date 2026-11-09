@@ -7,6 +7,7 @@ import type {
   CreateInstanceInput,
   CreateTokenInput,
   CreatedToken,
+  EnvInput,
   FleetApi,
   Health,
   Identity,
@@ -125,6 +126,17 @@ export const httpApi: FleetApi = {
   listInstances: () => request<InstanceSummary[]>("/api/instances"),
 
   getInstance: (id) => request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}`),
+
+  putInstanceEnv: (id: string, env: EnvInput[]) =>
+    request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}/env`, {
+      method: "PUT",
+      body: JSON.stringify({ env }),
+    }),
+
+  deleteInstanceEnv: (id: string, key: string) =>
+    request<void>(`/api/instances/${encodeURIComponent(id)}/env/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+    }),
 
   createInstance: (input: CreateInstanceInput) =>
     request<InstanceDetail>("/api/instances", { method: "POST", body: JSON.stringify(input) }),

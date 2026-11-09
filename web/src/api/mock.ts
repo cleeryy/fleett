@@ -8,6 +8,7 @@ import type {
   CreateInstanceInput,
   CreateTokenInput,
   CreatedToken,
+  EnvInput,
   FleetApi,
   Health,
   Identity,
@@ -82,6 +83,13 @@ function assertSecretsKey(token: string | null | undefined): void {
   }
 }
 
+interface StoredEnv {
+  key: string;
+  value: string;
+  secret: boolean;
+  updated_at: string;
+}
+
 interface Stored {
   id: string;
   name: string;
@@ -89,8 +97,10 @@ interface Stored {
   model: string;
   base_url: string;
   api_key_env: string;
-  /** Write-only secret; only its presence is exposed through env_keys. */
+  /** Write-only secret; only its presence is exposed through the env list. */
   gate_token: string | null;
+  /** Write-only secret for the platform bot; never returned. */
+  channel_token: string | null;
   channel: ChannelType;
   status: InstanceStatus;
   shares: { name: string; mode: ShareMode }[];
@@ -103,6 +113,8 @@ interface Stored {
   last_error: string | null;
   container_id: string | null;
   started_at: number | null;
+  /** Extra variables, excluding the gate and channel tokens. */
+  env: StoredEnv[];
   /** The next lifecycle call fails once, to exercise the 502 path. */
   fail_next: boolean;
   logs: string[];
@@ -221,12 +233,34 @@ function channelEnv(channel: ChannelType): string | null {
   return null;
 }
 
-function envKeys(row: Stored): string[] {
-  const keys: string[] = [];
-  if (row.gate_token) keys.push(...gateKeys(row));
+/** Rows the controller owns: the gate and platform tokens are always secret. */
+function forcedEnv(row: Stored): StoredEnv[] {
+  const entries: StoredEnv[] = [];
+  if (row.gate_token) {
+    for (const key of gateKeys(row)) {
+      entries.push({ key, value: row.gate_token, secret: true, updated_at: row.updated_at });
+    }
+  }
   const channel = channelEnv(row.channel);
-  if (channel) keys.push(channel);
-  return [...new Set(keys)];
+  if (channel && row.channel_token) {
+    entries.push({ key: channel, value: row.channel_token, secret: true, updated_at: row.updated_at });
+  }
+  return entries;
+}
+
+function envEntries(row: Stored): StoredEnv[] {
+  const seen = new Set<string>();
+  const entries: StoredEnv[] = [];
+  for (const entry of [...forcedEnv(row), ...row.env]) {
+    if (seen.has(entry.key)) continue;
+    seen.add(entry.key);
+    entries.push(entry);
+  }
+  return entries.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+function envKeys(row: Stored): string[] {
+  return envEntries(row).map((entry) => entry.key);
 }
 
 /** Display name of a clone when the request does not name it, like the controller. */
@@ -325,7 +359,11 @@ function toDetail(row: Stored): InstanceDetail {
     updated_at: row.updated_at,
     last_error: row.last_error,
     data_dir: `${FLEETT_ROOT}/instances/${row.id}/data`,
-    env_keys: envKeys(row),
+    env: envEntries(row).map((entry) =>
+      entry.secret
+        ? { key: entry.key, secret: true, updated_at: entry.updated_at }
+        : { key: entry.key, secret: false, updated_at: entry.updated_at, value: entry.value },
+    ),
     container: row.container_id
       ? { id: row.container_id, image: IMAGE, uptime_s: uptime }
       : null,
@@ -466,6 +504,7 @@ function seedRow(input: {
   notes?: string;
   last_error?: string | null;
   gate_token?: string;
+  env?: { key: string; value: string; secret?: boolean }[];
 }): Stored {
   const created = SEEDED_AT - input.age_days * DAY;
   const running = input.status === "running";
@@ -477,6 +516,7 @@ function seedRow(input: {
     base_url: "https://opencode.ai/inference/go/openai/v1",
     api_key_env: "HERMES_GATE_PROFILE_TOKEN",
     gate_token: input.gate_token ?? null,
+    channel_token: input.channel === "none" ? null : `seed-${input.id}-channel-token`,
     channel: input.channel,
     status: input.status,
     shares: input.shares,
@@ -488,6 +528,12 @@ function seedRow(input: {
     last_error: input.last_error ?? null,
     container_id: input.status === "created" ? null : containerId(),
     started_at: running && input.uptime_hours !== null ? SEEDED_AT - input.uptime_hours * HOUR : null,
+    env: (input.env ?? []).map((entry) => ({
+      key: entry.key,
+      value: entry.value,
+      secret: entry.secret ?? false,
+      updated_at: iso(created + 2 * HOUR),
+    })),
     fail_next: input.id === "workshop",
     logs: [],
   };
@@ -496,6 +542,36 @@ function seedRow(input: {
 }
 
 export function resetMock(): void {
+  const telegramEnv = [
+    {
+      key: "TELEGRAM_ALLOWED_USERS",
+      description:
+        "Comma-separated Telegram user ids allowed to talk to the agent; without it every message is denied.",
+    },
+    {
+      key: "GATEWAY_ALLOW_ALL_USERS",
+      description: "Set to true to accept every user on the platform, with no allowlist. Use with care.",
+    },
+  ];
+  const discordEnv = [
+    {
+      key: "DISCORD_ALLOWED_USERS",
+      description: "Comma-separated Discord user ids allowed to talk to the agent.",
+    },
+    {
+      key: "DISCORD_ALLOWED_ROLES",
+      description: "Comma-separated Discord role ids allowed to talk to the agent.",
+    },
+    {
+      key: "DISCORD_ALLOWED_CHANNELS",
+      description: "Comma-separated Discord channel ids where the agent answers.",
+    },
+    {
+      key: "DISCORD_ALLOW_ALL_USERS",
+      description: "Set to true to accept every Discord user, with no allowlist. Use with care.",
+    },
+  ];
+
   templates = [
     {
       id: "guest",
@@ -503,6 +579,15 @@ export function resetMock(): void {
       description: "Web and memory only. No infrastructure access.",
       default_model: "deepseek-v4.1-flash",
       channel: "telegram",
+      env: telegramEnv,
+    },
+    {
+      id: "guest-discord",
+      name: "Guest (Discord)",
+      description: "Same restrictions as guest, connected to Discord.",
+      default_model: "deepseek-v4.1-flash",
+      channel: "discord",
+      env: discordEnv,
     },
     {
       id: "family",
@@ -510,6 +595,7 @@ export function resetMock(): void {
       description: "Everyday assistant with a shared photo archive.",
       default_model: "deepseek-v4.1-flash",
       channel: "discord",
+      env: discordEnv,
     },
     {
       id: "ops",
@@ -517,6 +603,7 @@ export function resetMock(): void {
       description: "Homelab diagnostics. Read access to operations shares.",
       default_model: "muse-spark-1.3-contributor",
       channel: "none",
+      env: [],
     },
     {
       id: "sandbox",
@@ -524,6 +611,7 @@ export function resetMock(): void {
       description: "Free execution, isolated network, disposable data.",
       default_model: "deepseek-v4.1-flash",
       channel: "none",
+      env: [],
     },
   ];
 
@@ -560,6 +648,7 @@ export function resetMock(): void {
       age_days: 3,
       uptime_hours: 4.2,
       gate_token: "seed-alice",
+      env: [{ key: "TELEGRAM_ALLOWED_USERS", value: "81459823" }],
       notes: "Friend account. Telegram bot for personal use.",
     }),
     seedRow({
@@ -573,6 +662,10 @@ export function resetMock(): void {
       age_days: 12,
       uptime_hours: null,
       gate_token: "seed-margaret",
+      env: [
+        { key: "DISCORD_ALLOWED_USERS", value: "310472918374" },
+        { key: "DISCORD_ALLOWED_ROLES", value: "987654321098" },
+      ],
       notes: "Family account. Read-only access to the photo archive.",
     }),
     seedRow({
@@ -701,6 +794,70 @@ resetMock();
 // ---------------------------------------------------------------------------
 // adapter
 
+const ENV_KEY_RE = /^[A-Z_][A-Z0-9_]{0,63}$/;
+const RESERVED_ENV = new Set(["HERMES_UID", "HERMES_GID", "PATH", "HOME"]);
+
+/** Same grammar and error codes as the controller (`invalid_env`, `reserved_env`). */
+function assertEnvInputs(
+  vars: EnvInput[],
+  options: { requireValue: boolean; requireSecret: boolean },
+): void {
+  const seen = new Set<string>();
+  for (const variable of vars) {
+    if (RESERVED_ENV.has(variable.key) || variable.key.startsWith("FLEETT_")) {
+      fail(400, "reserved_env", `environment variable "${variable.key}" is reserved`);
+    }
+    if (!ENV_KEY_RE.test(variable.key)) {
+      fail(
+        400,
+        "invalid_env",
+        `environment variable "${variable.key}" must match ^[A-Z_][A-Z0-9_]{0,63}$`,
+      );
+    }
+    if (seen.has(variable.key)) {
+      fail(400, "duplicate_env", `environment variable "${variable.key}" is listed twice`);
+    }
+    seen.add(variable.key);
+    const value = variable.value;
+    if (value !== undefined && value !== null) {
+      if (value.length > 8192) {
+        fail(400, "invalid_env", `environment variable "${variable.key}" value is longer than 8 KiB`);
+      }
+      if (/[\n\r\0]/.test(value)) {
+        fail(400, "invalid_env", `environment variable "${variable.key}" value cannot span lines`);
+      }
+    } else if (options.requireValue) {
+      fail(400, "invalid_env", `environment variable "${variable.key}" requires a value`);
+    }
+    if (options.requireSecret && variable.secret === undefined) {
+      fail(
+        400,
+        "invalid_env",
+        `environment variable "${variable.key}" must say whether it is a secret`,
+      );
+    }
+  }
+}
+
+/** Keys a supplied gate or channel token owns: the token value always wins. */
+function forcedKeys(row: Stored): Set<string> {
+  const keys = new Set<string>();
+  if (row.gate_token) for (const key of gateKeys(row)) keys.add(key);
+  const channel = channelEnv(row.channel);
+  if (channel && row.channel_token) keys.add(channel);
+  return keys;
+}
+
+/** A write replaces the environment, so remember when the container restarts. */
+function applyEnvChange(row: Stored): void {
+  if (!row.container_id) row.container_id = containerId();
+  row.status = "running";
+  row.started_at = Date.now();
+  row.updated_at = nowIso();
+  row.last_error = null;
+  row.logs.push(logLine(Date.now(), "INFO", "environment changed, container recreated"));
+}
+
 function validateChannel(channel: { type: ChannelType; token?: string }, previous: ChannelType): void {
   if (channel.type === "none") return;
   if (!channel.token && channel.type !== previous) {
@@ -756,7 +913,10 @@ export const mockApi: FleetApi = {
   async listTemplates(): Promise<Template[]> {
     requireAuth();
     await delay();
-    return templates.map((template) => ({ ...template }));
+    return templates.map((template) => ({
+      ...template,
+      env: template.env.map((suggestion) => ({ ...suggestion })),
+    }));
   },
 
   async listInstances(): Promise<InstanceSummary[]> {
@@ -769,6 +929,73 @@ export const mockApi: FleetApi = {
     requireAuth();
     await delay();
     return toDetail(findRow(id));
+  },
+
+  async putInstanceEnv(id: string, env: EnvInput[]): Promise<InstanceDetail> {
+    requireWrite();
+    await delay(340);
+    const row = findRow(id);
+    assertEnvInputs(env, { requireValue: false, requireSecret: true });
+
+    const existing = envEntries(row);
+    const resolved: StoredEnv[] = env.map((variable) => {
+      const current = existing.find((entry) => entry.key === variable.key);
+      if (variable.value !== undefined && variable.value !== null) {
+        return {
+          key: variable.key,
+          value: variable.value,
+          secret: variable.secret === true,
+          updated_at: nowIso(),
+        };
+      }
+      if (current?.secret && variable.secret === true) {
+        // A secret never left the controller, so sending it back without a
+        // value is how the console keeps it.
+        return { ...current, updated_at: nowIso() };
+      }
+      if (!current) {
+        fail(400, "invalid_env", `environment variable "${variable.key}" is new: a value is required`);
+      }
+      fail(400, "invalid_env", `environment variable "${variable.key}" is not a secret: a value is required`);
+    });
+
+    if (resolved.some((entry) => entry.secret)) assertSecretsKey("x");
+
+    // A full replace drops every key it leaves out, gate and channel tokens
+    // included.
+    const requested = new Set(env.map((variable) => variable.key));
+    if (row.gate_token && gateKeys(row).some((key) => !requested.has(key))) {
+      row.gate_token = null;
+    }
+    const channelKey = channelEnv(row.channel);
+    if (channelKey && row.channel_token && !requested.has(channelKey)) {
+      row.channel_token = null;
+    }
+
+    row.env = resolved.filter((entry) => !forcedKeys(row).has(entry.key));
+    applyEnvChange(row);
+    return toDetail(row);
+  },
+
+  async deleteInstanceEnv(id: string, key: string): Promise<void> {
+    requireWrite();
+    await delay(280);
+    const row = findRow(id);
+    if (row.gate_token && gateKeys(row).includes(key)) {
+      row.gate_token = null;
+      applyEnvChange(row);
+      return;
+    }
+    if (row.channel_token && channelEnv(row.channel) === key) {
+      row.channel_token = null;
+      applyEnvChange(row);
+      return;
+    }
+    if (!row.env.some((entry) => entry.key === key)) {
+      fail(404, "not_found", `instance "${id}" has no environment variable "${key}"`);
+    }
+    row.env = row.env.filter((entry) => entry.key !== key);
+    applyEnvChange(row);
   },
 
   async createInstance(input: CreateInstanceInput): Promise<InstanceDetail> {
@@ -793,10 +1020,16 @@ export const mockApi: FleetApi = {
     }
     validateChannel(input.channel, "none");
     assertSharesExist(input.shares);
+    assertEnvInputs(input.env ?? [], { requireValue: true, requireSecret: true });
     assertSecretsKey(input.gate_token);
+    assertSecretsKey(input.channel.type === "none" ? undefined : input.channel.token);
+    assertSecretsKey((input.env ?? []).some((variable) => variable.secret === true) ? "env" : undefined);
     assertEgress(input.allow_lan === true);
 
     const created = Date.now();
+    const gateToken = input.gate_token?.trim() ? input.gate_token.trim() : null;
+    const channelToken =
+      input.channel.type === "none" ? null : (input.channel.token?.trim() ?? null);
     const row: Stored = {
       id,
       name: input.name.trim(),
@@ -804,7 +1037,8 @@ export const mockApi: FleetApi = {
       model: input.model.trim(),
       base_url: input.base_url.trim(),
       api_key_env: input.api_key_env.trim(),
-      gate_token: input.gate_token?.trim() ? input.gate_token.trim() : null,
+      gate_token: gateToken,
+      channel_token: channelToken,
       channel: input.channel.type,
       status: "running",
       shares: input.shares.map((share) => ({ name: share.name, mode: share.mode })),
@@ -816,9 +1050,21 @@ export const mockApi: FleetApi = {
       last_error: null,
       container_id: containerId(),
       started_at: created,
+      env: [],
       fail_next: false,
       logs: [],
     };
+    // Gate and platform tokens win over an entry with the same key, like the
+    // controller: the token is written under that name.
+    const owned = forcedKeys(row);
+    row.env = (input.env ?? [])
+      .filter((variable) => !owned.has(variable.key))
+      .map((variable) => ({
+        key: variable.key,
+        value: variable.value ?? "",
+        secret: variable.secret === true,
+        updated_at: iso(created),
+      }));
     row.logs = makeLogs(row);
     rows.unshift(row);
     for (const share of row.shares) attachToShare(share.name, id, share.mode);
@@ -887,6 +1133,7 @@ export const mockApi: FleetApi = {
       api_key_env: source.api_key_env,
       // Only the replacement token: the source secret is never copied.
       gate_token: gateToken || null,
+      channel_token: source.channel === "none" ? null : channelToken || null,
       channel: source.channel,
       status: "running",
       shares: inherited.map((ref) => ({ ...ref })),
@@ -898,6 +1145,10 @@ export const mockApi: FleetApi = {
       last_error: null,
       container_id: containerId(),
       started_at: created,
+      // Non-secret variables follow the clone; encrypted values never do.
+      env: source.env
+        .filter((entry) => !entry.secret)
+        .map((entry) => ({ key: entry.key, value: entry.value, secret: false, updated_at: iso(created) })),
       fail_next: false,
       logs: [],
     };
@@ -931,25 +1182,78 @@ export const mockApi: FleetApi = {
     }
     if (input.channel) validateChannel(input.channel, row.channel);
     if (input.shares) assertSharesExist(input.shares);
+    if (input.env) assertEnvInputs(input.env, { requireValue: false, requireSecret: false });
     assertSecretsKey(input.gate_token);
     // Only a transition to restricted needs the host firewall; a stale
     // allow_lan=false in a full form save must not block unrelated edits.
     if (input.allow_lan === false && row.allow_lan) assertEgress(false);
 
+    let nextGate = input.gate_token?.trim() || row.gate_token;
+    const nextChannel = input.channel ? input.channel.type : row.channel;
+    let nextChannelToken = row.channel_token;
+    if (input.channel) {
+      nextChannelToken =
+        input.channel.type === "none" ? null : (input.channel.token?.trim() || row.channel_token);
+    }
+
+    let nextEnv = row.env.map((entry) => ({ ...entry }));
+    if (input.env) {
+      const entries = new Map(nextEnv.map((entry) => [entry.key, entry]));
+      const owned = forcedKeys({
+        ...row,
+        gate_token: nextGate,
+        channel: nextChannel,
+        channel_token: nextChannelToken,
+      });
+      const channelKey = channelEnv(nextChannel);
+      for (const variable of input.env) {
+        if (variable.value === undefined || variable.value === null) {
+          if (owned.has(variable.key)) {
+            if (gateKeys(row).includes(variable.key)) nextGate = null;
+            else if (variable.key === channelKey) nextChannelToken = null;
+          } else {
+            entries.delete(variable.key);
+          }
+          continue;
+        }
+        if (owned.has(variable.key)) {
+          if (variable.key === channelKey) nextChannelToken = variable.value;
+          else nextGate = variable.value;
+          continue;
+        }
+        const current = entries.get(variable.key);
+        entries.set(variable.key, {
+          key: variable.key,
+          value: variable.value,
+          secret: variable.secret ?? current?.secret ?? false,
+          updated_at: nowIso(),
+        });
+      }
+      nextEnv = [...entries.values()];
+    }
+
+    // Refuse to leave a store that holds a secret when the host has no key,
+    // before touching anything (mirrors `check_storable`).
+    const prospective: Stored = {
+      ...row,
+      gate_token: nextGate,
+      channel: nextChannel,
+      channel_token: nextChannelToken,
+      env: nextEnv,
+    };
+    if (envEntries(prospective).some((entry) => entry.secret)) assertSecretsKey("x");
+
     if (input.name !== undefined) row.name = input.name.trim();
     if (input.model !== undefined) row.model = input.model.trim();
     if (input.base_url !== undefined) row.base_url = input.base_url.trim();
     if (input.api_key_env !== undefined) row.api_key_env = input.api_key_env.trim();
-    if (input.gate_token !== undefined && input.gate_token.trim()) {
-      row.gate_token = input.gate_token.trim();
-    }
     if (input.mem_limit_mb !== undefined) row.mem_limit_mb = input.mem_limit_mb;
     if (input.allow_lan !== undefined) row.allow_lan = input.allow_lan;
     if (input.notes !== undefined) row.notes = input.notes;
-
-    if (input.channel) {
-      row.channel = input.channel.type;
-    }
+    row.gate_token = nextGate;
+    row.channel = nextChannel;
+    row.channel_token = nextChannelToken;
+    row.env = nextEnv;
 
     if (input.shares) {
       const next = input.shares.map((share) => ({ name: share.name, mode: share.mode }));
@@ -957,7 +1261,11 @@ export const mockApi: FleetApi = {
       row.shares = next;
     }
 
-    row.updated_at = nowIso();
+    if (input.env) {
+      applyEnvChange(row);
+    } else {
+      row.updated_at = nowIso();
+    }
     row.last_error = row.status === "error" ? row.last_error : null;
     return toDetail(row);
   },

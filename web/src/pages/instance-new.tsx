@@ -20,9 +20,11 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { EnvironmentRows } from "@/components/env-rows";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { SharePicker } from "@/components/share-picker";
+import { envPayload, validateEnvRows, type EnvRow } from "@/lib/env";
 import { isHttpUrl, isValidSlug } from "@/lib/validation";
 import { navigate, setRouteGuard, useRoute } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
@@ -53,6 +55,7 @@ interface Draft {
   memLimit: string;
   allowLan: boolean;
   notes: string;
+  env: EnvRow[];
 }
 
 const DEFAULT_DRAFT: Draft = {
@@ -71,6 +74,7 @@ const DEFAULT_DRAFT: Draft = {
   memLimit: "1536",
   allowLan: false,
   notes: "",
+  env: [],
 };
 
 const FIELD_IDS: Record<string, string> = {
@@ -122,6 +126,13 @@ function validate(draft: Draft, step: number): Record<string, string> {
     const memory = Number(draft.memLimit);
     if (!Number.isFinite(memory) || memory < 128 || memory > 8192)
       errors.memLimit = "Use 128 to 8192 MB.";
+
+    const envErrors = validateEnvRows(draft.env, "create").rows;
+    for (const row of draft.env) {
+      const rowErrors = envErrors[row.id];
+      if (rowErrors?.key) errors[`env-${row.id}-key`] = rowErrors.key;
+      if (rowErrors?.value) errors[`env-${row.id}-value`] = rowErrors.value;
+    }
   }
 
   if (step === 3 && draft.channel !== "none" && !draft.token.trim()) {
@@ -288,6 +299,7 @@ export function NewInstancePage() {
         mem_limit_mb: Number(draft.memLimit),
         allow_lan: draft.allowLan,
         notes: draft.notes.trim(),
+        env: envPayload(draft.env, "create"),
       });
       toast.success(`Instance ${detail.id} created.`);
       leaveWizard(`/instances/${detail.id}`);
@@ -303,13 +315,20 @@ export function NewInstancePage() {
         setSubmitError(error);
         if (error.code === "egress_not_enforced" || error.code === "secrets_key_missing") {
           // Host prerequisites live on the "Model & network" step: put the
-          // user on the field that needs the command to be run.
+          // user on the field that needs the command to be run. A secret env
+          // row also needs the secrets key, so anchor that panel instead.
           setStep(2);
           setAttempted(null);
-          const field = error.code === "egress_not_enforced" ? "wizard-allow-lan" : "provider-token";
-          const marker = error.code === "egress_not_enforced" ? "[data-egress-alert]" : "[data-secrets-alert]";
+          const secretEnv = draft.env.some((row) => row.secret);
+          const egress = error.code === "egress_not_enforced";
+          const field = egress ? "wizard-allow-lan" : secretEnv ? null : "provider-token";
+          const marker = egress
+            ? "[data-egress-alert]"
+            : secretEnv
+              ? "[data-env-secrets-alert]"
+              : "[data-secrets-alert]";
           window.requestAnimationFrame(() => {
-            document.getElementById(field)?.focus({ preventScroll: true });
+            if (field) document.getElementById(field)?.focus({ preventScroll: true });
             document.querySelector(marker)?.scrollIntoView({ block: "center" });
           });
         }
@@ -334,6 +353,12 @@ export function NewInstancePage() {
   const shareList = shares.data ?? [];
   const egressError = submitError?.code === "egress_not_enforced" ? submitError : null;
   const secretsError = submitError?.code === "secrets_key_missing" ? submitError : null;
+  const selectedTemplate = templateList.find((template) => template.id === draft.template);
+  const envSuggestions = (selectedTemplate?.env ?? []).filter(
+    (suggestion) => !draft.env.some((row) => row.key.trim() === suggestion.key),
+  );
+  const envErrors = showErrors && step === 2 ? validateEnvRows(draft.env, "create").rows : {};
+  const envHasSecrets = draft.env.some((row) => row.secret);
 
   return (
     <>
@@ -591,7 +616,7 @@ export function NewInstancePage() {
                     (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
                     cannot call the model.
                   </p>
-                  {secretsError ? (
+                  {secretsError && !envHasSecrets ? (
                     <div data-secrets-alert>
                       <ErrorAlert error={secretsError} />
                     </div>
@@ -656,6 +681,21 @@ export function NewInstancePage() {
                       <ErrorAlert error={egressError} />
                     </div>
                   ) : null}
+                </div>
+
+                <div className="space-y-2" data-env-secrets-alert>
+                  <EnvironmentRows
+                    idPrefix="env"
+                    rows={draft.env}
+                    onChange={(next) => {
+                      update("env", next);
+                      if (secretsError) setSubmitError(null);
+                    }}
+                    errors={envErrors}
+                    suggestions={envSuggestions}
+                    templateName={selectedTemplate?.name}
+                  />
+                  {secretsError && envHasSecrets ? <ErrorAlert error={secretsError} /> : null}
                 </div>
               </div>
             ) : null}
@@ -739,6 +779,27 @@ export function NewInstancePage() {
                   <ReviewRow
                     label="Provider token"
                     value={draft.providerToken.trim() ? "•••••••• set" : "Not set"}
+                  />
+                  <ReviewRow
+                    label="Environment"
+                    value={
+                      draft.env.length ? (
+                        <span className="flex flex-wrap gap-1">
+                          {draft.env.map((row) => (
+                            <Badge
+                              key={row.id}
+                              variant="outline"
+                              className="gap-1 font-mono text-xs font-normal"
+                            >
+                              {row.key.trim() || "…"}
+                              {row.secret ? <span className="text-muted-foreground">secret</span> : null}
+                            </Badge>
+                          ))}
+                        </span>
+                      ) : (
+                        "None"
+                      )
+                    }
                   />
                   <ReviewRow
                     label="Memory limit"
