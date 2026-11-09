@@ -388,6 +388,83 @@ is ignored: tool results are MCP `content` + `structuredContent`, and execution 
 `isError` results carrying the API code. A token without the required role is refused by the
 API and the refusal is returned as-is (for example `code: "forbidden", status: 403`).
 
+## Fleet operations (v0.6)
+
+The commands below are client-mode calls to the HTTP API. They all accept the global
+`--json` flag; see `fleett <command> --help` for the full flag list.
+
+```bash
+# Agent-to-agent bus and shared memory
+fleett say <to> "..." --kind ask --from <id> --correlation <id>
+fleett messages <id> --view inbox|outbox|all --status queued|delivered|read
+fleett ack <id> <message-id>
+fleett memory set <namespace> <key> <value> --tag ops --ttl 86400
+fleett memory search "gateway upgrade" --namespace shared
+fleett memory history <entry-id>
+fleett memory restore <entry-id> <version>
+fleett memory promote <entry-id> --namespace global
+
+# Schedules, pipelines, runs
+fleett schedules <id>
+fleett schedule add <id> --name hourly --cron "0 * * * *" --prompt "summarize incidents"
+fleett schedule run <schedule-id>
+fleett runs <id> --limit 20
+fleett pipelines
+fleett pipeline apply -f pipeline.yaml
+fleett pipeline run <pipeline-id> --wait
+fleett pipeline runs <pipeline-id>
+
+# Costs, usage, quotas
+fleett cost --from 2026-11-01 --to 2026-11-30 --group-by instance
+fleett pricing list
+fleett pricing set <model> --input 0.15 --output 0.60
+fleett budget <id> --set 20
+fleett usage --detail
+fleett quota <id> --set 5120 --policy warn
+fleett quota cleanup <id>
+
+# Incidents, watchdog, deployments
+fleett incidents --status open
+fleett heal <id> --policy restart --unhealthy-after 3 --max-restarts 5
+fleett incident close <incident-id>
+fleett windows list
+fleett windows add --name nightly --days mon,tue,wed,thu,fri --start 02:00 --end 05:00
+fleett deployments --limit 20
+fleett deployment get <deployment-id>
+fleett upgrade --image TAG --canary 1 --soak 10m
+
+# Logs, notifications, webhooks, audit
+fleett logs search --q allowlist --instance probe --level warn --since 1h
+fleett logs tail --instance probe
+fleett logs export --format csv -f logs.csv
+fleett notifications
+fleett notification test <id>
+fleett deliveries --limit 50
+fleett webhooks
+fleett webhook test <id>
+fleett audit --actor alice --action instance.exec
+fleett audit export --from 2026-11-01 --to 2026-11-30 -f audit.jsonl
+fleett audit purge
+
+# Snapshots, exec, access, security, MCP
+fleett snapshot create <id> --label before-upgrade
+fleett snapshot restore <snapshot-id> --yes
+fleett exec <id> -- ls /opt/data
+fleett acl get <id>
+fleett acl set <id> alice@example.com operator
+fleett security
+fleett mcp                      # stdio; --http 127.0.0.1:8091 for HTTP
+fleett plan -f fleet.yaml
+fleett apply -f fleet.yaml --allow-delete
+fleett desired-state
+fleett reconcile -f fleet.yaml --interval 60
+```
+
+The HTTP routes behind each command are documented in [API.md](../API.md). The feature
+notes live in `docs/SCHEDULES.md`, `PIPELINES.md`, `COST.md`, `LOGS.md`, `WATCHDOG.md`,
+`DEPLOYMENTS.md`, `SNAPSHOTS.md`, `NOTIFICATIONS.md`, `WEBHOOKS.md`, `AUDIT.md`, `RBAC.md`,
+`SELINUX`/`HARDENING.md`, `GITOPS.md`, `MCP.md`, `BUS.md`, `MEMORY.md` and `EGRESS-POLICY.md`.
+
 ## Output and exit codes
 
 | Code | Meaning |

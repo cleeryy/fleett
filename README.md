@@ -38,7 +38,12 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | **Backups** | Rotating host backups, portable instance export/import, restore into a fresh root. |
 | **Upgrades** | Move the whole fleet to a new image: one at a time, health-checked, automatic rollback to the previous tag. |
 | **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit log, named revocable tokens, encrypted secrets, LAN egress firewall, opt-in strict hardening. |
-| **Ops** | Real healthcheck, Prometheus `/metrics` with an importable Grafana dashboard and alert rules, usage, `fleett doctor`, compose integration in CI. |
+| **Orchestration** | Persistent agent-to-agent bus (`say`/`messages`/`ack`), shared fleet memory with FTS5 search and history, per-agent cron schedules with run history, DAG pipelines with retries/cancellation. |
+| **Ops** | Watchdog with `off|restart|recreate` healing and an incident registry, per-instance snapshots/rollback, maintenance windows, canary upgrades with soak, deployment journal, disk quotas. |
+| **Observability** | Persistent searchable log center with SSE, token/cost accounting with budgets and versioned pricing, Prometheus `/metrics` with an importable Grafana dashboard and alert rules. |
+| **Integrations** | Signed outbound webhooks + OpenAPI 3.0 + TypeScript SDK, `fleett mcp` (stdio/HTTP), declarative `fleet.yaml` plan/apply with drift detection. |
+| **Security** | Per-instance RBAC and scoped tokens, allowlisted exec with audit, API rate limiting/lockout/security headers, signed audit export with retention, per-instance egress policy. |
+| **Reliability** | Real healthcheck, compose integration in CI, automatic rollback on failed upgrades, restore points before risky operations, `fleett doctor`. |
 
 ## Quick start
 
