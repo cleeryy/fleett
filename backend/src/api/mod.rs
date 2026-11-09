@@ -523,6 +523,27 @@ fn finalize(api: Router<AppState>, pages: Router<AppState>, state: AppState) -> 
 #[folder = "../web/dist/"]
 struct WebAssets;
 
+#[allow(dead_code)]
+/// Cache policy for the embedded frontend.
+///
+/// The service worker, the manifest and the offline page must never be cached
+/// by the HTTP layer, otherwise a new release can take an hour to be picked up.
+/// Vite emits content-hashed files under `assets/`, safe to cache forever.
+fn cache_control(requested: &str) -> &'static str {
+    if matches!(
+        requested,
+        "index.html" | "sw.js" | "manifest.webmanifest" | "offline.html"
+    ) {
+        "no-cache"
+    } else if requested.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else if requested.contains('.') {
+        "public, max-age=3600"
+    } else {
+        "no-cache"
+    }
+}
+
 #[cfg(feature = "embed-web")]
 async fn embedded_asset(uri: axum::http::Uri) -> axum::response::Response {
     use axum::http::header;
@@ -537,11 +558,7 @@ async fn embedded_asset(uri: axum::http::Uri) -> axum::response::Response {
     let Some(file) = WebAssets::get(requested).or_else(|| WebAssets::get("index.html")) else {
         return ApiError::not_found("the embedded frontend is empty").into_response();
     };
-    let cache = if requested.contains('.') {
-        "public, max-age=3600"
-    } else {
-        "no-cache"
-    };
+    let cache = cache_control(requested);
     (
         [
             (header::CONTENT_TYPE, content_type(requested)),
@@ -678,5 +695,37 @@ pub(crate) async fn up_and_record(
                 .record_compose_action("up", crate::metrics::RESULT_ERROR);
             Err(ApiError::driver(err))
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::cache_control;
+
+    #[test]
+    fn shell_files_are_never_cached() {
+        for path in [
+            "index.html",
+            "sw.js",
+            "manifest.webmanifest",
+            "offline.html",
+        ] {
+            assert_eq!(cache_control(path), "no-cache", "{path}");
+        }
+    }
+
+    #[test]
+    fn hashed_assets_are_immutable() {
+        assert_eq!(
+            cache_control("assets/index-abc123.js"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn other_static_files_keep_a_short_cache() {
+        assert_eq!(cache_control("icons/icon-192.png"), "public, max-age=3600");
+        assert_eq!(cache_control("favicon.svg"), "public, max-age=3600");
+        assert_eq!(cache_control("some/route"), "no-cache");
     }
 }
