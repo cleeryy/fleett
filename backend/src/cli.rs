@@ -341,11 +341,15 @@ pub enum Command {
         id: String,
         purge: bool,
     },
-    Usage,
+    Usage {
+        detail: bool,
+    },
     Cost(CostArgs),
     Pricing(PricingAction),
     Budget(BudgetArgs),
     Images,
+    Quota(QuotaArgs),
+    Disk(DiskCommand),
     Upgrade(UpgradeArgs),
     Hosts,
     Host(HostAction),
@@ -539,6 +543,27 @@ pub struct MoveArgs {
     pub keep_archive: bool,
 }
 
+/// Arguments of `fleett quota`.
+#[derive(Debug, Clone, Default)]
+pub struct QuotaArgs {
+    pub id: String,
+    /// Set the quota, in MB (`0` = unlimited).
+    pub set_mb: Option<u32>,
+    /// `warn`, `freeze` or `stop`.
+    pub policy: Option<String>,
+    /// `fleett quota cleanup <id>`: purge tmp/, cache/ and old logs.
+    pub cleanup: bool,
+}
+
+/// Sub-commands of `fleett disk`.
+#[derive(Debug, Clone)]
+pub enum DiskCommand {
+    Events {
+        instance: Option<String>,
+        limit: usize,
+    },
+}
+
 /// Arguments of `fleett say`.
 #[derive(Debug, Clone)]
 pub struct SayArgs {
@@ -707,11 +732,13 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Stop(id) => lifecycle(&client, json, &id, "stop").await,
         Command::Restart(id) => lifecycle(&client, json, &id, "restart").await,
         Command::Delete { id, purge } => delete(&client, json, &id, purge).await,
-        Command::Usage => usage(&client, json).await,
+        Command::Usage { detail } => usage(&client, json, detail).await,
         Command::Cost(args) => cost(&client, json, &args).await,
         Command::Pricing(action) => pricing(&client, json, &action).await,
         Command::Budget(args) => budget(&client, json, &args).await,
         Command::Images => images(&client, json).await,
+        Command::Quota(args) => quota(&client, json, &args).await,
+        Command::Disk(command) => disk(&client, json, &command).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Hosts => hosts(&client, json).await,
         Command::Host(action) => host(&client, json, &action).await,
@@ -961,6 +988,66 @@ struct BudgetView {
     #[serde(default)]
     exceeded: bool,
     projected_month_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UsageDetailView {
+    instance: String,
+    data: DirBreakdownView,
+    #[serde(default)]
+    docker_log_bytes: Option<u64>,
+    #[serde(default)]
+    image_bytes: Option<u64>,
+    quota: QuotaView,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DirBreakdownView {
+    #[serde(default)]
+    total_bytes: u64,
+    #[serde(default)]
+    tmp_bytes: u64,
+    #[serde(default)]
+    cache_bytes: u64,
+    #[serde(default)]
+    logs_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QuotaView {
+    instance: String,
+    quota_mb: u32,
+    policy: String,
+    used_bytes: u64,
+    percent: f64,
+    state: String,
+    #[serde(default)]
+    last_event: Option<DiskEventView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DiskEventView {
+    instance: String,
+    at: String,
+    action: String,
+    #[serde(default)]
+    before_bytes: u64,
+    #[serde(default)]
+    after_bytes: u64,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CleanupView {
+    instance: String,
+    before_bytes: u64,
+    after_bytes: u64,
+    freed_bytes: u64,
+    #[serde(default)]
+    removed_files: usize,
+    #[serde(default)]
+    removed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2092,8 +2179,11 @@ async fn delete(client: &Client, json: bool, id: &str, purge: bool) -> Result<()
     Ok(())
 }
 
-async fn usage(client: &Client, json: bool) -> Result<(), CliError> {
+async fn usage(client: &Client, json: bool, detail: bool) -> Result<(), CliError> {
     let value = client.value(Method::GET, "/api/usage", &[], None).await?;
+    if detail {
+        return usage_detail(client, json, &value).await;
+    }
     if json {
         return print_json(&value);
     }
@@ -2279,6 +2369,219 @@ async fn pricing(client: &Client, json: bool, action: &PricingAction) -> Result<
                 price.output_per_mtok,
                 price.currency,
                 price.effective_from
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `fleett usage --detail`: per-instance data, Docker log and image sizes.
+async fn usage_detail(client: &Client, json: bool, report: &Value) -> Result<(), CliError> {
+    let report: UsageReport = decode(report.clone())?;
+    let mut details = Vec::with_capacity(report.instances.len());
+    for entry in &report.instances {
+        let path = format!(
+            "/api/instances/{}/usage/detail",
+            encode_path_segment(&entry.id)
+        );
+        details.push(client.value(Method::GET, &path, &[], None).await?);
+    }
+    if json {
+        return print_json(&Value::Array(details));
+    }
+    let details: Vec<UsageDetailView> = details
+        .into_iter()
+        .map(decode)
+        .collect::<Result<_, CliError>>()?;
+    let rows: Vec<Vec<String>> = details
+        .iter()
+        .map(|detail| {
+            vec![
+                detail.instance.clone(),
+                human_bytes(detail.data.total_bytes),
+                human_bytes(detail.data.tmp_bytes),
+                human_bytes(detail.data.cache_bytes),
+                human_bytes(detail.data.logs_bytes),
+                detail
+                    .docker_log_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "-".to_string()),
+                detail
+                    .image_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "-".to_string()),
+                if detail.quota.quota_mb == 0 {
+                    "unlimited".to_string()
+                } else {
+                    format!(
+                        "{} / {} MB ({:.1}%, {})",
+                        human_bytes(detail.quota.used_bytes),
+                        detail.quota.quota_mb,
+                        detail.quota.percent,
+                        detail.quota.state
+                    )
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "ID",
+                "DATA",
+                "TMP",
+                "CACHE",
+                "LOGS",
+                "DOCKER LOG",
+                "IMAGE",
+                "QUOTA"
+            ],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+/// `fleett quota <id> [--set MB] [--policy ...]` and `... cleanup <id>`.
+async fn quota(client: &Client, json: bool, args: &QuotaArgs) -> Result<(), CliError> {
+    let encoded = encode_path_segment(&args.id);
+    if args.cleanup {
+        let value = client
+            .value(
+                Method::POST,
+                &format!("/api/instances/{encoded}/quota/cleanup"),
+                &[],
+                Some(json!({})),
+            )
+            .await?;
+        if json {
+            return print_json(&value);
+        }
+        let report: CleanupView = decode(value)?;
+        println!(
+            "{}: freed {} ({} -> {}, {} file(s) removed)",
+            report.instance,
+            human_bytes(report.freed_bytes),
+            human_bytes(report.before_bytes),
+            human_bytes(report.after_bytes),
+            report.removed_files
+        );
+        if !report.removed_paths.is_empty() {
+            println!("removed: {}", report.removed_paths.join(", "));
+        }
+        return Ok(());
+    }
+
+    if args.set_mb.is_none() && args.policy.is_none() {
+        let value = client
+            .value(
+                Method::GET,
+                &format!("/api/instances/{encoded}/quota"),
+                &[],
+                None,
+            )
+            .await?;
+        if json {
+            return print_json(&value);
+        }
+        let view: QuotaView = decode(value)?;
+        print_quota(&view);
+        return Ok(());
+    }
+
+    // PUT replaces both fields: read the current row so a lone `--set` never
+    // resets the policy (and vice versa).
+    let current: QuotaView = client
+        .json(
+            Method::GET,
+            &format!("/api/instances/{encoded}/quota"),
+            &[],
+            None,
+        )
+        .await?;
+    let body = json!({
+        "quota_mb": args.set_mb.unwrap_or(current.quota_mb),
+        "policy": args.policy.clone().unwrap_or(current.policy),
+    });
+    let value = client
+        .value(
+            Method::PUT,
+            &format!("/api/instances/{encoded}/quota"),
+            &[],
+            Some(body),
+        )
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: QuotaView = decode(value)?;
+    print_quota(&view);
+    Ok(())
+}
+
+fn print_quota(view: &QuotaView) {
+    if view.quota_mb == 0 {
+        println!("{}: unlimited (policy {})", view.instance, view.policy);
+    } else {
+        println!(
+            "{}: {} / {} MB ({:.2}%, {}, policy {})",
+            view.instance,
+            human_bytes(view.used_bytes),
+            view.quota_mb,
+            view.percent,
+            view.state,
+            view.policy
+        );
+    }
+    if let Some(event) = &view.last_event {
+        println!(
+            "last event: {} at {} ({})",
+            event.action,
+            event.at,
+            event.detail.as_deref().unwrap_or("-")
+        );
+    }
+}
+
+/// `fleett disk events [--instance ID] [--limit N]`.
+async fn disk(client: &Client, json: bool, command: &DiskCommand) -> Result<(), CliError> {
+    match command {
+        DiskCommand::Events { instance, limit } => {
+            let mut query = vec![("limit", limit.to_string())];
+            if let Some(id) = instance.as_deref().filter(|value| !value.is_empty()) {
+                query.push(("instance", id.to_string()));
+            }
+            let value = client
+                .value(Method::GET, "/api/disk/events", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let events: Vec<DiskEventView> = decode(value)?;
+            if events.is_empty() {
+                println!("no disk events");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = events
+                .iter()
+                .map(|event| {
+                    vec![
+                        event.at.clone(),
+                        event.instance.clone(),
+                        event.action.clone(),
+                        human_bytes(event.before_bytes),
+                        human_bytes(event.after_bytes),
+                        event.detail.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(
+                    &["AT", "INSTANCE", "ACTION", "BEFORE", "AFTER", "DETAIL"],
+                    &rows
+                )
             );
             Ok(())
         }

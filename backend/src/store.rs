@@ -521,6 +521,10 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         unhealthy_after: models::DEFAULT_UNHEALTHY_AFTER,
         max_restarts: models::DEFAULT_MAX_RESTARTS,
         heal_backoff_s: models::DEFAULT_HEAL_BACKOFF_S,
+        // The compose file is the source of truth for the container, not for
+        // the quota: `reconcile` keeps the stored columns on an existing row.
+        disk_quota_mb: crate::models::DEFAULT_DISK_QUOTA_MB,
+        disk_policy: crate::models::DiskPolicy::Warn,
         notes: String::new(),
         host: crate::hosts::LOCAL_HOST.to_string(),
         status: Status::Unknown,

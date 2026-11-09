@@ -172,7 +172,11 @@ enum Commands {
         purge: bool,
     },
     /// Show the CPU, memory and disk usage of the fleet (client mode).
-    Usage,
+    Usage {
+        /// Also show the per-instance data, Docker log and image sizes.
+        #[arg(long)]
+        detail: bool,
+    },
     /// Token usage and cost of the fleet (client mode). See docs/COST.md.
     Cost {
         /// Inclusive lower bound (`YYYY-MM-DD` or RFC 3339); default: first
@@ -213,6 +217,27 @@ enum Commands {
     Instances {
         #[command(subcommand)]
         action: InstanceCommands,
+    },
+    /// Show or change the disk quota of an instance (client mode).
+    ///
+    /// `fleett quota <id>` prints the quota and its usage; `--set`/`--policy`
+    /// updates it; `fleett quota cleanup <id>` frees tmp/, cache/ and rotated
+    /// logs older than 7 days (see docs/QUOTA.md).
+    Quota {
+        /// Instance id, or `cleanup` followed by an instance id.
+        #[arg(value_name = "ID", num_args = 1..=2)]
+        args: Vec<String>,
+        /// Set the quota, in MB (0 = unlimited).
+        #[arg(long)]
+        set: Option<u32>,
+        /// Policy on a breach: `warn`, `freeze` or `stop`.
+        #[arg(long)]
+        policy: Option<String>,
+    },
+    /// Read the disk event journal (client mode).
+    Disk {
+        #[command(subcommand)]
+        action: DiskCommands,
     },
     /// Move every agent to another container image, rolling back the ones
     /// that never become healthy (client mode). See docs/UPGRADE.md.
@@ -369,6 +394,19 @@ enum AclCommands {
     },
     /// Remove one subject.
     Rm { id: String, subject: String },
+}
+
+#[derive(Subcommand)]
+enum DiskCommands {
+    /// Journal of quota warnings, freezes, stops and cleanups, newest first.
+    Events {
+        /// Only the events of one instance.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -804,7 +842,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop { id } => cli::run(cli::Command::Stop(id), json).await,
         Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
         Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
-        Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Usage { detail } => cli::run(cli::Command::Usage { detail }, json).await,
         Commands::Cost { from, to, group_by } => {
             cli::run(
                 cli::Command::Cost(cli::CostArgs { from, to, group_by }),
@@ -875,6 +913,34 @@ async fn main() -> anyhow::Result<()> {
                 }),
             };
             cli::run(cli::Command::Instances(action), json).await
+        }
+        Commands::Quota { args, set, policy } => {
+            let (id, cleanup) = match args.as_slice() {
+                [id] => (id.clone(), false),
+                [first, id] if first == "cleanup" => (id.clone(), true),
+                _ => anyhow::bail!(
+                    "usage: fleett quota <id> [--set MB] [--policy warn|freeze|stop]; \
+                     fleett quota cleanup <id>"
+                ),
+            };
+            cli::run(
+                cli::Command::Quota(cli::QuotaArgs {
+                    id,
+                    set_mb: set,
+                    policy,
+                    cleanup,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Disk { action } => {
+            let command = match action {
+                DiskCommands::Events { instance, limit } => {
+                    cli::DiskCommand::Events { instance, limit }
+                }
+            };
+            cli::run(cli::Command::Disk(command), json).await
         }
         Commands::Upgrade {
             image,
@@ -1182,6 +1248,10 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     warn_about_egress(&cfg, driver.clone()).await;
 
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
+    // One tick before the first request: an instance that filled the host
+    // while the control plane was down is handled at startup, not 60 s later.
+    fleett::quota::tick(&state).await;
+    spawn_quota_loop(state.clone());
     let app = api::router(state.clone());
 
     // A `running` row belongs to a process that died; catchup=false schedules
@@ -1278,6 +1348,29 @@ fn spawn_scheduler(state: AppState) {
     });
 }
 
+/// Spawn the disk quota loop (`FLEETT_QUOTA_INTERVAL_S`, default 60).
+///
+/// `0` disables the loop for good; the startup tick still runs, so a broken
+/// host is reported once. Missed ticks are delayed, never replayed: a long
+/// `du` must not produce a burst of back-to-back samples.
+fn spawn_quota_loop(state: AppState) {
+    let interval_s = state.cfg.quota_interval_s;
+    if interval_s == 0 {
+        tracing::info!("disk quota loop disabled (FLEETT_QUOTA_INTERVAL_S=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first `tick()` completes immediately; `serve` already ran one.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            fleett::quota::tick(&state).await;
+        }
+    });
+}
+
 /// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).
 ///
 /// It is a second, independent listener: a scrape never reaches the API port and
@@ -1347,4 +1440,57 @@ fn warn_about_legacy_projects(cfg: &Config) {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_and_disk_command_lines_parse() {
+        let cli = Cli::try_parse_from(["fleett", "quota", "alice"]).expect("show form");
+        match cli.command {
+            Some(Commands::Quota { args, set, policy }) => {
+                assert_eq!(args, vec!["alice".to_string()]);
+                assert!(set.is_none());
+                assert!(policy.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["fleett", "quota", "cleanup", "alice"]).expect("cleanup");
+        match cli.command {
+            Some(Commands::Quota { args, .. }) => {
+                assert_eq!(args, vec!["cleanup".to_string(), "alice".to_string()]);
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "fleett", "quota", "alice", "--set", "2048", "--policy", "freeze",
+        ])
+        .expect("set form");
+        match cli.command {
+            Some(Commands::Quota { args, set, policy }) => {
+                assert_eq!(args, vec!["alice".to_string()]);
+                assert_eq!(set, Some(2048));
+                assert_eq!(policy.as_deref(), Some("freeze"));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from(["fleett", "disk", "events", "--limit", "10"])
+            .expect("disk events");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Disk {
+                action: DiskCommands::Events { limit: 10, .. }
+            })
+        ));
+        let cli = Cli::try_parse_from(["fleett", "usage", "--detail"]).expect("usage detail");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Usage { detail: true })
+        ));
+    }
 }

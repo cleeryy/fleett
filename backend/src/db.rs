@@ -623,6 +623,28 @@ INSERT OR IGNORE INTO hosts (id, name, transport, address, docker_context, statu
 VALUES ('local', 'local', 'local', '', NULL, 'unknown', NULL, NULL,
     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
 "#,
+    // v25 — disk quotas (issue #47). `0` keeps every instance
+    // created before this release unlimited; `warn` is the historical
+    // (non-destructive) behaviour. `disk_events` is the journal of quota
+    // crossings and cleanups, kept out of `audit_log` so the quota loop can
+    // append without an operator identity.
+    r#"
+ALTER TABLE instances ADD COLUMN disk_quota_mb INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instances ADD COLUMN disk_policy TEXT NOT NULL DEFAULT 'warn';
+
+CREATE TABLE IF NOT EXISTS disk_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id  TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    before_bytes INTEGER NOT NULL DEFAULT 0,
+    after_bytes  INTEGER NOT NULL DEFAULT 0,
+    detail       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_disk_events_instance ON disk_events (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_disk_events_at ON disk_events (at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -922,8 +944,8 @@ impl Db {
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, provider, channel, \
                  status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
-                 unhealthy_after, max_restarts, heal_backoff_s, notes, host, created_at, \
-                 updated_at \
+                 unhealthy_after, max_restarts, heal_backoff_s, disk_quota_mb, disk_policy, \
+                 notes, host, created_at, updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -941,7 +963,8 @@ impl Db {
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, provider, channel, status, \
              last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, unhealthy_after, \
-             max_restarts, heal_backoff_s, notes, host, created_at, updated_at \
+             max_restarts, heal_backoff_s, disk_quota_mb, disk_policy, notes, host, created_at, \
+             updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -987,9 +1010,10 @@ impl Db {
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, provider, \
              channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
-             unhealthy_after, max_restarts, heal_backoff_s, notes, host, created_at, updated_at) \
+             unhealthy_after, max_restarts, heal_backoff_s, disk_quota_mb, disk_policy, notes, \
+             host, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?20, ?21, ?22)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 spec.id,
                 spec.name,
@@ -1009,6 +1033,8 @@ impl Db {
                 spec.unhealthy_after,
                 spec.max_restarts,
                 spec.heal_backoff_s as i64,
+                spec.disk_quota_mb,
+                spec.disk_policy.as_str(),
                 spec.notes,
                 spec.host,
                 spec.created_at,
@@ -1029,8 +1055,8 @@ impl Db {
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, provider = ?7, channel = ?8, status = ?9, last_error = ?10, \
              mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, heal = ?15, \
-             unhealthy_after = ?16, max_restarts = ?17, heal_backoff_s = ?18, notes = ?19, \
-             host = ?20, updated_at = ?21 \
+             unhealthy_after = ?16, max_restarts = ?17, heal_backoff_s = ?18, \
+             disk_quota_mb = ?19, disk_policy = ?20, notes = ?21, host = ?22, updated_at = ?23 \
              WHERE id = ?1",
             params![
                 spec.id,
@@ -1051,6 +1077,8 @@ impl Db {
                 spec.unhealthy_after,
                 spec.max_restarts,
                 spec.heal_backoff_s as i64,
+                spec.disk_quota_mb,
+                spec.disk_policy.as_str(),
                 spec.notes,
                 spec.host,
                 spec.updated_at,
@@ -1141,6 +1169,25 @@ impl Db {
             params![id, host, now_iso()],
         )?;
         Ok(())
+    }
+
+    /// Store the disk quota and its enforcement policy of one instance.
+    ///
+    /// Only the two quota columns (and `updated_at`) move, so a concurrent
+    /// PATCH of the instance can never clobber a fresh quota. Returns the
+    /// number of updated rows (`0` when the instance is unknown).
+    pub fn set_disk_quota(
+        &self,
+        id: &str,
+        quota_mb: u32,
+        policy: crate::models::DiskPolicy,
+    ) -> Result<usize, DbError> {
+        let updated = self.lock().execute(
+            "UPDATE instances SET disk_quota_mb = ?2, disk_policy = ?3, updated_at = ?4 \
+             WHERE id = ?1",
+            params![id, quota_mb, policy.as_str(), now_iso()],
+        )?;
+        Ok(updated)
     }
 
     pub fn delete_instance(&self, id: &str) -> Result<(), DbError> {
@@ -2077,6 +2124,8 @@ struct StoredRow {
     unhealthy_after: i64,
     max_restarts: i64,
     heal_backoff_s: i64,
+    disk_quota_mb: i64,
+    disk_policy: String,
     notes: String,
     host: String,
     created_at: String,
@@ -2110,6 +2159,9 @@ impl StoredRow {
             unhealthy_after: self.unhealthy_after.clamp(0, u32::MAX as i64) as u32,
             max_restarts: self.max_restarts.clamp(0, u32::MAX as i64) as u32,
             heal_backoff_s: self.heal_backoff_s.clamp(0, i64::MAX) as u64,
+            disk_quota_mb: self.disk_quota_mb.clamp(0, i64::from(u32::MAX)) as u32,
+            disk_policy: crate::models::DiskPolicy::parse(&self.disk_policy)
+                .unwrap_or(crate::models::DiskPolicy::Warn),
             notes: self.notes,
             host: if self.host.trim().is_empty() {
                 crate::hosts::LOCAL_HOST.to_string()
@@ -2153,6 +2205,8 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         unhealthy_after: row.get("unhealthy_after")?,
         max_restarts: row.get("max_restarts")?,
         heal_backoff_s: row.get("heal_backoff_s")?,
+        disk_quota_mb: row.get("disk_quota_mb")?,
+        disk_policy: row.get("disk_policy")?,
         notes: row.get("notes")?,
         host: row.get("host")?,
         created_at: row.get("created_at")?,
@@ -2299,6 +2353,8 @@ mod tests {
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: crate::models::DiskPolicy::Warn,
             notes: String::new(),
             host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,
@@ -2596,7 +2652,14 @@ mod tests {
         assert_eq!(alice.cpu_limit, crate::models::DEFAULT_CPU_LIMIT);
         assert!(!alice.allow_lan);
         assert_eq!(alice.image, "", "a v0 row starts without an image");
+        assert_eq!(alice.disk_quota_mb, 0, "an old row stays unlimited");
+        assert_eq!(
+            alice.disk_policy,
+            crate::models::DiskPolicy::Warn,
+            "the historical behaviour is warn"
+        );
         assert!(table_exists(&db.lock(), "share_links"));
+        assert!(table_exists(&db.lock(), "disk_events"));
 
         // Re-opening an up-to-date database applies nothing.
         drop(db);
@@ -2605,6 +2668,39 @@ mod tests {
             reopened.schema_version().expect("version"),
             SCHEMA_VERSION as i64
         );
+    }
+
+    #[test]
+    fn disk_quota_columns_round_trip_and_update_in_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        let mut alice = spec("alice");
+        alice.disk_quota_mb = 512;
+        alice.disk_policy = crate::models::DiskPolicy::Freeze;
+        db.insert_instance(&alice).expect("insert");
+
+        let stored = db.get("alice").expect("get").expect("row");
+        assert_eq!(stored.disk_quota_mb, 512);
+        assert_eq!(stored.disk_policy, crate::models::DiskPolicy::Freeze);
+
+        db.set_disk_quota("alice", 2048, crate::models::DiskPolicy::Stop)
+            .expect("update");
+        let stored = db.get("alice").expect("get").expect("row");
+        assert_eq!(stored.disk_quota_mb, 2048);
+        assert_eq!(stored.disk_policy, crate::models::DiskPolicy::Stop);
+        assert_eq!(
+            db.set_disk_quota("absent", 1, crate::models::DiskPolicy::Warn)
+                .expect("no row"),
+            0
+        );
+
+        // A full rewrite (PATCH) keeps the quota too.
+        let mut stored = db.get("alice").expect("get").expect("row");
+        stored.notes = "patched".to_string();
+        db.update_instance(&stored).expect("update");
+        let stored = db.get("alice").expect("get").expect("row");
+        assert_eq!(stored.disk_quota_mb, 2048);
+        assert_eq!(stored.disk_policy, crate::models::DiskPolicy::Stop);
     }
 
     #[test]

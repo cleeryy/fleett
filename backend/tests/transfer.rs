@@ -180,6 +180,12 @@ fn manifest_of(instance: &Value) -> ArchiveInstance {
         mem_limit_mb: instance["mem_limit_mb"].as_u64().expect("mem") as u32,
         cpu_limit: instance["cpu_limit"].as_f64().expect("cpu"),
         allow_lan: instance["allow_lan"].as_bool().expect("allow_lan"),
+        // Older archives omit both fields; the defaults are applied on import.
+        disk_quota_mb: instance["disk_quota_mb"].as_u64().unwrap_or(0) as u32,
+        disk_policy: instance["disk_policy"]
+            .as_str()
+            .unwrap_or("warn")
+            .to_string(),
         shares: Vec::new(),
         notes: String::new(),
         host: fleett::hosts::LOCAL_HOST.to_string(),

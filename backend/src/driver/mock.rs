@@ -661,6 +661,31 @@ impl Driver for MockDriver {
         })
     }
 
+    fn log_path<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<Option<std::path::PathBuf>, DriverError>> {
+        Box::pin(async move {
+            self.record_for("log_path", &spec.id, &spec.host);
+            self.fail_if_requested("log_path")?;
+            Ok(None)
+        })
+    }
+
+    fn image_size<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<Option<u64>, DriverError>> {
+        Box::pin(async move {
+            self.fail_if_requested("image_size")?;
+            Ok(if image.trim().is_empty() {
+                None
+            } else {
+                Some(128 * 1024 * 1024)
+            })
+        })
+    }
+
     fn usage<'a>(
         &'a self,
         specs: &'a [InstanceSpec],
@@ -825,6 +850,8 @@ mod tests {
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: crate::models::DiskPolicy::Warn,
             notes: String::new(),
             host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,

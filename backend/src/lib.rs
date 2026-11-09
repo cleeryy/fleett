@@ -34,6 +34,7 @@ pub mod models;
 pub mod notify;
 pub mod pipelines;
 pub mod providers;
+pub mod quota;
 pub mod render;
 pub mod scheduler;
 pub mod secrets;

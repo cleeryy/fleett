@@ -50,7 +50,7 @@ fleett start <id>
 fleett stop <id>
 fleett restart <id>
 fleett delete <id> [--purge]
-fleett usage
+fleett usage [--detail]
 fleett cost [--from DATE] [--to DATE] [--group-by instance|model|day]
 fleett pricing [list | set MODEL --input X --output Y [--currency C] [--effective-from DATE]]
 fleett budget <id> [--set USD]
@@ -62,6 +62,9 @@ fleett instances move <id> --to HOST [--skip-transfer] [--no-start] [--remote-in
 fleett images
 fleett exec <id> [--timeout N] -- <argv...>
 fleett exec-policy
+fleett quota <id> [--set MB] [--policy warn|freeze|stop]
+fleett quota cleanup <id>
+fleett disk events [--instance ID] [--limit N]
 fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
@@ -127,7 +130,9 @@ fleett logs alice --level error --json
 
 ### `create`
 
-Creates an instance and starts it. `--id` is required (`[a-z0-9-]{2,32}`); everything else is
+Creates an instance and starts it. A create is also refused (`409 insufficient_disk`) when
+the host would drop below `max(FLEETT_MIN_FREE_DISK_MB, 2 * disk_quota_mb)` free; the API
+detail carries `{free_mb, required_mb}`. `--id` is required (`[a-z0-9-]{2,32}`); everything else is
 optional and validated by the server. `--base-url` defaults to
 `https://opencode.ai/inference/go/openai/v1`, the same value the web console pre-fills.
 `--gate-token` is stored as `HERMES_GATE_PROFILE_TOKEN`; `--channel-token` is stored as
@@ -247,6 +252,48 @@ fleett --json budget alice --set 25 | jq '{monthly_usd, percent, exceeded}'
 
 `--set 0` keeps a zero ceiling (it never fires); a crossing is reported as a `cost.budget`
 event (see [COST.md](COST.md#alert-hook)).
+
+### `quota`
+
+Show or change the disk quota of one instance, and purge its disposable files.
+See [QUOTA.md](QUOTA.md) for the semantics (warning at 80 %, policy at 100 %).
+
+```bash
+fleett quota alice                       # quota, usage, level, last event
+fleett quota alice --set 2048            # 2 GiB; the policy is kept
+fleett quota alice --policy freeze       # stop + last_error on a breach
+fleett quota alice --set 4096 --policy stop
+fleett quota cleanup alice               # tmp/, cache/, rotated logs > 7 days
+fleett --json quota alice | jq '{quota_mb, policy, state, percent}'
+```
+
+`--set 0` removes the quota. A cleanup prints the bytes freed and the removed
+paths; the response is journalled in `disk_events` and in the audit log.
+One-shot form: `fleett quota cleanup <id>` (the parser accepts `cleanup` as the
+first word rather than a subcommand, so `fleett quota <id>` stays short).
+
+### `disk`
+
+```bash
+fleett disk events
+fleett disk events --instance alice --limit 20
+fleett --json disk events | jq '.[] | {at, instance, action, freed: (.before_bytes - .after_bytes)}'
+```
+
+Columns: `AT`, `INSTANCE`, `ACTION` (`warn`, `freeze`, `stop`, `clean`), `BEFORE`, `AFTER`,
+`DETAIL`. Newest first; `--limit` is bounded to 1..=500.
+
+### `usage --detail`
+
+`fleett usage --detail` calls `/api/instances/{id}/usage/detail` for every instance and adds
+the data-directory breakdown (`DATA`, `TMP`, `CACHE`, `LOGS`), the Docker json-file size
+(`DOCKER LOG`), the image size and the quota (`used / quota MB (percent, state)`). With
+`--json` it prints the array of detail objects.
+
+```bash
+fleett usage --detail
+fleett --json usage --detail | jq '.[] | select(.quota.state != "ok")'
+```
 
 ### `images`
 
