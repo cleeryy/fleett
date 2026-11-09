@@ -2,9 +2,11 @@ import { ApiError } from "./errors";
 import { readCookie } from "@/lib/cookies";
 import { tokenStore } from "@/lib/token";
 import type {
+  AckMessageResult,
   AuditEntry,
   AuthConfig,
   CreateInstanceInput,
+  CreateMemoryInput,
   CreateProviderInput,
   CreateTokenInput,
   CreatedToken,
@@ -20,8 +22,14 @@ import type {
   Health,
   Identity,
   InstanceDetail,
+  InstanceMessagesParams,
   InstanceSummary,
   LifecycleResult,
+  ListMemoryParams,
+  ListMessagesParams,
+  MemoryEntry,
+  MemoryVersion,
+  Message,
   MkdirResult,
   PatchInstanceInput,
   PatchProviderInput,
@@ -29,14 +37,19 @@ import type {
   ProviderRotateResult,
   ProviderSummary,
   ProviderTestResult,
+  PurgeResult,
   RevertInput,
   RevertResult,
+  SearchMemoryParams,
+  SendMessageInput,
   Share,
   ShareMode,
   Template,
   TokenInfo,
+  UpdateMemoryInput,
   WriteFileInput,
   WriteFileResult,
+  WriteMemoryResult,
 } from "./types";
 
 /** Empty base = same origin. Vite proxies /api and /auth to the controller in development. */
@@ -51,6 +64,17 @@ interface RequestOptions {
 
 function isAbsoluteUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
+}
+
+/** Drop empty values so `?instance=&kind=` never reaches the controller. */
+function queryString(params: Record<string, string | number | undefined>): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") continue;
+    query.set(key, String(value));
+  }
+  const text = query.toString();
+  return text ? `?${text}` : "";
 }
 
 /** Keep `/auth/login` same-origin, or prefix it when VITE_API_BASE points elsewhere. */
@@ -293,4 +317,90 @@ export const httpApi: FleetApi = {
     request<void>(`/api/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   listAudit: (limit) => request<AuditEntry[]>(`/api/audit?limit=${limit}`),
+
+  listMessages: (params: ListMessagesParams = {}) =>
+    request<Message[]>(
+      `/api/messages${queryString({
+        instance: params.instance,
+        from: params.from,
+        to: params.to,
+        kind: params.kind,
+        limit: params.limit,
+      })}`,
+    ),
+
+  instanceMessages: (id, params: InstanceMessagesParams = {}) =>
+    request<Message[]>(
+      `/api/instances/${encodeURIComponent(id)}/messages${queryString({
+        view: params.view,
+        status: params.status,
+        limit: params.limit,
+      })}`,
+    ),
+
+  sendMessage: (id, input: SendMessageInput) =>
+    request<Message>(`/api/instances/${encodeURIComponent(id)}/messages`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  ackMessage: (id, messageId) =>
+    request<AckMessageResult>(
+      `/api/instances/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/ack`,
+      { method: "POST" },
+    ),
+
+  listMemory: (params: ListMemoryParams = {}) =>
+    request<MemoryEntry[]>(
+      `/api/memory${queryString({
+        namespace: params.namespace,
+        tag: params.tag,
+        limit: params.limit,
+      })}`,
+    ),
+
+  searchMemory: (params: SearchMemoryParams) =>
+    request<MemoryEntry[]>(
+      `/api/memory/search${queryString({
+        q: params.q,
+        namespace: params.namespace,
+        tags: params.tags?.length ? params.tags.join(",") : undefined,
+        limit: params.limit,
+      })}`,
+    ),
+
+  getMemoryByKey: (namespace, key) =>
+    request<MemoryEntry>(
+      `/api/memory/by-key${queryString({ namespace, key })}`,
+    ),
+
+  createOrUpdateMemory: (input: CreateMemoryInput) =>
+    request<WriteMemoryResult>("/api/memory", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  updateMemory: (id, input: UpdateMemoryInput) =>
+    request<MemoryEntry>(`/api/memory/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+
+  deleteMemory: (id) => request<void>(`/api/memory/${id}`, { method: "DELETE" }),
+
+  memoryHistory: (id) => request<MemoryVersion[]>(`/api/memory/${id}/history`),
+
+  rollbackMemory: (id, version) =>
+    request<MemoryEntry>(`/api/memory/${id}/rollback`, {
+      method: "POST",
+      body: JSON.stringify({ version }),
+    }),
+
+  promoteMemory: (id, namespace) =>
+    request<MemoryEntry>(`/api/memory/${id}/promote`, {
+      method: "POST",
+      body: JSON.stringify({ namespace }),
+    }),
+
+  purgeExpiredMemory: () => request<PurgeResult>("/api/memory/expired", { method: "DELETE" }),
 };
