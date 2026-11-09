@@ -371,6 +371,8 @@ pub struct Config {
     /// `0` disables the background scanner; ingestion stays available through
     /// `POST /api/usage/ingest`.
     pub cost_scan_interval_s: u64,
+    /// Raw `FLEETT_EXEC_ALLOWLIST` (`None` keeps the built-in allowlist).
+    pub exec_allowlist: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -592,6 +594,7 @@ impl Config {
         };
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
+        let exec_allowlist = get("EXEC_ALLOWLIST");
 
         let cost_scan_interval_s = match get("COST_SCAN_INTERVAL_S") {
             None => 300,
@@ -645,6 +648,7 @@ impl Config {
             metrics,
             cost_scan_interval_s,
             watchdog_interval_s,
+            exec_allowlist,
         })
     }
 
@@ -686,6 +690,7 @@ impl Config {
             watchdog_interval_s: 0,
             // Tests ingest usage explicitly; no background scanner.
             cost_scan_interval_s: 0,
+            exec_allowlist: None,
         }
     }
 

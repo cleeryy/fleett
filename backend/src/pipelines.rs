@@ -1927,6 +1927,8 @@ mod tests {
                 stdout: "draft".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         mock.push_exec_result(
@@ -1936,6 +1938,8 @@ mod tests {
                 stdout: "reviewed".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         mock.push_exec_result(
@@ -1945,6 +1949,8 @@ mod tests {
                 stdout: "published".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let mut produce = step("produce", &[]);
@@ -2005,6 +2011,8 @@ mod tests {
                 stdout: String::new(),
                 stderr: "boom".to_string(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
 
@@ -2040,6 +2048,8 @@ mod tests {
                 stdout: String::new(),
                 stderr: "boom".to_string(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         mock.push_exec_result(
@@ -2049,6 +2059,8 @@ mod tests {
                 stdout: "ready".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let mut broken = step("broken", &[]);
@@ -2099,6 +2111,8 @@ mod tests {
                     stdout: String::new(),
                     stderr: "not yet".to_string(),
                     timed_out: false,
+                    duration_ms: 0,
+                    truncated: false,
                 },
             );
         }
@@ -2109,6 +2123,8 @@ mod tests {
                 stdout: "finally".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let mut step = step("flaky", &[]);

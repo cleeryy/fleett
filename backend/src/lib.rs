@@ -13,6 +13,7 @@ pub mod deployments;
 pub mod driver;
 pub mod egress;
 pub mod envs;
+pub mod exec;
 pub mod files;
 pub mod gitops;
 pub mod history;

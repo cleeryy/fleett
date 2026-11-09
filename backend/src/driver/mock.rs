@@ -5,8 +5,8 @@
 //! Docker.
 
 use super::{
-    Driver, DriverError, DriverFuture, ExecOutput, ImageRecord, InspectInfo, LogsOptions, PsResult,
-    UsageSample,
+    Driver, DriverError, DriverFuture, ExecOutput, ExecResult, ImageRecord, InspectInfo,
+    LogsOptions, PsResult, UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
@@ -184,6 +184,11 @@ impl MockDriver {
     /// result, like [`MockDriver::push_exec_result`].
     pub fn force_exec(&self, id: &str, result: ExecOutput) {
         self.push_exec_result(id, result);
+    }
+
+    /// Compatibility helper of the exec API tests: queue one result.
+    pub fn set_exec_result(&self, id: &str, result: ExecResult) {
+        self.force_exec(id, result);
     }
 
     /// Drop every queued `exec` result of one instance.
@@ -658,12 +663,13 @@ impl Driver for MockDriver {
             }
             // A deterministic answer that keeps the prompt visible: pipeline
             // tests that do not queue a result can still assert substitution.
-            let prompt = argv.last().cloned().unwrap_or_default();
             Ok(ExecOutput {
                 exit_code: Some(0),
-                stdout: format!("[mock] {}: {prompt}", spec.id),
+                stdout: format!("[mock] exec in {}: {}", spec.id, argv.join(" ")),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             })
         })
     }
@@ -896,6 +902,8 @@ mod tests {
                 stdout: "queued".to_string(),
                 stderr: String::new(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let argv = vec![

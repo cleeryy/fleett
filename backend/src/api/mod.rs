@@ -7,6 +7,7 @@ pub mod cost;
 pub mod deployments;
 pub mod desired_state;
 pub mod error;
+pub mod exec;
 pub mod files;
 pub mod git;
 pub mod health;
@@ -66,6 +67,8 @@ pub struct AppState {
     pub metrics: Arc<crate::metrics::Metrics>,
     /// Watchdog sampling state (streaks, heal attempts, backoff).
     pub watchdog: Arc<crate::watchdog::WatchdogState>,
+    /// Effective command policy of `POST /api/instances/{id}/exec`.
+    pub exec_policy: Arc<crate::exec::ExecPolicy>,
     /// Shared HTTP client of the outbound notifications (and nothing else):
     /// one connection pool, one timeout, no per-alert client.
     pub http: reqwest::Client,
@@ -105,6 +108,7 @@ impl AppState {
         crate::history::reconcile_all(&cfg);
         // Drop expired restore points before serving (idempotent, best effort).
         crate::snapshots::startup(&cfg, &db);
+        let exec_policy = crate::exec::ExecPolicy::from_config(cfg.exec_allowlist.as_deref());
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
@@ -114,6 +118,7 @@ impl AppState {
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             watchdog: Arc::new(crate::watchdog::WatchdogState::default()),
+            exec_policy: Arc::new(exec_policy),
             http: reqwest::Client::builder()
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()
@@ -268,6 +273,9 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/instances/{id}/restart", post(instances::restart))
         .route("/instances/{id}/clone", post(instances::clone))
         .route("/instances/{id}/logs", get(instances::logs))
+        .route("/exec/policy", get(exec::policy))
+        .route("/instances/{id}/exec", post(exec::run))
+        .route("/instances/{id}/exec/stream", get(exec::stream))
         .route("/instances/{id}/messages", get(bus::inbox).post(bus::send))
         .route("/instances/{id}/messages/{message_id}/ack", post(bus::ack))
         .route(

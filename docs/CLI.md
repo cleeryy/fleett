@@ -55,6 +55,8 @@ fleett cost [--from DATE] [--to DATE] [--group-by instance|model|day]
 fleett pricing [list | set MODEL --input X --output Y [--currency C] [--effective-from DATE]]
 fleett budget <id> [--set USD]
 fleett images
+fleett exec <id> [--timeout N] -- <argv...>
+fleett exec-policy
 fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
@@ -212,6 +214,43 @@ Columns: `TAG` (`repository:tag`), `ID` (first 12 hex characters), `SIZE`, `CREA
 `INSTANCES` (comma-separated ids, `-` when the tag is unused). Dangling images (`<none>:<none>`)
 are omitted. A Docker failure answers `502 images_unavailable` with the Docker error.
 
+### `exec`
+
+Runs one allowlisted command **inside the instance container**, without SSH and without a
+host-side `docker exec`. Full security model in [docs/EXEC.md](EXEC.md).
+
+```bash
+fleett exec alice -- ls /opt/data
+fleett exec alice --timeout 10 -- df -h
+fleett exec alice -- cat /opt/data/config.yaml
+fleett --json exec alice -- ls /opt/data | jq -r .stdout
+```
+
+The command and its arguments come after `--` and are sent as an argv array: no shell is
+involved, locally or remotely. stdout goes to stdout, stderr to stderr. `--timeout` defaults
+to 30 s and is bounded to 1..=300. The exit code of the remote command becomes the exit code
+of `fleett exec` (`124` after a timeout), so scripts can branch on it. `--json` prints the
+full `{"exit_code","stdout","stderr","timed_out","duration_ms","truncated"}` object.
+
+The default allowlist is `ls cat tail head grep env ps df du date which pwd id uname uptime
+free echo`; the server answers `403 exec_refused` with the reason and the effective allowlist
+for anything else, and a hard denylist refuses `rm`, shells, package managers and other
+destructive binaries even when `FLEETT_EXEC_ALLOWLIST=*`. Every call is audited as
+`instance.exec` (`result`, `argv`, exit code, duration, truncation).
+
+### `exec-policy`
+
+Prints the effective policy of the control plane: source, wildcard flag, allowlist, denylist,
+timeout bounds and argument/output caps.
+
+```bash
+fleett exec-policy
+fleett --json exec-policy | jq .allowlist
+```
+
+Admin only. On the server, `FLEETT_EXEC_ALLOWLIST` (comma-separated basenames) replaces the
+default allowlist; `*` disables it while the hard denylist stays in force.
+
 ### `upgrade`
 
 Moves every agent to another image, one instance at a time by default, and rolls back the
@@ -325,6 +364,8 @@ fleett --json doctor
 | `0` | success |
 | `1` | API error, connection error, configuration error, a failed `doctor` check, or an `upgrade` with a rolled-back/failed instance |
 | `2` | invalid command line (clap) |
+| `3..255` | `fleett exec`: the remote command's exit code is mirrored |
+| `124` | `fleett exec`: the command was killed at its timeout |
 
 API errors print the API `error.message` and `error.code` on stderr:
 

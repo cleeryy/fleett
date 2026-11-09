@@ -166,6 +166,8 @@ fn output(stdout: &str) -> ExecOutput {
         stdout: stdout.to_string(),
         stderr: String::new(),
         timed_out: false,
+        duration_ms: 0,
+        truncated: false,
     }
 }
 
@@ -175,6 +177,8 @@ fn failure(stderr: &str) -> ExecOutput {
         stdout: String::new(),
         stderr: stderr.to_string(),
         timed_out: false,
+        duration_ms: 0,
+        truncated: false,
     }
 }
 

@@ -485,6 +485,8 @@ impl Driver for ComposeDriver {
                     stdout: String::new(),
                     stderr: format!("timed out after {}s", timeout.as_secs()),
                     timed_out: true,
+                    duration_ms: 0,
+                    truncated: false,
                 }),
                 Ok(Err(err)) => Err(DriverError::new(
                     "exec",
@@ -495,6 +497,8 @@ impl Driver for ComposeDriver {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     timed_out: false,
+                    duration_ms: 0,
+                    truncated: false,
                 }),
             }
         })

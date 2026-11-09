@@ -1474,6 +1474,8 @@ mod tests {
                 stdout: String::new(),
                 stderr: "gateway: model overloaded".to_string(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let schedule =
@@ -1503,6 +1505,8 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: true,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         let mut new = new_schedule("alice", "five", "*/5 * * * *");
@@ -1703,6 +1707,8 @@ mod tests {
                 stdout: String::new(),
                 stderr: "boom".to_string(),
                 timed_out: false,
+                duration_ms: 0,
+                truncated: false,
             },
         );
         execute(&state, &schedule).await.expect("run one");

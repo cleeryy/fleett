@@ -116,6 +116,10 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Wall-clock duration of the command, when measured.
+    pub duration_ms: u64,
+    /// At least one stream was cut at the output cap.
+    pub truncated: bool,
 }
 
 impl ExecResult {
@@ -334,6 +338,8 @@ mod tests {
             stdout: "ok".to_string(),
             stderr: String::new(),
             timed_out: false,
+            duration_ms: 0,
+            truncated: false,
         };
         assert!(success.succeeded());
         assert_eq!(success.failure_detail(), None);
@@ -343,6 +349,8 @@ mod tests {
             stdout: String::new(),
             stderr: "boom".to_string(),
             timed_out: false,
+            duration_ms: 0,
+            truncated: false,
         };
         assert!(!failed.succeeded());
         let detail = failed.failure_detail().expect("detail");
@@ -354,6 +362,8 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: true,
+            duration_ms: 0,
+            truncated: false,
         };
         assert!(!timed_out.succeeded());
         assert!(timed_out
