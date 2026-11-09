@@ -119,6 +119,9 @@ jobs:
         with:
           workspaces: backend
 
+      - name: Install cmake (libgit2)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
       - name: Build package
         run: packaging/build-deb.sh "${GITHUB_REF_NAME#v}" amd64
 
