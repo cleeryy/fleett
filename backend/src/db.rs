@@ -164,6 +164,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — per-instance RBAC and scoped tokens (issue #37). `instance_acl`
+    // grants an `owner|operator|viewer` level to one subject per instance;
+    // `api_tokens.scope` optionally restricts a named token to a JSON
+    // `{"instances":[…],"actions":["read","write","exec"]}` list. NULL keeps
+    // the legacy global role behaviour.
+    r#"
+CREATE TABLE IF NOT EXISTS instance_acl (
+    instance_id  TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (instance_id, subject)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instance_acl_subject ON instance_acl (subject);
+
+ALTER TABLE api_tokens ADD COLUMN scope TEXT;
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -256,6 +274,8 @@ pub struct ApiTokenRecord {
     pub role: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+    /// JSON `{instances,actions}` text; `None` is a legacy global token.
+    pub scope: Option<String>,
 }
 
 impl ApiTokenRecord {
@@ -271,6 +291,18 @@ pub struct NewApiToken {
     pub name: String,
     pub role: String,
     pub hash: String,
+    pub created_at: String,
+    /// JSON `{instances,actions}` text; `None` keeps the global role.
+    pub scope: Option<String>,
+}
+
+/// One row of `instance_acl` (issue #37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclRecord {
+    pub instance_id: String,
+    pub subject: String,
+    /// `owner`, `operator` or `viewer`; callers validate it.
+    pub role: String,
     pub created_at: String,
 }
 
@@ -526,6 +558,10 @@ impl Db {
         )?;
         transaction.execute(
             "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1",
             params![id],
         )?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
@@ -1018,14 +1054,15 @@ impl Db {
 
     pub fn insert_api_token(&self, token: &NewApiToken) -> Result<(), DbError> {
         self.lock().execute(
-            "INSERT INTO api_tokens (id, name, role, hash, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO api_tokens (id, name, role, hash, created_at, scope) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 token.id,
                 token.name,
                 token.role,
                 token.hash,
-                token.created_at
+                token.created_at,
+                token.scope
             ],
         )?;
         Ok(())
@@ -1034,7 +1071,8 @@ impl Db {
     pub fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>, DbError> {
         let conn = self.lock();
         let mut statement = conn.prepare(
-            "SELECT id, name, role, created_at, revoked_at FROM api_tokens ORDER BY created_at, id",
+            "SELECT id, name, role, created_at, revoked_at, scope FROM api_tokens \
+             ORDER BY created_at, id",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -1044,6 +1082,7 @@ impl Db {
                     role: row.get(2)?,
                     created_at: row.get(3)?,
                     revoked_at: row.get(4)?,
+                    scope: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1077,7 +1116,7 @@ impl Db {
         let conn = self.lock();
         let record = conn
             .query_row(
-                "SELECT id, name, role, created_at, revoked_at FROM api_tokens \
+                "SELECT id, name, role, created_at, revoked_at, scope FROM api_tokens \
                  WHERE hash = ?1 AND revoked_at IS NULL",
                 params![hash],
                 |row| {
@@ -1087,11 +1126,74 @@ impl Db {
                         role: row.get(2)?,
                         created_at: row.get(3)?,
                         revoked_at: row.get(4)?,
+                        scope: row.get(5)?,
                     })
                 },
             )
             .optional()?;
         Ok(record)
+    }
+
+    /// Every ACL row of one instance, oldest subject first.
+    pub fn list_instance_acl(&self, instance_id: &str) -> Result<Vec<AclRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id, subject, role, created_at FROM instance_acl \
+             WHERE instance_id = ?1 ORDER BY subject",
+        )?;
+        let rows = statement
+            .query_map(params![instance_id], row_to_acl)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every ACL row of one subject, across instances (the request path loads
+    /// these once per call: no caching, a revoked grant is gone immediately).
+    pub fn acl_for_subject(&self, subject: &str) -> Result<Vec<AclRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id, subject, role, created_at FROM instance_acl \
+             WHERE subject = ?1 ORDER BY instance_id",
+        )?;
+        let rows = statement
+            .query_map(params![subject], row_to_acl)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace every ACL row of one instance inside a single transaction.
+    pub fn replace_instance_acl(
+        &self,
+        instance_id: &str,
+        acl: &[(String, String)],
+        at: &str,
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1",
+            params![instance_id],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO instance_acl (instance_id, subject, role, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (subject, role) in acl {
+                insert.execute(params![instance_id, subject, role, at])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Delete one ACL row. Returns `false` when it did not exist.
+    pub fn delete_instance_acl(&self, instance_id: &str, subject: &str) -> Result<bool, DbError> {
+        let deleted = self.lock().execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1 AND subject = ?2",
+            params![instance_id, subject],
+        )?;
+        Ok(deleted > 0)
     }
 }
 
@@ -1178,6 +1280,15 @@ impl StoredRow {
             updated_at: self.updated_at,
         }
     }
+}
+
+fn row_to_acl(row: &Row<'_>) -> rusqlite::Result<AclRecord> {
+    Ok(AclRecord {
+        instance_id: row.get(0)?,
+        subject: row.get(1)?,
+        role: row.get(2)?,
+        created_at: row.get(3)?,
+    })
 }
 
 fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
@@ -1411,6 +1522,7 @@ mod tests {
             "instance_env",
             "audit_log",
             "api_tokens",
+            "instance_acl",
             "providers",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
@@ -1426,6 +1538,15 @@ mod tests {
         assert!(columns.iter().any(|column| column == "allow_lan"));
         assert!(columns.iter().any(|column| column == "image"));
         assert!(columns.iter().any(|column| column == "provider"));
+
+        let token_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(api_tokens)")
+            .expect("table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns");
+        assert!(token_columns.iter().any(|column| column == "scope"));
     }
 
     #[test]
@@ -1661,6 +1782,7 @@ mod tests {
             role: "viewer".to_string(),
             hash: hash.clone(),
             created_at: "2026-11-08T00:00:00Z".to_string(),
+            scope: Some(r#"{"instances":["probe"],"actions":["read"]}"#.to_string()),
         })
         .expect("insert");
 
@@ -1670,6 +1792,10 @@ mod tests {
             .expect("active");
         assert_eq!(found.name, "ci");
         assert_eq!(found.role, "viewer");
+        assert_eq!(
+            found.scope.as_deref(),
+            Some(r#"{"instances":["probe"],"actions":["read"]}"#)
+        );
         assert!(found.is_active());
         assert!(db
             .active_token_by_hash(&"b".repeat(64))
@@ -1690,8 +1816,67 @@ mod tests {
             listed[0].revoked_at.as_deref(),
             Some("2026-11-08T01:00:00Z")
         );
+        assert!(listed[0].scope.is_some());
         assert!(db.api_token_exists("tok-1").expect("exists"));
         assert!(!db.api_token_exists("tok-2").expect("exists"));
+    }
+
+    #[test]
+    fn instance_acl_rows_replace_and_follow_the_instance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        db.insert_instance(&spec("alice")).expect("insert");
+
+        db.replace_instance_acl(
+            "alice",
+            &[
+                ("owner@example.test".to_string(), "owner".to_string()),
+                ("operator@example.test".to_string(), "operator".to_string()),
+            ],
+            "2026-11-09T00:00:00Z",
+        )
+        .expect("replace");
+        let rows = db.list_instance_acl("alice").expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].subject, "operator@example.test");
+        assert_eq!(rows[0].role, "operator");
+        assert_eq!(rows[0].created_at, "2026-11-09T00:00:00Z");
+
+        let by_subject = db.acl_for_subject("owner@example.test").expect("list");
+        assert_eq!(by_subject.len(), 1);
+        assert_eq!(by_subject[0].instance_id, "alice");
+
+        // Replacing drops the rows the new list omits.
+        db.replace_instance_acl(
+            "alice",
+            &[("viewer@example.test".to_string(), "viewer".to_string())],
+            "2026-11-09T01:00:00Z",
+        )
+        .expect("replace again");
+        let rows = db.list_instance_acl("alice").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "viewer@example.test");
+
+        assert!(db
+            .delete_instance_acl("alice", "viewer@example.test")
+            .expect("delete"));
+        assert!(!db
+            .delete_instance_acl("alice", "viewer@example.test")
+            .expect("delete again"));
+        assert!(db.list_instance_acl("alice").expect("list").is_empty());
+
+        // Deleting the instance removes its grants too.
+        db.replace_instance_acl(
+            "alice",
+            &[("viewer@example.test".to_string(), "viewer".to_string())],
+            "2026-11-09T01:00:00Z",
+        )
+        .expect("replace");
+        db.delete_instance("alice").expect("delete instance");
+        assert!(db
+            .acl_for_subject("viewer@example.test")
+            .expect("list")
+            .is_empty());
     }
 
     #[test]

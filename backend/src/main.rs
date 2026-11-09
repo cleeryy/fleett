@@ -229,6 +229,38 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// Manage the per-instance access control list (client mode).
+    ///
+    /// See docs/RBAC.md.
+    Acl {
+        #[command(subcommand)]
+        action: AclCommands,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum AclCommands {
+    /// Print the ACL of one instance.
+    Get {
+        /// Instance id.
+        id: String,
+    },
+    /// Grant or update one role, keeping the other entries.
+    Set {
+        /// Instance id.
+        id: String,
+        /// OIDC email/sub of a user, or the name of a named token.
+        subject: String,
+        /// `owner`, `operator` or `viewer`.
+        role: String,
+    },
+    /// Remove one subject from the ACL.
+    Rm {
+        /// Instance id.
+        id: String,
+        /// OIDC email/sub of a user, or the name of a named token.
+        subject: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +498,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Acl { action } => {
+            let command = match action {
+                AclCommands::Get { id } => cli::Command::AclGet(id),
+                AclCommands::Set { id, subject, role } => {
+                    cli::Command::AclSet { id, subject, role }
+                }
+                AclCommands::Rm { id, subject } => cli::Command::AclRm { id, subject },
+            };
+            cli::run(command, json).await
         }
     };
 

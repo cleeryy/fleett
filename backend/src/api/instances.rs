@@ -118,10 +118,27 @@ struct Prepared {
     env: Vec<EnvWrite>,
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSummary>>, ApiError> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+) -> Result<Json<Vec<InstanceSummary>>, ApiError> {
     let mut specs = state.db.list().map_err(ApiError::from)?;
-    let mut summaries = Vec::with_capacity(specs.len());
-    for spec in &mut specs {
+    // The filter is server-side: a caller never receives the id of an instance
+    // it may not read, even if the console were to ignore a flag.
+    let acl = if context.role == crate::auth::Role::Admin && context.scope.is_none() {
+        Vec::new()
+    } else {
+        crate::authz::entries(
+            state
+                .db
+                .acl_for_subject(&context.subject)
+                .map_err(ApiError::from)?,
+        )
+    };
+    let all_ids: Vec<String> = specs.iter().map(|spec| spec.id.clone()).collect();
+    let visible = crate::authz::visible_instances(&context, &acl, &all_ids);
+    let mut summaries = Vec::with_capacity(visible.len());
+    for spec in specs.iter_mut().filter(|spec| visible.contains(&spec.id)) {
         let mut health = Health::Unknown;
         if let Ok(result) = state.driver.ps(spec).await {
             health = result.health;
@@ -134,7 +151,11 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSumm
             }
             record_health(&state, spec, health);
         }
-        summaries.push(to_summary(spec, health));
+        summaries.push(to_summary(
+            spec,
+            health,
+            crate::authz::instance_role(&context, &acl, &spec.id),
+        ));
     }
     Ok(Json(summaries))
 }
@@ -157,6 +178,9 @@ pub async fn create(
     Extension(context): Extension<AuthContext>,
     Json(request): Json<CreateInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // Creating an instance is fleet-level: only an admin may do it in v1
+    // (a per-instance ACL cannot grant an instance that does not exist yet).
+    audit::require_admin(&context)?;
     let prepared = prepare_create(&state, &request)?;
     let mut spec = prepared.spec;
 
@@ -248,6 +272,8 @@ pub async fn clone(
     Extension(context): Extension<AuthContext>,
     Json(request): Json<CloneInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // A clone is a new fleet member: admin only in v1, like `create`.
+    audit::require_admin(&context)?;
     let new_id = request
         .new_id
         .as_deref()
@@ -519,6 +545,8 @@ pub async fn import(
     Query(query): Query<ImportQuery>,
     request: Request,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // An import creates a new fleet member: admin only in v1.
+    audit::require_admin(&context)?;
     let id = query.id.as_deref().unwrap_or_default().trim().to_string();
     validate_instance_id(&id).map_err(|message| ApiError::bad_request("invalid_id", message))?;
     let start = query.start.unwrap_or(false);
@@ -1077,6 +1105,21 @@ pub async fn delete(
     let _guard = lock.lock().await;
 
     let spec = load(&state, &id)?;
+    // Destruction is an owner decision: `operator` may write, not delete.
+    if !(context.role == crate::auth::Role::Admin && context.scope.is_none()) {
+        let acl = crate::authz::entries(
+            state
+                .db
+                .acl_for_subject(&context.subject)
+                .map_err(ApiError::from)?,
+        );
+        if !crate::authz::is_owner(&context, &acl, &spec.id) {
+            return Err(ApiError::forbidden(
+                "forbidden",
+                "only an admin or an owner may delete an instance",
+            ));
+        }
+    }
     let purge = query.purge();
     if let Err(err) = state.driver.down(&spec).await {
         let detail = err.detail.clone();
@@ -1397,7 +1440,11 @@ fn effective_status(cached: Status, observed: Status) -> Status {
     }
 }
 
-fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
+fn to_summary(
+    spec: &InstanceSpec,
+    health: Health,
+    role: Option<crate::authz::InstanceRole>,
+) -> InstanceSummary {
     InstanceSummary {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -1413,6 +1460,7 @@ fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
+        role: role.map(|role| role.as_str().to_string()),
     }
 }
 

@@ -12,10 +12,15 @@ refusal, `404` unknown, `409` conflict, `422` invalid YAML/compose,
 `401` JSON, always.
 
 Credentials are resolved in this order: session cookie, then bearer token
-(`FLEETT_TOKEN` = admin, then named tokens). `viewer` tokens and sessions may
-only `GET`/`HEAD`; a mutation returns `403 forbidden`. A cookie-authenticated
-mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
-`403 csrf_required`; bearer clients are exempt.
+(`FLEETT_TOKEN` = admin, then named tokens). Authorization is granted per
+instance: `owner`, `operator` and `viewer` levels come from an `instance_acl`
+row, from a scoped token's `instances` list, or from the global `admin` role.
+See `docs/RBAC.md`. A `viewer` **session** only sees the instances an ACL grants
+it; a bearer token created before scopes existed keeps its global viewer read.
+A write outside an instance route, or a write an instance ACL does not allow,
+returns `403 forbidden`. A cookie-authenticated mutation must also echo the
+`fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise `403 csrf_required`; bearer
+clients are exempt.
 
 ## Health and auth
 
@@ -24,7 +29,7 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 | GET | `/api/health` | `{"ok":true,"version":"0.3.0","driver":"mock\|compose","docker":{"ok":true},"uptime_s":42,"secrets":{"key":true,"key_error":null,"encrypted":2,"plaintext":0},"egress":{"mode":"restrict\|off","marker":true}}` |
 | GET | `/api/auth/config` | `{"mode":"bearer\|oidc\|both","oidc":{"enabled":true,"login_url":"/auth/login"},"bearer":{"enabled":true}}` |
 | GET | `/api/auth/check` | `204` when the credential is valid |
-| GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions) |
+| GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","subject":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions; `subject` is the key matched against `instance_acl.subject`) |
 | GET | `/auth/login` | `303` to the IdP; `404` when OIDC is disabled |
 | GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; failures carry `details.reason` (`cookie_missing`, `state_mismatch`, `expired`). Browsers (`Accept: text/html`) get an HTML page with a retry link, and a missing state cookie redirects to `/auth/login`; API clients keep JSON `400`/`401`/`403`. State lifetime: `FLEETT_OIDC_STATE_TTL_SECS` (default 600) |
 | POST | `/auth/logout` | `204`, clears the fleett cookies |
@@ -34,12 +39,34 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 | Method | Route | Body | Response |
 |---|---|---|---|
 | GET | `/api/audit?limit=200` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","details":{…}}]`, newest first, admin only |
-| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null}]`, never the secret, admin only |
-| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin"}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
+| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null,"scope":{"instances":["probe"],"actions":["read"]}}]`, never the secret, admin only |
+| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin","scope"?}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
 | DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
 
-`role` defaults to `viewer`. Revoking is idempotent. Tokens are stored as a
-SHA-256 digest only.
+`role` defaults to `viewer`. `scope` is optional: `{"instances":["probe"],
+"actions":["read","write","exec"]}` restricts the token to those instance ids
+and actions. Every instance must exist, `actions` is a non-empty subset of
+`read`/`write`/`exec`; violations answer `400 invalid_scope`. An omitted scope
+keeps the legacy global role, and `scope` is absent from `GET /api/tokens` for
+such rows. A scope always intersects the ACL, even for an `admin` token. See
+`docs/RBAC.md`. Revoking is idempotent. Tokens are stored as a SHA-256 digest
+only.
+
+## Instance ACL
+
+Per-instance grants; admin or an `owner` of the instance only. See
+`docs/RBAC.md` for the role matrix and enforcement points.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/instances/{id}/acl` | — | `{"instance":"probe","acl":[{"subject":"cle@example.test","role":"owner","created_at":"…"}]}`, `404` unknown instance |
+| PUT | `/api/instances/{id}/acl` | `{"acl":[{"subject":"…","role":"owner\|operator\|viewer"}]}` | `200` with the new list; replaces every row; `400 invalid_acl` on a bad role/subject/duplicate |
+| DELETE | `/api/instances/{id}/acl/{subject}` | — | `204`, `404` when the subject has no row |
+
+The level is read from SQLite on every request: a grant, a role change or a
+removal applies to the next call. Changes are audited as
+`instance.acl.update` / `instance.acl.delete` with the affected `subject` in
+`details`.
 
 ## Templates
 
@@ -77,10 +104,15 @@ a provider keep their own `gate_token`/`api_key_env`.
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
  "health":"healthy","cpu_limit":1.0,"allow_lan":false,"provider":"9e2c…",
- "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z"}
+ "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z",
+ "role":"owner"}
 ```
 
-`POST /api/instances` → `201 InstanceDetail`
+The list is filtered server-side: a non-admin only receives the instances it
+may read (ACL or token scope), and `role` is the caller's level on that row
+(`owner`, `operator` or `viewer`). See `docs/RBAC.md`.
+
+`POST /api/instances` → `201 InstanceDetail` (admin only)
 ```json
 {"id":"alice","name":"Alice","template":"guest",
  "model":"deepseek-v4.1-flash",
@@ -211,8 +243,10 @@ Start/stop/restart/delete are never blocked by this policy.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
+Requires the `owner` level on the instance (or the admin role): `operator` may write but not
+destroy.
 
-`POST /api/instances/{id}/clone` → `201 InstanceDetail`. Body:
+`POST /api/instances/{id}/clone` → `201 InstanceDetail` (admin only). Body:
 ```json
 {"new_id":"bob","name":"Bob","model":"…",
  "gate_token":"…","channel_token":"…",
@@ -246,7 +280,7 @@ instance metadata: id, name, template, model, base_url, api_key_env, channel, me
 cpu_limit, allow_lan, shares, notes), `compose.yaml` and `data/` (the full Hermes home).
 Share contents and secrets are never included: no `secrets.env`, no `*.key`, no token value.
 
-`POST /api/instances/import?id=<new_id>&start=false` → `201 InstanceDetail`. The raw gzip
+`POST /api/instances/import?id=<new_id>&start=false` → `201 InstanceDetail` (admin only). The raw gzip
 archive is the request body (`Content-Type: application/gzip`); the id is required and must be
 free (`409 instance_exists`, nothing overwritten). Compression size cap: 2 GiB (`413
 archive_too_large`). Every archive entry is checked first: an absolute path or a `..` component

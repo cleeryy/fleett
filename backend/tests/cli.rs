@@ -8,7 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use fleett::cli::{TOKEN_ENV, URL_ENV};
 use serde_json::{json, Value};
@@ -110,6 +110,8 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/stop", post(stop_instance))
         .route("/api/instances/{id}/restart", post(restart_instance))
         .route("/api/instances/{id}/logs", get(logs))
+        .route("/api/instances/{id}/acl", get(acl_get).put(acl_put))
+        .route("/api/instances/{id}/acl/{subject}", delete(acl_rm))
         .route("/api/usage", get(usage))
         .route("/api/images", get(images))
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
@@ -369,6 +371,28 @@ async fn me() -> Json<Value> {
         "role": "admin",
         "method": "bearer"
     }))
+}
+
+fn acl_payload(id: &str) -> Value {
+    json!({
+        "instance": id,
+        "acl": [
+            {"subject": "cle@example.test", "role": "owner", "created_at": "2026-11-09T10:00:00Z"},
+            {"subject": "ci-robot", "role": "viewer", "created_at": "2026-11-09T10:00:00Z"}
+        ]
+    })
+}
+
+async fn acl_get(Path(id): Path<String>) -> Json<Value> {
+    Json(acl_payload(&id))
+}
+
+async fn acl_put(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({"instance": id, "acl": body["acl"]}))
+}
+
+async fn acl_rm(Path((_id, _subject)): Path<(String, String)>) -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 // ---------------------------------------------------------------------------
@@ -931,4 +955,71 @@ async fn images_json_passes_the_server_payload_through() {
     let images = value.as_array().expect("array");
     assert_eq!(images.len(), 2);
     assert_eq!(images[0]["instances"], json!(["alice"]));
+}
+
+#[tokio::test]
+async fn acl_get_set_and_rm_use_the_acl_endpoints() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["acl", "get", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("cle@example.test"), "{text}");
+    assert!(text.contains("owner"), "{text}");
+    assert!(text.contains("ci-robot"), "{text}");
+    assert_eq!(
+        server
+            .request("GET", "/api/instances/alice/acl")
+            .authorization
+            .as_deref(),
+        Some("Bearer test-token")
+    );
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["acl", "set", "alice", "ci-robot", "operator"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let put = server.request("PUT", "/api/instances/alice/acl");
+    let acl = put.body.expect("body")["acl"]
+        .as_array()
+        .expect("acl")
+        .clone();
+    assert_eq!(acl.len(), 2, "the other entry is preserved: {acl:?}");
+    let robot = acl
+        .iter()
+        .find(|item| item["subject"] == "ci-robot")
+        .expect("ci-robot row");
+    assert_eq!(robot["role"], "operator");
+    assert!(acl.iter().any(|item| item["subject"] == "cle@example.test"));
+
+    let output = run_against(&server, home.path(), &["acl", "rm", "alice", "ci-robot"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    server.request("DELETE", "/api/instances/alice/acl/ci-robot");
+
+    // An unknown role never reaches the API.
+    let before = server.requests().len();
+    let output = run_against(
+        &server,
+        home.path(),
+        &["acl", "set", "alice", "ci-robot", "root"],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("owner"));
+    assert_eq!(server.requests().len(), before, "no request expected");
+}
+
+#[tokio::test]
+async fn acl_json_prints_the_payload() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["--json", "acl", "get", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["instance"], "alice");
+    assert_eq!(value["acl"].as_array().expect("acl").len(), 2);
 }

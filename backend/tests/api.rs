@@ -3958,3 +3958,539 @@ async fn a_message_loop_is_stopped_by_hops() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(parse(&body)["error"]["code"], "message_loop");
 }
+
+// ---------------------------------------------------------------------------
+// Per-instance RBAC and scoped tokens (#37)
+// ---------------------------------------------------------------------------
+
+async fn create_token(harness: &Harness, body: Value) -> Value {
+    let (status, response) = harness
+        .request(Method::POST, "/api/tokens", Some(body))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "token create failed: {response}"
+    );
+    parse(&response)
+}
+
+async fn put_acl(harness: &Harness, id: &str, acl: Value) -> Value {
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            &format!("/api/instances/{id}/acl"),
+            Some(json!({ "acl": acl })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "acl update failed: {body}");
+    parse(&body)
+}
+
+#[tokio::test]
+async fn a_scoped_token_only_reaches_its_instances() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+
+    let created = create_token(
+        &harness,
+        json!({
+            "name": "probe-bot",
+            "role": "viewer",
+            "scope": {"instances": ["probe"], "actions": ["read"]},
+        }),
+    )
+    .await;
+    assert_eq!(created["scope"]["instances"][0], "probe");
+    assert_eq!(created["scope"]["actions"][0], "read");
+    let token = created["token"].as_str().expect("token").to_string();
+
+    // The acceptance criterion: a token scoped on `probe` gets 403 on
+    // `tchouniz` — logs included.
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances/probe/logs", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/tchouniz/logs",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "forbidden");
+
+    // Other instance routes are covered too: files, env, git, lifecycle.
+    for (method, uri) in [
+        (Method::GET, "/api/instances/tchouniz/files?path=/"),
+        (Method::GET, "/api/instances/tchouniz/git/status"),
+        (Method::POST, "/api/instances/tchouniz/start"),
+    ] {
+        let (status, _, body) = harness.send(method, uri, None, Some(&token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+
+    // An unknown id stays a 404: a scoped token cannot use 403 to confirm ids.
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/ghost/logs", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Percent-encoding the id must not bypass the check (the middleware
+    // decodes the segment exactly like the Path extractor does).
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/%74chouniz/logs",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The list is filtered server-side.
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = parse(&body);
+    let list = list.as_array().expect("array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "probe");
+    assert_eq!(list[0]["role"], "viewer");
+
+    // Fleet-wide admin routes stay closed.
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/tokens", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn an_acl_grant_takes_effect_immediately_and_can_be_revoked() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let created = create_token(
+        &harness,
+        json!({
+            "name": "alice-viewer",
+            "role": "viewer",
+            "scope": {"instances": ["alice"], "actions": ["read", "write"]},
+        }),
+    )
+    .await;
+    let token = created["token"].as_str().expect("token").to_string();
+
+    // Scope membership alone grants the viewer level: read works, write does
+    // not, even though the token lists `write` in its actions.
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances/alice", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/files/content",
+            Some(json!({"path": "/SOUL.md", "content": "nope"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    put_acl(
+        &harness,
+        "alice",
+        json!([{"subject": "alice-viewer", "role": "viewer"}]),
+    )
+    .await;
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances/alice", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A viewer reads but never writes, even when the token lists `write`.
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/files/content",
+            Some(json!({"path": "/SOUL.md", "content": "nope"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Promoting the same subject to `operator` applies on the next request.
+    put_acl(
+        &harness,
+        "alice",
+        json!([{"subject": "alice-viewer", "role": "operator"}]),
+    )
+    .await;
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Removing the row revokes the write level on the very next request. Read
+    // survives because the token scope itself lists `alice` (at most viewer);
+    // a session, which has no scope, loses read as well (tests/auth.rs).
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/acl/alice-viewer",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/alice", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_legacy_token_keeps_the_global_role_behaviour() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+
+    let created = create_token(&harness, json!({"name": "legacy", "role": "viewer"})).await;
+    assert!(created.get("scope").is_none(), "{created}");
+    let token = created["token"].as_str().expect("token").to_string();
+
+    // No ACL row, no scope: the pre-#37 global viewer read still works.
+    for uri in [
+        "/api/instances",
+        "/api/instances/probe/logs",
+        "/api/instances/tchouniz/logs",
+    ] {
+        let (status, _, body) = harness.send(Method::GET, uri, None, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 2);
+
+    // Writes stay refused.
+    let (status, _, _) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/probe/files/content",
+            Some(json!({"path": "/SOUL.md", "content": "nope"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn an_admin_is_unaffected_by_acls_and_scopes_intersect_for_tokens() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+    put_acl(
+        &harness,
+        "probe",
+        json!([{"subject": "someone@example.test", "role": "viewer"}]),
+    )
+    .await;
+
+    // The bootstrap admin sees and controls everything.
+    let (status, body) = harness.request(Method::GET, "/api/instances", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 2);
+    for id in ["probe", "tchouniz"] {
+        let (status, body) = harness
+            .request(Method::GET, &format!("/api/instances/{id}/acl"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // An admin *token* that carries a scope is still limited by it.
+    let created = create_token(
+        &harness,
+        json!({
+            "name": "scoped-admin",
+            "role": "admin",
+            "scope": {"instances": ["probe"], "actions": ["read"]},
+        }),
+    )
+    .await;
+    let token = created["token"].as_str().expect("token").to_string();
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/probe", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/tchouniz", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = harness
+        .send(
+            Method::POST,
+            "/api/instances/probe/start",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "read-only scope");
+}
+
+#[tokio::test]
+async fn only_an_owner_or_an_admin_manages_the_acl() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let operator = create_token(
+        &harness,
+        json!({
+            "name": "alice-operator",
+            "role": "viewer",
+            "scope": {"instances": ["alice"], "actions": ["read", "write"]},
+        }),
+    )
+    .await;
+    let operator = operator["token"].as_str().expect("token").to_string();
+    put_acl(
+        &harness,
+        "alice",
+        json!([{"subject": "alice-operator", "role": "operator"}]),
+    )
+    .await;
+
+    for (method, uri) in [
+        (Method::GET, "/api/instances/alice/acl"),
+        (Method::PUT, "/api/instances/alice/acl"),
+    ] {
+        let body = (method == Method::PUT).then(|| json!({"acl": []}));
+        let (status, response, body_text) = harness.send(method, uri, body, Some(&operator)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body_text}");
+        assert_eq!(parse(&body_text)["error"]["code"], "forbidden");
+        let _ = response;
+    }
+
+    // An owner (here a scoped viewer token promoted by ACL) manages the ACL.
+    let owner = create_token(
+        &harness,
+        json!({
+            "name": "alice-owner",
+            "role": "viewer",
+            "scope": {"instances": ["alice"], "actions": ["read", "write"]},
+        }),
+    )
+    .await;
+    let owner = owner["token"].as_str().expect("token").to_string();
+    put_acl(
+        &harness,
+        "alice",
+        json!([
+            {"subject": "alice-owner", "role": "owner"},
+            {"subject": "alice-operator", "role": "operator"},
+        ]),
+    )
+    .await;
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/instances/alice/acl", None, Some(&owner))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["acl"].as_array().expect("acl").len(), 2);
+
+    // A viewer gets a 403 on the ACL even when the instance exists.
+    let viewer = create_token(
+        &harness,
+        json!({
+            "name": "alice-viewer",
+            "role": "viewer",
+            "scope": {"instances": ["alice"], "actions": ["read"]},
+        }),
+    )
+    .await;
+    let viewer = viewer["token"].as_str().expect("token").to_string();
+    put_acl(
+        &harness,
+        "alice",
+        json!([
+            {"subject": "alice-owner", "role": "owner"},
+            {"subject": "alice-viewer", "role": "viewer"},
+        ]),
+    )
+    .await;
+    let (status, _, _) = harness
+        .send(Method::GET, "/api/instances/alice/acl", None, Some(&viewer))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn token_scopes_are_validated_and_listed() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+
+    for (scope, message) in [
+        (
+            json!({"instances": ["ghost"], "actions": ["read"]}),
+            "unknown",
+        ),
+        (
+            json!({"instances": ["probe"], "actions": ["root"]}),
+            "unknown action",
+        ),
+        (
+            json!({"instances": [], "actions": ["read"]}),
+            "at least one",
+        ),
+        (
+            json!({"instances": ["probe"], "actions": []}),
+            "at least one",
+        ),
+    ] {
+        let (status, body) = harness
+            .request(
+                Method::POST,
+                "/api/tokens",
+                Some(json!({"name": "bad", "role": "viewer", "scope": scope})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{message}: {body}");
+        assert_eq!(parse(&body)["error"]["code"], "invalid_scope");
+    }
+
+    let created = create_token(
+        &harness,
+        json!({
+            "name": "scoped",
+            "role": "viewer",
+            "scope": {"instances": ["probe", "probe"], "actions": ["read", "read"]},
+        }),
+    )
+    .await;
+    // Duplicates are dropped.
+    assert_eq!(
+        created["scope"]["instances"]
+            .as_array()
+            .expect("instances")
+            .len(),
+        1
+    );
+    assert_eq!(
+        created["scope"]["actions"]
+            .as_array()
+            .expect("actions")
+            .len(),
+        1
+    );
+
+    let (status, body) = harness.request(Method::GET, "/api/tokens", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens = parse(&body);
+    let tokens = tokens.as_array().expect("array");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0]["scope"]["instances"][0], "probe");
+}
+
+#[tokio::test]
+async fn acl_changes_are_audited_with_the_real_actor() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let admin = create_token(&harness, json!({"name": "ops-robot", "role": "admin"})).await;
+    let admin = admin["token"].as_str().expect("token").to_string();
+
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/acl",
+            Some(json!({"acl": [
+                {"subject": "user@example.test", "role": "viewer"},
+            ]})),
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, _) = harness
+        .send(
+            Method::DELETE,
+            "/api/instances/alice/acl/user@example.test",
+            None,
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=20", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entries = entries.as_array().expect("audit array");
+    let update = entries
+        .iter()
+        .find(|entry| entry["action"] == "instance.acl.update")
+        .expect("acl update audited");
+    assert_eq!(update["actor"], "ops-robot");
+    assert_eq!(update["target"], "alice");
+    assert_eq!(update["details"]["subjects"][0], "user@example.test");
+
+    let delete = entries
+        .iter()
+        .find(|entry| entry["action"] == "instance.acl.delete")
+        .expect("acl delete audited");
+    assert_eq!(delete["actor"], "ops-robot");
+    assert_eq!(delete["details"]["subject"], "user@example.test");
+
+    // Token creation records the scope it granted.
+    let create = entries
+        .iter()
+        .find(|entry| entry["action"] == "token.create")
+        .expect("token create audited");
+    assert_eq!(create["actor"], "bootstrap");
+    assert_eq!(create["details"]["name"], "ops-robot");
+}
+
+#[tokio::test]
+async fn a_viewer_session_sees_only_acl_instances() {
+    // The bearer path is covered above; this checks the same helpers with a
+    // session context (no scope, subject = email) without minting a cookie.
+    use fleett::auth::{AuthContext, AuthMethod, Role};
+    use fleett::authz::{can, visible_instances, AclEntry, Action, InstanceRole};
+
+    let context = AuthContext {
+        actor: "user@example.test".to_string(),
+        subject: "user@example.test".to_string(),
+        role: Role::Viewer,
+        method: AuthMethod::Session,
+        user: None,
+        scope: None,
+        ip: None,
+    };
+    let acl = vec![AclEntry {
+        instance_id: "alice".to_string(),
+        subject: "user@example.test".to_string(),
+        role: InstanceRole::Operator,
+    }];
+    assert!(can(&context, &acl, "alice", Action::Write));
+    assert!(!can(&context, &acl, "bob", Action::Read));
+    let all = vec!["alice".to_string(), "bob".to_string()];
+    assert_eq!(visible_instances(&context, &acl, &all), vec!["alice"]);
+}

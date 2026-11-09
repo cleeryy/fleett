@@ -56,6 +56,9 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett acl get <id>
+fleett acl set <id> <subject> <owner|operator|viewer>
+fleett acl rm <id> <subject>
 fleett doctor
 ```
 
@@ -184,6 +187,28 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `acl`
+
+Manage the per-instance access list ([docs/RBAC.md](RBAC.md)). Only an admin
+or an `owner` of the instance may read or change it.
+
+```bash
+fleett acl get probe
+fleett acl set probe cle@example.test owner
+fleett acl set probe ci-robot viewer
+fleett acl rm probe ci-robot
+fleett --json acl get probe
+```
+
+`<subject>` is the OIDC email (or `sub`) of a user, or the name of a named
+token. `acl set` reads the current list, upserts that one subject and sends the
+whole list back, so the other entries are preserved. Removing an entry takes
+effect on the next API request: nothing is cached. `--json` prints the
+`{"instance":"…","acl":[…]}` payload.
+
+A named token can also be created with a `scope` through the API
+(`POST /api/tokens`); there is no tokens CLI command yet.
 
 ### `doctor`
 

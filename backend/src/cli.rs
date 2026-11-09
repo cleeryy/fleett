@@ -301,20 +301,38 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
+    AclGet(String),
+    AclSet {
+        id: String,
+        subject: String,
+        role: String,
+    },
+    AclRm {
+        id: String,
+        subject: String,
+    },
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +431,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::AclGet(id) => acl_get(&client, json, &id).await,
+        Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
+        Command::AclRm { id, subject } => acl_rm(&client, json, &id, &subject).await,
     }
 }
 
@@ -850,6 +871,99 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
         return print_json(&value);
     }
     println!("message {message_id} marked as read");
+    Ok(())
+}
+
+/// One `instance_acl` row as returned by the API.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AclItemView {
+    subject: String,
+    role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AclView {
+    instance: String,
+    #[serde(default)]
+    acl: Vec<AclItemView>,
+}
+
+fn acl_path(id: &str) -> String {
+    format!("/api/instances/{}/acl", encode_path_segment(id))
+}
+
+fn print_acl(view: &AclView, json: bool) -> Result<(), CliError> {
+    if json {
+        return print_json(view);
+    }
+    if view.acl.is_empty() {
+        println!("{}: no ACL entries", view.instance);
+        return Ok(());
+    }
+    println!("{}:", view.instance);
+    let width = view
+        .acl
+        .iter()
+        .map(|item| item.subject.chars().count())
+        .max()
+        .unwrap_or(0);
+    for item in &view.acl {
+        println!("  {:width$}  {}", item.subject, item.role);
+    }
+    Ok(())
+}
+
+/// `fleett acl get <id>`.
+async fn acl_get(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let view: AclView = client.json(Method::GET, &acl_path(id), &[], None).await?;
+    print_acl(&view, json)
+}
+
+/// `fleett acl set <id> <subject> <role>` — upsert one grant, keep the rest.
+async fn acl_set(
+    client: &Client,
+    json: bool,
+    id: &str,
+    subject: &str,
+    role: &str,
+) -> Result<(), CliError> {
+    let role = role.trim().to_ascii_lowercase();
+    if !matches!(role.as_str(), "owner" | "operator" | "viewer") {
+        return Err(CliError::Config(
+            "role must be \"owner\", \"operator\" or \"viewer\"".to_string(),
+        ));
+    }
+    let path = acl_path(id);
+    let mut view: AclView = client.json(Method::GET, &path, &[], None).await?;
+    let subject = subject.trim().to_string();
+    match view.acl.iter_mut().find(|item| item.subject == subject) {
+        Some(item) => item.role = role,
+        None => view.acl.push(AclItemView {
+            subject,
+            role,
+            created_at: None,
+        }),
+    }
+    let body = json!({ "acl": view.acl });
+    let updated: AclView = client.json(Method::PUT, &path, &[], Some(body)).await?;
+    print_acl(&updated, json)
+}
+
+/// `fleett acl rm <id> <subject>`.
+async fn acl_rm(client: &Client, json: bool, id: &str, subject: &str) -> Result<(), CliError> {
+    let path = format!("{}/{}", acl_path(id), encode_path_segment(subject.trim()));
+    let value = client.value(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({
+            "instance": id,
+            "subject": subject.trim(),
+            "removed": true,
+            "response": value,
+        }));
+    }
+    println!("removed \"{}\" from the ACL of {}", subject.trim(), id);
     Ok(())
 }
 

@@ -12,7 +12,7 @@ use crate::auth::session::{
     OIDC_STATE_COOKIE, SESSION_COOKIE,
 };
 use crate::auth::tokens;
-use crate::auth::{random_hex, AuthContext, AuthMethod, Role, SessionUser};
+use crate::auth::{random_hex, AuthContext, AuthMethod, Role, SessionUser, TokenScope};
 use axum::extract::{ConnectInfo, Extension, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -121,6 +121,8 @@ pub async fn config(State(state): State<AppState>) -> Json<AuthConfigResponse> {
 pub struct MeResponse {
     pub authenticated: bool,
     pub actor: String,
+    /// Identity matched against `instance_acl.subject`.
+    pub subject: String,
     pub role: &'static str,
     pub method: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +134,7 @@ pub async fn me(Extension(ctx): Extension<AuthContext>) -> Json<MeResponse> {
     Json(MeResponse {
         authenticated: true,
         actor: ctx.actor,
+        subject: ctx.subject,
         role: ctx.role.as_str(),
         method: ctx.method.as_str(),
         user: ctx.user,
@@ -490,11 +493,14 @@ pub async fn require_auth(
             match state.auth.verify_session(value, Utc::now().timestamp()) {
                 Ok(claims) => {
                     let user = claims.user();
+                    let subject = user.actor();
                     context = Some(AuthContext {
-                        actor: user.actor(),
+                        actor: subject.clone(),
+                        subject,
                         role: claims.role,
                         method: AuthMethod::Session,
                         user: Some(user),
+                        scope: None,
                         ip: None,
                     });
                 }
@@ -508,12 +514,14 @@ pub async fn require_auth(
 
     if context.is_none() && state.auth.bearer_enabled() {
         if let Some(token) = bearer.as_deref() {
-            if let Some((actor, role)) = bearer_identity(&state, token)? {
+            if let Some((subject, role, scope)) = bearer_identity(&state, token)? {
                 context = Some(AuthContext {
-                    actor,
+                    actor: subject.clone(),
+                    subject,
                     role,
                     method: AuthMethod::Bearer,
                     user: None,
+                    scope,
                     ip: None,
                 });
             }
@@ -523,9 +531,11 @@ pub async fn require_auth(
     if context.is_none() && state.auth.allow_no_auth {
         context = Some(AuthContext {
             actor: "anonymous".to_string(),
+            subject: "anonymous".to_string(),
             role: Role::Admin,
             method: AuthMethod::Bearer,
             user: None,
+            scope: None,
             ip: None,
         });
     }
@@ -536,10 +546,15 @@ pub async fn require_auth(
     context.ip = ip;
 
     if context.role == Role::Viewer && !is_read_method(&method) {
-        return Err(ApiError::forbidden(
-            "forbidden",
-            "the viewer role is read-only",
-        ));
+        // A per-instance ACL may grant write (operator) or exec (owner) on an
+        // instance route; `authz::require_instance_access` decides there.
+        // Every other mutation stays admin-only.
+        if crate::authz::route_target(request.uri().path(), &method).is_none() {
+            return Err(ApiError::forbidden(
+                "forbidden",
+                "the viewer role is read-only",
+            ));
+        }
     }
 
     // Bearer clients are not vulnerable to CSRF; cookies are, unless the
@@ -563,11 +578,14 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-/// Resolve a bearer token to `(actor, role)`.
-fn bearer_identity(state: &AppState, token: &str) -> Result<Option<(String, Role)>, ApiError> {
+/// Resolve a bearer token to `(actor/subject, role, scope)`.
+fn bearer_identity(
+    state: &AppState,
+    token: &str,
+) -> Result<Option<(String, Role, Option<TokenScope>)>, ApiError> {
     if let Some(expected) = state.auth.bootstrap_token.as_deref() {
         if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
-            return Ok(Some(("bootstrap".to_string(), Role::Admin)));
+            return Ok(Some(("bootstrap".to_string(), Role::Admin, None)));
         }
     }
     if !tokens::looks_like_token(token) {
@@ -580,7 +598,8 @@ fn bearer_identity(state: &AppState, token: &str) -> Result<Option<(String, Role
         .map_err(ApiError::from)?;
     Ok(record.map(|record| {
         let role = Role::parse(&record.role).unwrap_or(Role::Viewer);
-        (record.name, role)
+        let scope = TokenScope::parse_stored(record.scope.as_deref());
+        (record.name, role, scope)
     }))
 }
 
