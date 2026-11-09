@@ -29,7 +29,9 @@ differ in how the process gets its data root and its Docker access:
 docker build -t fleett:test .
 ```
 
-Three stages: `node:22-alpine` builds `web/` (`pnpm install --frozen-lockfile`,
+Three stages build the control-plane image (the opt-in `s6-overlay` stage
+below is not part of the default target): `node:22-alpine` builds `web/`
+(`pnpm install --frozen-lockfile`,
 `pnpm build`), `rust:1-slim-trixie` + `cmake` (libgit2 is vendored and compiled
 from source by the `git2` crate used for instance history) builds the backend
 with `--release --locked --features embed-web` after copying `web/dist` to
@@ -37,6 +39,83 @@ with `--release --locked --features embed-web` after copying `web/dist` to
 runtime: `ca-certificates`, `curl` (healthcheck), `docker-cli` and
 `docker-compose` — the compose driver shells out to `docker compose`, so the
 image is useless without them.
+
+### s6-overlay downloads (Hermes agent image)
+
+The control-plane image above does **not** run s6-overlay. The Hermes agent
+image (`cleeryy/hermes-agent`) does: its Dockerfile installs `/init` from three
+s6-overlay release tarballs. On 2026-11-08 every
+`github.com/.../releases/download` request answered `504` from the `fra` edge
+while `api.github.com` stayed healthy, so that build failed twice at the s6
+step. The download logic now lives in `docker/fetch-s6-overlay.sh` and is
+exposed as an opt-in stage of this Dockerfile so it is reviewed and tested next
+to the control plane:
+
+```bash
+docker build --target s6-overlay -t fleett-s6-overlay .
+# /s6-overlay-root in that image is a verified s6-overlay tree (it has ./init)
+```
+
+The default target (`docker build .`) is unchanged: the stage is unreferenced,
+so BuildKit does not build it. Copy `docker/fetch-s6-overlay.sh` into the agent
+build context and replace its s6 `RUN` block with the same call when updating
+`cleeryy/hermes-agent`; keep the checksum `ARG`s below in sync with the agent
+Dockerfile.
+
+#### Build arguments
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `S6_OVERLAY_VERSION` | `3.2.3.0` | release tag used in every URL |
+| `S6_OVERLAY_BASE_URL` | `https://github.com/just-containers/s6-overlay/releases/download` | primary source; point it at a mirror, layout `<base>/v<version>/<asset>` |
+| `S6_OVERLAY_MIRROR_URL` | empty | second direct source, tried after the primary |
+| `S6_OVERLAY_API_URL` | `https://api.github.com/repos/just-containers/s6-overlay/releases` | release API for the fallback (`/tags/v<version>`, `/assets/<id>`) |
+| `S6_OVERLAY_NOARCH_SHA256` | upstream 3.2.3.0 value | sha256 of `s6-overlay-noarch.tar.xz` |
+| `S6_OVERLAY_X86_64_SHA256` | upstream 3.2.3.0 value | sha256 of `s6-overlay-x86_64.tar.xz` |
+| `S6_OVERLAY_AARCH64_SHA256` | upstream 3.2.3.0 value | sha256 of `s6-overlay-aarch64.tar.xz` |
+| `S6_OVERLAY_SYMLINKS_SHA256` | upstream 3.2.3.0 value | sha256 of `s6-overlay-symlinks-noarch.tar.xz` |
+| `TARGETARCH` | set by BuildKit | selects `x86_64` (`amd64`) or `aarch64` (`arm64`) |
+
+#### Fallback order and checksums
+
+For each of the three assets, `docker/fetch-s6-overlay.sh` tries:
+
+1. `S6_OVERLAY_BASE_URL/v<version>/<asset>` with
+   `curl --fail --retry 3 --retry-delay 2` (transient 5xx and timeouts retry);
+2. `S6_OVERLAY_MIRROR_URL/v<version>/<asset>` when it is set and differs from
+   the primary;
+3. the GitHub API: `GET <api>/tags/v<version>` resolves the asset id, then
+   `GET <api>/assets/<id>` with `Accept: application/octet-stream`
+   (`GITHUB_TOKEN` or `GH_TOKEN` is honoured when set, for the rate limit).
+
+Every successful byte stream goes through `sha256sum -c` against the pinned
+`ARG`, including the mirror and API paths. A mismatch is **fatal**: the file is
+removed, the helper exits 1, and no other source is tried with bytes that were
+already rejected — a proxy returning `200` with an HTML error page cannot be
+extracted. `S6_OVERLAY_BASE_URL` defaults to GitHub, so an operator can use a
+mirror without patching the Dockerfile.
+
+#### Reproduce the 504 locally
+
+Fast path (needs outbound access to `api.github.com`): point the primary at a
+closed port; the connection is refused instantly and the API fallback runs:
+
+```bash
+docker build --target s6-overlay \
+  --build-arg S6_OVERLAY_BASE_URL=http://127.0.0.1:9 \
+  -t fleett-s6-overlay .
+```
+
+Fully offline: `tests/image/test-fetch-s6-overlay.sh` starts a local HTTP
+server that answers `504` on the primary path, serves the API JSON and assets,
+and checks six cases (primary, 504→API, 504→mirror, corrupt checksum, all
+sources broken, missing checksum). No GitHub, no Docker:
+
+```bash
+bash tests/image/test-fetch-s6-overlay.sh
+```
+
+CI runs that script in the `image` job of `.github/workflows/ci.yml`.
 
 ### Smoke test (mock driver, no Docker socket)
 
