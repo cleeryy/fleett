@@ -769,6 +769,57 @@ sample. Both `PATCH …/heal` and the manual close are written to the audit log
 `400 invalid_heal_policy`, `400 invalid_unhealthy_after`,
 `400 invalid_max_restarts` or `400 invalid_heal_backoff_s`.
 
+## Notifications
+
+Outbound alert channels; see [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md). Secrets are
+encrypted and never returned (`has_secret` only).
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/api/notifications` | — | `Channel[]` |
+| POST | `/api/notifications` | `{"name","kind":"webhook|discord|telegram|smtp","target","secret?","events":["instance.down","incident.*"],"enabled?":true}` | `201 Channel` |
+| GET/PATCH/DELETE | `/api/notifications/{id}` | partial `Channel` | `200` / `204` |
+| POST | `/api/notifications/{id}/test` | — | `202 Delivery` (synthetic `notification.test`) |
+| GET | `/api/notifications/deliveries?channel=&limit=` | — | `Delivery[]` |
+
+Events: `instance.down`, `instance.unhealthy`, `instance.up`, `upgrade.failed`,
+`quota.exceeded`, `egress.drift`, `secret.expiring`, `incident.open`, `incident.close`,
+`notification.test`; `*` and `incident.*` are accepted. Deliveries are coalesced per
+channel/event over five minutes and retried with backoff.
+
+## Webhooks
+
+Signed outbound event deliveries (distinct from notifications); see
+[docs/WEBHOOKS.md](docs/WEBHOOKS.md).
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/api/webhooks` | — | `Webhook[]` (`has_secret`, never the secret) |
+| POST | `/api/webhooks` | `{"name","url","events":["instance.started"],"secret"}` | `201 Webhook` |
+| GET/PATCH/DELETE | `/api/webhooks/{id}` | partial | `200` / `204` |
+| POST | `/api/webhooks/{id}/test` | — | `202 Delivery` |
+| GET | `/api/webhooks/{id}/deliveries` | — | `Delivery[]` |
+| GET | `/api/openapi.json` | — | OpenAPI 3.0.3 document |
+
+Each delivery carries `X-Fleett-Event`, `X-Fleett-Delivery` and
+`X-Fleett-Signature: sha256=<hex HMAC-SHA256 of the exact body>`. Events:
+`instance.created|started|stopped|deleted`, `env.changed`, `upgrade.*`, `incident.*`,
+`secret.rotated`, `pipeline.run.*`.
+
+## Log center
+
+Persistent searchable logs; see [docs/LOGS.md](docs/LOGS.md).
+
+| Method | Path | Query | Result |
+|---|---|---|---|
+| GET | `/api/logs` | `instances=a,b&q=&level=info|warn|error&since=&until=&limit=500` | `LogEntry[]`, newest first |
+| GET | `/api/logs/instances/{id}` | same filters | `LogEntry[]` |
+| GET | `/api/logs/stream` | `instances=` | SSE `log` events, 15 s heartbeat |
+| GET | `/api/logs/export` | `format=json|csv` + filters | downloadable file |
+
+Secrets are redacted at ingestion (`flt_`, `sk-`, `Bot`, `Bearer`, `token=`). Retention is
+`FLEETT_LOG_RETENTION` (default `7d`) and `FLEETT_LOG_MAX_ROWS` (default 500000).
+
 ## Shares
 
 | Method | Route | Body | Response |
