@@ -40,8 +40,15 @@ clients are exempt.
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-<<<<<<< HEAD
-| GET | `/api/audit?limit=200` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","details":{…}}]`, newest first, admin only |
+| GET | `/api/audit` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","user_agent":"…","result":"ok","request_id":null,"details":{…}}]`, newest first, admin only |
+| GET | `/api/audit/export?from=&to=` | — | `200 application/x-ndjson`, one JSON object per line, `Content-Disposition: attachment; filename="fleett-audit-<ts>.jsonl"`, `X-Fleett-Signature: sha256=<hex HMAC-SHA256 of the exact body>`; `409 audit_key_missing` without `FLEETT_AUDIT_HMAC_KEY`, `400 missing_range` without both bounds, admin only |
+| DELETE | `/api/audit/expired` | — | `{"removed":12,"cutoff":"…","retention":"90d"}` deletes rows older than `FLEETT_AUDIT_RETENTION` and appends an `audit.purge` row, admin only |
+`GET /api/audit` filters: `limit` (default 200, max 1000), `offset`, `actor`,
+`action`, `target`, `from`, `to`, `result` (`ok|failed|refused`). `actor`,
+`action`, `target` and `result` are exact matches; `from`/`to` accept RFC 3339
+or `YYYY-MM-DD` (a date-only `to` covers the whole day). The legacy `?limit=`
+behaviour is unchanged.
+
 | GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null,"scope":{"instances":["probe"],"actions":["read"]}}]`, never the secret, admin only |
 | POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin","scope"?}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
 | DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
@@ -103,27 +110,57 @@ API, errors — also carries the security headers (`Content-Security-Policy`,
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
 `X-Content-Type-Options: nosniff`, and `Strict-Transport-Security` only when
 `FLEETT_PUBLIC_URL` is https).
-=======
-| GET | `/api/audit` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","user_agent":"…","result":"ok","request_id":null,"details":{…}}]`, newest first, admin only |
-| GET | `/api/audit/export?from=&to=` | — | `200 application/x-ndjson`, one JSON object per line, `Content-Disposition: attachment; filename="fleett-audit-<ts>.jsonl"`, `X-Fleett-Signature: sha256=<hex HMAC-SHA256 of the exact body>`; `409 audit_key_missing` without `FLEETT_AUDIT_HMAC_KEY`, `400 missing_range` without both bounds, admin only |
-| DELETE | `/api/audit/expired` | — | `{"removed":12,"cutoff":"…","retention":"90d"}` deletes rows older than `FLEETT_AUDIT_RETENTION` and appends an `audit.purge` row, admin only |
-| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null}]`, never the secret, admin only |
-| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin"}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
-| DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
-
-`GET /api/audit` filters: `limit` (default 200, max 1000), `offset`, `actor`,
-`action`, `target`, `from`, `to`, `result` (`ok|failed|refused`). `actor`,
-`action`, `target` and `result` are exact matches; `from`/`to` accept RFC 3339
-or `YYYY-MM-DD` (a date-only `to` covers the whole day). The legacy `?limit=`
-behaviour is unchanged.
-
-`role` defaults to `viewer`. Revoking is idempotent. Tokens are stored as a
-SHA-256 digest only. Full audit documentation: [docs/AUDIT.md](docs/AUDIT.md).
->>>>>>> issue-44
 
 ## Templates
 
-`GET /api/templates`
+Built-in templates (`guest`, `guest-discord`, `solo`) are compiled constants and
+read-only. Custom templates live under `$FLEETT_ROOT/templates/<id>/` and keep a
+versioned history; see `docs/TEMPLATES.md`.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/templates` | — | `TemplateInfo[]` (built-ins + custom, env schema and defaults resolved through the parent chain) |
+| POST | `/api/templates` | `{"id","name","description"?,"parent"?,"default_model"?,"channel"?,"env":[…],"config_yaml"?,"soul_md"?,"defaults"?}` | `201 TemplateDetail`, admin only |
+| GET | `/api/templates/{id}` | — | `TemplateDetail` (`config_yaml`, `soul_md`, `versions_count`) |
+| PUT | `/api/templates/{id}` | same fields, all optional; `null` clears | `200 TemplateDetail`, admin only |
+| DELETE | `/api/templates/{id}` | — | `204`; `409 read_only` for a built-in; `409 template_in_use` with `details.instances` / `details.templates` (child templates), admin only |
+| POST | `/api/templates/from-instance` | `{"instance_id","id","name"?}` | `201 TemplateDetail`, admin only |
+| GET | `/api/templates/{id}/versions` | — | `[{"version":1,"action":"create\|update\|delete","actor":"…","at":"…","sha256":{"config.yaml":"…","soul.md":"…"}}]` |
+| POST | `/api/templates/{id}/restore` | `{"version":1}` | `200 TemplateDetail`; the restored files are written and a new version is appended, admin only |
+
+`TemplateInfo`:
+```json
+{"id":"house","name":"House","description":"…","default_model":"deepseek-v4.1-flash",
+ "channel":"telegram","parent":"guest","read_only":false,
+ "env":[{"key":"HOUSE_FLAG","description":"…","example":"1","required":true,
+         "format":"boolean","secret":false}],
+ "defaults":{"mem_limit_mb":2048,"cpu_limit":2.0,"allow_lan":false},
+ "source_instance":null,"instances_count":2,
+ "created_at":"2026-11-09T01:00:00Z","updated_at":"2026-11-09T02:00:00Z"}
+```
+
+`env` entries extend the pre-0.6 shape: `example`, `required` and `format` are
+optional (`required` defaults to `false`). Inherited entries are merged by key,
+the child winning the description/flags. `defaults` drive
+`POST /api/instances` when the request leaves `model`, `base_url`,
+`mem_limit_mb`, `cpu_limit`, `allow_lan` or `notes` out.
+
+A custom template may set `parent`; resolution merges the parent then the child
+per field. A cycle is `400 template_cycle`. Built-ins can be parents but never
+modified (`409 read_only` on PUT/DELETE/restore).
+
+`POST /api/instances` refuses an unknown template (`400 unknown_template`), and
+a template with a `required` env entry the request does not supply returns
+`400 missing_required_env`:
+```json
+{"error":{"code":"missing_required_env","message":"template \"house\" requires environment variable(s): HOUSE_FLAG",
+ "details":[{"key":"HOUSE_FLAG","field":"env"}]}}
+```
+When an env entry omits `secret`, the template schema decides; an explicit
+`secret` in the request wins.
+
+A built-in template looks like:
+
 ```json
 [{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
   "default_model":"deepseek-v4.1-flash","channel":"telegram",

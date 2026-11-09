@@ -61,6 +61,15 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett templates
+fleett template get <id>
+fleett template create [-f file.yaml] [--id ID --name NAME --description TEXT]
+                       [--parent PARENT] [--default-model MODEL] [--channel telegram|discord|none]
+                       [--config FILE] [--soul FILE] [--defaults FILE] [--env KEY]…
+fleett template from-instance <instance> --id <new> [--name NAME]
+fleett template rm <id>
+fleett template versions <id>
+fleett template restore <id> <version>
 fleett schedules <id>
 fleett schedule add <id> --name NAME --cron EXPR --prompt TEXT
                 [--enabled|--disabled] [--overlap skip|queue] [--timeout S]
@@ -286,6 +295,36 @@ fleett ack tchouniz 3f2a…
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
 
+### `templates` / `template`
+
+Manage the versioned instance templates ([docs/TEMPLATES.md](TEMPLATES.md)). `templates`
+prints one row per template (id, name, parent, read-only, channel, model, env entries,
+instances); `template get` adds the env schema and the defaults. Mutations require the admin
+role.
+
+```bash
+fleett templates
+fleett template get house
+
+# Full definition (the POST /api/templates body) — the only way to set
+# descriptions, examples, required/secret flags and defaults in one go.
+fleett template create -f house.yaml
+
+# Quick creation from flags.
+fleett template create --id house --parent guest --channel telegram \
+  --config config.yaml --soul SOUL.md --defaults defaults.yaml \
+  --env HOUSE_FLAG --env TELEGRAM_ALLOWED_USERS
+
+# Save a running instance (config, SOUL.md, limits and env schema).
+fleett template from-instance tchouniz --id tchouniz-template
+
+fleett template versions house
+fleett template restore house 1   # rewrites the files, appends a new version
+fleett template rm house          # 409 template_in_use while an instance uses it
+```
+
+`fleett template rm` refuses a built-in (`409 read_only`) and a template still used by an
+instance or a child template (`409 template_in_use`). `--json` prints the raw API payload.
 ### `schedules` / `schedule` / `runs`
 
 Manage the cron schedules of an instance ([docs/SCHEDULES.md](SCHEDULES.md)):

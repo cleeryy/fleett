@@ -333,6 +333,8 @@ pub enum Command {
         id: String,
         message_id: String,
     },
+    Templates,
+    Template(TemplateCommand),
     Schedules {
         id: String,
     },
@@ -358,6 +360,46 @@ pub enum Command {
         id: String,
         subject: String,
     },
+}
+
+/// Arguments of `fleett template <action>`.
+#[derive(Debug, Clone)]
+pub enum TemplateCommand {
+    List,
+    Get(String),
+    Create(TemplateCreateArgs),
+    FromInstance {
+        instance: String,
+        id: String,
+        name: Option<String>,
+    },
+    Remove(String),
+    Versions(String),
+    Restore {
+        id: String,
+        version: i64,
+    },
+}
+
+/// Arguments of `fleett template create`.
+#[derive(Debug, Clone, Default)]
+pub struct TemplateCreateArgs {
+    /// Complete YAML definition (the full `POST /api/templates` body).
+    pub file: Option<PathBuf>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub parent: Option<String>,
+    pub default_model: Option<String>,
+    pub channel: Option<String>,
+    /// File copied into `templates/<id>/config.yaml`.
+    pub config: Option<PathBuf>,
+    /// File copied into `templates/<id>/soul.md`.
+    pub soul: Option<PathBuf>,
+    /// File copied into `templates/<id>/defaults.yaml`.
+    pub defaults: Option<PathBuf>,
+    /// Environment keys of the schema (`--env KEY`, repeatable).
+    pub env: Vec<String>,
 }
 
 /// Arguments of `fleett schedule add`.
@@ -610,6 +652,8 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Templates => templates_command(&client, json).await,
+        Command::Template(action) => template_command(&client, json, &action).await,
         Command::Memory(command) => memory(&client, json, &command).await,
         Command::AclGet(id) => acl_get(&client, json, &id).await,
         Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
@@ -2632,6 +2676,348 @@ async fn run_doctor(client: &Client) -> Vec<Check> {
     }
 
     checks
+}
+
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateEnvView {
+    key: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateInfoView {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    default_model: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    env: Vec<TemplateEnvView>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    instances_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateDetailView {
+    #[serde(flatten)]
+    info: TemplateInfoView,
+    #[serde(default)]
+    config_yaml: String,
+    #[serde(default)]
+    soul_md: Option<String>,
+    #[serde(default)]
+    versions_count: usize,
+    #[serde(default)]
+    defaults: Value,
+    #[serde(default)]
+    source_instance: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateVersionView {
+    version: i64,
+    action: String,
+    actor: String,
+    at: String,
+}
+
+async fn templates_command(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/templates", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let templates: Vec<TemplateInfoView> = decode(value)?;
+    let rows: Vec<Vec<String>> = templates
+        .iter()
+        .map(|template| {
+            vec![
+                template.id.clone(),
+                template.name.clone(),
+                template.parent.clone().unwrap_or_else(|| "-".to_string()),
+                if template.read_only {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+                template.channel.clone(),
+                template.default_model.clone(),
+                template.env.len().to_string(),
+                template.instances_count.to_string(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &[
+                "ID",
+                "NAME",
+                "PARENT",
+                "READ-ONLY",
+                "CHANNEL",
+                "MODEL",
+                "ENV",
+                "INSTANCES"
+            ],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn template_command(
+    client: &Client,
+    json: bool,
+    action: &TemplateCommand,
+) -> Result<(), CliError> {
+    match action {
+        TemplateCommand::List => templates_command(client, json).await,
+        TemplateCommand::Get(id) => {
+            let value = client
+                .value(
+                    Method::GET,
+                    &format!("/api/templates/{}", encode_path_segment(id)),
+                    &[],
+                    None,
+                )
+                .await?;
+            print_template_detail(&value, json)
+        }
+        TemplateCommand::Create(args) => create_template(client, json, args).await,
+        TemplateCommand::FromInstance { instance, id, name } => {
+            let mut body = json!({"instance_id": instance, "id": id});
+            if let Some(name) = name {
+                body["name"] = json!(name);
+            }
+            let value = client
+                .value(
+                    Method::POST,
+                    "/api/templates/from-instance",
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            print_template_detail(&value, json)
+        }
+        TemplateCommand::Remove(id) => {
+            client
+                .text(
+                    Method::DELETE,
+                    &format!("/api/templates/{}", encode_path_segment(id)),
+                    &[],
+                    None,
+                )
+                .await?;
+            if json {
+                print_json(&json!({"id": id, "deleted": true}))
+            } else {
+                println!("template {id} deleted");
+                Ok(())
+            }
+        }
+        TemplateCommand::Versions(id) => {
+            let value = client
+                .value(
+                    Method::GET,
+                    &format!("/api/templates/{}/versions", encode_path_segment(id)),
+                    &[],
+                    None,
+                )
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let versions: Vec<TemplateVersionView> = decode(value)?;
+            let rows: Vec<Vec<String>> = versions
+                .iter()
+                .map(|version| {
+                    vec![
+                        version.version.to_string(),
+                        version.action.clone(),
+                        version.actor.clone(),
+                        version.at.clone(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["VERSION", "ACTION", "ACTOR", "AT"], &rows)
+            );
+            Ok(())
+        }
+        TemplateCommand::Restore { id, version } => {
+            let value = client
+                .value(
+                    Method::POST,
+                    &format!("/api/templates/{}/restore", encode_path_segment(id)),
+                    &[],
+                    Some(json!({ "version": version })),
+                )
+                .await?;
+            print_template_detail(&value, json)
+        }
+    }
+}
+
+async fn create_template(
+    client: &Client,
+    json: bool,
+    args: &TemplateCreateArgs,
+) -> Result<(), CliError> {
+    let body = match &args.file {
+        Some(path) => read_yaml_json(path)?,
+        None => {
+            let id = args.id.clone().ok_or_else(|| {
+                CliError::Config("--id is required without -f <file.yaml>".to_string())
+            })?;
+            let mut body = json!({ "id": id });
+            if let Some(name) = &args.name {
+                body["name"] = json!(name);
+            }
+            if let Some(description) = &args.description {
+                body["description"] = json!(description);
+            }
+            if let Some(parent) = &args.parent {
+                body["parent"] = json!(parent);
+            }
+            if let Some(model) = &args.default_model {
+                body["default_model"] = json!(model);
+            }
+            if let Some(channel) = &args.channel {
+                body["channel"] = json!(channel);
+            }
+            if let Some(path) = &args.config {
+                body["config_yaml"] = json!(read_text(path)?);
+            }
+            if let Some(path) = &args.soul {
+                body["soul_md"] = json!(read_text(path)?);
+            }
+            if let Some(path) = &args.defaults {
+                body["defaults"] = read_yaml_json(path)?;
+            }
+            if !args.env.is_empty() {
+                let env: Vec<Value> = args
+                    .env
+                    .iter()
+                    .map(|key| {
+                        json!({
+                            "key": key,
+                            "description": "",
+                            "required": false,
+                            "secret": false,
+                        })
+                    })
+                    .collect();
+                body["env"] = json!(env);
+            }
+            body
+        }
+    };
+    let value = client
+        .value(Method::POST, "/api/templates", &[], Some(body))
+        .await?;
+    print_template_detail(&value, json)
+}
+
+fn read_text(path: &Path) -> Result<String, CliError> {
+    std::fs::read_to_string(path)
+        .map_err(|err| CliError::Config(format!("cannot read {}: {err}", path.display())))
+}
+
+fn read_yaml_json(path: &Path) -> Result<Value, CliError> {
+    let text = read_text(path)?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|err| CliError::Config(format!("invalid YAML in {}: {err}", path.display())))?;
+    serde_json::to_value(&yaml).map_err(|err| {
+        CliError::Config(format!("cannot convert {} to JSON: {err}", path.display()))
+    })
+}
+
+fn print_template_detail(value: &Value, json: bool) -> Result<(), CliError> {
+    if json {
+        return print_json(value);
+    }
+    let detail: TemplateDetailView = decode(value.clone())?;
+    println!("{} ({})", detail.info.name, detail.info.id);
+    if let Some(parent) = &detail.info.parent {
+        println!("  parent: {parent}");
+    }
+    if detail.info.read_only {
+        println!("  read-only: yes (built-in)");
+    }
+    if !detail.info.description.is_empty() {
+        println!("  description: {}", detail.info.description);
+    }
+    println!("  channel: {}", detail.info.channel);
+    println!("  model: {}", detail.info.default_model);
+    println!("  instances: {}", detail.info.instances_count);
+    println!("  versions: {}", detail.versions_count);
+    println!("  config.yaml: {} bytes", detail.config_yaml.len());
+    if let Some(soul) = &detail.soul_md {
+        println!("  soul.md: {} bytes", soul.len());
+    }
+    if let Some(source) = &detail.source_instance {
+        println!("  source instance: {source}");
+    }
+    if !detail.info.env.is_empty() {
+        let rows: Vec<Vec<String>> = detail
+            .info
+            .env
+            .iter()
+            .map(|entry| {
+                vec![
+                    entry.key.clone(),
+                    if entry.required {
+                        "yes".to_string()
+                    } else {
+                        "-".to_string()
+                    },
+                    if entry.secret {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                    entry.description.clone(),
+                ]
+            })
+            .collect();
+        println!();
+        print!(
+            "{}",
+            render_table(&["ENV", "REQUIRED", "SECRET", "DESCRIPTION"], &rows)
+        );
+    }
+    if detail
+        .defaults
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+    {
+        println!();
+        println!("defaults:");
+        let text = serde_yaml::to_string(&detail.defaults)
+            .map_err(|err| CliError::Decode(err.to_string()))?;
+        print!("{text}");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

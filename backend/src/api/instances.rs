@@ -18,7 +18,7 @@ use crate::models::{
     validate_env_key, validate_env_raw_value, validate_instance_id, validate_mem_limit,
     validate_model, validate_notes, validate_secret_value, validate_share_name, ChannelKind,
     ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvInput,
-    EnvVarInput, HealPolicy, Health, InstanceDetail, InstanceSpec, InstanceSummary,
+    EnvSuggestion, EnvVarInput, HealPolicy, Health, InstanceDetail, InstanceSpec, InstanceSummary,
     PatchInstanceRequest, ShareRef, Status, TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT,
     DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
     DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
@@ -1674,6 +1674,17 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         .map_err(|message| ApiError::bad_request("invalid_template", message))?;
     let template = render::load_template(&state.cfg, &template_id).map_err(ApiError::from)?;
 
+    let schema = template.env_schema();
+    let schema_secret: BTreeMap<&str, bool> = schema
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry.secret))
+        .collect();
+    let env_vars = request
+        .env
+        .clone()
+        .map(EnvInput::into_vars)
+        .unwrap_or_default();
+
     let model = match request.model.as_deref() {
         Some(value) => {
             let value = value.trim();
@@ -1687,7 +1698,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     };
 
     // A reusable provider supplies the default endpoint and variable name; an
-    // explicit request value always wins.
+    // explicit request value always wins, then the template defaults.
     let provider = resolve_provider(state, request.provider.as_deref())?;
     let base_url = request
         .base_url
@@ -1696,6 +1707,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| provider.as_ref().map(|entry| entry.base_url.clone()))
+        .or_else(|| template.defaults.base_url.clone())
         .ok_or_else(|| ApiError::bad_request("invalid_base_url", "base_url is required"))?;
     validate_base_url(&base_url)
         .map_err(|message| ApiError::bad_request("invalid_base_url", message))?;
@@ -1711,22 +1723,93 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     validate_api_key_env(&api_key_env)
         .map_err(|message| ApiError::bad_request("invalid_api_key_env", message))?;
 
-    let (channel, channel_token) = normalize_channel(request.channel.as_ref())?;
+    // Without an explicit `channel` the template metadata decides; a template
+    // saved from an instance therefore recreates the same platform.
+    let (channel, channel_token) = match request.channel.as_ref() {
+        Some(_) => normalize_channel(request.channel.as_ref())?,
+        None => (
+            template
+                .meta
+                .channel
+                .as_deref()
+                .and_then(ChannelKind::parse)
+                .unwrap_or(ChannelKind::None),
+            None,
+        ),
+    };
+
+    // Every `required` entry of the template schema must be supplied by the
+    // request itself (or by one of the token fields).
+    let mut provided: BTreeSet<&str> = env_vars.iter().map(|var| var.key.as_str()).collect();
+    if request
+        .gate_token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|token| !token.is_empty())
+    {
+        provided.insert(DEFAULT_API_KEY_ENV);
+        provided.insert(api_key_env.as_str());
+    }
+    if provider.is_some() {
+        provided.insert(api_key_env.as_str());
+    }
+    if channel_token.is_some() {
+        if let Some(env) = channel.token_env() {
+            provided.insert(env);
+        }
+    }
+    // Built-ins keep the #27 behaviour: a missing allowlist is a warning, not
+    // a creation error. Only the `required` keys declared by a custom layer of
+    // the chain are enforced.
+    {
+        let missing: Vec<serde_json::Value> = template
+            .enforced_required
+            .iter()
+            .filter(|key| !provided.contains(key.as_str()))
+            .map(|key| serde_json::json!({ "key": key, "field": "env" }))
+            .collect();
+        if !missing.is_empty() {
+            let keys: Vec<&str> = template
+                .enforced_required
+                .iter()
+                .filter(|key| !provided.contains(key.as_str()))
+                .map(|key| key.as_str())
+                .collect();
+            return Err(ApiError::bad_request(
+                "missing_required_env",
+                format!(
+                    "template \"{}\" requires environment variable(s): {}",
+                    template.id,
+                    keys.join(", ")
+                ),
+            )
+            .with_details(serde_json::json!(missing)));
+        }
+    }
 
     let shares = match &request.shares {
         Some(shares) => validate_share_refs(state, shares)?,
         None => Vec::new(),
     };
 
-    let mem_limit_mb = request.mem_limit_mb.unwrap_or(DEFAULT_MEM_LIMIT_MB);
+    let mem_limit_mb = request
+        .mem_limit_mb
+        .or(template.defaults.mem_limit_mb)
+        .unwrap_or(DEFAULT_MEM_LIMIT_MB);
     validate_mem_limit(mem_limit_mb)
         .map_err(|message| ApiError::bad_request("invalid_mem_limit", message))?;
 
-    let cpu_limit = request.cpu_limit.unwrap_or(DEFAULT_CPU_LIMIT);
+    let cpu_limit = request
+        .cpu_limit
+        .or(template.defaults.cpu_limit)
+        .unwrap_or(DEFAULT_CPU_LIMIT);
     validate_cpu_limit(cpu_limit)
         .map_err(|message| ApiError::bad_request("invalid_cpu_limit", message))?;
 
-    let allow_lan = request.allow_lan.unwrap_or(false);
+    let allow_lan = request
+        .allow_lan
+        .or(template.defaults.allow_lan)
+        .unwrap_or(false);
 
     let name = request
         .name
@@ -1742,24 +1825,33 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         ));
     }
 
-    let notes = request.notes.clone().unwrap_or_default();
+    let notes = request
+        .notes
+        .clone()
+        .or_else(|| template.defaults.notes.clone())
+        .unwrap_or_default();
     validate_notes(&notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
 
-    let env_vars = request
-        .env
-        .clone()
-        .map(EnvInput::into_vars)
-        .unwrap_or_default();
-    let env: Vec<EnvWrite> = validate_env_inputs(&env_vars, true, true)?
+    let env: Vec<EnvWrite> = validate_env_inputs(&env_vars, true, true, Some(&schema))?
         .into_iter()
-        .map(|var| EnvWrite {
-            key: var.key,
-            value: var.value.unwrap_or_default(),
-            secret: var.secret.unwrap_or(false),
+        .map(|var| {
+            // The template schema decides the storage shape unless the request
+            // says otherwise.
+            let secret = var.secret.unwrap_or_else(|| {
+                schema_secret
+                    .get(var.key.as_str())
+                    .copied()
+                    .unwrap_or(false)
+            });
+            EnvWrite {
+                key: var.key,
+                value: var.value.unwrap_or_default(),
+                secret,
+            }
         })
         .collect();
     checks::validate_values(
-        template.meta.env.as_deref().unwrap_or_default(),
+        &schema,
         env.iter()
             .map(|entry| (entry.key.as_str(), entry.value.as_str())),
     )
@@ -2009,6 +2101,7 @@ fn validate_env_inputs(
     vars: &[EnvVarInput],
     require_value: bool,
     require_secret: bool,
+    schema: Option<&[EnvSuggestion]>,
 ) -> Result<Vec<ParsedEnv>, ApiError> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::with_capacity(vars.len());
@@ -2032,7 +2125,10 @@ fn validate_env_inputs(
             }
             None => {}
         }
-        if require_secret && var.secret.is_none() {
+        if require_secret
+            && var.secret.is_none()
+            && !schema.is_some_and(|entries| entries.iter().any(|entry| entry.key == var.key))
+        {
             return Err(ApiError::bad_request(
                 "invalid_env",
                 format!(
@@ -2059,7 +2155,7 @@ fn resolve_full_env(
     existing: &[envs::EnvValue],
     vars: &[EnvVarInput],
 ) -> Result<Vec<EnvWrite>, ApiError> {
-    let parsed = validate_env_inputs(vars, false, true)?;
+    let parsed = validate_env_inputs(vars, false, true, None)?;
     let mut entries = Vec::with_capacity(parsed.len());
     for var in parsed {
         let secret = var.secret.unwrap_or(false);
@@ -2112,7 +2208,7 @@ fn apply_env_merge(
     let Some(vars) = vars else {
         return Ok(());
     };
-    let parsed = validate_env_inputs(vars, false, false)?;
+    let parsed = validate_env_inputs(vars, false, false, None)?;
     for var in parsed {
         match var.value {
             None => {
@@ -2281,6 +2377,9 @@ fn clone_template(state: &AppState, source: &InstanceSpec) -> Result<TemplateSou
                 config_yaml,
                 soul_md,
                 meta: TemplateMeta::default(),
+                defaults: crate::models::TemplateDefaults::default(),
+                read_only: false,
+                enforced_required: Vec::new(),
             })
         }
         Err(err) => Err(ApiError::from(err)),

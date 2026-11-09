@@ -568,6 +568,34 @@ ALTER TABLE audit_log ADD COLUMN request_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action);
 "#,
+    // v23 — versioned custom templates (issue #43). The files stay on disk
+    // under `templates/<id>/` (source of truth); this is the index rebuilt at
+    // startup plus the history of every create/update/delete/restore.
+    r#"
+CREATE TABLE IF NOT EXISTS templates (
+    id              TEXT PRIMARY KEY NOT NULL,
+    parent          TEXT,
+    read_only       INTEGER NOT NULL DEFAULT 0,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    source_instance TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS template_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    snapshot    TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    action      TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_template_versions_version
+    ON template_versions (template_id, version);
+CREATE INDEX IF NOT EXISTS idx_templates_parent ON templates (parent);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

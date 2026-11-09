@@ -129,6 +129,14 @@ fn app(state: MockState) -> Router {
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
         .route("/api/health", get(health))
         .route("/api/auth/me", get(me))
+        .route("/api/templates", get(list_templates).post(create_template))
+        .route(
+            "/api/templates/{id}",
+            get(get_template).delete(delete_template),
+        )
+        .route("/api/templates/{id}/versions", get(template_versions))
+        .route("/api/templates/{id}/restore", post(restore_template))
+        .route("/api/templates/from-instance", post(create_template))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, record))
 }
@@ -413,6 +421,73 @@ async fn acl_put(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value>
 
 async fn acl_rm(Path((_id, _subject)): Path<(String, String)>) -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+fn template_info(id: &str, name: &str, parent: Option<&str>, read_only: bool) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "description": format!("{name} template"),
+        "default_model": "deepseek-v4.1-flash",
+        "channel": "telegram",
+        "env": [{
+            "key": "TELEGRAM_ALLOWED_USERS",
+            "description": "Allowed ids",
+            "required": false,
+            "secret": false
+        }],
+        "parent": parent,
+        "read_only": read_only,
+        "defaults": {},
+        "instances_count": 0,
+        "created_at": "2026-11-09T01:00:00Z",
+        "updated_at": "2026-11-09T01:00:00Z"
+    })
+}
+
+fn template_detail(id: &str, name: &str, parent: Option<&str>) -> Value {
+    let mut detail = template_info(id, name, parent, false);
+    detail["config_yaml"] = json!("model:\n  default: x\n");
+    detail["soul_md"] = json!("# Agent\n");
+    detail["versions_count"] = json!(2);
+    detail
+}
+
+async fn list_templates() -> Json<Value> {
+    Json(json!([
+        template_info("guest", "Guest", None, true),
+        template_info("house", "House", Some("guest"), false)
+    ]))
+}
+
+async fn get_template(Path(id): Path<String>) -> Json<Value> {
+    Json(template_detail(&id, "House", Some("guest")))
+}
+
+async fn create_template(Json(body): Json<Value>) -> Response {
+    let id = body["id"].as_str().unwrap_or("house");
+    (
+        StatusCode::CREATED,
+        Json(template_detail(id, "House", body["parent"].as_str())),
+    )
+        .into_response()
+}
+
+async fn delete_template(Path(_id): Path<String>) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn template_versions(Path(_id): Path<String>) -> Json<Value> {
+    Json(json!([
+        {"version": 1, "action": "create", "actor": "admin",
+         "at": "2026-11-09T01:00:00Z", "sha256": {}},
+        {"version": 2, "action": "update", "actor": "admin",
+         "at": "2026-11-09T02:00:00Z", "sha256": {}}
+    ]))
+}
+
+async fn restore_template(Path(_id): Path<String>, Json(_body): Json<Value>) -> Json<Value> {
+    Json(template_detail("house", "House", Some("guest")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,4 +1146,133 @@ async fn acl_json_prints_the_payload() {
     let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
     assert_eq!(value["instance"], "alice");
     assert_eq!(value["acl"].as_array().expect("acl").len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Templates (issue #43)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn templates_print_a_table_and_the_json_payload() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["templates"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("READ-ONLY"), "{text}");
+    assert!(text.contains("guest"), "{text}");
+    assert!(text.contains("house"), "{text}");
+
+    let output = run_against(&server, home.path(), &["--json", "templates"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value.as_array().expect("array").len(), 2);
+}
+
+#[tokio::test]
+async fn template_get_prints_the_env_schema_and_defaults() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["template", "get", "house"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("House (house)"), "{text}");
+    assert!(text.contains("parent: guest"), "{text}");
+    assert!(text.contains("TELEGRAM_ALLOWED_USERS"), "{text}");
+    assert!(text.contains("versions: 2"), "{text}");
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "template", "get", "house"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["id"], "house");
+    assert_eq!(value["config_yaml"], "model:\n  default: x\n");
+}
+
+#[tokio::test]
+async fn template_create_sends_a_yaml_file_or_flags() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let definition = home.path().join("template.yaml");
+    std::fs::write(
+        &definition,
+        "id: house\nname: House\nparent: guest\nenv:\n  - key: HOUSE_FLAG\n    required: true\n",
+    )
+    .expect("definition");
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "template",
+            "create",
+            "-f",
+            definition.to_str().expect("utf-8"),
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = server.request("POST", "/api/templates").body.expect("body");
+    assert_eq!(body["id"], "house");
+    assert_eq!(body["parent"], "guest");
+    assert_eq!(body["env"][0]["key"], "HOUSE_FLAG");
+    assert_eq!(body["env"][0]["required"], true);
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "template",
+            "create",
+            "--id",
+            "second",
+            "--parent",
+            "guest",
+            "--channel",
+            "none",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let requests = server.requests();
+    let created = requests
+        .iter()
+        .rev()
+        .find(|record| record.method == "POST" && record.path == "/api/templates")
+        .expect("second create");
+    let body = created.body.as_ref().expect("body");
+    assert_eq!(body["id"], "second");
+    assert_eq!(body["channel"], "none");
+}
+
+#[tokio::test]
+async fn template_versions_restore_and_remove_are_scriptable() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["template", "versions", "house"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("VERSION"), "{}", stdout(&output));
+
+    let output = run_against(&server, home.path(), &["template", "restore", "house", "1"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("House (house)"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = run_against(&server, home.path(), &["template", "rm", "house"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("template house deleted"),
+        "{}",
+        stdout(&output)
+    );
 }

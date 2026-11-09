@@ -39,6 +39,7 @@ pub mod secrets;
 pub mod security;
 pub mod snapshots;
 pub mod store;
+pub mod templates;
 pub mod templates_builtin;
 pub mod watchdog;
 pub mod webhooks;

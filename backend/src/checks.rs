@@ -78,6 +78,13 @@ pub fn template_info(cfg: &Config, spec: &InstanceSpec) -> TemplateInfo {
                     .channel
                     .unwrap_or_else(|| spec.channel.as_str().to_string()),
                 env: meta.env.unwrap_or_default(),
+                parent: meta.parent,
+                read_only: template.read_only,
+                defaults: template.defaults,
+                source_instance: meta.source_instance,
+                instances_count: 0,
+                created_at: String::new(),
+                updated_at: String::new(),
             }
         }
         Err(_) => TemplateInfo {
@@ -87,6 +94,13 @@ pub fn template_info(cfg: &Config, spec: &InstanceSpec) -> TemplateInfo {
             default_model: spec.model.clone(),
             channel: spec.channel.as_str().to_string(),
             env: Vec::new(),
+            parent: None,
+            read_only: false,
+            defaults: crate::models::TemplateDefaults::default(),
+            source_instance: None,
+            instances_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
         },
     }
 }
@@ -240,6 +254,13 @@ mod tests {
             default_model: "deepseek-v4.1-flash".to_string(),
             channel: "discord".to_string(),
             env,
+            parent: None,
+            read_only: true,
+            defaults: crate::models::TemplateDefaults::default(),
+            source_instance: None,
+            instances_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
         }
     }
 

@@ -5416,3 +5416,468 @@ async fn memory_is_written_searched_and_rolled_back() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+// ---------------------------------------------------------------------------
+// Custom templates (issue #43)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn custom_templates_live_on_disk_and_inherit_their_parent() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({
+                "id": "house",
+                "name": "House",
+                "description": "Our house template",
+                "parent": "guest",
+                "env": [{
+                    "key": "HOUSE_FLAG",
+                    "description": "House switch",
+                    "example": "1",
+                    "format": "boolean",
+                    "required": false,
+                    "secret": false
+                }],
+                "defaults": {
+                    "mem_limit_mb": 2048,
+                    "cpu_limit": 2.0,
+                    "notes": "house policy",
+                    "allow_lan": false
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let detail = parse(&body);
+    assert_eq!(detail["id"], "house");
+    assert_eq!(detail["parent"], "guest");
+    assert_eq!(detail["read_only"], false);
+    assert_eq!(detail["defaults"]["mem_limit_mb"], 2048);
+    assert_eq!(detail["defaults"]["cpu_limit"], 2.0);
+    assert_eq!(detail["versions_count"], 1);
+    let env = detail["env"].as_array().expect("env");
+    assert!(env
+        .iter()
+        .any(|entry| entry["key"] == "HOUSE_FLAG" && entry["required"] == false));
+    // The inherited guest entries are part of the resolved schema.
+    assert!(env
+        .iter()
+        .any(|entry| entry["key"] == "TELEGRAM_ALLOWED_USERS"));
+
+    let dir = harness.root().join("templates/house");
+    let meta = read_yaml(&dir.join("template.yaml"));
+    assert_eq!(meta["parent"], "guest");
+    assert_eq!(meta["name"], "House");
+    assert!(
+        !dir.join("config.yaml").exists(),
+        "a child keeps inheriting the parent config instead of copying it"
+    );
+    assert!(!dir.join("soul.md").exists());
+    let defaults = read_yaml(&dir.join("defaults.yaml"));
+    assert_eq!(defaults["mem_limit_mb"], 2048);
+
+    let (status, body) = harness.request(Method::GET, "/api/templates", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let templates = parse(&body);
+    let house = templates
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|template| template["id"] == "house")
+        .expect("house template");
+    assert_eq!(house["parent"], "guest");
+    assert_eq!(house["instances_count"], 0);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/templates/house", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    assert!(detail["config_yaml"]
+        .as_str()
+        .expect("config")
+        .contains("fleett built-in template: guest"));
+    assert!(detail["soul_md"]
+        .as_str()
+        .expect("soul")
+        .contains("{{AGENT_NAME}}"));
+}
+
+#[tokio::test]
+async fn template_defaults_and_required_env_drive_instance_creation() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({
+                "id": "house",
+                "parent": "guest",
+                "env": [{
+                    "key": "HOUSE_FLAG",
+                    "description": "Required switch",
+                    "required": true,
+                    "secret": true
+                }],
+                "defaults": {
+                    "mem_limit_mb": 2048,
+                    "cpu_limit": 2.0,
+                    "notes": "house policy"
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A missing required variable is a 400 carrying the key and the field.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances",
+            Some(json!({
+                "id": "villa",
+                "template": "house",
+                "model": MODEL,
+                "base_url": BASE_URL,
+                "gate_token": "gate-secret"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = parse(&body);
+    assert_eq!(error["error"]["code"], "missing_required_env");
+    let details = error["error"]["details"].as_array().expect("details");
+    assert_eq!(details[0]["key"], "HOUSE_FLAG");
+    assert_eq!(details[0]["field"], "env");
+
+    // Supplied without a `secret` flag: the template schema decides (secret).
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances",
+            Some(json!({
+                "id": "villa",
+                "template": "house",
+                "model": MODEL,
+                "base_url": BASE_URL,
+                "gate_token": "gate-secret",
+                "env": [{"key": "HOUSE_FLAG", "value": "on"}]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let detail = parse(&body);
+    assert_eq!(detail["mem_limit_mb"], 2048);
+    assert_eq!(detail["cpu_limit"], 2.0);
+    assert_eq!(detail["notes"], "house policy");
+    // The template metadata supplied the platform; no channel was requested.
+    assert_eq!(detail["channel"], "telegram");
+    let flag = detail["env"]
+        .as_array()
+        .expect("env")
+        .iter()
+        .find(|entry| entry["key"] == "HOUSE_FLAG")
+        .expect("flag");
+    assert_eq!(flag["secret"], true);
+    assert!(flag.get("value").is_none(), "secret values never come back");
+    assert_eq!(
+        harness
+            .instance_secrets("villa")
+            .get("HOUSE_FLAG")
+            .map(String::as_str),
+        Some("on")
+    );
+
+    let config = read_yaml(&harness.instance_dir("villa").join("data/config.yaml"));
+    assert_eq!(
+        config["platforms"]["telegram"]["enabled"].as_bool(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn template_inheritance_is_live_and_cycles_are_refused() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({
+                "id": "base",
+                "name": "Base",
+                "channel": "none",
+                "env": [
+                    {"key": "SHARED", "description": "base", "required": false, "secret": false},
+                    {"key": "BASE_ONLY", "description": "base only", "required": false, "secret": false}
+                ]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({
+                "id": "child",
+                "name": "Child",
+                "parent": "base",
+                "env": [{"key": "SHARED", "description": "child", "required": true, "secret": false}]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/templates/child", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    let env = detail["env"].as_array().expect("env");
+    let keys: Vec<&str> = env
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
+    assert_eq!(keys, ["SHARED", "BASE_ONLY"]);
+    assert_eq!(env[0]["description"], "child");
+    assert_eq!(env[0]["required"], true);
+
+    // base -> child -> base would be a cycle.
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/templates/base",
+            Some(json!({"parent": "child"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "template_cycle");
+
+    // A self-parent is refused too.
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/templates/base",
+            Some(json!({"parent": "base"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "template_cycle");
+}
+
+#[tokio::test]
+async fn deleting_a_template_in_use_is_a_409_and_builtins_are_read_only() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({"id": "house", "parent": "solo", "defaults": {"mem_limit_mb": 512}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances",
+            Some(json!({
+                "id": "villa",
+                "template": "house",
+                "model": MODEL,
+                "base_url": BASE_URL,
+                "gate_token": "gate-secret"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(parse(&body)["mem_limit_mb"], 512);
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/templates/house", None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = parse(&body);
+    assert_eq!(error["error"]["code"], "template_in_use");
+    assert_eq!(error["error"]["details"]["instances"], json!(["villa"]));
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/templates/guest", None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "read_only");
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/villa", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/templates/house", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!harness.root().join("templates/house").exists());
+    let (status, _) = harness
+        .request(Method::GET, "/api/templates/house", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn from_instance_copies_the_config_the_soul_and_the_limits() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances",
+            Some(json!({
+                "id": "alice",
+                "name": "Alice",
+                "template": "solo",
+                "model": MODEL,
+                "base_url": BASE_URL,
+                "channel": {"type": "none"},
+                "mem_limit_mb": 1024,
+                "cpu_limit": 1.5,
+                "notes": "source instance",
+                "gate_token": "gate-secret",
+                "env": [{"key": "EXTRA_FLAG", "value": "1", "secret": false}]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    std::fs::write(
+        harness.instance_dir("alice").join("data/SOUL.md"),
+        "# Alice\n\nYou are the source agent.\n",
+    )
+    .expect("write soul");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates/from-instance",
+            Some(json!({"instance_id": "alice", "id": "alice-copy", "name": "Alice copy"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let detail = parse(&body);
+    assert_eq!(detail["id"], "alice-copy");
+    assert_eq!(detail["name"], "Alice copy");
+    assert_eq!(detail["source_instance"], "alice");
+    assert_eq!(detail["defaults"]["mem_limit_mb"], 1024);
+    assert_eq!(detail["defaults"]["cpu_limit"], 1.5);
+    assert_eq!(detail["defaults"]["notes"], "source instance");
+    assert_eq!(detail["parent"], Value::Null);
+    let env = detail["env"].as_array().expect("env");
+    assert!(env
+        .iter()
+        .any(|entry| entry["key"] == "EXTRA_FLAG" && entry["secret"] == false));
+    assert!(env
+        .iter()
+        .any(|entry| entry["key"] == "HERMES_GATE_PROFILE_TOKEN" && entry["secret"] == true));
+
+    let template_dir = harness.root().join("templates/alice-copy");
+    assert_eq!(
+        std::fs::read_to_string(template_dir.join("config.yaml")).expect("config"),
+        std::fs::read_to_string(harness.instance_dir("alice").join("data/config.yaml"))
+            .expect("source config")
+    );
+    assert_eq!(
+        std::fs::read_to_string(template_dir.join("soul.md")).expect("soul"),
+        "# Alice\n\nYou are the source agent.\n"
+    );
+
+    // The saved template recreates the same limits and starting SOUL.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances",
+            Some(json!({
+                "id": "bob",
+                "template": "alice-copy",
+                "gate_token": "gate-secret"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let detail = parse(&body);
+    assert_eq!(detail["mem_limit_mb"], 1024);
+    assert_eq!(detail["cpu_limit"], 1.5);
+    assert_eq!(
+        std::fs::read_to_string(harness.instance_dir("bob").join("data/SOUL.md"))
+            .expect("bob soul"),
+        "# Alice\n\nYou are the source agent.\n"
+    );
+}
+
+#[tokio::test]
+async fn template_versions_are_listed_and_restorable() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates",
+            Some(json!({
+                "id": "house",
+                "name": "House",
+                "channel": "none",
+                "soul_md": "# House one\n"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/templates/house",
+            Some(json!({"name": "Renamed", "soul_md": "# House two\n"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["name"], "Renamed");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/templates/house/versions", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let versions = parse(&body);
+    let versions = versions.as_array().expect("versions");
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["action"], "create");
+    assert_eq!(versions[1]["action"], "update");
+    assert_eq!(
+        versions[0]["sha256"]["soul.md"].as_str().map(str::len),
+        Some(64)
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates/house/restore",
+            Some(json!({"version": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    assert_eq!(detail["name"], "House");
+    assert_eq!(detail["soul_md"], "# House one\n");
+    assert_eq!(detail["versions_count"], 3);
+    assert_eq!(
+        std::fs::read_to_string(harness.root().join("templates/house/soul.md")).expect("soul"),
+        "# House one\n"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/templates/house/restore",
+            Some(json!({"version": 99})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

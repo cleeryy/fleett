@@ -282,7 +282,7 @@ never a value.
 }
 ```
 
-A custom template can declare its own list in `templates/<id>/template.yaml`.
+A custom template declares its own list in `templates/<id>/template.yaml`.
 The three new fields are optional, so a `template.yaml` written for an older
 release still parses (`required` defaults to `false`, `format` and `example` to
 `null`):
@@ -291,11 +291,17 @@ release still parses (`required` defaults to `false`, `format` and `example` to
 env:
   - key: DISCORD_ALLOWED_USERS
     description: Comma-separated Discord user ids allowed to talk to the agent.
-    secret: false
-    example: "274575374111866880"
+    example: "123456789,987654321"
     required: true
     format: csv-of-ids
+    secret: false
 ```
+
+`required: true` makes `POST /api/instances` fail with
+`400 missing_required_env` (`details: [{"key":"…","field":"env"}]`) until the
+variable is supplied; `secret` defaults to `false` and a request that omits the
+flag follows the schema. The parent template's entries are merged by key. See
+[TEMPLATES.md](TEMPLATES.md) for the full schema and inheritance rules.
 
 All built-in suggestions are non-secret: they are allowlists, not credentials.
 
