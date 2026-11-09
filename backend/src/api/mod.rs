@@ -8,6 +8,7 @@ pub mod bus;
 pub mod cost;
 pub mod deployments;
 pub mod desired_state;
+pub mod doctor;
 pub mod egress;
 pub mod error;
 pub mod exec;
@@ -297,6 +298,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/skills/{name}/git/log", get(skills::log))
         .route("/skills/{name}/git/diff", get(skills::diff))
         .route("/security/status", get(security::status))
+        .route("/doctor", get(doctor::doctor))
+        .route("/onboarding", get(doctor::onboarding))
         .route("/usage/ingest", post(cost::ingest))
         .route("/cost", get(cost::report))
         .route("/cost/budgets", get(cost::budgets))

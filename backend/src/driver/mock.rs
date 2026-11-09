@@ -12,7 +12,7 @@ use crate::config::DEFAULT_IMAGE;
 use crate::hosts::HostCapacity;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -88,6 +88,8 @@ pub struct MockDriver {
     usage_failures: Mutex<HashMap<String, String>>,
     /// `up` sleeps this long, so the upgrade tests can observe concurrency.
     up_delay: Mutex<Option<Duration>>,
+    /// `ping` answers `false` while set (`set_engine_down`).
+    engine_down: AtomicBool,
     in_flight_ups: AtomicUsize,
     max_in_flight_ups: AtomicUsize,
     /// Every `exec` call, oldest first.
@@ -139,6 +141,7 @@ impl MockDriver {
             host_probes: Mutex::new(Vec::new()),
             usage_failures: Mutex::new(HashMap::new()),
             up_delay: Mutex::new(None),
+            engine_down: AtomicBool::new(false),
             in_flight_ups: AtomicUsize::new(0),
             max_in_flight_ups: AtomicUsize::new(0),
             exec_calls: Mutex::new(Vec::new()),
@@ -344,6 +347,12 @@ impl MockDriver {
         lock(&self.failures).clear();
     }
 
+    /// Simulate an unreachable Docker engine: `ping` answers `false`, which is
+    /// what the health endpoint and the doctor checklist display.
+    pub fn set_engine_down(&self, down: bool) {
+        self.engine_down.store(down, Ordering::SeqCst);
+    }
+
     /// Force a status without going through an operation (test helper).
     pub fn force_status(&self, id: &str, status: Status) {
         let mut state = lock(&self.state);
@@ -490,7 +499,7 @@ impl Driver for MockDriver {
     }
 
     fn ping(&self) -> DriverFuture<'_, bool> {
-        Box::pin(async move { true })
+        Box::pin(async move { !self.engine_down.load(Ordering::SeqCst) })
     }
 
     fn ensure_network<'a>(
