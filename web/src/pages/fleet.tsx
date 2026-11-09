@@ -15,11 +15,13 @@ import {
   Send,
   Square,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
 import type { InstanceDetail, InstanceSummary } from "@/api/types";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -148,6 +150,10 @@ export function FleetPage() {
   const searchRef = useRef<HTMLInputElement>(null);
 
   const list = useResource(() => api.listInstances(), [nonce]);
+  const openIncidents = useResource(
+    () => api.listIncidents({ status: "open", limit: 100 }),
+    [nonce],
+  );
 
   useEffect(() => {
     persisted.q = q;
@@ -312,6 +318,28 @@ export function FleetPage() {
 
       {actionError ? <ErrorAlert error={actionError} /> : null}
       {list.error ? <ErrorAlert error={list.error} onRetry={list.reload} /> : null}
+
+      {(openIncidents.data?.length ?? 0) > 0 ? (
+        <Alert className="border-destructive/40 bg-destructive/5">
+          <TriangleAlert aria-hidden className="text-destructive" />
+          <AlertTitle>
+            {openIncidents.data?.length} open{" "}
+            {openIncidents.data?.length === 1 ? "incident" : "incidents"}
+          </AlertTitle>
+          <AlertDescription>
+            <p>
+              Affected:{" "}
+              <span className="font-mono">
+                {[...new Set((openIncidents.data ?? []).map((incident) => incident.instance_id))].join(", ")}
+              </span>
+              .
+            </p>
+            <a href="#/incidents" className="mt-1 text-sm font-medium underline-offset-4 hover:underline">
+              Open the incident list
+            </a>
+          </AlertDescription>
+        </Alert>
+      ) : null}
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="relative w-full sm:max-w-xs">

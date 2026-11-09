@@ -1,18 +1,38 @@
 import { ApiError } from "./errors";
 import type {
   AckMessageResult,
+  AclItem,
+  AclItemInput,
   AuditEntry,
   AuthConfig,
   AuthMode,
+  BudgetInput,
+  BudgetStatus,
+  BudgetView,
   ChannelType,
   CloneInstanceInput,
   CommitInfo,
+  CostGroup,
+  CostGroupBy,
+  CostReport,
+  CostReportParams,
+  CostTotals,
   CreateInstanceInput,
   CreateMemoryInput,
+  CreatePipelineInput,
   CreateProviderInput,
+  CreateScheduleInput,
+  CreateSnapshotInput,
   CreateTokenInput,
   CreatedToken,
+  Deployment,
+  DeploymentStatus,
+  EgressPolicyInput,
+  EgressPolicyView,
+  EgressTestResult,
   EnvInput,
+  ExecInput,
+  ExecResult,
   FileContent,
   FileEntry,
   FleetApi,
@@ -21,15 +41,28 @@ import type {
   GitLog,
   GitLogOptions,
   GitStatus,
+  HealPolicyInput,
+  HealPolicyView,
   Health,
   Identity,
+  Incident,
+  InstanceAcl,
   InstanceDetail,
   InstanceMessagesParams,
   InstanceStatus,
   InstanceSummary,
   LifecycleResult,
+  ListIncidentsParams,
   ListMemoryParams,
   ListMessagesParams,
+  LogEntry,
+  LogExportFormat,
+  LogLevel,
+  LogQueryParams,
+  LogSearchResponse,
+  MaintenanceStatus,
+  MaintenanceWindow,
+  MaintenanceWindowInput,
   MemoryEntry,
   MemoryVersion,
   Message,
@@ -38,20 +71,36 @@ import type {
   MessageStatus,
   MkdirResult,
   PatchInstanceInput,
+  PatchPipelineInput,
   PatchProviderInput,
+  PatchScheduleInput,
+  Pipeline,
+  PipelineRun,
+  PipelineRunDetail,
+  PipelineStep,
+  PipelineStepRun,
+  Pricing,
+  PricingInput,
   ProviderDetail,
   ProviderRestart,
   ProviderRotateResult,
   ProviderSummary,
   ProviderTestResult,
   PurgeResult,
+  RestoreReport,
   RevertInput,
   RevertResult,
   Role,
+  Schedule,
+  ScheduleRun,
+  ScheduleView,
   SearchMemoryParams,
+  SecurityStatus,
   SendMessageInput,
   Share,
   ShareMode,
+  Snapshot,
+  SnapshotDiff,
   Template,
   TokenInfo,
   UpdateMemoryInput,
@@ -219,6 +268,38 @@ const deletedMemory = new Set<number>();
 /** Append-only history, keyed by memory entry id, newest version first. */
 const memoryHistory = new Map<number, MemoryVersion[]>();
 let memorySequence = 1;
+
+/* Operation stores (schedules, pipelines, incidents, cost, logs). */
+interface MockSchedule {
+  schedule: Schedule;
+  runs: ScheduleRun[];
+}
+let scheduleStore: MockSchedule[] = [];
+interface MockPipeline {
+  pipeline: Pipeline;
+  runs: PipelineRunDetail[];
+}
+let pipelineStore: MockPipeline[] = [];
+let incidentStore: Incident[] = [];
+let healStore: Record<string, HealPolicyView> = {};
+let budgetStore: Record<string, { monthly_usd: number; enabled: boolean; updated_at: string }> = {};
+let pricingVersions: Pricing[] = [];
+let usageEvents: {
+  instance: string;
+  model: string;
+  at: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+}[] = [];
+let logEntries: LogEntry[] = [];
+let logSequence = 5000;
+let deploymentStore: Deployment[] = [];
+let maintenanceStore: MaintenanceWindow[] = [];
+let snapshotStore: Snapshot[] = [];
+/** File digests per snapshot, kept out of the wire type. */
+const snapshotFiles = new Map<string, Record<string, { size: number; sha256: string }>>();
+let aclStore: Record<string, AclItem[]> = {};
+let egressStore: Record<string, EgressPolicyView> = {};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -468,6 +549,21 @@ function toDetail(row: Stored): InstanceDetail {
     row.status === "running" && row.started_at
       ? Math.max(0, Math.floor((Date.now() - row.started_at) / 1000))
       : 0;
+  const warnings: string[] = [];
+  if (row.allow_lan) {
+    warnings.push(
+      "LAN access is enabled: this agent can reach 10/8, 172.16/12 and 192.168/16 (egress firewall bypassed).",
+    );
+  }
+  const template = templates.find((candidate) => candidate.id === row.template);
+  for (const suggestion of template?.env ?? []) {
+    if (!suggestion.required) continue;
+    if (!envKeys(row).includes(suggestion.key)) {
+      warnings.push(
+        `${suggestion.key} is required by the ${row.template} template but is not set: the gateway may refuse every message.`,
+      );
+    }
+  }
 
   return {
     id: row.id,
@@ -496,6 +592,7 @@ function toDetail(row: Stored): InstanceDetail {
       ? { id: row.container_id, image: IMAGE, uptime_s: uptime }
       : null,
     compose_yaml: composeYaml(row),
+    warnings,
   };
 }
 
@@ -1738,34 +1835,778 @@ function seedBusAndMemory(): void {
   });
 }
 
+const DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+function mockId(prefix: string): string {
+  return `${prefix}_${randomHex(8)}`;
+}
+
+function seedRuns(
+  scheduleId: string,
+  instanceId: string,
+  count: number,
+  pattern: Array<"ok" | "error" | "timeout" | "skipped">,
+  intervalMin: number,
+  timeoutS: number,
+): ScheduleRun[] {
+  const runs: ScheduleRun[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const status = pattern[index % pattern.length];
+    const started = SEEDED_AT - (index + 1) * intervalMin * 60_000;
+    const duration =
+      status === "timeout"
+        ? timeoutS * 1000
+        : status === "skipped"
+          ? 0
+          : 850 + ((index * 617) % 2600);
+    const output =
+      status === "ok"
+        ? "gateway ask completed\nresult: 4 sessions summarized, 2 projects updated\n"
+        : status === "error"
+          ? "gateway ask failed (exit 1): upstream 429 after 3 retries\n"
+          : status === "timeout"
+            ? `command timed out after ${timeoutS}s\n`
+            : "previous run still in progress: occurrence skipped\n";
+    runs.push({
+      id: mockId("run"),
+      schedule_id: scheduleId,
+      instance_id: instanceId,
+      started_at: iso(started),
+      finished_at: iso(started + duration),
+      status,
+      exit_code: status === "ok" ? 0 : status === "error" ? 1 : null,
+      output,
+      duration_ms: status === "skipped" ? 0 : duration,
+      created_at: iso(started),
+    });
+  }
+  return runs;
+}
+
+function seedSchedule(input: {
+  instance: string;
+  name: string;
+  cron: string;
+  prompt: string;
+  enabled: boolean;
+  overlap?: "skip" | "queue";
+  timeout?: number;
+  catchup?: boolean;
+  pattern: Array<"ok" | "error" | "timeout" | "skipped">;
+  count: number;
+  intervalMin: number;
+}): MockSchedule {
+  const id = mockId("sch");
+  const timeout = input.timeout ?? 300;
+  const runs = seedRuns(id, input.instance, input.count, input.pattern, input.intervalMin, timeout);
+  const newest = runs[0];
+  return {
+    schedule: {
+      id,
+      instance_id: input.instance,
+      name: input.name,
+      cron: input.cron,
+      prompt: input.prompt,
+      enabled: input.enabled,
+      timezone: "UTC",
+      overlap: input.overlap ?? "skip",
+      timeout,
+      catchup: input.catchup ?? false,
+      last_run_at: newest?.started_at,
+      next_run_at: input.enabled
+        ? iso(SEEDED_AT + Math.max(5, Math.min(input.intervalMin / 2, 12 * 60)) * 60_000)
+        : undefined,
+      created_at: iso(SEEDED_AT - 21 * DAY),
+      updated_at: iso(SEEDED_AT - 2 * DAY),
+    },
+    runs,
+  };
+}
+
+function scheduleView(entry: MockSchedule): ScheduleView {
+  const failures = entry.runs.filter(
+    (run) => run.status === "error" || run.status === "timeout",
+  ).length;
+  const counted = entry.runs.filter((run) => run.status !== "skipped" && run.status !== "running").length;
+  return {
+    ...entry.schedule,
+    last_run: entry.runs[0] ?? null,
+    runs_total: entry.runs.length,
+    runs_failed: failures,
+    failure_rate: counted === 0 ? 0 : failures / counted,
+  };
+}
+
+function stepRun(
+  runId: string,
+  stepId: string,
+  instance: string,
+  status: "pending" | "running" | "ok" | "failed" | "skipped",
+  output: string | null,
+  error: string | null,
+  sequence: number,
+  startedAt: number | null,
+): PipelineStepRun {
+  return {
+    id: sequence,
+    run_id: runId,
+    step_id: stepId,
+    instance_id: instance,
+    status,
+    attempt: 1,
+    ...(output === null ? {} : { output }),
+    ...(error === null ? {} : { error }),
+    ...(startedAt === null ? {} : { started_at: iso(startedAt), finished_at: iso(startedAt + 42_000) }),
+  };
+}
+
+function seedOperations(): void {
+  scheduleStore = [
+    seedSchedule({
+      instance: "alice",
+      name: "morning-digest",
+      cron: "0 7 * * *",
+      prompt: "Summarize yesterday's conversations and send one digest per project.",
+      enabled: true,
+      pattern: ["ok", "ok", "ok", "error", "ok", "ok", "skipped"],
+      count: 14,
+      intervalMin: 1_440,
+    }),
+    seedSchedule({
+      instance: "ops",
+      name: "heartbeat",
+      cron: "*/15 * * * *",
+      prompt: "Check the Proxmox cluster, OPNsense and PBS; report only anomalies.",
+      enabled: true,
+      overlap: "queue",
+      timeout: 120,
+      pattern: ["ok", "ok", "timeout", "ok", "ok", "ok"],
+      count: 20,
+      intervalMin: 15,
+    }),
+    seedSchedule({
+      instance: "margaret",
+      name: "weekly-archive",
+      cron: "0 9 * * 1",
+      prompt: "File the week's photos into the archive and report the count.",
+      enabled: false,
+      pattern: ["ok", "skipped", "ok"],
+      count: 6,
+      intervalMin: 10_080,
+    }),
+    seedSchedule({
+      instance: "workshop",
+      name: "retry-check",
+      cron: "*/30 * * * *",
+      prompt: "Retry the failed template check and print the first error.",
+      enabled: true,
+      pattern: ["error", "error", "ok", "error"],
+      count: 9,
+      intervalMin: 30,
+    }),
+  ];
+
+  const releaseSteps: PipelineStep[] = [
+    { id: "produce", instance: "alice", prompt: "Draft the release notes from the last 20 commits." },
+    {
+      id: "verify",
+      instance: "ops",
+      depends_on: ["produce"],
+      prompt: "Review this draft and answer with the corrected text only:\n{{steps.produce.output}}",
+      retries: 1,
+      timeout_s: 300,
+      on_failure: "stop",
+    },
+    { id: "publish", instance: "alice", depends_on: ["verify"], prompt: "Publish: {{steps.verify.output}}" },
+  ];
+  const releaseId = "pipe_release";
+  const releaseOkRun = "run_release_ok";
+  const releaseOk: PipelineRunDetail = {
+    id: releaseOkRun,
+    pipeline_id: releaseId,
+    status: "ok",
+    trigger: "manual",
+    context: '{"version":"0.6.0"}',
+    started_at: iso(SEEDED_AT - 5 * HOUR),
+    finished_at: iso(SEEDED_AT - 5 * HOUR + 132_000),
+    steps: [
+      stepRun(
+        releaseOkRun,
+        "produce",
+        "alice",
+        "ok",
+        "## 0.6.0\n- schedules, pipelines and incidents in the console\n- log center and cost report\n",
+        null,
+        1,
+        SEEDED_AT - 5 * HOUR,
+      ),
+      stepRun(
+        releaseOkRun,
+        "verify",
+        "ops",
+        "ok",
+        "## 0.6.0\n- operations console: schedules, pipelines, incidents\n- log center and cost report\n",
+        null,
+        2,
+        SEEDED_AT - 5 * HOUR + 45_000,
+      ),
+      stepRun(
+        releaseOkRun,
+        "publish",
+        "alice",
+        "ok",
+        "published 0.6.0 notes to the release share\n",
+        null,
+        3,
+        SEEDED_AT - 5 * HOUR + 90_000,
+      ),
+    ],
+  };
+  const releaseFailedRun = "run_release_failed";
+  const releaseFailed: PipelineRunDetail = {
+    id: releaseFailedRun,
+    pipeline_id: releaseId,
+    status: "failed",
+    trigger: "manual",
+    started_at: iso(SEEDED_AT - 2 * DAY),
+    finished_at: iso(SEEDED_AT - 2 * DAY + 61_000),
+    error: "step verify failed",
+    steps: [
+      stepRun(
+        releaseFailedRun,
+        "produce",
+        "alice",
+        "ok",
+        "draft produced\n",
+        null,
+        4,
+        SEEDED_AT - 2 * DAY,
+      ),
+      stepRun(
+        releaseFailedRun,
+        "verify",
+        "ops",
+        "failed",
+        null,
+        "gateway ask failed (exit 1): upstream 502 bad gateway",
+        5,
+        SEEDED_AT - 2 * DAY + 20_000,
+      ),
+      stepRun(releaseFailedRun, "publish", "alice", "skipped", null, null, 6, null),
+    ],
+  };
+
+  const briefSteps: PipelineStep[] = [
+    { id: "collect", instance: "ops", prompt: "Collect overnight alerts from Proxmox and OPNsense." },
+    {
+      id: "summarize",
+      instance: "alice",
+      depends_on: ["collect"],
+      prompt: "Write a three-line brief from:\n{{steps.collect.output}}",
+      on_failure: "continue",
+    },
+  ];
+  const briefId = "pipe_morning_brief";
+  const briefRun = "run_brief_ok";
+  pipelineStore = [
+    {
+      pipeline: {
+        id: releaseId,
+        name: "release",
+        trigger: "manual",
+        enabled: true,
+        steps: releaseSteps,
+        created_at: iso(SEEDED_AT - 30 * DAY),
+        updated_at: iso(SEEDED_AT - 4 * DAY),
+      },
+      runs: [releaseOk, releaseFailed],
+    },
+    {
+      pipeline: {
+        id: briefId,
+        name: "morning-brief",
+        trigger: "cron",
+        cron: "0 6 * * *",
+        enabled: true,
+        steps: briefSteps,
+        created_at: iso(SEEDED_AT - 12 * DAY),
+        updated_at: iso(SEEDED_AT - DAY),
+      },
+      runs: [
+        {
+          id: briefRun,
+          pipeline_id: briefId,
+          status: "ok",
+          trigger: "cron",
+          started_at: iso(SEEDED_AT - 4 * HOUR),
+          finished_at: iso(SEEDED_AT - 4 * HOUR + 71_000),
+          steps: [
+            stepRun(
+              briefRun,
+              "collect",
+              "ops",
+              "ok",
+              "0 alerts, 1 warning: PBS job finished 4 min late\n",
+              null,
+              7,
+              SEEDED_AT - 4 * HOUR,
+            ),
+            stepRun(
+              briefRun,
+              "summarize",
+              "alice",
+              "ok",
+              "All quiet overnight. PBS finished 4 minutes late; no failed jobs.\n",
+              null,
+              8,
+              SEEDED_AT - 4 * HOUR + 25_000,
+            ),
+          ],
+        },
+      ],
+    },
+    {
+      pipeline: {
+        id: "pipe_sandbox_smoke",
+        name: "sandbox-smoke",
+        trigger: "webhook",
+        enabled: false,
+        steps: [
+          { id: "smoke", instance: "school", prompt: "Answer with the single word: ready" },
+        ],
+        created_at: iso(SEEDED_AT - 6 * DAY),
+        updated_at: iso(SEEDED_AT - 6 * DAY),
+      },
+      runs: [],
+    },
+  ];
+
+  incidentStore = [
+    {
+      id: "inc_workshop_unhealthy",
+      instance_id: "workshop",
+      cause: "unhealthy",
+      status: "open",
+      opened_at: iso(SEEDED_AT - 47 * 60_000),
+      detail: "container health check failed for 3 consecutive sample(s) (threshold 3)",
+      actions: [
+        { at: iso(SEEDED_AT - 42 * 60_000), action: "restart", result: "ok" },
+        { at: iso(SEEDED_AT - 28 * 60_000), action: "restart", result: "error", detail: "exit code 1" },
+        {
+          at: iso(SEEDED_AT - 12 * 60_000),
+          action: "heal_exhausted",
+          result: "skipped",
+          detail: "max_restarts reached",
+        },
+      ],
+      restart_count: 2,
+      last_seen_at: iso(SEEDED_AT - 60_000),
+    },
+    {
+      id: "inc_alice_oom",
+      instance_id: "alice",
+      cause: "oom",
+      status: "closed",
+      opened_at: iso(SEEDED_AT - 2 * DAY),
+      closed_at: iso(SEEDED_AT - 2 * DAY + 9 * 60_000),
+      detail: "container was killed by the kernel OOM killer (memory limit 1536 MB)",
+      actions: [
+        {
+          at: iso(SEEDED_AT - 2 * DAY + 2 * 60_000),
+          action: "recreate",
+          result: "ok",
+          detail: "memory limit raised to 2048 MB",
+        },
+      ],
+      restart_count: 1,
+      last_seen_at: iso(SEEDED_AT - 2 * DAY + 9 * 60_000),
+    },
+    {
+      id: "inc_ops_heal",
+      instance_id: "ops",
+      cause: "heal_failed",
+      status: "closed",
+      opened_at: iso(SEEDED_AT - 6 * DAY),
+      closed_at: iso(SEEDED_AT - 6 * DAY + 22 * 60_000),
+      detail: "restart did not bring the gateway socket back within 120 s",
+      actions: [
+        { at: iso(SEEDED_AT - 6 * DAY + 2 * 60_000), action: "restart", result: "ok" },
+        { at: iso(SEEDED_AT - 6 * DAY + 5 * 60_000), action: "restart", result: "ok" },
+      ],
+      restart_count: 2,
+      last_seen_at: iso(SEEDED_AT - 6 * DAY + 22 * 60_000),
+    },
+  ];
+
+  healStore = {
+    alice: { id: "alice", heal: "restart", unhealthy_after: 3, max_restarts: 5, heal_backoff_s: 30 },
+    ops: { id: "ops", heal: "restart", unhealthy_after: 3, max_restarts: 5, heal_backoff_s: 30 },
+    workshop: { id: "workshop", heal: "recreate", unhealthy_after: 2, max_restarts: 3, heal_backoff_s: 60 },
+    margaret: { id: "margaret", heal: "off", unhealthy_after: 3, max_restarts: 5, heal_backoff_s: 30 },
+    school: { id: "school", heal: "off", unhealthy_after: 3, max_restarts: 5, heal_backoff_s: 30 },
+  };
+
+  budgetStore = {
+    alice: { monthly_usd: 25, enabled: true, updated_at: iso(SEEDED_AT - 6 * DAY) },
+    ops: { monthly_usd: 10, enabled: true, updated_at: iso(SEEDED_AT - 11 * DAY) },
+    margaret: { monthly_usd: 5, enabled: false, updated_at: iso(SEEDED_AT - 20 * DAY) },
+  };
+
+  pricingVersions = [
+    {
+      model: "deepseek-v4.1-flash",
+      input_per_mtok: 0.27,
+      output_per_mtok: 1.1,
+      currency: "USD",
+      effective_from: "2026-10-01",
+      updated_at: iso(SEEDED_AT - 30 * DAY),
+    },
+    {
+      model: "muse-spark-1.3-contributor",
+      input_per_mtok: 0.9,
+      output_per_mtok: 3.6,
+      currency: "USD",
+      effective_from: "2026-10-15",
+      updated_at: iso(SEEDED_AT - 12 * DAY),
+    },
+    {
+      model: "claude-sonnet-4-20250514",
+      input_per_mtok: 3,
+      output_per_mtok: 15,
+      currency: "USD",
+      effective_from: "2026-09-01",
+      updated_at: iso(SEEDED_AT - 40 * DAY),
+    },
+  ];
+
+  usageEvents = [];
+  const modelFor: Record<string, string> = {
+    alice: "deepseek-v4.1-flash",
+    margaret: "deepseek-v4.1-flash",
+    ops: "muse-spark-1.3-contributor",
+    school: "deepseek-v4.1-flash",
+    workshop: "claude-sonnet-4-20250514",
+  };
+  for (const row of rows) {
+    for (let day = 0; day < 10; day += 1) {
+      const events = row.id === "ops" ? 4 : 2;
+      for (let index = 0; index < events; index += 1) {
+        const seed = day * 37 + index * 11 + row.id.length * 13;
+        usageEvents.push({
+          instance: row.id,
+          model: modelFor[row.id] ?? row.model,
+          at: iso(SEEDED_AT - day * DAY - (index + 1) * HOUR),
+          prompt_tokens: 600 + ((seed * 97) % 5_400),
+          completion_tokens: 120 + ((seed * 53) % 1_800),
+        });
+      }
+    }
+  }
+
+  logEntries = [];
+  for (const row of rows) {
+    const lines = row.logs.length > 0 ? row.logs : makeLogs(row);
+    for (const line of lines) {
+      const match = /^(\S+)\s+(\w+)\s+(.*)$/.exec(line);
+      if (!match) continue;
+      logSequence += 1;
+      logEntries.push({
+        id: logSequence,
+        instance: row.id,
+        at: match[1],
+        level: (match[2].toLowerCase() === "error"
+          ? "error"
+          : match[2].toLowerCase() === "warn"
+            ? "warn"
+            : "info") as LogLevel,
+        message: match[3],
+      });
+    }
+  }
+  for (let index = 0; index < 8; index += 1) {
+    logSequence += 1;
+    logEntries.push({
+      id: logSequence,
+      instance: "ops",
+      at: iso(SEEDED_AT - (index + 1) * 7 * 60_000),
+      level: index % 3 === 0 ? "error" : index % 3 === 1 ? "warn" : "info",
+      message:
+        index % 3 === 0
+          ? "upstream 502 bad gateway while calling the model"
+          : index % 3 === 1
+            ? "PBS verify job finished 4 min late"
+            : "watchdog sample: all containers healthy",
+    });
+  }
+  const recentLines: Record<string, Array<[LogLevel, string]>> = {
+    alice: [
+      ["info", "session ses_2f4a turn started"],
+      ["info", "tool web.search ok 318ms"],
+      ["info", "message sent to telegram:81459823"],
+      ["warn", "upstream 429, retry 1/3 in 2s"],
+    ],
+    margaret: [
+      ["info", "session ses_91c2 turn started"],
+      ["info", "file.read /opt/data/shared/media/2026-11/IMG_0421.jpg"],
+      ["info", "message sent to discord:310472918374"],
+    ],
+    school: [
+      ["info", "sandbox session ses_08aa started"],
+      ["info", "tool memory.write ok 12ms"],
+    ],
+    workshop: [
+      ["error", "template check failed: HERMES_MODEL is not set"],
+      ["info", "retry scheduled in 30 minutes"],
+    ],
+  };
+  for (const [instance, lines] of Object.entries(recentLines)) {
+    lines.forEach(([level, message], index) => {
+      logSequence += 1;
+      logEntries.push({
+        id: logSequence,
+        instance,
+        at: iso(SEEDED_AT - (index + 1) * (23 + instance.length * 2) * 60_000),
+        level,
+        message,
+      });
+    });
+  }
+  logEntries.sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
+
+  deploymentStore = [
+    {
+      id: "dep_ok_0230",
+      image: "hermes-agent:0.23.0-local",
+      status: "ok",
+      instances: ["alice", "margaret", "ops", "school"],
+      canary: 1,
+      soak_s: 600,
+      started_at: iso(SEEDED_AT - 2 * DAY - 3 * HOUR),
+      finished_at: iso(SEEDED_AT - 2 * DAY - 3 * HOUR + 12 * 60_000),
+      result: [
+        { id: "alice", from: "hermes-agent:0.22.2-local", to: "hermes-agent:0.23.0-local", status: "healthy" },
+        { id: "margaret", from: "hermes-agent:0.22.2-local", to: "hermes-agent:0.23.0-local", status: "healthy" },
+        { id: "ops", from: "hermes-agent:0.22.2-local", to: "hermes-agent:0.23.0-local", status: "healthy" },
+        { id: "school", from: "hermes-agent:0.22.2-local", to: "hermes-agent:0.23.0-local", status: "healthy" },
+      ],
+      error: null,
+      rollback: false,
+      created_by: "cleeryy@example.com",
+    },
+    {
+      id: "dep_rolled_back",
+      image: "hermes-agent:0.23.1-local",
+      status: "rolled_back",
+      instances: ["alice", "ops"],
+      canary: 1,
+      soak_s: 300,
+      started_at: iso(SEEDED_AT - 5 * DAY),
+      finished_at: iso(SEEDED_AT - 5 * DAY + 18 * 60_000),
+      result: [
+        { id: "alice", from: "hermes-agent:0.22.2-local", to: "hermes-agent:0.23.1-local", status: "healthy" },
+        {
+          id: "ops",
+          from: "hermes-agent:0.22.2-local",
+          to: "hermes-agent:0.23.1-local",
+          status: "rolled_back",
+          error: "upgrade failed: the container reported unhealthy; rolled back to hermes-agent:0.22.2-local",
+        },
+      ],
+      error: "canary soak failed on ops",
+      rollback: true,
+      created_by: "cleeryy@example.com",
+    },
+    {
+      id: "dep_scheduled",
+      image: "hermes-agent:0.23.2-local",
+      status: "scheduled",
+      instances: ["alice", "margaret", "ops", "school", "workshop"],
+      canary: 1,
+      soak_s: 600,
+      started_at: iso(SEEDED_AT + 2 * DAY),
+      result: {
+        request: { image: "hermes-agent:0.23.2-local", canary: 1, soak_s: 600, window: "nightly" },
+      },
+      error: null,
+      rollback: false,
+      created_by: "cleeryy@example.com",
+    },
+  ];
+
+  maintenanceStore = [
+    {
+      id: "mw_nightly",
+      name: "nightly",
+      days: ["mon", "tue", "wed", "thu", "fri"],
+      start_minute: 120,
+      end_minute: 300,
+      enabled: true,
+      created_at: iso(SEEDED_AT - 45 * DAY),
+      updated_at: iso(SEEDED_AT - 8 * DAY),
+    },
+    {
+      id: "mw_sunday_patch",
+      name: "sunday-patch",
+      days: ["sun"],
+      start_minute: 60,
+      end_minute: 180,
+      enabled: false,
+      created_at: iso(SEEDED_AT - 20 * DAY),
+      updated_at: iso(SEEDED_AT - 20 * DAY),
+    },
+  ];
+
+  snapshotStore = [];
+  snapshotFiles.clear();
+  const aliceSnapshot = (id: string, agoMin: number, label: string, soul: string): Snapshot => {
+    const created = SEEDED_AT - agoMin * 60_000;
+    const snapshot: Snapshot = {
+      id,
+      instance_id: "alice",
+      path: `/opt/fleett/snapshots/${id}/20261109-183512.tgz`,
+      label,
+      created_at: iso(created),
+      expires_at: iso(created + 7 * DAY),
+      size_bytes: 1_048_576 + agoMin * 211,
+      status: "ok",
+      error: null,
+    };
+    snapshotFiles.set(id, {
+      "data/SOUL.md": { size: byteLength(soul), sha256: mockEtag(soul) },
+      "data/config.yaml": { size: 412, sha256: mockEtag("config") },
+      "data/skills/note.md": { size: 260, sha256: mockEtag("note") },
+      ...(label === "weekly"
+        ? { "data/skills/digest.md": { size: 190, sha256: mockEtag("digest") } }
+        : {}),
+    });
+    return snapshot;
+  };
+  snapshotStore.push(
+    aliceSnapshot(
+      "snap_alice_weekly",
+      300,
+      "weekly",
+      soulText(rows.find((row) => row.id === "alice") ?? rows[0], true).replace("## Voice", "## Voice\n- Prefer short messages."),
+    ),
+    aliceSnapshot("snap_alice_upgrade", 2 * 24 * 60, "before upgrade", soulText(rows[0])),
+  );
+  const opsSnapshotId = "snap_ops_egress";
+  const opsCreated = SEEDED_AT - 26 * HOUR;
+  snapshotStore.push({
+    id: opsSnapshotId,
+    instance_id: "ops",
+    path: `/opt/fleett/snapshots/${opsSnapshotId}/20261108-090000.tgz`,
+    label: "before egress change",
+    created_at: iso(opsCreated),
+    expires_at: iso(opsCreated + 7 * DAY),
+    size_bytes: 2_097_152,
+    status: "ok",
+    error: null,
+  });
+  snapshotFiles.set(opsSnapshotId, {
+    "data/SOUL.md": { size: 210, sha256: mockEtag("ops-soul") },
+    "data/config.yaml": { size: 388, sha256: mockEtag("ops-config") },
+  });
+
+  aclStore = {};
+  for (const row of rows) aclStore[row.id] = [];
+  aclStore.alice = [{ subject: "cleeryy@example.com", role: "owner", created_at: iso(SEEDED_AT - 21 * DAY) }];
+  aclStore.ops = [
+    { subject: "cleeryy@example.com", role: "owner", created_at: iso(SEEDED_AT - 18 * DAY) },
+    { subject: "ops@example.com", role: "operator", created_at: iso(SEEDED_AT - 4 * DAY) },
+  ];
+
+  egressStore = {};
+  for (const row of rows) {
+    if (row.id === "alice") {
+      egressStore.alice = {
+        instance: "alice",
+        source: "explicit",
+        mode: "deny",
+        fqdns: ["api.telegram.org", "opencode.ai"],
+        cidrs: [],
+        ports: [443],
+        updated_at: iso(SEEDED_AT - 3 * DAY),
+        proxy: "http://fleett-egress-proxy:3128",
+        proxy_acl: "acl alice_dst dstdomain .api.telegram.org .opencode.ai\nhttp_access allow alice alice_dst",
+        warnings: [],
+      };
+    } else if (row.allow_lan) {
+      egressStore[row.id] = {
+        instance: row.id,
+        source: "allow_lan",
+        mode: "allow",
+        fqdns: [],
+        cidrs: [],
+        ports: [],
+        warnings: ["LAN access is enabled: the host egress firewall does not filter this instance."],
+      };
+    } else {
+      egressStore[row.id] = {
+        instance: row.id,
+        source: "legacy",
+        mode: "deny",
+        fqdns: [],
+        cidrs: [],
+        ports: [],
+        warnings: [],
+      };
+    }
+  }
+}
+
 export function resetMock(): void {
   const telegramEnv = [
     {
       key: "TELEGRAM_ALLOWED_USERS",
       description:
         "Comma-separated Telegram user ids allowed to talk to the agent; without it every message is denied.",
+      example: "81459823",
+      required: true,
+      format: "csv-of-ids",
+      secret: false,
     },
     {
       key: "GATEWAY_ALLOW_ALL_USERS",
       description: "Set to true to accept every user on the platform, with no allowlist. Use with care.",
+      example: "false",
+      required: false,
+      format: "bool",
+      secret: false,
     },
   ];
   const discordEnv = [
     {
       key: "DISCORD_ALLOWED_USERS",
       description: "Comma-separated Discord user ids allowed to talk to the agent.",
+      example: "310472918374",
+      required: true,
+      format: "csv-of-ids",
+      secret: false,
     },
     {
       key: "DISCORD_ALLOWED_ROLES",
       description: "Comma-separated Discord role ids allowed to talk to the agent.",
+      example: "987654321098",
+      required: false,
+      format: "csv-of-ids",
+      secret: false,
     },
     {
       key: "DISCORD_ALLOWED_CHANNELS",
       description: "Comma-separated Discord channel ids where the agent answers.",
+      example: "1182736450918273645",
+      required: false,
+      format: "csv-of-ids",
+      secret: false,
     },
     {
       key: "DISCORD_ALLOW_ALL_USERS",
       description: "Set to true to accept every Discord user, with no allowlist. Use with care.",
+      example: "false",
+      required: false,
+      format: "bool",
+      secret: false,
     },
   ];
 
@@ -2019,6 +2860,7 @@ export function resetMock(): void {
   ];
 
   seedBusAndMemory();
+  seedOperations();
 
   filesystems.clear();
   repositories.clear();
@@ -2099,6 +2941,428 @@ function validateChannel(channel: { type: ChannelType; token?: string }, previou
   if (!channel.token && channel.type !== previous) {
     fail(400, "invalid_input", `A token is required when switching the channel to ${channel.type}.`);
   }
+}
+
+/* --------------------------------------------------------------------------
+ * Operations helpers
+ * -------------------------------------------------------------------------- */
+
+function findSchedule(id: string): MockSchedule {
+  const entry = scheduleStore.find((candidate) => candidate.schedule.id === id);
+  if (!entry) fail(404, "not_found", `unknown schedule "${id}"`);
+  return entry;
+}
+
+function scheduleFor(entry: MockSchedule): Schedule {
+  return { ...entry.schedule };
+}
+
+function findPipeline(id: string): MockPipeline {
+  const entry = pipelineStore.find((candidate) => candidate.pipeline.id === id);
+  if (!entry) fail(404, "not_found", `pipeline "${id}" not found`);
+  return entry;
+}
+
+function findPipelineRun(entry: MockPipeline, runId: string): PipelineRunDetail {
+  const run = entry.runs.find((candidate) => candidate.id === runId);
+  if (!run) fail(404, "not_found", `run "${runId}" not found`);
+  return { ...run, steps: run.steps.map((step) => ({ ...step })) };
+}
+
+function copyPipelineRun(run: PipelineRunDetail): PipelineRunDetail {
+  return { ...run, steps: run.steps.map((step) => ({ ...step })) };
+}
+
+function dayStart(value: string): number {
+  const parsed = Date.parse(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed)) fail(400, "invalid_range", `invalid date "${value}"`);
+  return parsed;
+}
+
+function rangeBounds(from?: string, to?: string): { from: number; to: number; fromIso: string; toIso: string } {
+  const now = Date.now();
+  const current = new Date(now);
+  const start = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), 1);
+  let fromMs = from ? dayStart(from) : start;
+  let toMs = to ? (to.includes("T") ? Date.parse(to) : dayStart(to) + DAY) : now;
+  if (Number.isNaN(toMs)) fail(400, "invalid_range", `invalid timestamp "${to}"`);
+  if (toMs <= fromMs) fail(400, "invalid_range", "from must be before to");
+  if (fromMs < 0) fromMs = start;
+  return {
+    from: fromMs,
+    to: toMs,
+    fromIso: new Date(fromMs).toISOString(),
+    toIso: new Date(toMs).toISOString(),
+  };
+}
+
+function priceFor(model: string, at: string): Pricing | undefined {
+  const day = at.slice(0, 10);
+  return pricingVersions
+    .filter((price) => price.model === model && price.effective_from <= day)
+    .sort((left, right) => right.effective_from.localeCompare(left.effective_from))[0];
+}
+
+function eventCost(event: { model: string; at: string; prompt_tokens: number; completion_tokens: number }): number {
+  const price = priceFor(event.model, event.at);
+  if (!price) return 0;
+  return (
+    (event.prompt_tokens / 1_000_000) * price.input_per_mtok +
+    (event.completion_tokens / 1_000_000) * price.output_per_mtok
+  );
+}
+
+function emptyTotals(): CostTotals {
+  return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_usd: 0, events: 0 };
+}
+
+function costReportFor(from: string | undefined, to: string | undefined, groupBy: CostGroupBy): CostReport {
+  const bounds = rangeBounds(from, to);
+  const selected = usageEvents.filter((event) => {
+    const at = Date.parse(event.at);
+    return at >= bounds.from && at < bounds.to;
+  });
+  const totals = emptyTotals();
+  const groups = new Map<string, CostGroup>();
+  const agents = new Map<string, { cost_usd: number; total_tokens: number }>();
+
+  for (const event of selected) {
+    const cost = eventCost(event);
+    const tokens = event.prompt_tokens + event.completion_tokens;
+    totals.prompt_tokens += event.prompt_tokens;
+    totals.completion_tokens += event.completion_tokens;
+    totals.total_tokens += tokens;
+    totals.cost_usd += cost;
+    totals.events += 1;
+
+    const key =
+      groupBy === "instance"
+        ? event.instance
+        : groupBy === "model"
+          ? event.model
+          : event.at.slice(0, 10);
+    const group = groups.get(key) ?? { key, ...emptyTotals() };
+    group.prompt_tokens += event.prompt_tokens;
+    group.completion_tokens += event.completion_tokens;
+    group.total_tokens += tokens;
+    group.cost_usd += cost;
+    group.events += 1;
+    groups.set(key, group);
+
+    const agent = agents.get(event.instance) ?? { cost_usd: 0, total_tokens: 0 };
+    agent.cost_usd += cost;
+    agent.total_tokens += tokens;
+    agents.set(event.instance, agent);
+  }
+
+  const monthKey = new Date().toISOString().slice(0, 7);
+  let monthToDate = 0;
+  for (const event of usageEvents) {
+    if (event.at.slice(0, 7) === monthKey) monthToDate += eventCost(event);
+  }
+  const now = new Date();
+  const elapsed =
+    (now.getUTCDate() - 1 + now.getUTCHours() / 24 + now.getUTCMinutes() / 1_440) /
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+
+  const budgets = Object.entries(budgetStore)
+    .map(([instance_id, budget]) => budgetStatusFor(instance_id, budget.monthly_usd, budget.enabled))
+    .filter((status): status is BudgetStatus => status !== null)
+    .sort((left, right) => left.instance_id.localeCompare(right.instance_id));
+
+  return {
+    from: bounds.fromIso,
+    to: bounds.toIso,
+    group_by: groupBy,
+    currency: "USD",
+    totals,
+    groups: [...groups.values()].sort((left, right) => right.cost_usd - left.cost_usd),
+    top_agents: [...agents.entries()]
+      .map(([instance_id, value]) => ({ instance_id, ...value }))
+      .sort((left, right) => right.cost_usd - left.cost_usd)
+      .slice(0, 5),
+    budgets,
+    projection: {
+      month: monthKey,
+      elapsed_fraction: Math.min(1, Math.max(0, elapsed)),
+      month_to_date_usd: monthToDate,
+      projected_usd: elapsed > 0 ? monthToDate / elapsed : monthToDate,
+    },
+  };
+}
+
+function budgetStatusFor(instanceId: string, monthly: number, enabled: boolean): BudgetStatus | null {
+  if (!rows.some((row) => row.id === instanceId)) return null;
+  const monthKey = new Date().toISOString().slice(0, 7);
+  let used = 0;
+  for (const event of usageEvents) {
+    if (event.instance === instanceId && event.at.slice(0, 7) === monthKey) used += eventCost(event);
+  }
+  const percent = monthly > 0 ? (used / monthly) * 100 : 0;
+  const now = new Date();
+  const elapsed =
+    (now.getUTCDate() - 1 + now.getUTCHours() / 24 + now.getUTCMinutes() / 1_440) /
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+  return {
+    instance_id: instanceId,
+    month: monthKey,
+    monthly_usd: monthly,
+    enabled,
+    used_usd: used,
+    percent,
+    exceeded: enabled && monthly > 0 && used >= monthly,
+    projected_month_usd: elapsed > 0 ? used / elapsed : used,
+    updated_at: budgetStore[instanceId]?.updated_at ?? nowIso(),
+  };
+}
+
+function budgetViewFor(instanceId: string): BudgetView {
+  const stored = budgetStore[instanceId];
+  if (!stored) {
+    return {
+      instance_id: instanceId,
+      month: new Date().toISOString().slice(0, 7),
+      monthly_usd: null,
+      enabled: false,
+      configured: false,
+      used_usd: 0,
+      percent: 0,
+      exceeded: false,
+      projected_month_usd: 0,
+    };
+  }
+  const status = budgetStatusFor(instanceId, stored.monthly_usd, stored.enabled);
+  return {
+    instance_id: instanceId,
+    month: status?.month ?? new Date().toISOString().slice(0, 7),
+    monthly_usd: stored.monthly_usd,
+    enabled: stored.enabled,
+    configured: true,
+    used_usd: status?.used_usd ?? 0,
+    percent: status?.percent ?? 0,
+    exceeded: status?.exceeded ?? false,
+    projected_month_usd: status?.projected_month_usd ?? 0,
+    updated_at: stored.updated_at,
+  };
+}
+
+function parseLogSince(value: string | undefined, field: "since" | "until"): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const relative = /^(\d+)([smhdw])$/.exec(trimmed);
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2];
+    const factor = unit === "s" ? 1_000 : unit === "m" ? 60_000 : unit === "h" ? HOUR : unit === "d" ? DAY : 7 * DAY;
+    return Date.now() - amount * factor;
+  }
+  const parsed = Date.parse(trimmed);
+  if (Number.isNaN(parsed)) fail(400, `invalid_${field}`, `${field} must be an RFC 3339 timestamp or a window like 24h`);
+  return parsed;
+}
+
+function searchLogEntries(params: LogQueryParams = {}): LogEntry[] {
+  const since = parseLogSince(params.since, "since");
+  const until = parseLogSince(params.until, "until");
+  if (since !== undefined && until !== undefined && since > until) {
+    fail(400, "invalid_window", "since must be before until");
+  }
+  const limit = Math.min(Math.max(params.limit ?? 100, 1), 500);
+  const rank: Record<LogLevel, number> = { info: 0, warn: 1, error: 2 };
+  const needle = params.q?.trim().toLowerCase();
+  return logEntries
+    .filter((entry) => {
+      if (params.instances?.length && !params.instances.includes(entry.instance)) return false;
+      if (params.level && rank[entry.level] < rank[params.level]) return false;
+      const at = Date.parse(entry.at);
+      if (since !== undefined && at < since) return false;
+      if (until !== undefined && at > until) return false;
+      if (needle && !entry.message.toLowerCase().includes(needle)) return false;
+      return true;
+    })
+    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at) || right.id - left.id)
+    .slice(0, limit);
+}
+
+function egressMatches(policy: { fqdns: string[]; cidrs: string[]; ports: number[] }, host: string, port: number): boolean {
+  if (policy.ports.length > 0 && !policy.ports.includes(port)) return false;
+  const name = host.toLowerCase();
+  if (policy.fqdns.length > 0) {
+    const domainHit = policy.fqdns.some((entry) => {
+      if (entry.startsWith("*.")) return name.endsWith(entry.slice(1)) && name !== entry.slice(2);
+      return name === entry;
+    });
+    if (domainHit) return true;
+  }
+  if (policy.cidrs.length > 0) {
+    const cidrHit = policy.cidrs.some((entry) => {
+      const [base, bitsRaw] = entry.split("/");
+      const bits = Number(bitsRaw);
+      if (!base || !Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+      const toInt = (value: string) => value.split(".").reduce((acc, part) => (acc << 8) + Number(part), 0) >>> 0;
+      const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+      return (toInt(name) & mask) === (toInt(base) & mask);
+    });
+    if (cidrHit) return true;
+  }
+  return policy.fqdns.length === 0 && policy.cidrs.length === 0;
+}
+
+function execCommand(row: Stored, input: ExecInput): ExecResult {
+  const started = performance.now();
+  let argv: string[];
+  if (input.argv && input.argv.length > 0) {
+    argv = input.argv.map((value) => value.trim()).filter(Boolean);
+  } else if (input.cmd?.trim()) {
+    if (/[;|&$`<>()\\"'\n]/.test(input.cmd)) {
+      fail(400, "invalid_exec", "cmd cannot contain shell metacharacters; send argv instead");
+    }
+    argv = input.cmd.trim().split(/\s+/);
+  } else {
+    fail(400, "invalid_exec", "send argv or cmd");
+  }
+  const allowed = [
+    "ls", "cat", "tail", "head", "grep", "env", "ps", "df", "du", "date", "which", "pwd", "id", "uname",
+    "uptime", "free", "echo",
+  ];
+  const base = argv[0].split("/").pop() ?? argv[0];
+  if (!allowed.includes(base)) {
+    fail(403, "exec_refused", `command "${base}" is not allowed`, {
+      reason: "not in the allowlist",
+      argv,
+      allowlist: allowed,
+      denylist: [],
+      wildcard: false,
+    });
+  }
+  if (row.status !== "running") {
+    fail(502, "driver_error", "container is not running");
+  }
+  let stdout = "";
+  let stderr = "";
+  let exit: number | null = 0;
+  switch (base) {
+    case "ls":
+      stdout = "SOUL.md\nconfig.yaml\nhealthcheck.py\nskills\nlogs\n";
+      break;
+    case "cat": {
+      const path = argv[1];
+      if (!path) {
+        stderr = "cat: missing operand\n";
+        exit = 1;
+        break;
+      }
+      const fs = filesystems.get(row.id);
+      const virtual = path.startsWith("/opt/data") ? path.slice(9) || "/" : path;
+      const file = fs?.files.get(virtual);
+      if (file) stdout = file.content;
+      else {
+        stderr = `cat: ${path}: No such file or directory\n`;
+        exit = 1;
+      }
+      break;
+    }
+    case "pwd":
+      stdout = "/opt/data\n";
+      break;
+    case "id":
+      stdout = "uid=10000(hermes) gid=10000(hermes) groups=10000(hermes)\n";
+      break;
+    case "uname":
+      stdout = "Linux\n";
+      break;
+    case "uptime":
+      stdout = ` ${new Date().toISOString()} up 4:12, load average: 0.08, 0.04, 0.01\n`;
+      break;
+    case "df":
+      stdout = "Filesystem     1K-blocks    Used Available Use% Mounted on\noverlay         61202244 8123420  49953544  14% /\n";
+      break;
+    case "free":
+      stdout = "              total        used        free\nMem:        1572864       41216     1531648\n";
+      break;
+    case "ps":
+      stdout = "PID   USER     TIME  COMMAND\n1     hermes   0:02  python -m hermes gateway run\n42    hermes   0:00  python -m hermes healthcheck\n";
+      break;
+    case "env":
+      stdout = `HERMES_PROFILE=${row.id}\nHERMES_MODEL=${row.model}\nHERMES_CHANNEL=${row.channel}\n`;
+      for (const entry of row.env) stdout += `${entry.key}=${entry.secret ? "[REDACTED]" : entry.value}\n`;
+      break;
+    case "which":
+      stdout = argv[1] ? `/usr/bin/${argv[1]}\n` : "";
+      break;
+    case "date":
+      stdout = `${new Date().toISOString()}\n`;
+      break;
+    case "echo":
+      stdout = `${argv.slice(1).join(" ")}\n`;
+      break;
+    default:
+      stdout = "";
+  }
+  return {
+    exit_code: exit,
+    stdout,
+    stderr,
+    timed_out: false,
+    duration_ms: Math.max(12, Math.round(performance.now() - started)),
+    truncated: false,
+  };
+}
+
+function maintenanceOpen(window: MaintenanceWindow, now: Date): boolean {
+  if (!window.enabled) return false;
+  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const today = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][now.getUTCDay()];
+  const yesterday = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][(now.getUTCDay() + 6) % 7];
+  if (window.start_minute === window.end_minute) return window.days.includes(today);
+  if (window.end_minute > window.start_minute) {
+    return window.days.includes(today) && minute >= window.start_minute && minute < window.end_minute;
+  }
+  return (
+    (window.days.includes(today) && minute >= window.start_minute) ||
+    (window.days.includes(yesterday) && minute < window.end_minute)
+  );
+}
+
+function maintenanceStatus(): MaintenanceStatus {
+  const now = new Date();
+  const enabled = maintenanceStore.filter((window) => window.enabled);
+  const open = enabled.some((window) => maintenanceOpen(window, now));
+  if (open) return { open: true, next_open: null, enforce: enabled.length > 0 };
+  let next: number | null = null;
+  for (const window of enabled) {
+    for (let offset = 0; offset < 8; offset += 1) {
+      const candidate = new Date(now.getTime() + offset * DAY);
+      const day = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][candidate.getUTCDay()];
+      if (!window.days.includes(day)) continue;
+      const at = Date.UTC(
+        candidate.getUTCFullYear(),
+        candidate.getUTCMonth(),
+        candidate.getUTCDate(),
+        Math.floor(window.start_minute / 60),
+        window.start_minute % 60,
+      );
+      if (at > now.getTime() && (next === null || at < next)) next = at;
+      if (at > now.getTime()) break;
+    }
+  }
+  return {
+    open: false,
+    next_open: next === null ? null : new Date(next).toISOString(),
+    enforce: enabled.length > 0,
+  };
+}
+
+function snapshotDigest(id: string): Record<string, { size: number; sha256: string }> {
+  const fs = filesystems.get(id);
+  if (!fs) return {};
+  const out: Record<string, { size: number; sha256: string }> = {};
+  for (const [path, file] of fs.files) {
+    if (path.includes("/logs/")) continue;
+    out[`data${path}`] = { size: byteLength(file.content), sha256: mockEtag(file.content) };
+  }
+  return out;
 }
 
 export const mockApi: FleetApi = {
@@ -3497,4 +4761,870 @@ export const mockApi: FleetApi = {
     memoryStore = memoryStore.filter((entry) => !isExpiredMemory(entry));
     return { removed: expired.length };
   },
+
+  /* Schedules */
+
+  async listSchedules(): Promise<ScheduleView[]> {
+    requireAdmin();
+    await delay(180);
+    return scheduleStore
+      .map((entry) => scheduleView(entry))
+      .sort((left, right) => left.instance_id.localeCompare(right.instance_id) || left.name.localeCompare(right.name));
+  },
+
+  async listInstanceSchedules(id: string): Promise<Schedule[]> {
+    requireAuth();
+    findRow(id);
+    await delay(150);
+    return scheduleStore
+      .filter((entry) => entry.schedule.instance_id === id)
+      .map((entry) => scheduleFor(entry))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  },
+
+  async createSchedule(id: string, input: CreateScheduleInput): Promise<Schedule> {
+    requireWrite();
+    await delay(260);
+    findRow(id);
+    const name = input.name.trim();
+    if (!name) fail(400, "invalid_name", "schedule name must not be empty");
+    if (scheduleStore.some((entry) => entry.schedule.instance_id === id && entry.schedule.name === name)) {
+      fail(409, "schedule_exists", `a schedule named "${name}" already exists for this instance`);
+    }
+    if (!input.cron.trim() || input.cron.trim().split(/\s+/).length !== 5) {
+      fail(400, "invalid_cron", "cron must be a five-field expression");
+    }
+    if (!input.prompt.trim()) fail(400, "invalid_prompt", "prompt must not be empty");
+    const timeout = input.timeout ?? 300;
+    if (timeout < 1 || timeout > 3_600) {
+      fail(400, "invalid_timeout", "timeout must be between 1 and 3600 seconds");
+    }
+    const schedule: Schedule = {
+      id: mockId("sch"),
+      instance_id: id,
+      name,
+      cron: input.cron.trim(),
+      prompt: input.prompt.trim(),
+      enabled: input.enabled ?? true,
+      timezone: input.timezone?.trim() || "UTC",
+      overlap: input.overlap ?? "skip",
+      timeout,
+      catchup: input.catchup ?? false,
+      next_run_at: (input.enabled ?? true) ? iso(Date.now() + 15 * 60_000) : undefined,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    };
+    scheduleStore.push({ schedule, runs: [] });
+    recordAudit(requireAuth(), "schedule.create", schedule.id, { instance: id, name, cron: schedule.cron });
+    return { ...schedule };
+  },
+
+  async patchSchedule(scheduleId: string, input: PatchScheduleInput): Promise<Schedule> {
+    requireWrite();
+    await delay(220);
+    const entry = findSchedule(scheduleId);
+    const next = { ...entry.schedule };
+    if (input.name !== undefined) {
+      const name = input.name.trim();
+      if (!name) fail(400, "invalid_name", "schedule name must not be empty");
+      if (
+        scheduleStore.some(
+          (candidate) =>
+            candidate.schedule.id !== scheduleId &&
+            candidate.schedule.instance_id === next.instance_id &&
+            candidate.schedule.name === name,
+        )
+      ) {
+        fail(409, "schedule_exists", `a schedule named "${name}" already exists for this instance`);
+      }
+      next.name = name;
+    }
+    if (input.cron !== undefined) {
+      if (!input.cron.trim() || input.cron.trim().split(/\s+/).length !== 5) {
+        fail(400, "invalid_cron", "cron must be a five-field expression");
+      }
+      next.cron = input.cron.trim();
+    }
+    if (input.prompt !== undefined) {
+      if (!input.prompt.trim()) fail(400, "invalid_prompt", "prompt must not be empty");
+      next.prompt = input.prompt.trim();
+    }
+    if (input.enabled !== undefined) {
+      next.enabled = input.enabled;
+      next.next_run_at = input.enabled ? iso(Date.now() + 15 * 60_000) : undefined;
+    }
+    if (input.timezone !== undefined) next.timezone = input.timezone.trim() || "UTC";
+    if (input.overlap !== undefined) next.overlap = input.overlap;
+    if (input.timeout !== undefined) {
+      if (input.timeout < 1 || input.timeout > 3_600) {
+        fail(400, "invalid_timeout", "timeout must be between 1 and 3600 seconds");
+      }
+      next.timeout = input.timeout;
+    }
+    if (input.catchup !== undefined) next.catchup = input.catchup;
+    next.updated_at = nowIso();
+    entry.schedule = next;
+    return { ...next };
+  },
+
+  async deleteSchedule(scheduleId: string): Promise<void> {
+    requireWrite();
+    await delay(180);
+    findSchedule(scheduleId);
+    scheduleStore = scheduleStore.filter((entry) => entry.schedule.id !== scheduleId);
+  },
+
+  async runSchedule(scheduleId: string): Promise<ScheduleRun> {
+    requireWrite();
+    await delay(420);
+    const entry = findSchedule(scheduleId);
+    if (entry.runs.some((run) => run.status === "running")) {
+      fail(409, "run_in_progress", "a run is already in progress for this schedule");
+    }
+    const started = Date.now();
+    const failed = entry.schedule.name === "retry-check";
+    const run: ScheduleRun = {
+      id: mockId("run"),
+      schedule_id: scheduleId,
+      instance_id: entry.schedule.instance_id,
+      started_at: iso(started),
+      finished_at: iso(started + 1_240),
+      status: failed ? "error" : "ok",
+      exit_code: failed ? 1 : 0,
+      output: failed
+        ? "gateway ask failed (exit 1): template check still failing\n"
+        : `schedule "${entry.schedule.name}" ran ok\n`,
+      duration_ms: 1_240,
+      created_at: iso(started),
+    };
+    entry.runs.unshift(run);
+    entry.schedule.last_run_at = run.started_at;
+    entry.schedule.next_run_at = entry.schedule.enabled ? iso(started + 15 * 60_000) : undefined;
+    entry.schedule.updated_at = nowIso();
+    recordAudit(requireAuth(), "schedule.run", scheduleId, { instance: entry.schedule.instance_id });
+    return { ...run };
+  },
+
+  async listRuns(id: string, limit = 50): Promise<ScheduleRun[]> {
+    requireAuth();
+    findRow(id);
+    await delay(180);
+    return scheduleStore
+      .flatMap((entry) => entry.runs)
+      .filter((run) => run.instance_id === id)
+      .sort((left, right) => Date.parse(right.started_at) - Date.parse(left.started_at))
+      .slice(0, Math.min(Math.max(limit, 1), 500))
+      .map((run) => ({ ...run }));
+  },
+
+  /* Pipelines */
+
+  async listPipelines(): Promise<Pipeline[]> {
+    requireAuth();
+    await delay(180);
+    return pipelineStore
+      .map((entry) => ({ ...entry.pipeline, steps: entry.pipeline.steps.map((step) => ({ ...step })) }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  },
+
+  async getPipeline(id: string): Promise<Pipeline> {
+    requireAuth();
+    await delay(120);
+    const entry = findPipeline(id);
+    return { ...entry.pipeline, steps: entry.pipeline.steps.map((step) => ({ ...step })) };
+  },
+
+  async createPipeline(input: CreatePipelineInput): Promise<Pipeline> {
+    requireAdmin();
+    await delay(320);
+    const name = input.name.trim();
+    if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(name)) {
+      fail(400, "invalid_name", "name must match [a-z0-9][a-z0-9_-]{1,62}");
+    }
+    if (pipelineStore.some((entry) => entry.pipeline.name === name)) {
+      fail(409, "pipeline_exists", `pipeline "${name}" already exists`);
+    }
+    const steps = validatePipelineSteps(input.steps ?? []);
+    const pipeline: Pipeline = {
+      id: mockId("pipe"),
+      name,
+      trigger: input.trigger ?? "manual",
+      ...(input.cron ? { cron: input.cron } : {}),
+      enabled: input.enabled ?? true,
+      steps,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    };
+    pipelineStore.push({ pipeline, runs: [] });
+    recordAudit(requireAuth(), "pipeline.create", pipeline.id, { name });
+    return { ...pipeline, steps: pipeline.steps.map((step) => ({ ...step })) };
+  },
+
+  async patchPipeline(id: string, input: PatchPipelineInput): Promise<Pipeline> {
+    requireAdmin();
+    await delay(280);
+    const entry = findPipeline(id);
+    const next: Pipeline = { ...entry.pipeline };
+    if (input.name !== undefined) {
+      const name = input.name.trim();
+      if (!/^[a-z0-9][a-z0-9_-]{1,62}$/.test(name)) {
+        fail(400, "invalid_name", "name must match [a-z0-9][a-z0-9_-]{1,62}");
+      }
+      if (pipelineStore.some((candidate) => candidate.pipeline.id !== id && candidate.pipeline.name === name)) {
+        fail(409, "pipeline_exists", `pipeline "${name}" already exists`);
+      }
+      next.name = name;
+    }
+    if (input.trigger !== undefined) next.trigger = input.trigger;
+    if (input.cron !== undefined) next.cron = input.cron || undefined;
+    if (input.enabled !== undefined) next.enabled = input.enabled;
+    if (input.steps !== undefined) next.steps = validatePipelineSteps(input.steps);
+    next.updated_at = nowIso();
+    entry.pipeline = next;
+    return { ...next, steps: next.steps.map((step) => ({ ...step })) };
+  },
+
+  async deletePipeline(id: string): Promise<void> {
+    requireAdmin();
+    await delay(180);
+    findPipeline(id);
+    pipelineStore = pipelineStore.filter((entry) => entry.pipeline.id !== id);
+  },
+
+  async runPipeline(id: string, context?: unknown): Promise<PipelineRunDetail> {
+    requireAdmin();
+    await delay(380);
+    const entry = findPipeline(id);
+    if (!entry.pipeline.enabled) fail(409, "pipeline_disabled", "pipeline is disabled");
+    for (const step of entry.pipeline.steps) findRow(step.instance);
+    const runId = mockId("run");
+    const started = Date.now();
+    const steps: PipelineStepRun[] = entry.pipeline.steps.map((step, index) => ({
+      id: Date.now() + index,
+      run_id: runId,
+      step_id: step.id,
+      instance_id: step.instance,
+      status: index === 0 ? "running" : "pending",
+      attempt: 0,
+      ...(index === 0 ? { started_at: iso(started) } : {}),
+    }));
+    const run: PipelineRunDetail = {
+      id: runId,
+      pipeline_id: id,
+      status: "running",
+      trigger: "manual",
+      ...(context === undefined ? {} : { context: JSON.stringify(context) }),
+      started_at: iso(started),
+      steps,
+    };
+    entry.runs.unshift(run);
+    // A mock run completes on the next read, so the console can show the
+    // pending/running states and then the final report without a scheduler.
+    window.setTimeout(() => {
+      for (const step of run.steps) {
+        step.status = "ok";
+        step.attempt = 1;
+        step.finished_at = iso(Date.now());
+        step.output = `${step.step_id}: ok\n`;
+      }
+      run.status = "ok";
+      run.finished_at = iso(Date.now());
+    }, 900);
+    recordAudit(requireAuth(), "pipeline.run", id, { run: runId });
+    return copyPipelineRun(run);
+  },
+
+  async listPipelineRuns(id: string, limit = 50): Promise<PipelineRun[]> {
+    requireAuth();
+    await delay(160);
+    const entry = findPipeline(id);
+    return entry.runs
+      .map(({ steps: _steps, ...run }) => ({ ...run }))
+      .sort((left, right) => Date.parse(right.started_at ?? "") - Date.parse(left.started_at ?? ""))
+      .slice(0, Math.min(Math.max(limit, 1), 500));
+  },
+
+  async getPipelineRun(id: string, runId: string): Promise<PipelineRunDetail> {
+    requireAuth();
+    await delay(160);
+    return copyPipelineRun(findPipelineRun(findPipeline(id), runId));
+  },
+
+  async cancelPipelineRun(id: string, runId: string): Promise<PipelineRunDetail> {
+    requireAdmin();
+    await delay(220);
+    const run = findPipelineRun(findPipeline(id), runId);
+    if (run.status !== "pending" && run.status !== "running") {
+      fail(409, "run_finished", "the run has already finished");
+    }
+    run.status = "cancelled";
+    run.finished_at = nowIso();
+    for (const step of run.steps) {
+      if (step.status === "pending" || step.status === "running") step.status = "skipped";
+    }
+    return copyPipelineRun(run);
+  },
+
+  /* Incidents */
+
+  async listIncidents(params: ListIncidentsParams = {}): Promise<Incident[]> {
+    requireAuth();
+    await delay(160);
+    const limit = Math.min(Math.max(params.limit ?? 100, 1), 500);
+    return incidentStore
+      .filter((incident) => (params.status ? incident.status === params.status : true))
+      .filter((incident) => (params.instance ? incident.instance_id === params.instance : true))
+      .sort((left, right) => Date.parse(right.opened_at) - Date.parse(left.opened_at))
+      .slice(0, limit)
+      .map((incident) => ({ ...incident, actions: incident.actions.map((action) => ({ ...action })) }));
+  },
+
+  async instanceIncidents(id: string, limit = 100): Promise<Incident[]> {
+    requireAuth();
+    findRow(id);
+    await delay(140);
+    return incidentStore
+      .filter((incident) => incident.instance_id === id)
+      .sort((left, right) => Date.parse(right.opened_at) - Date.parse(left.opened_at))
+      .slice(0, Math.min(Math.max(limit, 1), 500))
+      .map((incident) => ({ ...incident, actions: incident.actions.map((action) => ({ ...action })) }));
+  },
+
+  async closeIncident(id: string): Promise<Incident> {
+    requireAdmin();
+    await delay(220);
+    const incident = incidentStore.find((candidate) => candidate.id === id);
+    if (!incident) fail(404, "not_found", `incident "${id}" not found`);
+    if (incident.status === "closed") fail(409, "incident_closed", "incident is already closed");
+    incident.status = "closed";
+    incident.closed_at = nowIso();
+    incident.last_seen_at = incident.closed_at;
+    recordAudit(requireAuth(), "incident.close", id, { instance: incident.instance_id });
+    return { ...incident, actions: incident.actions.map((action) => ({ ...action })) };
+  },
+
+  async patchHeal(id: string, input: HealPolicyInput): Promise<HealPolicyView> {
+    requireAdmin();
+    await delay(200);
+    findRow(id);
+    const current = healStore[id] ?? {
+      id,
+      heal: "off",
+      unhealthy_after: 3,
+      max_restarts: 5,
+      heal_backoff_s: 30,
+    };
+    if (input.heal !== undefined) current.heal = input.heal;
+    if (input.unhealthy_after !== undefined) {
+      if (input.unhealthy_after < 1 || input.unhealthy_after > 100) {
+        fail(400, "invalid_unhealthy_after", "unhealthy_after must be between 1 and 100");
+      }
+      current.unhealthy_after = input.unhealthy_after;
+    }
+    if (input.max_restarts !== undefined) {
+      if (input.max_restarts < 0 || input.max_restarts > 100) {
+        fail(400, "invalid_max_restarts", "max_restarts must be between 0 and 100");
+      }
+      current.max_restarts = input.max_restarts;
+    }
+    if (input.heal_backoff_s !== undefined) {
+      if (input.heal_backoff_s < 1 || input.heal_backoff_s > 3_600) {
+        fail(400, "invalid_heal_backoff_s", "heal_backoff_s must be between 1 and 3600");
+      }
+      current.heal_backoff_s = input.heal_backoff_s;
+    }
+    healStore[id] = current;
+    recordAudit(requireAuth(), "instance.heal", id, { ...current });
+    return { ...current };
+  },
+
+  /* Cost */
+
+  async costReport(params: CostReportParams = {}): Promise<CostReport> {
+    requireAuth();
+    await delay(220);
+    const groupBy = params.group_by ?? "instance";
+    if (!["instance", "model", "day"].includes(groupBy)) {
+      fail(400, "invalid_group_by", "group_by must be instance, model or day");
+    }
+    return costReportFor(params.from, params.to, groupBy);
+  },
+
+  async listBudgets(): Promise<BudgetStatus[]> {
+    requireAuth();
+    await delay(160);
+    return Object.entries(budgetStore)
+      .map(([instanceId, budget]) => budgetStatusFor(instanceId, budget.monthly_usd, budget.enabled))
+      .filter((status): status is BudgetStatus => status !== null)
+      .sort((left, right) => left.instance_id.localeCompare(right.instance_id));
+  },
+
+  async getBudget(id: string): Promise<BudgetView> {
+    requireAuth();
+    await delay(120);
+    findRow(id);
+    return budgetViewFor(id);
+  },
+
+  async setBudget(id: string, input: BudgetInput): Promise<BudgetView> {
+    requireAdmin();
+    await delay(220);
+    findRow(id);
+    if (!Number.isFinite(input.monthly_usd) || input.monthly_usd < 0 || input.monthly_usd > 100_000) {
+      fail(400, "invalid_budget", "monthly_usd must be between 0 and 100000");
+    }
+    budgetStore[id] = {
+      monthly_usd: input.monthly_usd,
+      enabled: input.enabled,
+      updated_at: nowIso(),
+    };
+    recordAudit(requireAuth(), "cost.budget.update", id, { ...input });
+    return budgetViewFor(id);
+  },
+
+  async listPricing(): Promise<Pricing[]> {
+    requireAuth();
+    await delay(140);
+    const latest = new Map<string, Pricing>();
+    for (const price of pricingVersions) {
+      const current = latest.get(price.model);
+      if (!current || current.effective_from < price.effective_from) latest.set(price.model, price);
+    }
+    return [...latest.values()].sort((left, right) => left.model.localeCompare(right.model));
+  },
+
+  async setPricing(input: PricingInput): Promise<Pricing> {
+    requireAdmin();
+    await delay(240);
+    const model = input.model.trim();
+    if (!model) fail(400, "invalid_pricing", "model is required");
+    if (!Number.isFinite(input.input_per_mtok) || input.input_per_mtok < 0) {
+      fail(400, "invalid_pricing", "input_per_mtok must be zero or more");
+    }
+    if (!Number.isFinite(input.output_per_mtok) || input.output_per_mtok < 0) {
+      fail(400, "invalid_pricing", "output_per_mtok must be zero or more");
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.effective_from)) {
+      fail(400, "invalid_pricing", "effective_from must be YYYY-MM-DD");
+    }
+    const price: Pricing = {
+      model,
+      input_per_mtok: input.input_per_mtok,
+      output_per_mtok: input.output_per_mtok,
+      currency: input.currency.trim().toUpperCase() || "USD",
+      effective_from: input.effective_from,
+      updated_at: nowIso(),
+    };
+    pricingVersions.push(price);
+    recordAudit(requireAuth(), "cost.pricing.update", model, { ...price });
+    return { ...price };
+  },
+
+  async deletePricing(model: string): Promise<void> {
+    requireAdmin();
+    await delay(160);
+    const before = pricingVersions.length;
+    pricingVersions = pricingVersions.filter((price) => price.model !== model);
+    if (pricingVersions.length === before) fail(404, "not_found", `unknown model "${model}"`);
+  },
+
+  /* Log center */
+
+  async searchLogs(params: LogQueryParams = {}): Promise<LogSearchResponse> {
+    requireAuth();
+    await delay(180);
+    const entries = searchLogEntries(params);
+    return { entries, count: entries.length, limit: params.limit ?? 100 };
+  },
+
+  async exportLogs(params: LogQueryParams | undefined, format: LogExportFormat) {
+    requireAuth();
+    await delay(200);
+    const entries = searchLogEntries({ ...params, limit: 500 });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    if (format === "csv") {
+      const escape = (value: string) => `"${value.replace(/"/g, '""')}"`;
+      const rows = [
+        "at,instance,level,message",
+        ...entries.map((entry) =>
+          [entry.at, entry.instance, entry.level, entry.message].map(escape).join(","),
+        ),
+      ];
+      return {
+        blob: new Blob([rows.join("\n")], { type: "text/csv" }),
+        filename: `fleett-logs-${stamp}.csv`,
+      };
+    }
+    return {
+      blob: new Blob([JSON.stringify(entries, null, 2)], { type: "application/json" }),
+      filename: `fleett-logs-${stamp}.json`,
+    };
+  },
+
+  /* Security */
+
+  async securityStatus(): Promise<SecurityStatus> {
+    requireAdmin();
+    await delay(160);
+    const active = tokens.filter((token) => !token.revoked_at).length;
+    return {
+      rate_limit: { enabled: true, limits: { per_min: 120, auth_per_min: 10, heavy_per_min: 30 } },
+      lockout: { failures: 10, window_s: 600, lockout_s: 900, locked_ips: 0 },
+      headers: {
+        csp: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
+        x_frame_options: "DENY",
+        referrer_policy: "no-referrer",
+        permissions_policy: "camera=(), microphone=(), geolocation=()",
+        x_content_type_options: "nosniff",
+        hsts: true,
+      },
+      tokens: { expired_or_revoked: tokens.length - active, active },
+      auth_mode: mockAuthMode,
+    };
+  },
+
+  /* Deployments and maintenance */
+
+  async listDeployments(params: { limit?: number; status?: DeploymentStatus } = {}): Promise<Deployment[]> {
+    requireAuth();
+    await delay(180);
+    return deploymentStore
+      .filter((deployment) => (params.status ? deployment.status === params.status : true))
+      .sort((left, right) => (right.started_at ?? "").localeCompare(left.started_at ?? ""))
+      .slice(0, Math.min(Math.max(params.limit ?? 50, 1), 500))
+      .map((deployment) => ({ ...deployment }));
+  },
+
+  async getDeployment(id: string): Promise<Deployment> {
+    requireAuth();
+    await delay(140);
+    const deployment = deploymentStore.find((candidate) => candidate.id === id);
+    if (!deployment) fail(404, "not_found", `deployment "${id}" not found`);
+    return { ...deployment };
+  },
+
+  async listMaintenanceWindows(): Promise<MaintenanceWindow[]> {
+    requireAuth();
+    await delay(140);
+    return maintenanceStore.map((window) => ({ ...window, days: [...window.days] }));
+  },
+
+  async createMaintenanceWindow(input: MaintenanceWindowInput): Promise<MaintenanceWindow> {
+    requireAdmin();
+    await delay(220);
+    assertMaintenance(input);
+    const window: MaintenanceWindow = {
+      id: mockId("mw"),
+      ...input,
+      days: [...input.days],
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    };
+    maintenanceStore.push(window);
+    return { ...window, days: [...window.days] };
+  },
+
+  async patchMaintenanceWindow(
+    id: string,
+    input: Partial<MaintenanceWindowInput>,
+  ): Promise<MaintenanceWindow> {
+    requireAdmin();
+    await delay(200);
+    const window = maintenanceStore.find((candidate) => candidate.id === id);
+    if (!window) fail(404, "not_found", `maintenance window "${id}" not found`);
+    const next = { ...window, ...input };
+    assertMaintenance(next);
+    Object.assign(window, next, { updated_at: nowIso() });
+    return { ...window, days: [...window.days] };
+  },
+
+  async deleteMaintenanceWindow(id: string): Promise<void> {
+    requireAdmin();
+    await delay(160);
+    const before = maintenanceStore.length;
+    maintenanceStore = maintenanceStore.filter((window) => window.id !== id);
+    if (maintenanceStore.length === before) fail(404, "not_found", `maintenance window "${id}" not found`);
+  },
+
+  async maintenanceStatus(): Promise<MaintenanceStatus> {
+    requireAuth();
+    await delay(100);
+    return maintenanceStatus();
+  },
+
+  /* Snapshots */
+
+  async listSnapshots(id: string): Promise<Snapshot[]> {
+    requireAuth();
+    findRow(id);
+    await delay(160);
+    return snapshotStore
+      .filter((snapshot) => snapshot.instance_id === id)
+      .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+      .map((snapshot) => ({ ...snapshot }));
+  },
+
+  async createSnapshot(id: string, input: CreateSnapshotInput = {}): Promise<Snapshot> {
+    requireAdmin();
+    await delay(420);
+    const row = findRow(id);
+    const label = (input.label ?? "").trim();
+    if (label.length > 128) fail(400, "invalid_snapshot", "label must be at most 128 characters");
+    const ttl = input.ttl_s ?? 7 * 24 * 3_600;
+    if (ttl < 1 || ttl > 7_776_000) {
+      fail(400, "invalid_snapshot", "ttl_s must be between 1 and 7776000");
+    }
+    const created = Date.now();
+    const snapshot: Snapshot = {
+      id: mockId("snap"),
+      instance_id: row.id,
+      path: `${FLEETT_ROOT}/snapshots/${mockId("snap")}/20261109-183512.tgz`,
+      label,
+      created_at: iso(created),
+      expires_at: iso(created + ttl * 1_000),
+      size_bytes: 1_048_576 + Math.round(Math.random() * 800_000),
+      status: "ok",
+      error: null,
+    };
+    snapshotStore.unshift(snapshot);
+    snapshotFiles.set(snapshot.id, snapshotDigest(row.id));
+    recordAudit(requireAuth(), "snapshot.create", snapshot.id, { instance: row.id, label });
+    return { ...snapshot };
+  },
+
+  async compareSnapshots(id: string, a: string, b: string): Promise<SnapshotDiff> {
+    requireAuth();
+    findRow(id);
+    await delay(240);
+    const left = snapshotFiles.get(a) ?? {};
+    const right = snapshotFiles.get(b) ?? {};
+    const paths = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+    const added: SnapshotDiff["added"] = [];
+    const removed: SnapshotDiff["removed"] = [];
+    const changed: SnapshotDiff["changed"] = [];
+    let unchanged = 0;
+    for (const path of paths) {
+      const before = left[path];
+      const after = right[path];
+      if (!before && after) added.push({ path, ...after });
+      else if (before && !after) removed.push({ path, ...before });
+      else if (before && after) {
+        if (before.sha256 === after.sha256) unchanged += 1;
+        else {
+          changed.push({
+            path,
+            size_a: before.size,
+            size_b: after.size,
+            sha256_a: before.sha256,
+            sha256_b: after.sha256,
+          });
+        }
+      }
+    }
+    return { instance_id: id, a, b, added, removed, changed, unchanged };
+  },
+
+  async restoreSnapshot(snapshotId: string): Promise<RestoreReport> {
+    requireAdmin();
+    await delay(680);
+    const snapshot = snapshotStore.find((candidate) => candidate.id === snapshotId);
+    if (!snapshot) fail(404, "not_found", `snapshot "${snapshotId}" not found`);
+    if (snapshot.status === "restoring") {
+      fail(409, "restore_failed", "a restore is already in progress for this snapshot", {
+        snapshot,
+        rolled_back: true,
+      });
+    }
+    const row = findRow(snapshot.instance_id);
+    row.status = "running";
+    row.started_at = Date.now();
+    row.updated_at = nowIso();
+    row.last_error = null;
+    snapshot.status = "ok";
+    recordAudit(requireAuth(), "snapshot.restore", snapshotId, { instance: snapshot.instance_id });
+    return {
+      snapshot: { ...snapshot },
+      instance_id: snapshot.instance_id,
+      files: Object.keys(snapshotFiles.get(snapshotId) ?? {}).length,
+      status: row.status,
+      env_restored: true,
+      compose_restored: true,
+      previous_data_dir: `${FLEETT_ROOT}/instances/${snapshot.instance_id}/data.pre-restore-20261109-184001`,
+    };
+  },
+
+  async deleteSnapshot(snapshotId: string): Promise<void> {
+    requireAdmin();
+    await delay(180);
+    const before = snapshotStore.length;
+    snapshotStore = snapshotStore.filter((snapshot) => snapshot.id !== snapshotId);
+    snapshotFiles.delete(snapshotId);
+    if (snapshotStore.length === before) fail(404, "not_found", `snapshot "${snapshotId}" not found`);
+  },
+
+  /* Instance ACL, egress and exec */
+
+  async getInstanceAcl(id: string): Promise<InstanceAcl> {
+    requireAuth();
+    findRow(id);
+    await delay(120);
+    return { instance: id, acl: (aclStore[id] ?? []).map((item) => ({ ...item })) };
+  },
+
+  async putInstanceAcl(id: string, acl: AclItemInput[]): Promise<InstanceAcl> {
+    requireAdmin();
+    await delay(220);
+    findRow(id);
+    const seen = new Set<string>();
+    const next: AclItem[] = [];
+    for (const item of acl) {
+      const subject = item.subject.trim();
+      if (!subject) fail(400, "invalid_acl", "subject must not be empty");
+      if (seen.has(subject)) fail(400, "invalid_acl", `subject "${subject}" is listed twice`);
+      if (!["owner", "operator", "viewer"].includes(item.role)) {
+        fail(400, "invalid_acl", "role must be owner, operator or viewer");
+      }
+      seen.add(subject);
+      next.push({ subject, role: item.role, created_at: nowIso() });
+    }
+    aclStore[id] = next;
+    recordAudit(requireAuth(), "instance.acl.update", id, { subjects: next.map((item) => item.subject) });
+    return { instance: id, acl: next.map((item) => ({ ...item })) };
+  },
+
+  async getEgress(id: string): Promise<EgressPolicyView> {
+    requireAuth();
+    findRow(id);
+    await delay(140);
+    const policy = egressStore[id];
+    if (policy) return { ...policy, fqdns: [...policy.fqdns], cidrs: [...policy.cidrs], ports: [...policy.ports], warnings: [...policy.warnings] };
+    return {
+      instance: id,
+      source: "legacy",
+      mode: "deny",
+      fqdns: [],
+      cidrs: [],
+      ports: [],
+      warnings: [],
+    };
+  },
+
+  async putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView> {
+    requireWrite();
+    await delay(300);
+    const row = findRow(id);
+    if (input.mode !== "deny" && input.mode !== "allow") {
+      fail(400, "invalid_egress_policy", "mode must be deny or allow");
+    }
+    const fqdns = input.fqdns.map((value) => value.trim().toLowerCase()).filter(Boolean);
+    const cidrs = input.cidrs.map((value) => value.trim()).filter(Boolean);
+    const ports = input.ports.filter((port) => Number.isInteger(port) && port >= 1 && port <= 65_535);
+    if (ports.length !== input.ports.length) {
+      fail(400, "invalid_egress_policy", "ports must be integers between 1 and 65535");
+    }
+    const policy: EgressPolicyView = {
+      instance: id,
+      source: "explicit",
+      mode: input.mode,
+      fqdns,
+      cidrs,
+      ports,
+      updated_at: nowIso(),
+      proxy: "http://fleett-egress-proxy:3128",
+      proxy_acl: `${row.id}: ${input.mode} ${fqdns.join(" ") || "(no domain)"}`,
+      warnings: [],
+    };
+    egressStore[id] = policy;
+    recordAudit(requireAuth(), "egress.policy.update", id, { ...input });
+    return { ...policy, fqdns: [...fqdns], cidrs: [...cidrs], ports: [...ports], warnings: [] };
+  },
+
+  async testEgress(id: string, host: string, port: number): Promise<EgressTestResult> {
+    requireAuth();
+    await delay(220);
+    findRow(id);
+    const policy = egressStore[id] ?? {
+      instance: id,
+      source: "legacy" as const,
+      mode: "deny" as const,
+      fqdns: [],
+      cidrs: [],
+      ports: [],
+      warnings: [],
+    };
+    const matched = egressMatches(policy, host, port);
+    const allowed = policy.mode === "deny" ? matched : !matched;
+    const explicit = policy.source === "explicit";
+    return {
+      instance: id,
+      host,
+      port,
+      allowed,
+      reason:
+        policy.mode === "deny"
+          ? matched
+            ? "destination matches the allowlist"
+            : "destination is not on the allowlist"
+          : matched
+            ? "destination matches the blocklist"
+            : "destination is not on the blocklist",
+      source: policy.source,
+      mode: policy.mode,
+      enforced: explicit,
+      ...(explicit ? { enforcement: "squid proxy reachable", proxy: policy.proxy } : {}),
+    };
+  },
+
+  async exec(id: string, input: ExecInput): Promise<ExecResult> {
+    requireAdmin();
+    await delay(320);
+    return execCommand(findRow(id), input);
+  },
 };
+
+function validatePipelineSteps(steps: PipelineStep[]): PipelineStep[] {
+  if (steps.length === 0) fail(400, "no_steps", "a pipeline needs at least one step");
+  if (steps.length > 50) fail(400, "too_many_steps", "a pipeline has at most 50 steps");
+  const ids = new Set<string>();
+  for (const step of steps) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(step.id)) {
+      fail(400, "invalid_step_id", `invalid step id "${step.id}"`);
+    }
+    if (ids.has(step.id)) fail(400, "duplicate_step_id", `step "${step.id}" is listed twice`);
+    if (!step.instance.trim()) fail(400, "empty_instance", `step "${step.id}" has no instance`);
+    if (!step.prompt.trim()) fail(400, "empty_prompt", `step "${step.id}" has no prompt`);
+    ids.add(step.id);
+  }
+  for (const step of steps) {
+    for (const dependency of step.depends_on ?? []) {
+      if (!ids.has(dependency)) {
+        fail(400, "unknown_dependency", `step "${step.id}" depends on unknown "${dependency}"`);
+      }
+    }
+  }
+  return steps.map((step) => ({
+    ...step,
+    depends_on: [...(step.depends_on ?? [])],
+    retries: Math.min(Math.max(step.retries ?? 0, 0), 5),
+    timeout_s: Math.min(Math.max(step.timeout_s ?? 300, 1), 3_600),
+    on_failure: step.on_failure ?? "stop",
+  }));
+}
+
+function assertMaintenance(input: MaintenanceWindowInput): void {
+  if (!input.name.trim()) fail(400, "invalid_window", "name must not be empty");
+  if (!input.days.length) fail(400, "invalid_window", "pick at least one day");
+  for (const day of input.days) {
+    if (!DAY_NAMES.includes(day)) fail(400, "invalid_window", `invalid day "${day}"`);
+  }
+  if (
+    !Number.isInteger(input.start_minute) ||
+    !Number.isInteger(input.end_minute) ||
+    input.start_minute < 0 ||
+    input.start_minute > 1_439 ||
+    input.end_minute < 0 ||
+    input.end_minute > 1_439
+  ) {
+    fail(400, "invalid_window", "minutes must be between 0 and 1439");
+  }
+}

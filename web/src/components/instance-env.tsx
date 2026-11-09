@@ -3,7 +3,7 @@ import { Check, Loader2, Pencil, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { InstanceDetail } from "@/api/types";
+import type { EnvSuggestion, InstanceDetail } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -37,11 +37,14 @@ import {
 export function InstanceEnvironment({
   detail,
   rows,
+  suggestions = [],
   onRowsChange,
   onApplied,
 }: {
   detail: InstanceDetail;
   rows: EnvRow[];
+  /** Template suggestions rendered as one-click additions. */
+  suggestions?: EnvSuggestion[];
   onRowsChange: (rows: EnvRow[]) => void;
   onApplied: () => void;
 }) {
@@ -59,18 +62,22 @@ export function InstanceEnvironment({
     node?.focus();
   });
 
-  const errors = attempted ? validateEnvRows(rows, "apply").rows : {};
+  const errors = attempted ? validateEnvRows(rows, "apply", suggestions).rows : {};
   const dirty = !envRowsMatch(detail.env, rows);
+  const suggestionByKey = new Map(suggestions.map((suggestion) => [suggestion.key, suggestion]));
+  const available = suggestions.filter(
+    (suggestion) => !rows.some((row) => row.key.trim() === suggestion.key),
+  );
 
   function patch(id: number, changes: Partial<EnvRow>) {
     onRowsChange(rows.map((row) => (row.id === id ? { ...row, ...changes } : row)));
   }
 
-  function addRow() {
-    const row = newEnvRow();
+  function addRow(seed: { key?: string; value?: string; secret?: boolean } = {}) {
+    const row = newEnvRow(seed);
     onRowsChange([...rows, row]);
     setEditingId(row.id);
-    focusId.current = `cfg-env-${row.id}-key`;
+    focusId.current = `cfg-env-${row.id}-${seed.key ? "value" : "key"}`;
   }
 
   function editRow(row: EnvRow) {
@@ -84,7 +91,7 @@ export function InstanceEnvironment({
   }
 
   function doneRow(row: EnvRow) {
-    const rowErrors = validateEnvRows(rows, "apply").rows[row.id];
+    const rowErrors = validateEnvRows(rows, "apply", suggestions).rows[row.id];
     if (rowErrors) {
       setAttempted(true);
       const suffix = rowErrors.key ? "key" : "value";
@@ -96,7 +103,7 @@ export function InstanceEnvironment({
 
   async function apply() {
     setAttempted(true);
-    const { rows: rowErrors, count } = validateEnvRows(rows, "apply");
+    const { rows: rowErrors, count } = validateEnvRows(rows, "apply", suggestions);
     if (count > 0) {
       const [id, rowErrorsForRow] = Object.entries(rowErrors)[0] ?? [];
       if (id && rowErrorsForRow) {
@@ -136,6 +143,7 @@ export function InstanceEnvironment({
   ): ComponentProps<typeof Input> & { id: string } {
     const rowErrors = errors[row.id];
     const name = row.key.trim() || "variable";
+    const hint = suggestionByKey.get(row.key.trim());
     return {
       id: `cfg-env-${row.id}-${field}`,
       value: row[field],
@@ -161,7 +169,9 @@ export function InstanceEnvironment({
                 ? "Leave empty to keep"
                 : row.secret
                   ? "Secret value"
-                  : "Value",
+                  : hint?.example
+                    ? `e.g. ${hint.example}`
+                    : "Value",
           }),
     };
   }
@@ -171,7 +181,7 @@ export function InstanceEnvironment({
       title="Environment"
       description="Variables the agent receives. Secret values are encrypted at rest and never returned."
       action={
-        <Button type="button" variant="outline" size="sm" onClick={addRow}>
+        <Button type="button" variant="outline" size="sm" onClick={() => addRow()}>
           <Plus aria-hidden />
           Add variable
         </Button>
@@ -341,6 +351,54 @@ export function InstanceEnvironment({
             </TableBody>
           </Table>
         </div>
+
+        {available.length > 0 ? (
+          <div className="space-y-2 rounded-md border border-dashed p-3">
+            <p className="text-xs font-medium text-muted-foreground">
+              Suggested by the template
+            </p>
+            <div className="grid gap-1.5">
+              {available.map((suggestion) => (
+                <button
+                  key={suggestion.key}
+                  type="button"
+                  onClick={() =>
+                    addRow({ key: suggestion.key, secret: suggestion.secret ?? false })
+                  }
+                  className="group flex w-full items-start gap-2 rounded-md border px-3 py-2 text-left transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  <Plus aria-hidden className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 space-y-0.5">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-xs">{suggestion.key}</span>
+                      {suggestion.required ? (
+                        <Badge
+                          variant="outline"
+                          className="border-amber-600/40 text-[11px] font-normal text-amber-700 dark:text-amber-400"
+                        >
+                          required
+                        </Badge>
+                      ) : null}
+                      {suggestion.secret ? (
+                        <Badge variant="outline" className="text-[11px] font-normal">
+                          secret
+                        </Badge>
+                      ) : null}
+                    </span>
+                    {suggestion.description ? (
+                      <span className="block text-xs text-muted-foreground">{suggestion.description}</span>
+                    ) : null}
+                    {suggestion.example ? (
+                      <span className="block font-mono text-[11px] text-muted-foreground">
+                        example: {suggestion.example}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         {error ? (
           <div ref={alertRef}>

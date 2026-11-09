@@ -19,6 +19,7 @@ export function EnvironmentRows({
   onChange,
   errors,
   suggestions = [],
+  hints,
   templateName,
 }: {
   idPrefix: string;
@@ -26,9 +27,12 @@ export function EnvironmentRows({
   onChange: (rows: EnvRow[]) => void;
   errors: Record<number, EnvRowErrors>;
   suggestions?: EnvSuggestion[];
+  /** Every suggestion of the template, including keys already added. */
+  hints?: EnvSuggestion[];
   templateName?: string;
 }) {
   const focusId = useRef<string | null>(null);
+  const hintByKey = new Map((hints ?? suggestions).map((suggestion) => [suggestion.key, suggestion]));
 
   useEffect(() => {
     if (!focusId.current) return;
@@ -41,7 +45,7 @@ export function EnvironmentRows({
     onChange(rows.map((row) => (row.id === id ? { ...row, ...changes } : row)));
   }
 
-  function addRow(seed: { key?: string; secret?: boolean } = {}, focus: "key" | "value" = "key") {
+  function addRow(seed: { key?: string; secret?: boolean; value?: string } = {}, focus: "key" | "value" = "key") {
     const row = newEnvRow(seed);
     onChange([...rows, row]);
     focusId.current = `${idPrefix}-${row.id}-${focus}`;
@@ -66,6 +70,8 @@ export function EnvironmentRows({
           {rows.map((row, index) => {
             const rowErrors = errors[row.id];
             const name = row.key.trim() || `variable ${index + 1}`;
+            const hint = hintByKey.get(row.key.trim());
+            const example = hint?.example ? `e.g. ${hint.example}` : hint?.format ? `format: ${hint.format}` : undefined;
             return (
               <div key={row.id} className="space-y-1">
                 <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_auto_auto] sm:items-center">
@@ -93,7 +99,9 @@ export function EnvironmentRows({
                         ? "Leave empty to keep the stored secret"
                         : row.secret
                           ? "Secret value"
-                          : "Value"
+                          : hint?.example
+                            ? `e.g. ${hint.example}`
+                            : "Value"
                     }
                     aria-label={`${name} value`}
                     aria-invalid={!!rowErrors?.value}
@@ -124,6 +132,16 @@ export function EnvironmentRows({
                     <Trash2 aria-hidden />
                   </Button>
                 </div>
+                {hint?.required || example ? (
+                  <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    {hint?.required ? (
+                      <Badge variant="outline" className="border-amber-600/40 font-normal text-amber-700 dark:text-amber-400">
+                        required
+                      </Badge>
+                    ) : null}
+                    {example ? <span className="font-mono">{example}</span> : null}
+                  </p>
+                ) : null}
                 {rowErrors?.key ? (
                   <p id={`${idPrefix}-${row.id}-key-error`} className="text-xs text-destructive">
                     {rowErrors.key}
@@ -159,13 +177,23 @@ export function EnvironmentRows({
               <button
                 key={suggestion.key}
                 type="button"
-                onClick={() => addRow({ key: suggestion.key, secret: suggestion.secret ?? false }, "value")}
+                onClick={() =>
+                  addRow(
+                    { key: suggestion.key, secret: suggestion.secret ?? false },
+                    "value",
+                  )
+                }
                 className="group flex w-full items-start gap-2 rounded-md border px-3 py-2 text-left transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
               >
                 <Plus aria-hidden className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 space-y-0.5">
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="font-mono text-xs">{suggestion.key}</span>
+                    {suggestion.required ? (
+                      <Badge variant="outline" className="border-amber-600/40 text-[11px] font-normal text-amber-700 dark:text-amber-400">
+                        required
+                      </Badge>
+                    ) : null}
                     {suggestion.secret ? (
                       <Badge variant="outline" className="text-[11px] font-normal">
                         secret
@@ -175,6 +203,11 @@ export function EnvironmentRows({
                   </span>
                   {suggestion.description ? (
                     <span className="block text-xs text-muted-foreground">{suggestion.description}</span>
+                  ) : null}
+                  {suggestion.example ? (
+                    <span className="block font-mono text-[11px] text-muted-foreground">
+                      example: {suggestion.example}
+                    </span>
                   ) : null}
                 </span>
               </button>

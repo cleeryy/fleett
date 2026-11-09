@@ -2,6 +2,9 @@ import { useState, type ReactNode } from "react";
 import {
   Boxes,
   Brain,
+  CalendarClock,
+  CircleDollarSign,
+  FileClock,
   FolderTree,
   KeyRound,
   LayoutTemplate,
@@ -10,8 +13,12 @@ import {
   MessagesSquare,
   Moon,
   Plug,
+  Rocket,
   ScrollText,
+  ShieldCheck,
   Sun,
+  TriangleAlert,
+  Workflow,
   type LucideIcon,
 } from "lucide-react";
 import type { Health, Identity } from "@/api/types";
@@ -45,16 +52,30 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { key: "instances", label: "Instances", href: "#/instances", icon: Boxes },
+  { key: "schedules", label: "Schedules", href: "#/schedules", icon: CalendarClock, adminOnly: true },
+  { key: "pipelines", label: "Pipelines", href: "#/pipelines", icon: Workflow },
+  { key: "incidents", label: "Incidents", href: "#/incidents", icon: TriangleAlert },
+  { key: "cost", label: "Cost", href: "#/cost", icon: CircleDollarSign },
+  { key: "logs", label: "Logs", href: "#/logs", icon: ScrollText },
+  { key: "deployments", label: "Deployments", href: "#/deployments", icon: Rocket },
+  { key: "security", label: "Security", href: "#/security", icon: ShieldCheck, adminOnly: true },
   { key: "messages", label: "Messages", href: "#/messages", icon: MessagesSquare, adminOnly: true },
   { key: "memory", label: "Memory", href: "#/memory", icon: Brain },
   { key: "providers", label: "Providers", href: "#/providers", icon: Plug },
   { key: "shares", label: "Shares", href: "#/shares", icon: FolderTree },
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
   { key: "tokens", label: "Tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
-  { key: "audit", label: "Audit log", href: "#/audit", icon: ScrollText, adminOnly: true },
+  { key: "audit", label: "Audit log", href: "#/audit", icon: FileClock, adminOnly: true },
 ];
 
 function activeKey(path: string): string {
+  if (path.startsWith("/schedules")) return "schedules";
+  if (path.startsWith("/pipelines")) return "pipelines";
+  if (path.startsWith("/incidents")) return "incidents";
+  if (path.startsWith("/cost")) return "cost";
+  if (path.startsWith("/logs")) return "logs";
+  if (path.startsWith("/deployments")) return "deployments";
+  if (path.startsWith("/security")) return "security";
   if (path.startsWith("/providers")) return "providers";
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/templates")) return "templates";
@@ -99,7 +120,7 @@ function SideNav({
         <span className="text-sm font-semibold tracking-tight">fleett</span>
       </div>
 
-      <nav aria-label="Console sections" className="flex-1 space-y-1 p-2">
+      <nav aria-label="Console sections" className="flex-1 space-y-1 overflow-y-auto p-2">
         {items.map((item) => {
           const Icon = item.icon;
           const isActive = item.key === active;

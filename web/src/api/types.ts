@@ -80,6 +80,12 @@ export interface EnvSuggestion {
   description: string;
   /** `true` when the value has to be stored encrypted. The controller defaults to false. */
   secret?: boolean;
+  /** Value the console pre-fills when the variable is added. */
+  example?: string;
+  /** A missing value makes the gateway refuse every message. */
+  required?: boolean;
+  /** `csv-of-ids`, `bool`, `url` or `text`; enforced by the write endpoints. */
+  format?: string;
 }
 
 export interface Template {
@@ -244,6 +250,11 @@ export interface InstanceDetail {
   env: EnvEntry[];
   container: ContainerInfo | null;
   compose_yaml: string;
+  /**
+   * Operator-facing warnings: egress enforcement, LAN access, plaintext
+   * secrets and template allowlists. Empty when there is nothing to report.
+   */
+  warnings?: string[];
 }
 
 export interface ShareInstance {
@@ -609,6 +620,540 @@ export interface PurgeResult {
   removed: number;
 }
 
+/* --------------------------------------------------------------------------
+ * Cron schedules (docs/SCHEDULES.md)
+ * -------------------------------------------------------------------------- */
+
+export type ScheduleOverlap = "skip" | "queue";
+export type ScheduleRunStatus = "running" | "ok" | "error" | "timeout" | "skipped";
+
+export interface Schedule {
+  id: string;
+  instance_id: string;
+  name: string;
+  cron: string;
+  prompt: string;
+  enabled: boolean;
+  timezone: string;
+  overlap: ScheduleOverlap;
+  /** Execution budget in seconds. */
+  timeout: number;
+  catchup: boolean;
+  last_run_at?: string;
+  next_run_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleRun {
+  id: string;
+  schedule_id: string;
+  instance_id: string;
+  started_at: string;
+  finished_at?: string;
+  status: ScheduleRunStatus;
+  exit_code?: number | null;
+  output?: string;
+  duration_ms?: number | null;
+  created_at: string;
+}
+
+/** A schedule flattened with its latest run and all-time failure statistics. */
+export interface ScheduleView extends Schedule {
+  last_run?: ScheduleRun | null;
+  runs_total: number;
+  runs_failed: number;
+  /** `runs_failed / runs_total`, `0` when the schedule never ran. */
+  failure_rate: number;
+}
+
+export interface CreateScheduleInput {
+  name: string;
+  cron: string;
+  prompt: string;
+  enabled?: boolean;
+  timezone?: string;
+  overlap?: ScheduleOverlap;
+  timeout?: number;
+  catchup?: boolean;
+}
+
+export type PatchScheduleInput = Partial<CreateScheduleInput>;
+
+/* --------------------------------------------------------------------------
+ * Pipelines (docs/PIPELINES.md)
+ * -------------------------------------------------------------------------- */
+
+export type PipelineTrigger = "manual" | "cron" | "webhook";
+export type PipelineStepStatus = "pending" | "running" | "ok" | "failed" | "skipped";
+export type PipelineRunStatus = "pending" | "running" | "ok" | "failed" | "cancelled";
+export type PipelineOnFailure = "stop" | "continue";
+
+export interface PipelineStep {
+  id: string;
+  instance: string;
+  prompt: string;
+  depends_on?: string[];
+  retries?: number;
+  timeout_s?: number;
+  on_failure?: PipelineOnFailure;
+}
+
+export interface Pipeline {
+  id: string;
+  name: string;
+  trigger: PipelineTrigger;
+  cron?: string;
+  enabled: boolean;
+  steps: PipelineStep[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PipelineRun {
+  id: string;
+  pipeline_id: string;
+  status: PipelineRunStatus;
+  trigger: PipelineTrigger;
+  context?: string;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
+}
+
+export interface PipelineStepRun {
+  id: number;
+  run_id: string;
+  step_id: string;
+  instance_id: string;
+  status: PipelineStepStatus;
+  attempt: number;
+  output?: string;
+  error?: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface PipelineRunDetail extends PipelineRun {
+  steps: PipelineStepRun[];
+}
+
+export interface CreatePipelineInput {
+  name: string;
+  trigger?: PipelineTrigger;
+  cron?: string;
+  enabled?: boolean;
+  steps: PipelineStep[];
+}
+
+export type PatchPipelineInput = Partial<CreatePipelineInput>;
+
+/* --------------------------------------------------------------------------
+ * Watchdog and incidents (docs/WATCHDOG.md)
+ * -------------------------------------------------------------------------- */
+
+export type IncidentCause = "oom" | "crashloop" | "unhealthy" | "image_missing" | "heal_failed";
+export type IncidentStatus = "open" | "closed";
+export type HealPolicy = "off" | "restart" | "recreate";
+
+export interface IncidentAction {
+  at: string;
+  /** `restart`, `recreate`, `heal_exhausted` or `observe`. */
+  action: string;
+  /** `ok`, `error` or `skipped`. */
+  result: string;
+  detail?: string;
+}
+
+export interface Incident {
+  id: string;
+  instance_id: string;
+  cause: IncidentCause;
+  status: IncidentStatus;
+  opened_at: string;
+  closed_at?: string;
+  detail: string;
+  actions: IncidentAction[];
+  restart_count: number;
+  last_seen_at: string;
+}
+
+export interface HealPolicyView {
+  id: string;
+  heal: HealPolicy;
+  unhealthy_after: number;
+  max_restarts: number;
+  heal_backoff_s: number;
+}
+
+/** Every field is optional: a missing field keeps the stored value. */
+export interface HealPolicyInput {
+  heal?: HealPolicy;
+  unhealthy_after?: number;
+  max_restarts?: number;
+  heal_backoff_s?: number;
+}
+
+export interface ListIncidentsParams {
+  status?: IncidentStatus;
+  instance?: string;
+  limit?: number;
+}
+
+/* --------------------------------------------------------------------------
+ * Cost, budgets and pricing (docs/COST.md)
+ * -------------------------------------------------------------------------- */
+
+export type CostGroupBy = "instance" | "model" | "day";
+
+export interface CostTotals {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  events: number;
+}
+
+export interface CostGroup extends CostTotals {
+  /** Instance id, model name or `YYYY-MM-DD` day. */
+  key: string;
+}
+
+export interface AgentCost {
+  instance_id: string;
+  cost_usd: number;
+  total_tokens: number;
+}
+
+export interface BudgetStatus {
+  instance_id: string;
+  month: string;
+  monthly_usd: number;
+  enabled: boolean;
+  used_usd: number;
+  /** `used / limit * 100`. */
+  percent: number;
+  exceeded: boolean;
+  projected_month_usd: number;
+  updated_at: string;
+}
+
+export interface CostProjection {
+  month: string;
+  elapsed_fraction: number;
+  month_to_date_usd: number;
+  projected_usd: number;
+}
+
+export interface CostReport {
+  from: string;
+  to: string;
+  group_by: string;
+  currency: string;
+  totals: CostTotals;
+  groups: CostGroup[];
+  top_agents: AgentCost[];
+  budgets: BudgetStatus[];
+  projection: CostProjection;
+}
+
+export interface CostReportParams {
+  from?: string;
+  to?: string;
+  group_by?: CostGroupBy;
+}
+
+export interface Pricing {
+  model: string;
+  input_per_mtok: number;
+  output_per_mtok: number;
+  currency: string;
+  /** First day (`YYYY-MM-DD`) the price applies to. */
+  effective_from: string;
+  updated_at: string;
+}
+
+export interface PricingInput {
+  model: string;
+  input_per_mtok: number;
+  output_per_mtok: number;
+  currency: string;
+  effective_from: string;
+}
+
+export interface BudgetView {
+  instance_id: string;
+  month: string;
+  /** `null` when no budget is configured. */
+  monthly_usd: number | null;
+  enabled: boolean;
+  configured: boolean;
+  used_usd: number;
+  percent: number;
+  exceeded: boolean;
+  projected_month_usd: number;
+  updated_at?: string;
+}
+
+export interface BudgetInput {
+  monthly_usd: number;
+  enabled: boolean;
+}
+
+/* --------------------------------------------------------------------------
+ * Log center (docs/LOGS.md)
+ * -------------------------------------------------------------------------- */
+
+export type LogLevel = "info" | "warn" | "error";
+
+export interface LogEntry {
+  id: number;
+  instance: string;
+  at: string;
+  level: LogLevel;
+  message: string;
+}
+
+export interface LogSearchResponse {
+  entries: LogEntry[];
+  count: number;
+  limit: number;
+}
+
+export interface LogQueryParams {
+  instances?: string[];
+  q?: string;
+  level?: LogLevel;
+  /** RFC 3339 timestamp or a relative window (`30m`, `24h`, `7d`). */
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+export type LogExportFormat = "json" | "csv";
+
+/* --------------------------------------------------------------------------
+ * Security posture (docs/HARDENING.md)
+ * -------------------------------------------------------------------------- */
+
+export interface SecurityStatus {
+  rate_limit: {
+    enabled: boolean;
+    limits: { per_min: number; auth_per_min: number; heavy_per_min: number };
+  };
+  lockout: { failures: number; window_s: number; lockout_s: number; locked_ips: number };
+  headers: {
+    csp: string;
+    x_frame_options: string;
+    referrer_policy: string;
+    permissions_policy: string;
+    x_content_type_options: string;
+    hsts: boolean;
+  };
+  tokens: { expired_or_revoked: number; active: number };
+  auth_mode: string;
+}
+
+/* --------------------------------------------------------------------------
+ * Deployments and maintenance windows (docs/DEPLOYMENTS.md)
+ * -------------------------------------------------------------------------- */
+
+export type DeploymentStatus =
+  | "pending"
+  | "canary"
+  | "running"
+  | "scheduled"
+  | "ok"
+  | "failed"
+  | "rolled_back"
+  | "cancelled";
+
+export interface DeploymentInstanceResult {
+  id: string;
+  from?: string | null;
+  to: string;
+  status: string;
+  error?: string;
+}
+
+export interface Deployment {
+  id: string;
+  image: string;
+  status: DeploymentStatus;
+  instances: string[];
+  canary: number;
+  soak_s: number;
+  started_at?: string;
+  finished_at?: string;
+  /** Per-instance results once it runs, the deferred request while scheduled. */
+  result?: { request?: Record<string, unknown> } | DeploymentInstanceResult[] | null;
+  error?: string | null;
+  rollback: boolean;
+  created_by: string;
+}
+
+export interface MaintenanceWindow {
+  id: string;
+  name: string;
+  days: string[];
+  /** UTC minute since midnight, inclusive. */
+  start_minute: number;
+  /** UTC minute since midnight, exclusive. */
+  end_minute: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MaintenanceWindowInput {
+  name: string;
+  days: string[];
+  start_minute: number;
+  end_minute: number;
+  enabled: boolean;
+}
+
+export interface MaintenanceStatus {
+  open: boolean;
+  next_open?: string | null;
+  enforce: boolean;
+}
+
+/* --------------------------------------------------------------------------
+ * Snapshots (docs/SNAPSHOTS.md)
+ * -------------------------------------------------------------------------- */
+
+export interface Snapshot {
+  id: string;
+  instance_id: string;
+  path: string;
+  label: string;
+  created_at: string;
+  expires_at: string;
+  size_bytes: number;
+  /** `ok`, `restoring` or `failed`. */
+  status: string;
+  error?: string | null;
+}
+
+export interface CreateSnapshotInput {
+  label?: string;
+  /** 1 … 7 776 000 seconds; defaults to 7 days. */
+  ttl_s?: number;
+}
+
+export interface SnapshotDiffFile {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface SnapshotChangedFile {
+  path: string;
+  size_a: number;
+  size_b: number;
+  sha256_a: string;
+  sha256_b: string;
+}
+
+export interface SnapshotDiff {
+  instance_id: string;
+  a: string;
+  b: string;
+  added: SnapshotDiffFile[];
+  removed: SnapshotDiffFile[];
+  changed: SnapshotChangedFile[];
+  unchanged: number;
+}
+
+export interface RestoreReport {
+  snapshot: Snapshot;
+  instance_id: string;
+  files: number;
+  status: string;
+  env_restored: boolean;
+  compose_restored: boolean;
+  previous_data_dir?: string | null;
+}
+
+/* --------------------------------------------------------------------------
+ * Instance ACL, egress policy and exec (docs/RBAC.md, docs/EGRESS-POLICY.md)
+ * -------------------------------------------------------------------------- */
+
+export type AclRole = "owner" | "operator" | "viewer";
+
+export interface AclItem {
+  subject: string;
+  role: AclRole;
+  created_at: string;
+}
+
+export interface InstanceAcl {
+  instance: string;
+  acl: AclItem[];
+}
+
+export interface AclItemInput {
+  subject: string;
+  role: AclRole;
+}
+
+export type EgressMode = "deny" | "allow";
+export type EgressPolicySource = "explicit" | "allow_lan" | "legacy" | "disabled";
+
+export interface EgressPolicyView {
+  instance: string;
+  source: EgressPolicySource;
+  mode: EgressMode;
+  fqdns: string[];
+  cidrs: string[];
+  ports: number[];
+  updated_at?: string;
+  proxy?: string;
+  proxy_acl?: string;
+  warnings: string[];
+}
+
+export interface EgressPolicyInput {
+  mode: EgressMode;
+  fqdns: string[];
+  cidrs: string[];
+  ports: number[];
+}
+
+export interface EgressTestResult {
+  instance: string;
+  host: string;
+  port: number;
+  /** Decision of the policy, not an observation of real traffic. */
+  allowed: boolean;
+  reason: string;
+  source: EgressPolicySource;
+  mode: EgressMode;
+  /** True only when a component that could enforce the decision is reachable. */
+  enforced: boolean;
+  enforcement?: string;
+  proxy?: string;
+}
+
+export interface ExecInput {
+  /** Preferred: command and arguments already separated. */
+  argv?: string[];
+  /** Split on whitespace; refused characters include `; | & $` and quotes. */
+  cmd?: string;
+  timeout_s?: number;
+}
+
+export interface ExecResult {
+  /** `null` when the timeout or a signal killed the command. */
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+  timed_out: boolean;
+  duration_ms: number;
+  truncated: boolean;
+}
+
 export interface FleetApi {
   health(): Promise<Health>;
   /** Public: which login methods the controller advertises. */
@@ -681,4 +1226,73 @@ export interface FleetApi {
   /** Copies the entry into another namespace; the source stays readable. */
   promoteMemory(id: number, namespace: string): Promise<MemoryEntry>;
   purgeExpiredMemory(): Promise<PurgeResult>;
+
+  /* Schedules */
+  listSchedules(): Promise<ScheduleView[]>;
+  listInstanceSchedules(id: string): Promise<Schedule[]>;
+  createSchedule(id: string, input: CreateScheduleInput): Promise<Schedule>;
+  patchSchedule(scheduleId: string, input: PatchScheduleInput): Promise<Schedule>;
+  deleteSchedule(scheduleId: string): Promise<void>;
+  runSchedule(scheduleId: string): Promise<ScheduleRun>;
+  listRuns(id: string, limit?: number): Promise<ScheduleRun[]>;
+
+  /* Pipelines */
+  listPipelines(): Promise<Pipeline[]>;
+  getPipeline(id: string): Promise<Pipeline>;
+  createPipeline(input: CreatePipelineInput): Promise<Pipeline>;
+  patchPipeline(id: string, input: PatchPipelineInput): Promise<Pipeline>;
+  deletePipeline(id: string): Promise<void>;
+  runPipeline(id: string, context?: unknown): Promise<PipelineRunDetail>;
+  listPipelineRuns(id: string, limit?: number): Promise<PipelineRun[]>;
+  getPipelineRun(id: string, runId: string): Promise<PipelineRunDetail>;
+  cancelPipelineRun(id: string, runId: string): Promise<PipelineRunDetail>;
+
+  /* Incidents and healing */
+  listIncidents(params?: ListIncidentsParams): Promise<Incident[]>;
+  instanceIncidents(id: string, limit?: number): Promise<Incident[]>;
+  closeIncident(id: string): Promise<Incident>;
+  patchHeal(id: string, input: HealPolicyInput): Promise<HealPolicyView>;
+
+  /* Cost */
+  costReport(params?: CostReportParams): Promise<CostReport>;
+  listBudgets(): Promise<BudgetStatus[]>;
+  getBudget(id: string): Promise<BudgetView>;
+  setBudget(id: string, input: BudgetInput): Promise<BudgetView>;
+  listPricing(): Promise<Pricing[]>;
+  setPricing(input: PricingInput): Promise<Pricing>;
+  deletePricing(model: string): Promise<void>;
+
+  /* Log center */
+  searchLogs(params?: LogQueryParams): Promise<LogSearchResponse>;
+  exportLogs(
+    params: LogQueryParams | undefined,
+    format: LogExportFormat,
+  ): Promise<{ blob: Blob; filename: string }>;
+
+  /* Security */
+  securityStatus(): Promise<SecurityStatus>;
+
+  /* Deployments and maintenance */
+  listDeployments(params?: { limit?: number; status?: DeploymentStatus }): Promise<Deployment[]>;
+  getDeployment(id: string): Promise<Deployment>;
+  listMaintenanceWindows(): Promise<MaintenanceWindow[]>;
+  createMaintenanceWindow(input: MaintenanceWindowInput): Promise<MaintenanceWindow>;
+  patchMaintenanceWindow(id: string, input: Partial<MaintenanceWindowInput>): Promise<MaintenanceWindow>;
+  deleteMaintenanceWindow(id: string): Promise<void>;
+  maintenanceStatus(): Promise<MaintenanceStatus>;
+
+  /* Snapshots */
+  listSnapshots(id: string): Promise<Snapshot[]>;
+  createSnapshot(id: string, input?: CreateSnapshotInput): Promise<Snapshot>;
+  compareSnapshots(id: string, a: string, b: string): Promise<SnapshotDiff>;
+  restoreSnapshot(snapshotId: string): Promise<RestoreReport>;
+  deleteSnapshot(snapshotId: string): Promise<void>;
+
+  /* Instance ACL, egress and exec */
+  getInstanceAcl(id: string): Promise<InstanceAcl>;
+  putInstanceAcl(id: string, acl: AclItemInput[]): Promise<InstanceAcl>;
+  getEgress(id: string): Promise<EgressPolicyView>;
+  putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView>;
+  testEgress(id: string, host: string, port: number): Promise<EgressTestResult>;
+  exec(id: string, input: ExecInput): Promise<ExecResult>;
 }
