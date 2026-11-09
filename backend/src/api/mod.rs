@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bus;
+pub mod cost;
 pub mod deployments;
 pub mod desired_state;
 pub mod error;
@@ -198,6 +199,18 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))
+        .route("/usage/ingest", post(cost::ingest))
+        .route("/cost", get(cost::report))
+        .route("/cost/budgets", get(cost::budgets))
+        .route(
+            "/models/pricing",
+            get(cost::pricing_list).post(cost::pricing_set),
+        )
+        .route("/models/pricing/{model}", delete(cost::pricing_delete))
+        .route(
+            "/instances/{id}/budget",
+            get(cost::budget_get).put(cost::budget_put),
+        )
         .route("/usage", get(usage::usage))
         .route("/images", get(upgrade::images))
         .route("/upgrade", get(upgrade::status).post(upgrade::start))

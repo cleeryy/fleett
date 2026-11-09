@@ -309,6 +309,9 @@ pub enum Command {
     Restart(String),
     Delete { id: String, purge: bool },
     Usage,
+    Cost(CostArgs),
+    Pricing(PricingAction),
+    Budget(BudgetArgs),
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
@@ -417,6 +420,38 @@ pub struct MessagesArgs {
     pub limit: usize,
 }
 
+/// Arguments of `fleett cost`.
+#[derive(Debug, Clone)]
+pub struct CostArgs {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub group_by: String,
+}
+
+/// Arguments of `fleett pricing set`.
+#[derive(Debug, Clone)]
+pub struct PricingArgs {
+    pub model: String,
+    pub input: f64,
+    pub output: f64,
+    pub currency: String,
+    pub effective_from: Option<String>,
+}
+
+/// `fleett pricing` subcommand.
+#[derive(Debug, Clone)]
+pub enum PricingAction {
+    List,
+    Set(PricingArgs),
+}
+
+/// Arguments of `fleett budget`.
+#[derive(Debug, Clone)]
+pub struct BudgetArgs {
+    pub id: String,
+    pub set: Option<f64>,
+}
+
 /// Arguments of `fleett upgrade`.
 #[derive(Debug, Clone)]
 pub struct UpgradeArgs {
@@ -487,6 +522,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Restart(id) => lifecycle(&client, json, &id, "restart").await,
         Command::Delete { id, purge } => delete(&client, json, &id, purge).await,
         Command::Usage => usage(&client, json).await,
+        Command::Cost(args) => cost(&client, json, &args).await,
+        Command::Pricing(action) => pricing(&client, json, &action).await,
+        Command::Budget(args) => budget(&client, json, &args).await,
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
@@ -601,6 +639,89 @@ struct UsageReport {
     instances: Vec<UsageEntry>,
     totals: UsageTotals,
     caps: UsageCaps,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostTotalsView {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    events: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostGroupView {
+    key: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    events: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentCostView {
+    instance_id: String,
+    cost_usd: f64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectionView {
+    month: String,
+    elapsed_fraction: f64,
+    month_to_date_usd: f64,
+    projected_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BudgetStatusView {
+    instance_id: String,
+    monthly_usd: f64,
+    used_usd: f64,
+    percent: f64,
+    projected_month_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostReportView {
+    from: String,
+    to: String,
+    group_by: String,
+    currency: String,
+    totals: CostTotalsView,
+    #[serde(default)]
+    groups: Vec<CostGroupView>,
+    #[serde(default)]
+    top_agents: Vec<AgentCostView>,
+    #[serde(default)]
+    budgets: Vec<BudgetStatusView>,
+    projection: ProjectionView,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PricingView {
+    model: String,
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    currency: String,
+    effective_from: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BudgetView {
+    instance_id: String,
+    month: String,
+    #[serde(default)]
+    monthly_usd: Option<f64>,
+    enabled: bool,
+    configured: bool,
+    used_usd: f64,
+    percent: f64,
+    #[serde(default)]
+    exceeded: bool,
+    projected_month_usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1503,6 +1624,202 @@ async fn usage(client: &Client, json: bool) -> Result<(), CliError> {
     );
     println!("{}", caps_line(&report.caps));
     Ok(())
+}
+
+async fn cost(client: &Client, json: bool, args: &CostArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("group_by", args.group_by.clone())];
+    if let Some(from) = args.from.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("from", from.to_string()));
+    }
+    if let Some(to) = args.to.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("to", to.to_string()));
+    }
+    let value = client.value(Method::GET, "/api/cost", &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let report: CostReportView = decode(value)?;
+    let mut rows: Vec<Vec<String>> = report
+        .groups
+        .iter()
+        .map(|group| {
+            vec![
+                group.key.clone(),
+                group.prompt_tokens.to_string(),
+                group.completion_tokens.to_string(),
+                group.total_tokens.to_string(),
+                format_cost(group.cost_usd),
+                group.events.to_string(),
+            ]
+        })
+        .collect();
+    rows.push(vec![
+        "TOTAL".to_string(),
+        report.totals.prompt_tokens.to_string(),
+        report.totals.completion_tokens.to_string(),
+        report.totals.total_tokens.to_string(),
+        format_cost(report.totals.cost_usd),
+        report.totals.events.to_string(),
+    ]);
+    println!(
+        "cost {} -> {} by {} ({} tokens, {})",
+        report.from, report.to, report.group_by, report.totals.total_tokens, report.currency
+    );
+    print!(
+        "{}",
+        render_table(
+            &["KEY", "PROMPT", "COMPLETION", "TOTAL", "COST", "EVENTS"],
+            &rows
+        )
+    );
+    for agent in &report.top_agents {
+        println!(
+            "top {:<16} {} {} ({} tokens)",
+            agent.instance_id,
+            format_cost(agent.cost_usd),
+            report.currency,
+            agent.total_tokens
+        );
+    }
+    for budget in &report.budgets {
+        println!(
+            "budget {:<16} {} / {} {} ({:.1}%) projected {}",
+            budget.instance_id,
+            format_cost(budget.used_usd),
+            format_cost(budget.monthly_usd),
+            report.currency,
+            budget.percent,
+            format_cost(budget.projected_month_usd)
+        );
+    }
+    println!(
+        "month {}: {} {} so far, {} projected ({:.0}% elapsed)",
+        report.projection.month,
+        format_cost(report.projection.month_to_date_usd),
+        report.currency,
+        format_cost(report.projection.projected_usd),
+        report.projection.elapsed_fraction * 100.0
+    );
+    Ok(())
+}
+
+async fn pricing(client: &Client, json: bool, action: &PricingAction) -> Result<(), CliError> {
+    match action {
+        PricingAction::List => {
+            let value = client
+                .value(Method::GET, "/api/models/pricing", &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let prices: Vec<PricingView> = decode(value)?;
+            if prices.is_empty() {
+                println!("no price configured");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = prices
+                .iter()
+                .map(|price| {
+                    vec![
+                        price.model.clone(),
+                        format!("{}", price.input_per_mtok),
+                        format!("{}", price.output_per_mtok),
+                        price.currency.clone(),
+                        price.effective_from.clone(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(
+                    &[
+                        "MODEL",
+                        "INPUT/MTOK",
+                        "OUTPUT/MTOK",
+                        "CURRENCY",
+                        "EFFECTIVE"
+                    ],
+                    &rows
+                )
+            );
+            Ok(())
+        }
+        PricingAction::Set(args) => {
+            let mut body = json!({
+                "model": args.model,
+                "input_per_mtok": args.input,
+                "output_per_mtok": args.output,
+                "currency": args.currency,
+            });
+            if let Some(effective_from) = &args.effective_from {
+                body["effective_from"] = json!(effective_from);
+            }
+            let value = client
+                .value(Method::POST, "/api/models/pricing", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let price: PricingView = decode(value)?;
+            println!(
+                "price {}: input {} / output {} {} per Mtok, effective {}",
+                price.model,
+                price.input_per_mtok,
+                price.output_per_mtok,
+                price.currency,
+                price.effective_from
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn budget(client: &Client, json: bool, args: &BudgetArgs) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/budget", encode_path_segment(&args.id));
+    let value = match args.set {
+        Some(monthly_usd) => {
+            client
+                .value(
+                    Method::PUT,
+                    &path,
+                    &[],
+                    Some(json!({"monthly_usd": monthly_usd, "enabled": true})),
+                )
+                .await?
+        }
+        None => client.value(Method::GET, &path, &[], None).await?,
+    };
+    if json {
+        return print_json(&value);
+    }
+    let view: BudgetView = decode(value)?;
+    match view.monthly_usd {
+        Some(monthly_usd) => println!(
+            "{}: {} / {} USD ({:.1}%) in {}{}, projected {} USD",
+            view.instance_id,
+            format_cost(view.used_usd),
+            format_cost(monthly_usd),
+            view.percent,
+            view.month,
+            if view.exceeded { ", EXCEEDED" } else { "" },
+            format_cost(view.projected_month_usd)
+        ),
+        None => println!(
+            "{}: no budget configured ({} USD used in {})",
+            view.instance_id,
+            format_cost(view.used_usd),
+            view.month
+        ),
+    }
+    Ok(())
+}
+
+fn format_cost(value: f64) -> String {
+    if value != 0.0 && value.abs() < 1.0 {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.2}")
+    }
 }
 
 async fn images(client: &Client, json: bool) -> Result<(), CliError> {

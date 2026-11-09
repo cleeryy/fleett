@@ -7,6 +7,7 @@ pub mod backup;
 pub mod bus;
 pub mod cli;
 pub mod config;
+pub mod cost;
 pub mod db;
 pub mod deployments;
 pub mod driver;

@@ -168,6 +168,32 @@ enum Commands {
     },
     /// Show the CPU, memory and disk usage of the fleet (client mode).
     Usage,
+    /// Token usage and cost of the fleet (client mode). See docs/COST.md.
+    Cost {
+        /// Inclusive lower bound (`YYYY-MM-DD` or RFC 3339); default: first
+        /// day of the month.
+        #[arg(long)]
+        from: Option<String>,
+        /// Upper bound (`YYYY-MM-DD` includes the whole day); default: now.
+        #[arg(long)]
+        to: Option<String>,
+        /// `instance` (default), `model` or `day`.
+        #[arg(long, default_value = "instance")]
+        group_by: String,
+    },
+    /// Show or change the per-model token prices (client mode).
+    Pricing {
+        #[command(subcommand)]
+        action: Option<PricingCommands>,
+    },
+    /// Show or set the monthly budget of one instance (client mode).
+    Budget {
+        /// Instance id.
+        id: String,
+        /// Monthly ceiling in USD; omit to only show the status.
+        #[arg(long)]
+        set: Option<f64>,
+    },
     /// List the container images present on the host and their instances
     /// (client mode).
     Images,
@@ -412,6 +438,29 @@ enum BackupCommands {
     },
 }
 
+#[derive(Subcommand, Clone)]
+enum PricingCommands {
+    /// List the latest price of every model.
+    List,
+    /// Set the price of one model (a new effective date adds a version).
+    Set {
+        /// Model name, as written by the gateway.
+        model: String,
+        /// Input price, per million tokens.
+        #[arg(long)]
+        input: f64,
+        /// Output price, per million tokens.
+        #[arg(long)]
+        output: f64,
+        /// Three-letter currency code (default USD).
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        /// First day the price applies to (`YYYY-MM-DD`, default today).
+        #[arg(long)]
+        effective_from: Option<String>,
+    },
+}
+
 #[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
 enum SecretsCommands {
     /// Generate the key file (0640); refuses to overwrite an existing one.
@@ -567,6 +616,35 @@ async fn main() -> anyhow::Result<()> {
         Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
         Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
         Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Cost { from, to, group_by } => {
+            cli::run(
+                cli::Command::Cost(cli::CostArgs { from, to, group_by }),
+                json,
+            )
+            .await
+        }
+        Commands::Pricing { action } => {
+            let action = match action.unwrap_or(PricingCommands::List) {
+                PricingCommands::List => cli::PricingAction::List,
+                PricingCommands::Set {
+                    model,
+                    input,
+                    output,
+                    currency,
+                    effective_from,
+                } => cli::PricingAction::Set(cli::PricingArgs {
+                    model,
+                    input,
+                    output,
+                    currency,
+                    effective_from,
+                }),
+            };
+            cli::run(cli::Command::Pricing(action), json).await
+        }
+        Commands::Budget { id, set } => {
+            cli::run(cli::Command::Budget(cli::BudgetArgs { id, set }), json).await
+        }
         Commands::Images => cli::run(cli::Command::Images, json).await,
         Commands::Upgrade {
             image,
@@ -828,6 +906,12 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!("watchdog disabled (FLEETT_WATCHDOG_INTERVAL_S=0)");
     }
+    if cfg.cost_scan_interval_s > 0 {
+        fleett::cost::spawn_scanner(
+            state.clone(),
+            std::time::Duration::from_secs(cfg.cost_scan_interval_s),
+        );
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -842,6 +926,18 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
+    }
+
+    // Token accounting (issue #35): one scan at startup, then every
+    // `FLEETT_COST_SCAN_INTERVAL_S` seconds. `0` disables the scanner; the
+    // ingest endpoint stays available either way.
+    if cfg.cost_scan_interval_s > 0 {
+        fleett::cost::spawn_scanner(
+            state.clone(),
+            std::time::Duration::from_secs(cfg.cost_scan_interval_s),
+        );
+    } else {
+        tracing::info!("cost scanner disabled (FLEETT_COST_SCAN_INTERVAL_S=0)");
     }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

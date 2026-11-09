@@ -367,6 +367,10 @@ pub struct Config {
     /// default 30). `0` disables the background loop; `fleett incidents` still
     /// reads the registry.
     pub watchdog_interval_s: u64,
+    /// Seconds between two automatic usage-log scans (`FLEETT_COST_SCAN_INTERVAL_S`).
+    /// `0` disables the background scanner; ingestion stays available through
+    /// `POST /api/usage/ingest`.
+    pub cost_scan_interval_s: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -589,6 +593,15 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
 
+        let cost_scan_interval_s = match get("COST_SCAN_INTERVAL_S") {
+            None => 300,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_COST_SCAN_INTERVAL_S",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
         let watchdog_interval_s = match get("WATCHDOG_INTERVAL_S") {
             None => DEFAULT_WATCHDOG_INTERVAL_S,
             Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
@@ -630,6 +643,7 @@ impl Config {
             hardening,
             maintenance_enforce,
             metrics,
+            cost_scan_interval_s,
             watchdog_interval_s,
         })
     }
@@ -670,6 +684,8 @@ impl Config {
             metrics: MetricsConfig::default(),
             // Tests drive `watchdog::tick` explicitly; no background loop runs.
             watchdog_interval_s: 0,
+            // Tests ingest usage explicitly; no background scanner.
+            cost_scan_interval_s: 0,
         }
     }
 
