@@ -68,13 +68,13 @@ caller cannot send on behalf of an instance other than the one in the path.
 
 ## Agent side
 
-Every rendered compose file mounts `$FLEETT_ROOT/bus` at `/opt/data/shared/bus`. When a
+Every rendered compose file mounts `$FLEETT_ROOT/bus` at `/opt/bus`. When a
 message is queued, a JSON mirror is written to `bus/<recipient>/<id>.json`, so an agent
 without HTTP access can still read its inbox:
 
 ```bash
-ls /opt/data/shared/bus/tchouniz/
-cat /opt/data/shared/bus/tchouniz/<id>.json
+ls /opt/bus/tchouniz/
+cat /opt/bus/tchouniz/<id>.json
 ```
 
 The spool is a convenience mirror, not the source of truth: acknowledgements and the
