@@ -48,7 +48,7 @@ network call: the DNS check only reads `/etc/resolv.conf`, so an isolated host s
 - A check that cannot run (database error, unreachable Docker daemon, `df` missing) is
   reported as `error` with its detail. The route never answers `500`.
 
-### The ten checks
+### The eleven checks
 
 | `id` | Verifies | `warn` / `error` | `fix` |
 |---|---|---|---|
@@ -57,6 +57,7 @@ network call: the DNS check only reads `/etc/resolv.conf`, so an isolated host s
 | `image` | `FLEETT_IMAGE` is present in the driver's local image store (`docker images`) | `error`: tag absent or the daemon unreachable | `docker build -t <image> /path/to/hermes-official` |
 | `secrets` | An encryption key is configured; counts encrypted instances and leftover plaintext `secrets.env` files | `warn`: plaintext files remain; `error`: no key | `sudo fleett secrets init` (missing key) / `fleett secrets migrate --apply` (plaintext) |
 | `egress` | `FLEETT_EGRESS` mode and the marker written by `fleett egress install` | `warn`: mode `off`, marker missing/unreadable, or marker written by another fleett version (stale) | `sudo fleett egress install` |
+| `egress-policy` | Stored destination policies and the proxy they render. At most one TCP probe per distinct proxy (750 ms) | `error`: a policy renders a proxy that does not answer (every connection of that instance fails); `warn`: a policy needs a proxy but no address is configured | `docker compose -f docker/fleett-proxy.example.yaml up -d` / set `FLEETT_EGRESS_PROXY` or remove the policy |
 | `providers` | Number of providers in the database | `warn`: zero | — |
 | `instances` | Number of instances | never | — |
 | `permissions` | `FLEETT_ROOT` is writable (probe file, deleted immediately); with `FLEETT_DRIVER=compose`, the Docker socket is reachable (`DOCKER_HOST`, else `/var/run/docker.sock`) | `error`: root not writable or socket unreachable | `sudo chown -R fleett:fleett <root>` / `sudo usermod -aG docker fleett` |
@@ -65,6 +66,8 @@ network call: the DNS check only reads `/etc/resolv.conf`, so an isolated host s
 
 The egress marker is *stale* when it was installed by a different fleett version than the one
 running: the rules may not match the current release, so the checklist asks for a reinstall.
+`egress-policy` is `ok` when no explicit policy exists: that is the normal legacy state, not a
+degradation. See [EGRESS.md](EGRESS.md) for the proxy deployment recipe.
 
 ## `GET /api/onboarding`
 

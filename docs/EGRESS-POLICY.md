@@ -117,34 +117,55 @@ agent-to-agent traffic and the gate do not depend on the proxy. A gate with
 another DNS name must be added to the proxy ACLs (and, when it is reached by
 name, to `NO_PROXY` by the operator).
 
-### Warnings
+### Reachability: `422 proxy_unreachable`
 
-`GET /api/instances/{id}/egress` and the `PUT` response include a `warnings`
-entry when a proxy is rendered but does not answer:
+`PUT /api/instances/{id}/egress` probes the proxy the resulting policy would
+render (fresh TCP connect, 750 ms, no cache) **before** writing the row or
+recreating the container. If it does not answer, the write is refused:
 
+```json
+{
+  "error": {
+    "code": "proxy_unreachable",
+    "message": "proxy http://127.0.0.1:9 is unreachable (…); deploying a policy …",
+    "details": {
+      "instance": "alice",
+      "proxy": "http://127.0.0.1:9",
+      "hint": "docker compose -f docker/fleett-proxy.example.yaml up -d"
+    }
+  }
+}
 ```
-proxy 127.0.0.1:9 is unreachable: Connection refused (os error 111): the
-instance points at a proxy that does not answer, so every outbound connection
-fails; start the proxy or remove the policy with DELETE
-/api/instances/alice/egress
-```
 
-The reachability probe is a TCP connect (same one as `POST …/egress/test`),
-cached for ten seconds per proxy URL, successes and failures alike, so a dead
-proxy does not slow every read. The `PUT` **never** fails because of the probe:
-it saves the policy, restarts the instance and returns the warning. Removing
-the policy is the operator's decision, not the server's.
+No row is written, the compose file is unchanged and the container is not
+recreated. The same guard runs on every other recreation path (instance patch,
+env change, clone, import, share change). A reachable proxy is accepted even if
+its ACLs do not match the policy: the probe checks the socket only.
+
+`GET /api/instances/{id}/egress` still reports a proxy that died *after* the
+write, without failing the read:
+
+- `proxy_reachable: true|false`, absent when no proxy is rendered;
+- `proxy_error`: the socket error text when `proxy_reachable` is `false`;
+- a human-readable entry in `warnings` (kept for compatibility).
+
+The probe results are cached for ten seconds per proxy URL, successes and
+failures alike, so a dead proxy does not slow every read. `fleett doctor` /
+`GET /api/doctor` reports the same state as the `egress-policy` check
+(`ok`/`error`/`warn`), and `GET /api/egress/summary` gives every instance at
+once.
 
 ## Deploy the proxy
 
 `docker/fleett-proxy.example.yaml` runs Squid on the `fleett` network under the
-container name `fleett-egress-proxy`:
+container name `fleett-egress-proxy`. The complete, executable recipe lives in
+[EGRESS.md](EGRESS.md#deploy-the-egress-proxy-complete-recipe); the short form:
 
 ```bash
 cd docker
 cp fleett-proxy.domains.example.txt fleett-proxy.domains.txt
 cp fleett-proxy.cidrs.example.txt fleett-proxy.cidrs.txt
-# edit both allowlists, then:
+# generate both files from GET /api/egress/summary (see EGRESS.md), then:
 docker compose -f fleett-proxy.example.yaml up -d
 ```
 
@@ -160,18 +181,21 @@ http_access allow fleett_nets fleett_ports
 http_access deny all
 ```
 
-Generate the allowlist files from the API. `GET /api/instances/{id}/egress`
-returns the effective lists and, for an explicit policy, a ready-to-copy
-`proxy_acl` snippet naming `/etc/squid/fleett-<id>.domains` and
-`/etc/squid/fleett-<id>.cidrs`:
+The `proxy_acl` snippet returned by `GET /api/instances/{id}/egress` reads those
+same **shared** files (`/etc/squid/fleett-domains.txt`,
+`/etc/squid/fleett-cidrs.txt`), with per-instance ACL names so several snippets
+can be concatenated without redeclaring an ACL. Generate the files from the
+fleet-wide union:
 
 ```bash
 curl -fsS -H "Authorization: Bearer $FLEETT_TOKEN" \
-  "$FLEETT_URL/api/instances/alice/egress" | jq -r '.fqdns[]' \
-  > fleett-proxy.domains.txt
+  "$FLEETT_URL/api/egress/summary" \
+  | jq -r '[.instances[] | select(.policy == "enforced") | .fqdns[]] | unique[]' \
+  | sed 's/^\*\././' > docker/fleett-proxy.domains.txt
 curl -fsS -H "Authorization: Bearer $FLEETT_TOKEN" \
-  "$FLEETT_URL/api/instances/alice/egress" | jq -r '.cidrs[]' \
-  > fleett-proxy.cidrs.txt
+  "$FLEETT_URL/api/egress/summary" \
+  | jq -r '[.instances[] | select(.policy == "enforced") | .cidrs[]] | unique[]' \
+  > docker/fleett-proxy.cidrs.txt
 docker compose -f docker/fleett-proxy.example.yaml restart fleett-proxy
 ```
 
@@ -183,12 +207,13 @@ the host.
 
 | Method | Route | Body | Effect |
 |---|---|---|---|
-| GET | `/api/instances/{id}/egress` | — | effective policy: `source`, `mode`, `fqdns`, `cidrs`, `ports`, `proxy` (only when rendered), `proxy_acl` (explicit only), `legacy_equivalent`, `warnings` |
-| PUT | `/api/instances/{id}/egress` | `{"mode","fqdns","cidrs","ports","proxy"}` | validate, store, rewrite the compose file, restart; `400 invalid_egress_policy`; never `409` on an unreachable proxy (warning instead); audited as `egress.policy.update` |
+| GET | `/api/instances/{id}/egress` | — | effective policy: `source`, `mode`, `fqdns`, `cidrs`, `ports`, `proxy` (only when rendered), `proxy_reachable`, `proxy_error`, `proxy_acl`, `legacy_equivalent`, `warnings` |
+| PUT | `/api/instances/{id}/egress` | `{"mode","fqdns","cidrs","ports","proxy"}` | validate, probe the rendered proxy, store, rewrite the compose file, restart; `400 invalid_egress_policy`; `422 proxy_unreachable` (details `{instance,proxy,hint}`) when the proxy does not answer, before any write; audited as `egress.policy.update` |
 | DELETE | `/api/instances/{id}/egress` | — | drop the explicit policy, return to the legacy shape; `404` when none; `egress.policy.delete` |
 | POST | `/api/instances/{id}/egress/test` | `{"host":"api.github.com","port":443}` | policy decision plus enforcement state (below) |
 | GET | `/api/instances/{id}/egress/blocks?limit=200` | — | refused destinations, newest first; `limit` 1..=1000 |
 | DELETE | `/api/instances/{id}/egress/blocks` | — | `{"removed":N}`; audited as `egress.blocks.clear` |
+| GET | `/api/egress/summary` | — | `{"instances":[{instance,policy:"none\|legacy\|enforced",mode,fqdns,cidrs,ports,proxy?,proxy_reachable?,proxy_error?,source,warnings}]}`; filtered to readable instances, one probe per distinct proxy |
 | GET | `/api/egress/blocks?instance=&limit=` | — | admin view across the fleet |
 | POST | `/api/egress/blocks` | `{"instance","host","port","reason?"}` | proxy ingestion; `201`, rate-limited, token required |
 
@@ -250,16 +275,20 @@ an honest gap, not a hidden failure.
 ## Enforcement limits (read this before trusting a policy)
 
 1. **fleett does not run the proxy.** `docker/fleett-proxy.example.yaml` is an
-   operator artifact. If it is not running, `HTTP_PROXY` points at a dead name
-   and nothing is enforced — only for policies that render the variables; a
-   legacy-equivalent one renders none and the host firewall covers it.
+   operator artifact. The API refuses to *create* a policy that renders a dead
+   proxy (`422 proxy_unreachable`), but it cannot keep it alive: if the proxy
+   stops later, `HTTP_PROXY` points at a dead name until the operator restarts
+   it. A legacy-equivalent policy renders no variables and the host firewall
+   covers it. `GET /api/egress/summary` and the `egress-policy` doctor check
+   report the breakage.
 2. **One shared proxy cannot distinguish instances.** The rendered variables
    are identical for every instance, so the proxy only sees the source IP; the
    ACL files are therefore a union unless the operator runs one proxy per
    instance or a proxy that authenticates each agent. Docker container IPs are
-   not stable enough for `src` ACLs. Per-instance ACL files and the `proxy_acl`
-   snippet are provided for the per-instance deployment, not for a magic
-   shared one.
+   not stable enough for `src` ACLs. `proxy_acl` keeps per-instance ACL names
+   but reads the shared files, so it can be concatenated into the shared proxy
+   configuration; per-instance files are only meaningful with one proxy per
+   instance.
 3. **`HTTP_PROXY` is advisory.** An agent controls its process environment and
    can unset it or open a raw socket. Actual enforcement requires host rules
    that allow the `fleett` subnet to reach only the proxy and drop other

@@ -382,6 +382,7 @@ fn api_routes(state: AppState) -> Router<AppState> {
             "/egress/blocks",
             get(egress::list_all_blocks).post(egress::ingest_block),
         )
+        .route("/egress/summary", get(egress::summary))
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",
@@ -604,11 +605,15 @@ fn content_type(path: &str) -> &'static str {
 }
 
 /// Write the compose file from the current spec and run `up -d`.
+///
+/// The stored egress policy is probed first: recreating a container that would
+/// point at a dead proxy is refused with `422 proxy_unreachable` (issue #60).
 pub(crate) async fn apply_compose(
     state: &AppState,
     spec: &mut InstanceSpec,
 ) -> Result<(), ApiError> {
     crate::api::hydrate_previous_image(state, spec);
+    crate::api::egress::ensure_egress_proxy(state, spec).await?;
     write_compose_file(state, spec)?;
     up_and_record(state, spec).await
 }

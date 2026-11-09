@@ -241,6 +241,9 @@ pub async fn create(
     crate::api::quota::enforce_host_disk(&state, &spec)?;
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
+    // A stale policy row for a freshly created id would be the only way a
+    // create renders a proxy; refuse before writing anything (issue #60).
+    crate::api::egress::ensure_egress_proxy(&state, &spec).await?;
 
     let values = render::build_secrets(
         &spec,
@@ -507,6 +510,14 @@ pub async fn clone(
     // A clone of a restricted instance inherits its destination policy: a
     // security setting must never loosen silently when an agent is duplicated.
     let source_policy = egress_policy::load(&state.db, &source.id).map_err(ApiError::from)?;
+    // The clone inherits that policy: if it renders a proxy, refuse before
+    // creating anything (issue #60).
+    if let Some(proxy) = source_policy
+        .as_ref()
+        .and_then(|policy| egress_policy::proxy_url(&state.cfg, policy))
+    {
+        crate::api::egress::ensure_proxy_reachable(&new_id, &proxy).await?;
+    }
     let inherited: BTreeMap<String, String> = source_env
         .iter()
         .filter(|entry| !entry.secret)
@@ -876,6 +887,10 @@ async fn import_archive(
     }
 
     if start {
+        // Starting an imported instance recreates its container: refuse a
+        // policy that renders a dead proxy (the archive does not carry one,
+        // but the id may already have a row from an earlier life).
+        crate::api::egress::ensure_egress_proxy(state, &spec).await?;
         up_and_record(state, &mut spec).await?;
     }
 
@@ -1110,6 +1125,8 @@ pub async fn patch(
         crate::history::record_ui_write(&state.cfg, &spec.id, &context, "/SOUL.md");
     }
 
+    // A recreation must never point at a dead egress proxy (issue #60).
+    crate::api::egress::ensure_egress_proxy(&state, &spec).await?;
     up_and_record(&state, &mut spec).await?;
     let (status, health, container) = match state.driver.ps(&spec).await {
         Ok(result) => (result.status, result.health, result.container),
@@ -1255,6 +1272,7 @@ pub async fn delete_env(
         &spec.id,
         audit::with_assistant_tag(Some(serde_json::json!({ "key": key })), &headers),
     );
+    crate::api::egress::ensure_egress_proxy(&state, &spec).await?;
     up_and_record(&state, &mut spec).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1274,6 +1292,9 @@ async fn detail_after_apply(
     spec: &InstanceSpec,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let mut spec = spec.clone();
+    // An environment change recreates the container: same dead-proxy guard as
+    // every other recreation path (issue #60).
+    crate::api::egress::ensure_egress_proxy(state, &spec).await?;
     up_and_record(state, &mut spec).await?;
     let (status, health, container) = match state.driver.ps(&spec).await {
         Ok(result) => (result.status, result.health, result.container),

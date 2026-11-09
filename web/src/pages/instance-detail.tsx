@@ -14,7 +14,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef, SkillRef } from "@/api/types";
+import type { ChannelType, EgressPolicyState, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef, SkillRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -42,6 +42,7 @@ import { CopyButton } from "@/components/copy-button";
 import { DataList, Section } from "@/components/data-list";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
+import { EgressBadge } from "@/components/egress-badge";
 import { InstanceMemoryTab, InstanceMessagesTab } from "@/components/instance-bus";
 import { InstanceEnvironment } from "@/components/instance-env";
 import { InstanceLogs } from "@/components/instance-logs";
@@ -139,6 +140,13 @@ function OverviewTab({
   const suppliedByProvider = !!detail.provider;
   const providerKeySet = suppliedByProvider || hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
   const secretCount = detail.env.filter((entry) => entry.secret).length;
+  const egress = useResource(() => api.getEgress(detail.id), [detail.id]);
+  const egressState: EgressPolicyState =
+    egress.data?.source === "explicit"
+      ? "enforced"
+      : egress.data?.source === "disabled"
+        ? "none"
+        : "legacy";
 
   return (
     <div className="space-y-6">
@@ -249,6 +257,20 @@ function OverviewTab({
                     </Badge>
                     <p className="text-xs text-muted-foreground">
                       {detail.allow_lan ? t("detail.lanOn") : t("detail.lanOff")}
+                    </p>
+                  </div>
+                ),
+              },
+              {
+                label: t("detail.egressPolicy"),
+                value: (
+                  <div className="space-y-1">
+                    <EgressBadge
+                      policy={egressState}
+                      proxyReachable={egress.data?.proxy_reachable}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t(`detail.egress.${egressState}`)}
                     </p>
                   </div>
                 ),

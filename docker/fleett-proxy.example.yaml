@@ -13,6 +13,10 @@
 # The proxy joins the external `fleett` network so agents resolve
 # `fleett-egress-proxy:3128`. It publishes no host port.
 #
+# Complete deployment, verification, firewall and troubleshooting recipe:
+# docs/EGRESS.md. The two allowlist files are the fleet-wide union generated
+# from GET /api/egress/summary (one shared proxy cannot tell instances apart).
+#
 # Limitation: one shared proxy cannot enforce a different allowlist per
 # instance. The two allowlist files are the union of the destinations you
 # decide to trust; for true per-instance isolation run one proxy per instance

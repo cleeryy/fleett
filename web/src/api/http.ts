@@ -29,6 +29,7 @@ import type {
   DoctorReport,
   EgressPolicyInput,
   EgressPolicyView,
+  EgressSummary,
   EgressTestResult,
   EnvInput,
   ExecInput,
@@ -966,6 +967,8 @@ export const httpApi: FleetApi = {
       method: "POST",
       body: JSON.stringify({ host, port }),
     }),
+
+  egressSummary: () => request<EgressSummary>("/api/egress/summary"),
 
   exec: (id, input: ExecInput) =>
     request<ExecResult>(`/api/instances/${encodeURIComponent(id)}/exec`, {

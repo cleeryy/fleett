@@ -1437,6 +1437,8 @@ export interface AclItemInput {
 
 export type EgressMode = "deny" | "allow";
 export type EgressPolicySource = "explicit" | "allow_lan" | "legacy" | "disabled";
+/** Coarse state of the fleet-wide summary (`GET /api/egress/summary`). */
+export type EgressPolicyState = "none" | "legacy" | "enforced";
 
 export interface EgressPolicyView {
   instance: string;
@@ -1447,6 +1449,10 @@ export interface EgressPolicyView {
   ports: number[];
   updated_at?: string;
   proxy?: string;
+  /** Absent when no proxy is rendered; false means the socket did not answer. */
+  proxy_reachable?: boolean;
+  /** Socket error text when `proxy_reachable` is false. */
+  proxy_error?: string;
   proxy_acl?: string;
   /**
    * The policy decides nothing more than the host firewall already does, so no
@@ -1455,6 +1461,27 @@ export interface EgressPolicyView {
    */
   legacy_equivalent?: boolean;
   warnings: string[];
+}
+
+/** One line of `GET /api/egress/summary`, already filtered by the server. */
+export interface EgressSummaryEntry {
+  instance: string;
+  policy: EgressPolicyState;
+  mode: EgressMode;
+  fqdns: string[];
+  cidrs: string[];
+  ports: number[];
+  /** `null` when no proxy is rendered. */
+  proxy?: string | null;
+  /** `null` when no proxy is rendered. */
+  proxy_reachable?: boolean | null;
+  proxy_error?: string;
+  source: EgressPolicySource;
+  warnings: string[];
+}
+
+export interface EgressSummary {
+  instances: EgressSummaryEntry[];
 }
 
 export interface EgressPolicyInput {
@@ -1504,7 +1531,7 @@ export interface ExecResult {
 /** `ok` passes, `warn` degrades a protection, `error` needs the operator. */
 export type DoctorCheckStatus = "ok" | "warn" | "error";
 
-/** One line of `GET /api/doctor`; the ten checks always come in the same order. */
+/** One line of `GET /api/doctor`; the eleven checks always come in the same order. */
 export interface DoctorCheck {
   /** Stable id (`api`, `docker`, `image`, …). */
   id: string;
@@ -1851,6 +1878,8 @@ export interface FleetApi {
   /** Drops the explicit policy and returns the legacy view now in force. */
   deleteEgress(id: string): Promise<EgressPolicyView>;
   testEgress(id: string, host: string, port: number): Promise<EgressTestResult>;
+  /** Fleet-wide badge state in one call; server-filtered to readable instances. */
+  egressSummary(): Promise<EgressSummary>;
   exec(id: string, input: ExecInput): Promise<ExecResult>;
 
   /* Onboarding and doctor */

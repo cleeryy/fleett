@@ -12,3 +12,7 @@ data/
 
 # parallel agent worktrees
 .worktrees/
+
+# generated egress-proxy allowlists (docs/EGRESS.md)
+docker/fleett-proxy.domains.txt
+docker/fleett-proxy.cidrs.txt

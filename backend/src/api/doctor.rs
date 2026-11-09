@@ -13,7 +13,16 @@ use axum::Json;
 /// `GET /api/doctor` — the checklist of `fleett doctor`, for the console.
 pub async fn doctor(State(state): State<AppState>) -> Json<Report> {
     let uptime_s = state.started_at.elapsed().as_secs() as i64;
-    Json(crate::doctor::report(&state.cfg, &state.db, state.driver.as_ref(), uptime_s).await)
+    Json(
+        crate::doctor::report(
+            &state.cfg,
+            &state.db,
+            state.driver.as_ref(),
+            uptime_s,
+            state.egress_probe.as_ref(),
+        )
+        .await,
+    )
 }
 
 /// `GET /api/onboarding` — the four first-run steps and their live state.

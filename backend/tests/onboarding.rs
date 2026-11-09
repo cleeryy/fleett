@@ -384,6 +384,130 @@ async fn doctor_reports_the_egress_modes_and_the_marker() {
 }
 
 #[tokio::test]
+async fn doctor_distinguishes_absent_policies_from_a_broken_proxy() {
+    // No explicit policy anywhere: the normal state, not an error.
+    let harness = Harness::new();
+    let report = harness.get_json("/api/doctor").await;
+    let check_egress_policy = check(&report, "egress-policy");
+    assert_eq!(check_egress_policy["status"], "ok", "{report}");
+    assert!(
+        check_egress_policy["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("no explicit destination policy"),
+        "{check_egress_policy}"
+    );
+    assert!(
+        check_egress_policy.get("fix").is_none(),
+        "{check_egress_policy}"
+    );
+
+    // A policy that needs no proxy is fine even with the proxy switched off.
+    let off = Harness::with_config(|cfg| cfg.egress_proxy = "off".to_string());
+    store_policy(
+        &off,
+        "alice",
+        &[],
+        None,
+        fleett::egress_policy::PolicyMode::Allow,
+    );
+    let report = off.get_json("/api/doctor").await;
+    let check_egress_policy = check(&report, "egress-policy");
+    assert_eq!(check_egress_policy["status"], "ok", "{report}");
+
+    // A policy that needs a proxy but has no address is a warning, not a
+    // silent success.
+    store_policy(
+        &off,
+        "bob",
+        &["api.github.com"],
+        None,
+        fleett::egress_policy::PolicyMode::Deny,
+    );
+    let report = off.get_json("/api/doctor").await;
+    let check_egress_policy = check(&report, "egress-policy");
+    assert_eq!(check_egress_policy["status"], "warn", "{report}");
+    assert!(
+        check_egress_policy["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("bob"),
+        "{check_egress_policy}"
+    );
+
+    // An explicit policy whose proxy does not answer is an error, distinct
+    // from the absence of a policy, with the deploy command as the fix.
+    let broken = Harness::with_config(|cfg| cfg.egress_proxy = "http://127.0.0.1:9".to_string());
+    store_policy(
+        &broken,
+        "alice",
+        &["api.github.com"],
+        None,
+        fleett::egress_policy::PolicyMode::Deny,
+    );
+    let report = broken.get_json("/api/doctor").await;
+    let check_egress_policy = check(&report, "egress-policy");
+    assert_eq!(check_egress_policy["status"], "error", "{report}");
+    assert_eq!(
+        check_egress_policy["fix"],
+        "docker compose -f docker/fleett-proxy.example.yaml up -d"
+    );
+    let detail = check_egress_policy["detail"].as_str().expect("detail");
+    assert!(detail.contains("alice"), "{detail}");
+    assert!(detail.contains("http://127.0.0.1:9"), "{detail}");
+    assert_eq!(report["ok"], false, "{report}");
+
+    // The same policy with a live proxy is an ok line.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let live = Harness::with_config(|cfg| cfg.egress_proxy = format!("http://{address}"));
+    store_policy(
+        &live,
+        "alice",
+        &["api.github.com"],
+        None,
+        fleett::egress_policy::PolicyMode::Deny,
+    );
+    let report = live.get_json("/api/doctor").await;
+    let check_egress_policy = check(&report, "egress-policy");
+    assert_eq!(check_egress_policy["status"], "ok", "{report}");
+    assert!(
+        check_egress_policy["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("reachable"),
+        "{check_egress_policy}"
+    );
+}
+
+/// Insert a policy row directly: the API refuses a dead proxy (issue #60), so
+/// a broken state can only come from a proxy that died after the write.
+fn store_policy(
+    harness: &Harness,
+    id: &str,
+    fqdns: &[&str],
+    proxy: Option<&str>,
+    mode: fleett::egress_policy::PolicyMode,
+) {
+    let policy = fleett::egress_policy::EgressPolicy {
+        instance_id: id.to_string(),
+        mode,
+        fqdns: fqdns.iter().map(|value| value.to_string()).collect(),
+        cidrs: Vec::new(),
+        ports: if fqdns.is_empty() {
+            Vec::new()
+        } else {
+            vec![443]
+        },
+        proxy: proxy.map(str::to_string),
+        updated_at: "2026-11-09T10:00:00Z".to_string(),
+    };
+    fleett::egress_policy::upsert(&harness.state.db, &policy).expect("store policy");
+}
+
+#[tokio::test]
 async fn doctor_measures_the_free_space_of_the_data_root() {
     let harness = Harness::new();
     let report = harness.get_json("/api/doctor").await;

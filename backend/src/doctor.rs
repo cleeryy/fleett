@@ -9,13 +9,17 @@
 //! is off) or `error` (the operator must fix it). The report is `ok` only when
 //! no check is `error`: warnings never fail it.
 //!
-//! Everything here is local: no network call is made, so the checklist answers
-//! on an isolated host (the DNS check only reads `/etc/resolv.conf`).
+//! Everything here is local except the `egress-policy` check: when a policy
+//! renders a proxy, that check makes at most one bounded TCP probe per distinct
+//! proxy URL (750 ms each, through the shared probe cache). The DNS check only
+//! reads `/etc/resolv.conf`, so the rest of the checklist still answers on an
+//! isolated host.
 
 use crate::config::{Config, DriverKind, EgressMode, VERSION};
 use crate::db::Db;
 use crate::driver::Driver;
 use crate::egress::{self, MarkerState};
+use crate::egress_policy::{self, ProxyProbeCache};
 use crate::hosts::LOCAL_HOST;
 use crate::secrets;
 use serde::Serialize;
@@ -23,12 +27,13 @@ use std::path::Path;
 use std::process::Command;
 
 /// Ids of every check, in the order the report lists them.
-pub const CHECK_IDS: [&str; 10] = [
+pub const CHECK_IDS: [&str; 11] = [
     "api",
     "docker",
     "image",
     "secrets",
     "egress",
+    "egress-policy",
     "providers",
     "instances",
     "permissions",
@@ -131,7 +136,13 @@ pub struct Report {
 
 /// Run every check. Never fails: an error inside one check is reported as that
 /// check's `error` line.
-pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver, uptime_s: i64) -> Report {
+pub async fn report(
+    cfg: &Config,
+    db: &Db,
+    driver: &dyn Driver,
+    uptime_s: i64,
+    probe: &ProxyProbeCache,
+) -> Report {
     // `DOCKER_HOST` only feeds the permissions check; read it once so every
     // call of the report sees the same endpoint.
     let docker_host = std::env::var("DOCKER_HOST").ok();
@@ -142,6 +153,12 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver, uptime_s: i64) -
         guarded("image", "Agent image", check_image(cfg, driver)).await,
         guarded_now("secrets", "Secrets", Ok(check_secrets(cfg, db))),
         check_egress(cfg, &marker),
+        guarded(
+            "egress-policy",
+            "Egress policy",
+            check_egress_policy(cfg, db, probe),
+        )
+        .await,
         guarded_now("providers", "Providers", check_providers(db)),
         guarded_now("instances", "Instances", check_instances(db)),
         check_permissions(cfg, docker_host.as_deref()),
@@ -313,6 +330,106 @@ fn check_egress(cfg: &Config, marker: &MarkerState) -> Check {
             ),
         },
     }
+}
+
+/// Destination policies under `FLEETT_EGRESS`: distinguishes "no policy" from
+/// "policy whose proxy is down".
+///
+/// An explicit policy that needs no proxy is fine (the host firewall covers
+/// it); one that renders a proxy is `error` when that proxy does not answer,
+/// because every outbound connection of the instance then fails. At most one
+/// probe runs per distinct proxy URL, through the shared cache.
+async fn check_egress_policy(
+    cfg: &Config,
+    db: &Db,
+    probe: &ProxyProbeCache,
+) -> Result<Check, String> {
+    let policies = egress_policy::list_all(db).map_err(|err| err.to_string())?;
+    if policies.is_empty() {
+        return Ok(Check::ok(
+            "egress-policy",
+            "Egress policy",
+            "no explicit destination policy on any instance; only the host LAN filter applies \
+             (legacy source)",
+        ));
+    }
+
+    let mut proxied: Vec<(String, String)> = Vec::new();
+    let mut unconfigured: Vec<String> = Vec::new();
+    for policy in &policies {
+        if !egress_policy::needs_proxy(cfg, policy) {
+            continue;
+        }
+        match egress_policy::proxy_url(cfg, policy) {
+            Some(proxy) => proxied.push((policy.instance_id.clone(), proxy)),
+            None => unconfigured.push(policy.instance_id.clone()),
+        }
+    }
+
+    if proxied.is_empty() && unconfigured.is_empty() {
+        return Ok(Check::ok(
+            "egress-policy",
+            "Egress policy",
+            format!(
+                "{} stored; none needs the proxy, the host firewall covers {}",
+                count(policies.len(), "policy"),
+                if policies.len() == 1 { "it" } else { "them" }
+            ),
+        ));
+    }
+
+    let mut failures = Vec::new();
+    let mut probed: Vec<&str> = Vec::new();
+    for (_, proxy) in &proxied {
+        if probed.contains(&proxy.as_str()) {
+            continue;
+        }
+        probed.push(proxy);
+        if let Err(detail) = probe.reachable(proxy).await {
+            let instances: Vec<&str> = proxied
+                .iter()
+                .filter(|(_, url)| url == proxy)
+                .map(|(instance, _)| instance.as_str())
+                .collect();
+            failures.push(format!("{} → {proxy} ({detail})", instances.join(", ")));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Ok(Check::error(
+            "egress-policy",
+            "Egress policy",
+            format!(
+                "explicit policy renders an unreachable proxy: {}; every outbound connection of \
+                 the instance(s) fails until it answers",
+                failures.join("; ")
+            ),
+        )
+        .with_fix(egress_policy::PROXY_DEPLOY_HINT));
+    }
+
+    if !unconfigured.is_empty() {
+        return Ok(Check::warn(
+            "egress-policy",
+            "Egress policy",
+            format!(
+                "{} needs a proxy but no address is configured (FLEETT_EGRESS_PROXY is off and \
+                 the policy has no proxy override), so it is stored but unenforced",
+                unconfigured.join(", ")
+            ),
+        )
+        .with_fix("set FLEETT_EGRESS_PROXY, add a proxy override, or remove the policy"));
+    }
+
+    Ok(Check::ok(
+        "egress-policy",
+        "Egress policy",
+        format!(
+            "{} stored; rendered proxy reachable ({})",
+            count(policies.len(), "policy"),
+            probed.join(", ")
+        ),
+    ))
 }
 
 fn check_providers(db: &Db) -> Result<Check, String> {

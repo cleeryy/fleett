@@ -42,7 +42,7 @@ Read-only diagnostics and first-run state, available to every authenticated role
 
 | Method | Route | Response |
 |---|---|---|
-| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?}]}` — api, docker, image, secrets, egress, providers, instances, permissions, disk, dns |
+| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?}]}` — api, docker, image, secrets, egress, egress-policy, providers, instances, permissions, disk, dns |
 | GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, instance; `complete` when at least one instance exists |
 
 `fix` is either a copyable command or a UI link; a failing check is reported inline and never
@@ -697,12 +697,13 @@ behaviour; `GET …/egress` always returns that effective projection with
 
 | Method | Route | Body | Effect |
 |---|---|---|---|
-| GET | `/api/instances/{id}/egress` | — | `{instance,source,mode,fqdns,cidrs,ports,updated_at?,proxy?,proxy_acl?,warnings}` |
-| PUT | `/api/instances/{id}/egress` | `{"mode":"deny\|allow","fqdns":[],"cidrs":[],"ports":[]}` | validate, store, rewrite compose, restart; `400 invalid_egress_policy`; audit `egress.policy.update` |
+| GET | `/api/instances/{id}/egress` | — | `{instance,source,mode,fqdns,cidrs,ports,updated_at?,proxy?,proxy_reachable?,proxy_error?,proxy_acl?,legacy_equivalent,warnings}` |
+| PUT | `/api/instances/{id}/egress` | `{"mode":"deny\|allow","fqdns":[],"cidrs":[],"ports":[],"proxy":"http://…"}` | validate, probe the rendered proxy, store, rewrite compose, restart; `400 invalid_egress_policy`; `422 proxy_unreachable` (`details {instance,proxy,hint}`) before any write when it does not answer; audit `egress.policy.update` |
 | DELETE | `/api/instances/{id}/egress` | — | drop the explicit policy (back to legacy); `404` when none; audit `egress.policy.delete` |
 | POST | `/api/instances/{id}/egress/test` | `{"host":"api.github.com","port":443}` | `{allowed,reason,source,mode,enforced,enforcement?,proxy?}` |
 | GET | `/api/instances/{id}/egress/blocks?limit=200` | — | `[{id,instance_id,host,port,reason?,at}]`, newest first |
 | DELETE | `/api/instances/{id}/egress/blocks` | — | `{"removed":N}`; audit `egress.blocks.clear` |
+| GET | `/api/egress/summary` | — | `{instances:[{instance,policy:"none\|legacy\|enforced",mode,fqdns,cidrs,ports,proxy?,proxy_reachable?,proxy_error?,source,warnings}]}`; readable instances only, one probe per distinct proxy |
 | GET | `/api/egress/blocks?instance=&limit=` | — | admin view across the fleet |
 | POST | `/api/egress/blocks` | `{"instance","host","port","reason?"}` | `201` refused-destination record; token required, 120/min/instance |
 
@@ -722,6 +723,22 @@ socket probe does not verify that the proxy ACLs match the stored policy.
 `POST /api/egress/blocks` is authenticated (bearer or session, so a `viewer`
 token cannot POST), validates the host/port/reason, answers `404` for an unknown
 instance and `429 rate_limited` beyond 120 records per instance per minute.
+
+`GET /api/egress/summary` is the fleet-wide projection: `policy` is `enforced`
+when an explicit policy is stored, `legacy` when only `allow_lan` / the host
+firewall applies, `none` under `FLEETT_EGRESS=off`. It is filtered by the same
+instance authorization as `GET /api/instances` (a scoped token or a viewer
+session only sees its instances) and probes each distinct proxy URL at most
+once. `proxy` and `proxy_reachable` are `null` when no proxy is rendered;
+`proxy_error` carries the socket error when `proxy_reachable` is `false`.
+
+`PUT …/egress` refuses a policy whose rendered proxy does not answer with
+`422 proxy_unreachable` before writing the row or recreating the container;
+`error.details` is `{instance,proxy,hint}` where `hint` is the deploy command
+(`docker compose -f docker/fleett-proxy.example.yaml up -d`). The same guard
+applies to every other recreation path (patch, env, clone, import, shares).
+`GET …/egress` reports a proxy that died after the write through
+`proxy_reachable:false` + `proxy_error`, without failing the read.
 
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.

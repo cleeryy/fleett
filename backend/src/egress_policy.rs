@@ -45,6 +45,8 @@ pub const DEFAULT_PROXY_URL: &str = "http://fleett-egress-proxy:3128";
 pub const PROXY_SERVICE: &str = "fleett-proxy";
 /// Container name of the proxy on the `fleett` network.
 pub const PROXY_CONTAINER: &str = "fleett-egress-proxy";
+/// Command that deploys the shipped proxy example (see `docs/EGRESS.md`).
+pub const PROXY_DEPLOY_HINT: &str = "docker compose -f docker/fleett-proxy.example.yaml up -d";
 /// Proxy port used by the shipped example.
 pub const PROXY_PORT: u16 = 3128;
 /// LAN ranges the legacy host firewall drops for a restricted instance.
@@ -674,21 +676,30 @@ pub fn no_proxy(network: &str) -> String {
 /// The endpoint returns it in the policy view so an operator can copy it into
 /// the shared proxy without re-deriving the lists. It is documentation, not a
 /// deployment: fleett never writes the proxy configuration.
+///
+/// The snippet reads the **shared** allowlist files of
+/// `docker/fleett-proxy.example.yaml` (`/etc/squid/fleett-domains.txt`,
+/// `/etc/squid/fleett-cidrs.txt`), which are the fleet-wide union generated
+/// from `GET /api/egress/summary` (see `docs/EGRESS.md`). One shared proxy
+/// cannot distinguish instances, so per-instance files would not be enforced
+/// anyway; the ACL *names* stay per-instance so several snippets can be
+/// concatenated without redeclaring an ACL.
 pub fn squid_acl(policy: &EgressPolicy) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# fleett egress policy for {} ({} mode)\n",
         policy.instance_id, policy.mode
     ));
+    out.push_str("# files: fleet-wide union generated from GET /api/egress/summary\n");
     if !policy.fqdns.is_empty() {
         out.push_str(&format!(
-            "acl fleett_{0}_domains dstdomain \"/etc/squid/fleett-{0}.domains\"\n",
+            "acl fleett_{0}_domains dstdomain \"/etc/squid/fleett-domains.txt\"\n",
             policy.instance_id
         ));
     }
     if !policy.cidrs.is_empty() {
         out.push_str(&format!(
-            "acl fleett_{0}_nets dst \"/etc/squid/fleett-{0}.cidrs\"\n",
+            "acl fleett_{0}_nets dst \"/etc/squid/fleett-cidrs.txt\"\n",
             policy.instance_id
         ));
     }
@@ -802,6 +813,20 @@ fn join_ports(ports: &[u16]) -> String {
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Every stored policy, ordered by instance id.
+///
+/// [`crate::doctor`] and `GET /api/egress/summary` need the whole table; one
+/// query beats one `load` per instance.
+pub fn list_all(db: &Db) -> Result<Vec<EgressPolicy>, DbError> {
+    db.with_conn(|conn| {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {POLICY_COLUMNS} FROM egress_policies ORDER BY instance_id"
+        ))?;
+        let rows = statement.query_map([], row_to_policy)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    })
 }
 
 /// Stored policy of one instance.
@@ -937,15 +962,34 @@ pub fn clear_blocks(db: &Db, instance_id: &str) -> Result<usize, DbError> {
 // Proxy probe
 // ---------------------------------------------------------------------------
 
-/// Whether a TCP connection to the proxy succeeds.
+/// Host and port a proxy URL points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEndpoint {
+    /// Hostname or IP literal (IPv6 without brackets).
+    pub host: String,
+    pub port: u16,
+}
+
+impl ProxyEndpoint {
+    /// `host:port`, bracketed for IPv6, ready for `TcpStream::connect`.
+    pub fn target(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    fn is_ip(&self) -> bool {
+        self.host.parse::<IpAddr>().is_ok()
+    }
+}
+
+/// Parse and validate a proxy URL into the endpoint to probe.
 ///
-/// This deliberately checks the socket only: it proves the proxy process is
-/// reachable, not that its ACLs match the policy. `POST …/egress/test` and the
-/// warnings of `GET|PUT …/egress` report the distinction instead of pretending
-/// a policy is enforced. The API reaches this through [`ProxyProbeCache`] so a
-/// dead proxy does not slow every read.
-pub async fn probe_proxy(proxy_url: &str) -> Result<String, String> {
-    let parsed = url::Url::parse(proxy_url)
+/// Pure: no DNS lookup and no Docker call, so the URL handling is unit-testable.
+pub fn parse_proxy_endpoint(proxy_url: &str) -> Result<ProxyEndpoint, String> {
+    let parsed = url::Url::parse(proxy_url.trim())
         .map_err(|err| format!("\"{proxy_url}\" is not a valid proxy URL: {err}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!(
@@ -955,9 +999,92 @@ pub async fn probe_proxy(proxy_url: &str) -> Result<String, String> {
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("\"{proxy_url}\" has no host"))?
+        .trim_matches(['[', ']'])
         .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(PROXY_PORT);
-    let target = format!("{host}:{port}");
+    Ok(ProxyEndpoint {
+        host,
+        port: parsed.port_or_known_default().unwrap_or(PROXY_PORT),
+    })
+}
+
+/// First IP address in the `{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}`
+/// output of `docker inspect`.
+fn first_container_ip(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .find(|value| value.parse::<IpAddr>().is_ok())
+        .map(str::to_string)
+}
+
+/// Container IP of a Docker service/container name, if the CLI knows it.
+///
+/// The control plane is a host systemd unit, not a member of the `fleett`
+/// bridge: `fleett-egress-proxy` does not resolve from the host. Docker
+/// inspect returns the address the host can actually reach. Arguments are
+/// passed to `Command` directly (never through a shell), so a hostile URL host
+/// cannot inject a command; the caller has already validated it as a URL host.
+fn docker_container_ip(host: &str) -> Option<String> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            host,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    first_container_ip(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Resolve the endpoint to probe.
+///
+/// An IP literal is used as-is. A hostname first gets one bounded `docker
+/// inspect` (service names on the `fleett` network); when Docker does not know
+/// it, DNS resolution is left to the connect call. The Docker call is bounded
+/// by [`PROXY_PROBE_TIMEOUT`] and its result is cached by [`ProxyProbeCache`],
+/// while a fresh probe (`PUT` guard) always resolves again.
+pub async fn resolve_proxy_endpoint(proxy_url: &str) -> Result<ProxyEndpoint, String> {
+    let endpoint = parse_proxy_endpoint(proxy_url)?;
+    if endpoint.is_ip() {
+        return Ok(endpoint);
+    }
+    let host = endpoint.host.clone();
+    let inspected = tokio::time::timeout(
+        PROXY_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || docker_container_ip(&host)),
+    )
+    .await;
+    match inspected {
+        Ok(Ok(Some(address))) => Ok(ProxyEndpoint {
+            host: address,
+            port: endpoint.port,
+        }),
+        // Docker did not answer, does not know the name, or the timeout hit:
+        // fall back to the system resolver at connect time.
+        _ => Ok(endpoint),
+    }
+}
+
+/// Whether a TCP connection to the proxy succeeds.
+///
+/// This deliberately checks the socket only: it proves the proxy process is
+/// reachable, not that its ACLs match the policy. `POST …/egress/test` and the
+/// warnings of `GET|PUT …/egress` report the distinction instead of pretending
+/// a policy is enforced. The API reaches this through [`ProxyProbeCache`] so a
+/// dead proxy does not slow every read.
+///
+/// Never cached: the `PUT` guard must not accept a proxy that answered ten
+/// seconds ago but is gone now.
+pub async fn probe_proxy(proxy_url: &str) -> Result<String, String> {
+    let endpoint = resolve_proxy_endpoint(proxy_url).await?;
+    probe_endpoint(&endpoint).await
+}
+
+async fn probe_endpoint(endpoint: &ProxyEndpoint) -> Result<String, String> {
+    let target = endpoint.target();
     match tokio::time::timeout(PROXY_PROBE_TIMEOUT, tokio::net::TcpStream::connect(&target)).await {
         Ok(Ok(_)) => Ok(target),
         Ok(Err(err)) => Err(format!("proxy {target} is unreachable: {err}")),
@@ -978,11 +1105,14 @@ pub const PROXY_PROBE_CACHE_TTL: Duration = Duration::from_secs(10);
 /// Cached reachability of the proxies the API renders.
 ///
 /// One entry per proxy URL, successes *and* failures cached for
-/// [`PROXY_PROBE_CACHE_TTL`]. The cache is per process and never persisted: a
-/// restart is exactly when an operator expects a fresh probe.
+/// [`PROXY_PROBE_CACHE_TTL`], plus the Docker-resolved endpoint so a page that
+/// lists thirty instances does not run thirty `docker inspect` calls. The
+/// cache is per process and never persisted: a restart is exactly when an
+/// operator expects a fresh probe.
 #[derive(Debug, Default)]
 pub struct ProxyProbeCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, CachedProbe>>,
+    endpoints: std::sync::Mutex<std::collections::HashMap<String, CachedEndpoint>>,
 }
 
 #[derive(Debug, Clone)]
@@ -991,13 +1121,22 @@ struct CachedProbe {
     result: Result<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedEndpoint {
+    at: Instant,
+    result: Result<ProxyEndpoint, String>,
+}
+
 impl ProxyProbeCache {
     /// Whether `proxy_url` answers, reusing a probe younger than the TTL.
     pub async fn reachable(&self, proxy_url: &str) -> Result<String, String> {
         if let Some(result) = self.cached(proxy_url) {
             return result;
         }
-        let result = probe_proxy(proxy_url).await;
+        let result = match self.endpoint(proxy_url).await {
+            Ok(endpoint) => probe_endpoint(&endpoint).await,
+            Err(detail) => Err(detail),
+        };
         let mut entries = self
             .entries
             .lock()
@@ -1016,6 +1155,31 @@ impl ProxyProbeCache {
         result
     }
 
+    /// Resolved endpoint of `proxy_url`, reusing a resolution younger than the
+    /// TTL. Docker container IPs can change on restart; ten seconds of staleness
+    /// is the same trade-off as the probe result.
+    async fn endpoint(&self, proxy_url: &str) -> Result<ProxyEndpoint, String> {
+        if let Some(result) = self.cached_endpoint(proxy_url) {
+            return result;
+        }
+        let result = resolve_proxy_endpoint(proxy_url).await;
+        let mut endpoints = self
+            .endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if endpoints.len() > 64 {
+            endpoints.retain(|_, cached| cached.at.elapsed() < PROXY_PROBE_CACHE_TTL);
+        }
+        endpoints.insert(
+            proxy_url.to_string(),
+            CachedEndpoint {
+                at: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        result
+    }
+
     fn cached(&self, proxy_url: &str) -> Option<Result<String, String>> {
         let entries = self
             .entries
@@ -1027,9 +1191,24 @@ impl ProxyProbeCache {
             .map(|probe| probe.result.clone())
     }
 
+    fn cached_endpoint(&self, proxy_url: &str) -> Option<Result<ProxyEndpoint, String>> {
+        let endpoints = self
+            .endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        endpoints
+            .get(proxy_url)
+            .filter(|cached| cached.at.elapsed() < PROXY_PROBE_CACHE_TTL)
+            .map(|cached| cached.result.clone())
+    }
+
     /// Drop every cached result (tests and `PUT` after a restart).
     pub fn clear(&self) {
         self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.endpoints
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -1540,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn squid_acls_follow_the_mode() {
+    fn squid_acls_follow_the_mode_and_use_the_shared_files() {
         let deny = policy(
             PolicyMode::Deny,
             &["api.github.com"],
@@ -1550,11 +1729,94 @@ mod tests {
         let acl = squid_acl(&deny);
         assert!(acl.contains("http_access allow fleett_alice_domains fleett_alice_ports"));
         assert!(acl.contains("http_access deny all"));
+        // The shared proxy reads the shared files, not per-instance ones.
+        assert!(
+            acl.contains("dstdomain \"/etc/squid/fleett-domains.txt\""),
+            "{acl}"
+        );
+        assert!(acl.contains("dst \"/etc/squid/fleett-cidrs.txt\""), "{acl}");
+        assert!(!acl.contains("fleett-alice.domains"), "{acl}");
 
         let allow = policy(PolicyMode::Allow, &["blocked.test"], &[], &[]);
         let acl = squid_acl(&allow);
         assert!(acl.contains("http_access deny fleett_alice_domains"));
         assert!(acl.contains("http_access allow all"));
+    }
+
+    #[test]
+    fn proxy_endpoints_are_parsed_without_a_network_call() {
+        let endpoint = parse_proxy_endpoint("http://fleett-egress-proxy:3128").expect("valid");
+        assert_eq!(endpoint.host, "fleett-egress-proxy");
+        assert_eq!(endpoint.port, 3128);
+        assert_eq!(endpoint.target(), "fleett-egress-proxy:3128");
+
+        // The default port of the scheme applies when the URL omits it.
+        assert_eq!(
+            parse_proxy_endpoint("https://proxy.test")
+                .expect("valid")
+                .port,
+            443
+        );
+        assert_eq!(
+            parse_proxy_endpoint("http://proxy.test")
+                .expect("valid")
+                .port,
+            80
+        );
+
+        // IPv6 literals lose their brackets for the probe and get them back.
+        let v6 = parse_proxy_endpoint("http://[::1]:3128").expect("valid");
+        assert_eq!(v6.host, "::1");
+        assert_eq!(v6.target(), "[::1]:3128");
+
+        // A trailing slash and whitespace are accepted; no path is rejected
+        // because the probe ignores it (HTTP proxies accept one).
+        assert_eq!(
+            parse_proxy_endpoint(" http://proxy.test:3128/ ")
+                .expect("valid")
+                .port,
+            3128
+        );
+
+        assert!(parse_proxy_endpoint("ftp://proxy.test").is_err());
+        assert!(parse_proxy_endpoint("proxy.test:3128").is_err());
+        assert!(parse_proxy_endpoint("http://").is_err());
+    }
+
+    #[test]
+    fn container_ips_are_extracted_from_docker_inspect_output() {
+        assert_eq!(
+            first_container_ip("172.18.0.2 \n").as_deref(),
+            Some("172.18.0.2")
+        );
+        assert_eq!(
+            first_container_ip("172.18.0.2 172.19.0.3 ").as_deref(),
+            Some("172.18.0.2")
+        );
+        assert_eq!(first_container_ip(""), None);
+        assert_eq!(first_container_ip("<no value>"), None);
+    }
+
+    #[test]
+    fn every_stored_policy_is_listed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open db");
+        assert!(list_all(&db).expect("list").is_empty());
+        upsert(
+            &db,
+            &policy(PolicyMode::Deny, &["api.github.com"], &[], &[443]),
+        )
+        .expect("insert");
+        let mut beta = policy(PolicyMode::Allow, &[], &[], &[]);
+        beta.instance_id = "beta".to_string();
+        upsert(&db, &beta).expect("insert");
+        let all = list_all(&db).expect("list");
+        assert_eq!(
+            all.iter()
+                .map(|policy| policy.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "beta"]
+        );
     }
 
     #[test]

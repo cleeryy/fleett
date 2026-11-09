@@ -2432,7 +2432,14 @@ async fn egress_policy_reports_the_legacy_modes() {
 
 #[tokio::test]
 async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
-    let harness = Harness::with_config(|cfg| cfg.egress_proxy = "http://127.0.0.1:9".to_string());
+    // A live socket: since issue #60 a policy that renders a proxy is refused
+    // (`422 proxy_unreachable`) when that proxy does not answer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let proxy = format!("http://{address}");
+    let harness = Harness::with_config(|cfg| cfg.egress_proxy = proxy.clone());
     create_instance(&harness, "alice").await;
 
     let (status, body) = harness
@@ -2454,20 +2461,17 @@ async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
     assert_eq!(policy["fqdns"], json!(["api.github.com"]));
     assert_eq!(policy["ports"], json!([443]));
     assert!(policy["updated_at"].is_string());
+    assert_eq!(policy["proxy"], proxy.as_str());
+    assert_eq!(policy["proxy_reachable"], true);
+    assert!(policy.get("proxy_error").is_none(), "{policy}");
     assert!(policy["proxy_acl"]
         .as_str()
         .is_some_and(|acl| acl.contains("http_access allow fleett_alice_domains")));
 
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
     let environment = &compose["services"]["agent"]["environment"];
-    assert_eq!(
-        environment["HTTP_PROXY"].as_str(),
-        Some("http://127.0.0.1:9")
-    );
-    assert_eq!(
-        environment["HTTPS_PROXY"].as_str(),
-        Some("http://127.0.0.1:9")
-    );
+    assert_eq!(environment["HTTP_PROXY"].as_str(), Some(proxy.as_str()));
+    assert_eq!(environment["HTTPS_PROXY"].as_str(), Some(proxy.as_str()));
     assert!(environment["NO_PROXY"]
         .as_str()
         .is_some_and(|value| value.contains("fleett")));
@@ -2483,11 +2487,11 @@ async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let result = parse(&body);
     assert_eq!(result["allowed"], true);
-    assert_eq!(result["enforced"], false);
+    assert_eq!(result["enforced"], true, "{result}");
     assert!(
         result["enforcement"]
             .as_str()
-            .is_some_and(|value| value.contains("unreachable")),
+            .is_some_and(|value| value.contains("socket only")),
         "{result}"
     );
 
@@ -2513,7 +2517,7 @@ async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
     assert_eq!(
         compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
-        Some("http://127.0.0.1:9")
+        Some(proxy.as_str())
     );
 
     // Deleting the policy returns to the legacy shape and drops the variables.
@@ -2647,12 +2651,14 @@ async fn egress_policy_equivalent_to_legacy_renders_no_proxy() {
 }
 
 #[tokio::test]
-async fn egress_policy_with_a_dead_proxy_warns_instead_of_failing() {
+async fn egress_policy_with_a_dead_proxy_is_refused_before_any_write() {
     let harness = Harness::with_config(|cfg| cfg.egress_proxy = "http://127.0.0.1:9".to_string());
     create_instance(&harness, "alice").await;
+    let compose_before =
+        std::fs::read(harness.instance_dir("alice").join("compose.yaml")).expect("compose file");
 
-    // A real exception needs the proxy; the proxy is down. The PUT succeeds
-    // (a warning, never a 409) and says why every connection will fail.
+    // A real exception needs the proxy; the proxy is down. The write is
+    // refused *before* the row or the compose file change (issue #60).
     let (status, body) = harness
         .request(
             Method::PUT,
@@ -2660,45 +2666,34 @@ async fn egress_policy_with_a_dead_proxy_warns_instead_of_failing() {
             Some(json!({"mode": "allow", "fqdns": ["blocked.example"], "ports": [443]})),
         )
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let policy = parse(&body);
-    assert_eq!(policy["source"], "explicit");
-    assert_eq!(policy["proxy"], "http://127.0.0.1:9");
-    assert_eq!(policy["legacy_equivalent"], false);
-    let warnings = policy["warnings"].as_array().expect("warnings");
-    assert!(
-        warnings.iter().any(|warning| {
-            warning.as_str().is_some_and(|text| {
-                text.contains("unreachable") && text.contains("remove the policy")
-            })
-        }),
-        "{policy}"
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body);
+    assert_eq!(error["error"]["code"], "proxy_unreachable", "{error}");
+    assert_eq!(error["error"]["details"]["instance"], "alice");
+    assert_eq!(
+        error["error"]["details"]["proxy"], "http://127.0.0.1:9",
+        "{error}"
+    );
+    assert_eq!(
+        error["error"]["details"]["hint"],
+        "docker compose -f docker/fleett-proxy.example.yaml up -d",
+        "{error}"
     );
 
-    // The variables are rendered, and GET reports the same warning (cached, so
-    // a dead proxy does not slow every read).
-    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
-    assert_eq!(
-        compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
-        Some("http://127.0.0.1:9")
-    );
+    // No row was written and the container was not recreated.
     let (status, body) = harness
         .request(Method::GET, "/api/instances/alice/egress", None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        parse(&body)["warnings"]
-            .as_array()
-            .expect("warnings")
-            .iter()
-            .any(|warning| warning
-                .as_str()
-                .is_some_and(|text| text.contains("unreachable"))),
-        "{body}"
-    );
+    let policy = parse(&body);
+    assert_eq!(policy["source"], "disabled", "{policy}");
+    assert!(policy.get("updated_at").is_none(), "{policy}");
+    let compose_after =
+        std::fs::read(harness.instance_dir("alice").join("compose.yaml")).expect("compose file");
+    assert_eq!(compose_before, compose_after, "compose must not change");
 
-    // A per-policy proxy keeps the variables even for a legacy-equivalent
-    // policy: the operator asked for their own proxy.
+    // A per-policy override is probed the same way, and a dead one is refused
+    // even for a legacy-equivalent policy (the operator asked for a proxy).
     let (status, body) = harness
         .request(
             Method::PUT,
@@ -2710,18 +2705,39 @@ async fn egress_policy_with_a_dead_proxy_warns_instead_of_failing() {
             })),
         )
         .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "proxy_unreachable");
+
+    // A reachable per-policy override is accepted and rendered.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let live = format!("http://{address}");
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({
+                "mode": "allow",
+                "cidrs": ["10.0.0.0/8"],
+                "proxy": live
+            })),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let policy = parse(&body);
     assert_eq!(policy["legacy_equivalent"], true);
-    assert_eq!(policy["proxy"], "http://127.0.0.1:8");
+    assert_eq!(policy["proxy"], live.as_str());
+    assert_eq!(policy["proxy_reachable"], true);
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
     assert_eq!(
         compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
-        Some("http://127.0.0.1:8")
+        Some(live.as_str())
     );
 
-    // `--proxy off` clears the override; the configured FLEETT_EGRESS_PROXY is
-    // explicit too (it is not the built-in default), so it is rendered instead.
+    // `--proxy off` clears the override; the configured `FLEETT_EGRESS_PROXY`
+    // is explicit too, so it is rendered — and it is dead, so the write fails.
     let (status, body) = harness
         .request(
             Method::PUT,
@@ -2729,14 +2745,144 @@ async fn egress_policy_with_a_dead_proxy_warns_instead_of_failing() {
             Some(json!({"mode": "allow", "cidrs": ["10.0.0.0/8"], "proxy": "off"})),
         )
         .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "proxy_unreachable");
+    // The live override and its compose rendering are still in place.
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["proxy"], live.as_str(), "{policy}");
+}
+
+#[tokio::test]
+async fn egress_summary_reports_the_fleet_state() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let live = format!("http://{address}");
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.mock.force_network_subnet(Some("172.18.0.0/16"));
+    harness.write_egress_marker("172.18.0.0/16");
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+
+    // alice: an explicit policy that renders a live proxy.
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({
+                "mode": "deny",
+                "fqdns": ["api.github.com"],
+                "ports": [443],
+                "proxy": live
+            })),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let policy = parse(&body);
-    assert_eq!(policy["proxy"], "http://127.0.0.1:9", "{policy}");
-    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
-    assert_eq!(
-        compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
-        Some("http://127.0.0.1:9")
+
+    // bob stays on the legacy shape (`FLEETT_EGRESS=restrict`).
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/summary", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = parse(&body);
+    let rows = summary["instances"].as_array().expect("instances");
+    assert_eq!(rows.len(), 2, "{summary}");
+    let alice = rows
+        .iter()
+        .find(|row| row["instance"] == "alice")
+        .expect("alice row");
+    assert_eq!(alice["policy"], "enforced");
+    assert_eq!(alice["source"], "explicit");
+    assert_eq!(alice["mode"], "deny");
+    assert_eq!(alice["fqdns"], json!(["api.github.com"]));
+    assert_eq!(alice["proxy"], live.as_str());
+    assert_eq!(alice["proxy_reachable"], true);
+    assert!(alice.get("proxy_error").is_none(), "{alice}");
+    let bob = rows
+        .iter()
+        .find(|row| row["instance"] == "bob")
+        .expect("bob row");
+    assert_eq!(bob["policy"], "legacy");
+    assert_eq!(bob["source"], "legacy");
+    assert!(bob["proxy"].is_null(), "{bob}");
+    assert!(bob["proxy_reachable"].is_null(), "{bob}");
+
+    // Drop the proxy and clear the cache: the summary reports the breakage
+    // instead of pretending the policy is still enforced.
+    drop(listener);
+    harness.state.egress_probe.clear();
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/summary", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = parse(&body);
+    let alice = summary["instances"]
+        .as_array()
+        .expect("instances")
+        .iter()
+        .find(|row| row["instance"] == "alice")
+        .expect("alice row");
+    assert_eq!(alice["policy"], "enforced");
+    assert_eq!(alice["proxy_reachable"], false, "{alice}");
+    assert!(
+        alice["proxy_error"]
+            .as_str()
+            .is_some_and(|value| value.contains("unreachable")),
+        "{alice}"
     );
+
+    // `FLEETT_EGRESS=off` with no policy is `none`, not `legacy`.
+    let off = Harness::new();
+    create_instance(&off, "carol").await;
+    let (status, body) = off.request(Method::GET, "/api/egress/summary", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let carol = &parse(&body)["instances"][0];
+    assert_eq!(carol["policy"], "none");
+    assert_eq!(carol["source"], "disabled");
+}
+
+#[tokio::test]
+async fn egress_summary_only_lists_readable_instances() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+
+    // A scoped bearer token sees only the instance it names.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({
+                "name": "scoped",
+                "role": "viewer",
+                "scope": {"instances": ["alice"], "actions": ["read"]}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/egress/summary", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary = parse(&body);
+    let ids: Vec<&str> = summary["instances"]
+        .as_array()
+        .expect("instances")
+        .iter()
+        .filter_map(|row| row["instance"].as_str())
+        .collect();
+    assert_eq!(ids, ["alice"], "{summary}");
+}
+
+#[tokio::test]
+async fn egress_summary_requires_authentication() {
+    let harness = Harness::new();
+    let (status, _) = harness
+        .request_as(Method::GET, "/api/egress/summary", None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

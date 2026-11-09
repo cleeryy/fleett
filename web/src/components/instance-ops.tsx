@@ -1118,11 +1118,9 @@ export function InstanceEgress({ id }: { id: string }) {
   const [removeError, setRemoveError] = useState<ApiError | null>(null);
   const policy = useResource(() => api.getEgress(id), [id, nonce]);
   const data: EgressPolicyView | null = policy.data;
-  const proxyDown =
-    !!data?.proxy &&
-    data.warnings.some((warning) =>
-      /unreachable|does not answer|connection refused|timed out|no route/i.test(warning),
-    );
+  // Structured socket result (issue #60); no warning-text matching.
+  const proxyDown = data?.proxy_reachable === false;
+  const proxyError = data?.proxy_error;
   const emptyPolicy =
     !!data &&
     data.source === "explicit" &&
@@ -1243,9 +1241,18 @@ export function InstanceEgress({ id }: { id: string }) {
               </AlertTitle>
               <AlertDescription>
                 {proxyDown ? (
-                  <p className="font-medium">
-                    {t("ops.egress.proxyDownBody", { proxy: data.proxy ?? "" })}
-                  </p>
+                  <>
+                    <p className="font-medium">
+                      {t("ops.egress.proxyDownBody", { proxy: data.proxy ?? "" })}
+                    </p>
+                    {proxyError ? (
+                      <p className="font-mono text-xs opacity-90">{proxyError}</p>
+                    ) : null}
+                    <p className="text-xs opacity-90">{t("ops.egress.proxyDownHint")}</p>
+                    <p className="font-mono text-xs opacity-90">
+                      {t("ops.egress.proxyDeployHint")}
+                    </p>
+                  </>
                 ) : null}
                 <ul className="list-disc space-y-1 pl-4 text-sm">
                   {data.warnings.map((warning) => (
@@ -1254,9 +1261,6 @@ export function InstanceEgress({ id }: { id: string }) {
                     </li>
                   ))}
                 </ul>
-                {proxyDown ? (
-                  <p className="text-xs opacity-90">{t("ops.egress.proxyDownHint")}</p>
-                ) : null}
               </AlertDescription>
             </Alert>
           ) : null}

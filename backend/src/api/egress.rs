@@ -98,6 +98,14 @@ pub struct PolicyView {
     /// Whether the policy decides nothing more than the host firewall does, in
     /// which case no proxy variable is rendered (issue #58).
     pub legacy_equivalent: bool,
+    /// Socket result of the rendered proxy: `None` when no proxy is rendered,
+    /// `Some(true|false)` otherwise. Populated from the shared probe cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_reachable: Option<bool>,
+    /// Why the proxy does not answer, when [`Self::proxy_reachable`] is
+    /// `Some(false)`. The console reads this instead of matching `warnings`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_error: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -110,6 +118,8 @@ async fn policy_view(
     let effective = egress_policy::effective(cfg, spec, policy);
     let mut warnings = Vec::new();
     let proxy = policy.and_then(|policy| egress_policy::proxy_url(cfg, policy));
+    let mut proxy_reachable = None;
+    let mut proxy_error = None;
     if let Some(policy) = policy {
         if proxy.is_none() && egress_policy::needs_proxy(cfg, policy) {
             warnings.push(
@@ -137,13 +147,18 @@ async fn policy_view(
         // connection, which is exactly the silent outage of issue #58: say it
         // here instead of waiting for the operator to read aiohttp tracebacks.
         if let Some(proxy_url) = proxy.as_deref() {
-            if let Err(detail) = state.egress_probe.reachable(proxy_url).await {
-                warnings.push(format!(
-                    "{detail}: the instance points at a proxy that does not answer, so every \
-                     outbound connection fails; start the proxy or remove the policy with \
-                     DELETE /api/instances/{}/egress",
-                    spec.id
-                ));
+            match state.egress_probe.reachable(proxy_url).await {
+                Ok(_) => proxy_reachable = Some(true),
+                Err(detail) => {
+                    proxy_reachable = Some(false);
+                    proxy_error = Some(detail.clone());
+                    warnings.push(format!(
+                        "{detail}: the instance points at a proxy that does not answer, so every \
+                         outbound connection fails; start the proxy or remove the policy with \
+                         DELETE /api/instances/{}/egress",
+                        spec.id
+                    ));
+                }
             }
         }
     } else {
@@ -160,6 +175,8 @@ async fn policy_view(
         proxy,
         proxy_acl: policy.map(egress_policy::squid_acl),
         legacy_equivalent: policy.is_some_and(egress_policy::is_legacy_equivalent),
+        proxy_reachable,
+        proxy_error,
         warnings,
     }
 }
@@ -174,6 +191,160 @@ pub async fn get_policy(
     Ok(Json(policy_view(&state, &spec, policy.as_ref()).await))
 }
 
+/// One line of `GET /api/egress/summary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryEntry {
+    pub instance: String,
+    /// `none`, `legacy` or `enforced` (see [`Summary::instances`]).
+    pub policy: String,
+    pub mode: String,
+    pub fqdns: Vec<String>,
+    /// IPv4/IPv6 ranges of the effective policy; the shared proxy allowlist
+    /// generator unions them (see `docs/EGRESS.md`).
+    pub cidrs: Vec<String>,
+    /// Destination ports of the effective policy; empty means every port.
+    pub ports: Vec<u16>,
+    /// Proxy rendered into the container, `null` when none is.
+    pub proxy: Option<String>,
+    /// Socket result of that proxy: `null` when none is rendered.
+    pub proxy_reachable: Option<bool>,
+    /// Why the proxy does not answer, when it does not (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_error: Option<String>,
+    /// Same vocabulary as `GET …/egress`: `explicit`, `allow_lan`, `legacy`,
+    /// `disabled`.
+    pub source: String,
+    pub warnings: Vec<String>,
+}
+
+/// Body of `GET /api/egress/summary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Summary {
+    pub instances: Vec<SummaryEntry>,
+}
+
+/// `GET /api/egress/summary` — the fleet-wide destination-policy state.
+///
+/// One row per readable instance, so the console can render a badge on the
+/// fleet list with a single request instead of N+1 `GET …/egress` calls. The
+/// `policy` field is the coarse state the UI shows:
+///
+/// * `enforced` — an explicit policy is stored (its proxy may still be down,
+///   which `proxy_reachable` reports separately);
+/// * `legacy` — no stored policy, only the historical behaviour (`allow_lan`
+///   or the host `DOCKER-USER` filter);
+/// * `none` — no stored policy and `FLEETT_EGRESS=off`: nothing filters.
+///
+/// At most one TCP probe runs per distinct proxy URL, through the shared
+/// [`crate::egress_policy::ProxyProbeCache`].
+pub async fn summary(
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+) -> Result<Json<Summary>, ApiError> {
+    let specs = state.db.list().map_err(ApiError::from)?;
+    // Same filter as `GET /api/instances`: a token scoped to one instance, or a
+    // viewer session without an ACL, must not learn the rest of the fleet.
+    let acl = if context.role == Role::Admin && context.scope.is_none() {
+        Vec::new()
+    } else {
+        crate::authz::entries(
+            state
+                .db
+                .acl_for_subject(&context.subject)
+                .map_err(ApiError::from)?,
+        )
+    };
+    let all_ids: Vec<String> = specs.iter().map(|spec| spec.id.clone()).collect();
+    let visible = crate::authz::visible_instances(&context, &acl, &all_ids);
+    let policies: HashMap<String, EgressPolicy> = egress_policy::list_all(&state.db)
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|policy| (policy.instance_id.clone(), policy))
+        .collect();
+
+    let mut entries = Vec::with_capacity(visible.len());
+    for spec in specs.iter().filter(|spec| visible.contains(&spec.id)) {
+        let policy = policies.get(&spec.id);
+        let view = policy_view(&state, spec, policy).await;
+        let policy_state = if policy.is_some() {
+            "enforced"
+        } else if spec.allow_lan {
+            "legacy"
+        } else if state.cfg.egress == crate::config::EgressMode::Off {
+            "none"
+        } else {
+            "legacy"
+        };
+        entries.push(SummaryEntry {
+            instance: spec.id.clone(),
+            policy: policy_state.to_string(),
+            mode: view.mode,
+            fqdns: view.fqdns,
+            cidrs: view.cidrs,
+            ports: view.ports,
+            proxy: view.proxy,
+            proxy_reachable: view.proxy_reachable,
+            proxy_error: view.proxy_error,
+            source: view.source,
+            warnings: view.warnings,
+        });
+    }
+    Ok(Json(Summary { instances: entries }))
+}
+
+/// Exact command that deploys the shipped proxy (also in `docs/EGRESS.md`).
+pub use crate::egress_policy::PROXY_DEPLOY_HINT;
+
+/// `422 proxy_unreachable` with the instance, the dead URL and the deploy hint.
+pub(crate) fn proxy_unreachable(instance: &str, proxy: &str, detail: &str) -> ApiError {
+    ApiError::unprocessable(
+        "proxy_unreachable",
+        format!(
+            "proxy {proxy} is unreachable ({detail}); deploying a policy that this proxy must \
+             enforce would cut every outbound connection of \"{instance}\". Deploy the proxy \
+             first: {PROXY_DEPLOY_HINT} (see docs/EGRESS.md)"
+        ),
+    )
+    .with_details(json!({
+        "instance": instance,
+        "proxy": proxy,
+        "hint": PROXY_DEPLOY_HINT,
+    }))
+}
+
+/// Probe a proxy URL from scratch, bypassing the ten-second cache.
+///
+/// Used before any write that recreates a container with `HTTP_PROXY` set: a
+/// proxy that answered ten seconds ago must not be trusted for a new policy.
+pub(crate) async fn ensure_proxy_reachable(instance: &str, proxy: &str) -> Result<(), ApiError> {
+    // The probe resolves Docker service names (the control plane runs on the
+    // host, outside the fleett bridge) and bounds the socket at 750 ms.
+    match egress_policy::probe_proxy(proxy).await {
+        Ok(_) => Ok(()),
+        Err(detail) => Err(proxy_unreachable(instance, proxy, &detail)),
+    }
+}
+
+/// Refuse to recreate `spec` when its stored policy renders a dead proxy.
+///
+/// Shared by every recreation path (`apply_compose`, patch, env, import,
+/// clone): a container must never be restarted pointing at a proxy that does
+/// not answer (issue #60). A policy that needs no proxy, or an instance
+/// without a policy, passes without a socket call.
+pub(crate) async fn ensure_egress_proxy(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
+    let policy = egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
+    let Some(policy) = policy.as_ref() else {
+        return Ok(());
+    };
+    let Some(proxy) = egress_policy::proxy_url(&state.cfg, policy) else {
+        return Ok(());
+    };
+    ensure_proxy_reachable(&spec.id, &proxy).await
+}
+
 /// Rewrite the compose file and apply it, keeping the policy as the source of
 /// truth for the proxy variables.
 async fn apply(state: &AppState, spec: &mut InstanceSpec) -> Result<(), ApiError> {
@@ -184,10 +355,12 @@ async fn apply(state: &AppState, spec: &mut InstanceSpec) -> Result<(), ApiError
 /// `PUT /api/instances/{id}/egress` — replace the explicit policy.
 ///
 /// The compose file is rewritten and the container restarted so the proxy
-/// variables reach the process. A failure after the database write restores the
-/// previous row rather than leaving the store and the container disagreeing.
-/// An unreachable proxy is reported in `warnings`, never as an error: the
-/// operator decides whether to start the proxy or remove the policy (#58).
+/// variables reach the process. A proxy the resulting policy would render is
+/// probed **before** the database write (fresh socket, no cache): a dead proxy
+/// answers `422 proxy_unreachable`, leaves the stored policy and the compose
+/// file untouched and never recreates the container (issue #60). A failure
+/// after the database write restores the previous row rather than leaving the
+/// store and the container disagreeing.
 pub async fn put_policy(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -211,6 +384,11 @@ pub async fn put_policy(
         proxy: normalized.proxy,
         updated_at: now_iso(),
     };
+    // Before the DB write and the recreate: a policy that renders a proxy must
+    // point at a socket that answers right now.
+    if let Some(proxy) = egress_policy::proxy_url(&state.cfg, &policy) {
+        ensure_proxy_reachable(&id, &proxy).await?;
+    }
     egress_policy::upsert(&state.db, &policy).map_err(ApiError::from)?;
 
     if let Err(err) = apply(&state, &mut spec).await {

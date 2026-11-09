@@ -51,6 +51,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DoctorDialog } from "@/components/doctor";
+import { EgressBadge } from "@/components/egress-badge";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import {
@@ -195,6 +196,13 @@ export function FleetPage() {
 
   const list = useResource(() => api.listInstances(), [nonce]);
   const onboarding = useResource(() => api.onboarding(), [nonce]);
+  // One fleet-wide call for the egress badge of every row (issue #60): never
+  // one `getEgress` per instance.
+  const egress = useResource(() => api.egressSummary(), [nonce]);
+  const egressByInstance = useMemo(
+    () => new Map((egress.data?.instances ?? []).map((entry) => [entry.instance, entry])),
+    [egress.data],
+  );
   const personas = useResource(() => api.listPersonas(), []);
   const personaNames = useMemo(
     () => new Map((personas.data ?? []).map((persona) => [persona.id, persona.name])),
@@ -591,6 +599,7 @@ export function FleetPage() {
                 <TableBody>
                   {rows.map((row) => {
                     const detail = details[row.id];
+                    const egressEntry = egressByInstance.get(row.id);
                     const uptime =
                       row.status === "running" && detail?.container
                         ? formatUptime(detail.container.uptime_s)
@@ -614,6 +623,12 @@ export function FleetPage() {
                                 {row.name}
                               </span>
                               {row.allow_lan ? <LanBadge /> : null}
+                              {egressEntry ? (
+                                <EgressBadge
+                                  policy={egressEntry.policy}
+                                  proxyReachable={egressEntry.proxy_reachable}
+                                />
+                              ) : null}
                               <PersonaBadge
                                 row={row}
                                 name={row.persona ? personaNames.get(row.persona) : undefined}
@@ -685,6 +700,7 @@ export function FleetPage() {
             <div className="divide-y md:hidden">
               {rows.map((row) => {
                 const detail = details[row.id];
+                const egressEntry = egressByInstance.get(row.id);
                 const uptime =
                   row.status === "running" && detail?.container
                     ? formatUptime(detail.container.uptime_s)
@@ -702,6 +718,12 @@ export function FleetPage() {
                             {row.name}
                           </a>
                           {row.allow_lan ? <LanBadge /> : null}
+                          {egressEntry ? (
+                            <EgressBadge
+                              policy={egressEntry.policy}
+                              proxyReachable={egressEntry.proxy_reachable}
+                            />
+                          ) : null}
                           <PersonaBadge
                             row={row}
                             name={row.persona ? personaNames.get(row.persona) : undefined}

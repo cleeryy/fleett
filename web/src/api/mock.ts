@@ -38,6 +38,8 @@ import type {
   DoctorReport,
   EgressPolicyInput,
   EgressPolicyView,
+  EgressSummary,
+  EgressSummaryEntry,
   EgressTestResult,
   EnvInput,
   ExecInput,
@@ -3278,6 +3280,7 @@ function seedOperations(): void {
         ports: [443],
         updated_at: iso(SEEDED_AT - 3 * DAY),
         proxy: "http://fleett-egress-proxy:3128",
+        proxy_reachable: true,
         proxy_acl: "acl alice_dst dstdomain .api.telegram.org .opencode.ai\nhttp_access allow alice alice_dst",
         legacy_equivalent: false,
         warnings: [],
@@ -3318,6 +3321,9 @@ function seedOperations(): void {
     ports: [443],
     updated_at: iso(SEEDED_AT - 26 * HOUR),
     proxy: "http://fleett-egress-proxy:3128",
+    proxy_reachable: false,
+    proxy_error:
+      "proxy http://fleett-egress-proxy:3128 is unreachable: Connection refused (os error 111)",
     proxy_acl: "acl workshop_dst dstdomain .api.anthropic.com\nhttp_access allow workshop workshop_dst",
     legacy_equivalent: false,
     warnings: [
@@ -4138,13 +4144,17 @@ function mockOnboardingReport(): OnboardingReport {
   return { complete: instanceDone, steps };
 }
 
-/** `GET /api/doctor`: the ten checks, shaped by the selected demo scenario. */
+/** `GET /api/doctor`: the eleven checks, shaped by the selected demo scenario. */
 function mockDoctorReport(): DoctorReport {
   const mode = mockConfig.doctor;
   const bare = mockConfig.onboarding === "empty";
   const complete = mockConfig.onboarding === "complete";
   const providerCount = providerStore.length;
   const instanceCount = rows.length;
+  const explicitPolicies = Object.values(egressStore).filter(
+    (policy) => policy.source === "explicit",
+  );
+  const brokenProxy = explicitPolicies.some((policy) => policy.proxy_reachable === false);
 
   const dockerOk = !bare;
   const imageOk = !bare && mode !== "error" && !(mode === "mixed" && complete);
@@ -4193,6 +4203,21 @@ function mockDoctorReport(): DoctorReport {
           ? "restrict, marker present (subnet 172.31.240.0/24, installed 2026-11-09T09:12:00Z)"
           : "restrict, but the firewall is not installed (no marker at /etc/fleett/egress.json)",
       fix: mode === "ok" ? undefined : "sudo fleett egress install",
+    },
+    {
+      id: "egress-policy",
+      label: "Egress policy",
+      status: brokenProxy || mode === "error" ? "error" : "ok",
+      detail:
+        brokenProxy || mode === "error"
+          ? "explicit policy renders an unreachable proxy: workshop → http://fleett-egress-proxy:3128 (proxy 172.18.0.2:3128 is unreachable: Connection refused)"
+          : explicitPolicies.length === 0
+            ? "no explicit destination policy on any instance; only the host LAN filter applies (legacy source)"
+            : `${explicitPolicies.length} stored; rendered proxy reachable (http://fleett-egress-proxy:3128)`,
+      fix:
+        brokenProxy || mode === "error"
+          ? "docker compose -f docker/fleett-proxy.example.yaml up -d"
+          : undefined,
     },
     {
       id: "providers",
@@ -7981,7 +8006,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       cidrs,
       ports,
       updated_at: nowIso(),
-      ...(legacyEquivalent ? {} : { proxy: "http://fleett-egress-proxy:3128" }),
+      ...(legacyEquivalent ? {} : { proxy: "http://fleett-egress-proxy:3128", proxy_reachable: true }),
       proxy_acl: `${id}: ${input.mode} ${fqdns.join(" ") || "(no domain)"}`,
       legacy_equivalent: legacyEquivalent,
       warnings: [],
@@ -8022,6 +8047,39 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
           legacy_equivalent: false,
           warnings: [],
         };
+  },
+
+  async egressSummary(): Promise<EgressSummary> {
+    requireAuth();
+    await delay(160);
+    const instances: EgressSummaryEntry[] = rows.map((row) => {
+      const policy: EgressPolicyView = egressStore[row.id] ?? {
+        instance: row.id,
+        source: row.allow_lan ? "allow_lan" : "legacy",
+        mode: row.allow_lan ? "allow" : "deny",
+        fqdns: [],
+        cidrs: [],
+        ports: [],
+        legacy_equivalent: false,
+        warnings: [],
+      };
+      const state =
+        policy.source === "explicit" ? "enforced" : policy.source === "disabled" ? "none" : "legacy";
+      return {
+        instance: row.id,
+        policy: state,
+        mode: policy.mode,
+        fqdns: [...policy.fqdns],
+        cidrs: [...policy.cidrs],
+        ports: [...policy.ports],
+        ...(policy.proxy ? { proxy: policy.proxy } : {}),
+        ...(policy.proxy_reachable !== undefined ? { proxy_reachable: policy.proxy_reachable } : {}),
+        ...(policy.proxy_error ? { proxy_error: policy.proxy_error } : {}),
+        source: policy.source,
+        warnings: [...policy.warnings],
+      };
+    });
+    return { instances };
   },
 
   async testEgress(id: string, host: string, port: number): Promise<EgressTestResult> {
