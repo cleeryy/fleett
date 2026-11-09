@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { FileEntry, FileSearchHit, FileSearchResult } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -40,6 +40,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CopyButton } from "@/components/copy-button";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { LineDiff } from "@/components/diff-view";
 import { FileUploadsList } from "@/components/file-uploads-list";
 import { Input } from "@/components/ui/input";
@@ -65,6 +66,7 @@ import {
 } from "@/lib/assistant";
 import { saveBlob } from "@/lib/download";
 import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { setRouteGuard } from "@/lib/router";
 import { isMarkdownPath, syntaxLanguage } from "@/lib/syntax";
 import { useResource } from "@/lib/use-resource";
@@ -148,7 +150,9 @@ const UPLOAD_LIMITS_LABEL = `${MAX_UPLOAD_FILE_BYTES / (1024 * 1024)} MiB per fi
 } MiB per drop`;
 
 
-function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: string) => void }) {  const segments = path === "/" ? [] : path.split("/").filter(Boolean);
+function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: string) => void }) {
+  const { t } = useI18n();
+  const segments = path === "/" ? [] : path.split("/").filter(Boolean);
   const crumbs = [
     { label: "data", path: "/" },
     ...segments.map((segment, index) => ({
@@ -158,7 +162,7 @@ function Breadcrumb({ path, onNavigate }: { path: string; onNavigate: (next: str
   ];
 
   return (
-    <nav aria-label="Folder" className="min-w-0">
+    <nav aria-label={t("files.breadcrumbAria")} className="min-w-0">
       <ol className="flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-xs">
         {crumbs.map((crumb, index) => (
           <li key={crumb.path} className="flex min-w-0 items-center gap-1.5">
@@ -206,6 +210,7 @@ function SearchHits({
   searching: boolean;
   onOpen: (hit: FileSearchHit) => void;
 }) {
+  const { t } = useI18n();
   if (error) {
     return (
       <div className="min-h-0 flex-1 overflow-auto p-3">
@@ -217,7 +222,7 @@ function SearchHits({
   if (!result) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
-        {searching ? "Walking the folder…" : null}
+        {searching ? t("files.searchWalking") : null}
       </div>
     );
   }
@@ -225,12 +230,8 @@ function SearchHits({
   if (result.results.length === 0) {
     return (
       <div className="min-h-0 flex-1 p-6 text-center text-sm text-muted-foreground">
-        No match for <span className="font-mono">{query}</span> in{" "}
-        <span className="font-mono">{cwd}</span>.
-        <p className="mt-1 text-[11px]">
-          {result.scanned} {result.scanned === 1 ? "file" : "files"} scanned. Files above 1 MiB and
-          binaries are skipped.
-        </p>
+        <RichText text={t("files.noMatch", { query, cwd })} />
+        <p className="mt-1 text-[11px]">{t("files.scanned", { count: result.scanned })}</p>
       </div>
     );
   }
@@ -256,7 +257,7 @@ function SearchHits({
       </ul>
       {result.truncated ? (
         <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
-          Stopped at the hit or file cap: narrow the folder or the pattern to see the rest.
+          {t("files.truncated")}
         </p>
       ) : null}
     </>
@@ -279,6 +280,7 @@ export function InstanceFiles({
   /** Any successful write or delete; lets the page refresh persona drift badges. */
   onFileSaved?: () => void;
 }) {
+  const { t, lang } = useI18n();
   const [cwd, setCwd] = useState("/");
   const listing = useResource(() => api.listFiles(id, cwd), [id, cwd]);
 
@@ -345,7 +347,7 @@ export function InstanceFiles({
   useAssistantScope(
     active
       ? {
-          page: "Files",
+          page: t("files.title"),
           instance: id,
           path: open?.path,
           fileContent: open ? draft : undefined,
@@ -370,7 +372,7 @@ export function InstanceFiles({
       const current = openRef.current;
       if (!applied.path || current?.path !== applied.path) return;
       if (dirtyRef.current) {
-        toast.info(`${current.name} changed on disk. Your unsaved buffer was kept.`);
+        toast.info(t("files.changedOnDisk", { name: current.name }));
         return;
       }
       void loadFileRef.current(applied.path, { keepView: true });
@@ -428,7 +430,7 @@ export function InstanceFiles({
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
     setRouteGuard(() =>
-      window.confirm(`Discard unsaved changes to ${open?.name ?? "this file"}?`),
+      window.confirm(t("files.discardConfirm", { name: open?.name ?? t("files.thisFile") })),
     );
     return () => {
       window.removeEventListener("beforeunload", handleBeforeUnload);
@@ -457,7 +459,9 @@ export function InstanceFiles({
 
   function confirmDiscard(): boolean {
     if (!dirty) return true;
-    return window.confirm(`Discard unsaved changes to ${open?.name ?? "this file"}?`);
+    return window.confirm(
+      t("files.discardConfirm", { name: open?.name ?? t("files.thisFile") }),
+    );
   }
 
   async function loadFile(
@@ -523,12 +527,12 @@ export function InstanceFiles({
 
   function validateNewName(value: string): string | null {
     const trimmed = value.trim();
-    if (!trimmed) return "Enter a name.";
-    if (trimmed === "." || trimmed === "..") return "That name is reserved.";
-    if (trimmed.includes("/")) return "Use a plain name: it is created in the current folder.";
-    if (entries.some((entry) => entry.name === trimmed)) return "An entry with this name already exists.";
+    if (!trimmed) return t("files.validate.nameRequired");
+    if (trimmed === "." || trimmed === "..") return t("files.validate.nameReserved");
+    if (trimmed.includes("/")) return t("files.validate.namePlain");
+    if (entries.some((entry) => entry.name === trimmed)) return t("files.validate.nameExists");
     if (dialog === "new-file" && !isEditableFileName(trimmed)) {
-      return `Use an editable extension: ${EDITABLE_EXTENSIONS_LABEL}.`;
+      return t("files.validate.extension", { extensions: EDITABLE_EXTENSIONS_LABEL });
     }
     return null;
   }
@@ -574,7 +578,7 @@ export function InstanceFiles({
     setDialogError(null);
     try {
       const result = await api.mkdir(id, joinPath(cwd, name.trim()));
-      toast.success(`Created ${result.path}.`);
+      toast.success(t("files.created", { path: result.path }));
       listing.reload();
       closeDialog();
     } catch (cause) {
@@ -614,20 +618,25 @@ export function InstanceFiles({
       if (result.restarted) onRestarted?.();
       onFileSaved?.();
       const message = options.force
-        ? `Overwrote ${name}.`
+        ? t("files.overwrote", { name })
         : options.restart
-          ? `Saved ${name} and restarted ${id}.`
-          : `Saved ${name}.`;
-      toast.success(message, result.backup ? { description: `Previous version: ${result.backup}` } : undefined);
+          ? t("files.savedRestart", { name, id })
+          : t("files.saved", { name });
+      toast.success(
+        message,
+        result.backup
+          ? { description: t("files.previousVersion", { backup: result.backup }) }
+          : undefined,
+      );
     } catch (cause) {
       const error = toApiError(cause);
       if (error.code === "etag_mismatch") {
         const details = error.details as { current?: string | null } | null;
         setConflict({ kind: "etag", current: details?.current ?? null });
       } else if (error.code === "file_regenerated") {
-        setConflict({ kind: "rendered", message: error.message });
+        setConflict({ kind: "rendered", message: apiErrorMessage(error, t) });
       } else if (error.code === "file_not_editable") {
-        setConflict({ kind: "not_editable", message: error.message });
+        setConflict({ kind: "not_editable", message: apiErrorMessage(error, t) });
       } else {
         setSaveError(error);
       }
@@ -642,7 +651,7 @@ export function InstanceFiles({
     setDialogError(null);
     try {
       await api.deleteFile(id, open.path);
-      toast.success(`Deleted ${open.name}.`);
+      toast.success(t("files.deletedToast", { name: open.name }));
       requestId.current += 1;
       setOpen(null);
       setSelectedPath(null);
@@ -814,7 +823,7 @@ export function InstanceFiles({
     dragDepth.current = 0;
     setDropping(false);
     if (!canEdit) {
-      toast.info("This account can download and read files, not upload them.");
+      toast.info(t("files.uploadViewerOnly"));
       return;
     }
     const files = Array.from(event.dataTransfer.files ?? []);
@@ -837,16 +846,16 @@ export function InstanceFiles({
   const language = open ? syntaxLanguage(open.path) : null;
   const viewOptions: Array<{ value: FileView; label: string; title: string }> = markdown
     ? [
-        { value: "source", label: "Source", title: "Show the Markdown source" },
-        { value: "preview", label: "Preview", title: "Render the Markdown" },
+        { value: "source", label: t("skills.detail.source"), title: t("files.showSource") },
+        { value: "preview", label: t("skills.detail.preview"), title: t("files.renderMarkdown") },
       ]
     : language
       ? [
-          { value: "source", label: "Source", title: "Edit the text" },
+          { value: "source", label: t("skills.detail.source"), title: t("files.editText") },
           {
             value: "highlight",
-            label: "Coloured",
-            title: `Read ${language.toUpperCase()} with syntax colouring`,
+            label: t("files.coloured"),
+            title: t("files.readColoured", { language: language.toUpperCase() }),
           },
         ]
       : [];
@@ -867,14 +876,14 @@ export function InstanceFiles({
                 variant="outline"
                 onClick={pickFiles}
                 disabled={uploads.busy}
-                title={`Upload files into ${cwd} (${UPLOAD_LIMITS_LABEL})`}
+                title={t("files.uploadTitle", { cwd, limits: UPLOAD_LIMITS_LABEL })}
               >
                 {uploads.busy ? (
                   <Loader2 aria-hidden className="animate-spin" />
                 ) : (
                   <Upload aria-hidden />
                 )}
-                Upload
+                {t("common.upload")}
               </Button>
               <input
                 ref={fileInputRef}
@@ -898,7 +907,7 @@ export function InstanceFiles({
                 }}
               >
                 <FilePlus2 aria-hidden />
-                New file
+                {t("files.newFile")}
               </Button>
               <Button
                 size="sm"
@@ -911,7 +920,7 @@ export function InstanceFiles({
                 }}
               >
                 <FolderPlus aria-hidden />
-                New folder
+                {t("files.newFolder")}
               </Button>
             </>
           ) : null}
@@ -920,21 +929,21 @@ export function InstanceFiles({
             variant="outline"
             onClick={() => void downloadFolder()}
             disabled={downloading !== null}
-            title={`Download ${cwd} as a .zip archive (built on the controller)`}
+            title={t("files.downloadZipTitle", { cwd })}
           >
             {downloading === "folder" ? (
               <Loader2 aria-hidden className="animate-spin" />
             ) : (
               <FolderDown aria-hidden />
             )}
-            Download .zip
+            {t("files.downloadZip")}
           </Button>
           <Button
             size="icon-sm"
             variant="ghost"
             onClick={listing.reload}
-            aria-label="Refresh files"
-            title="Refresh files"
+            aria-label={t("files.refresh")}
+            title={t("files.refresh")}
           >
             <RefreshCw aria-hidden className={listing.refreshing ? "animate-spin" : undefined} />
           </Button>
@@ -956,8 +965,8 @@ export function InstanceFiles({
           <Input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={`Search in ${cwd}`}
-            aria-label={`Search the text of ${cwd}`}
+            placeholder={t("files.searchPlaceholder", { cwd })}
+            aria-label={t("files.searchAria", { cwd })}
             className="pl-8 font-mono text-xs"
             spellCheck={false}
           />
@@ -967,7 +976,7 @@ export function InstanceFiles({
           size="sm"
           variant={regexMode ? "default" : "outline"}
           aria-pressed={regexMode}
-          title="Treat the search as a regular expression instead of plain text"
+          title={t("files.regexTitle")}
           onClick={() => setRegexMode((value) => !value)}
         >
           <Regex aria-hidden />
@@ -975,16 +984,16 @@ export function InstanceFiles({
         </Button>
         <Button type="submit" size="sm" variant="outline" disabled={searching || !query.trim()}>
           {searching ? <Loader2 aria-hidden className="animate-spin" /> : <ScanSearch aria-hidden />}
-          Search
+          {t("common.search")}
         </Button>
         {query || searchActive ? (
           <Button type="button" size="sm" variant="ghost" onClick={clearSearch}>
             <X aria-hidden />
-            Clear
+            {t("personas.apply.clear")}
           </Button>
         ) : null}
         <span className="hidden text-[11px] text-muted-foreground sm:inline">
-          Literal by default · 200 hits, 50 000 files max
+          {t("files.searchHint")}
         </span>
       </form>
 
@@ -1019,10 +1028,10 @@ export function InstanceFiles({
             <div className="space-y-1">
               <Upload aria-hidden className="mx-auto size-5 text-muted-foreground" />
               <p className="text-sm font-medium">
-                Drop to upload into <span className="font-mono">{cwd}</span>
+                <RichText text={t("files.dropHint", { cwd })} />
               </p>
               <p className="text-xs text-muted-foreground">
-                {UPLOAD_LIMITS_LABEL} · executables are refused
+                {t("files.dropLimits", { limits: UPLOAD_LIMITS_LABEL })}
               </p>
             </div>
           </div>
@@ -1036,21 +1045,31 @@ export function InstanceFiles({
                 {searching ? <Loader2 aria-hidden className="size-3 shrink-0 animate-spin" /> : null}
                 <span className="truncate">
                   {searchResult
-                    ? `${searchResult.results.length} ${searchResult.results.length === 1 ? "hit" : "hits"} · ${searchResult.scanned} scanned`
+                    ? t(
+                        searchResult.results.length === 1
+                          ? "files.hitsOne"
+                          : "files.hitsMany",
+                        {
+                          hits: searchResult.results.length,
+                          scanned: searchResult.scanned,
+                        },
+                      )
                     : searching
-                      ? "Searching…"
-                      : "Search failed"}
+                      ? t("memory.searching")
+                      : t("files.searchFailed")}
                 </span>
                 {searchResult?.truncated ? (
                   <Badge variant="outline" className="px-1 py-0 text-[10px] font-normal">
-                    truncated
+                    {t("files.truncatedBadge")}
                   </Badge>
                 ) : null}
               </span>
             ) : (
               <span>
-                {folderCount} {folderCount === 1 ? "folder" : "folders"} · {fileCount}{" "}
-                {fileCount === 1 ? "file" : "files"}
+                {t(folderCount === 1 ? "files.folderOne" : "files.folderMany", {
+                  count: folderCount,
+                })}{" "}
+                · {t(fileCount === 1 ? "files.fileOne" : "files.fileMany", { count: fileCount })}
               </span>
             )}
             {listing.refreshing ? <Loader2 aria-hidden className="size-3 animate-spin" /> : null}
@@ -1114,12 +1133,12 @@ export function InstanceFiles({
                       <span className="min-w-0 flex-1 truncate font-mono text-xs">{entry.name}</span>
                       {entry.rendered ? (
                         <span className="shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
-                          rendered
+                          {t("files.renderedBadge")}
                         </span>
                       ) : entry.type === "file" && !entry.editable ? (
                         <span className="shrink-0">
                           <Lock aria-hidden className="size-3 text-muted-foreground" />
-                          <span className="sr-only">Read-only</span>
+                          <span className="sr-only">{t("files.readOnlyBadge")}</span>
                         </span>
                       ) : null}
                       {entry.type === "file" ? (
@@ -1132,8 +1151,8 @@ export function InstanceFiles({
                       <button
                         type="button"
                         className="shrink-0 px-2 text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:-outline-offset-2"
-                        aria-label={`Download ${entry.name}`}
-                        title="Download file"
+                        aria-label={t("files.downloadAria", { name: entry.name })}
+                        title={t("files.downloadTitle")}
                         onClick={() => void downloadFile(entry.path)}
                       >
                         {downloading === entry.path ? (
@@ -1149,7 +1168,7 @@ export function InstanceFiles({
 
               {entries.length === 0 ? (
                 <li className="px-3 py-8 text-center text-sm text-muted-foreground">
-                  This folder is empty.
+                  {t("files.emptyFolder")}
                 </li>
               ) : null}
             </ul>
@@ -1166,7 +1185,7 @@ export function InstanceFiles({
             <div className="space-y-3 rounded-md border p-3">
               <ErrorAlert error={fileError} onRetry={selectedPath ? () => void loadFile(selectedPath) : undefined} />
               <Button variant="outline" size="sm" onClick={closeFile}>
-                Close
+                {t("common.close")}
               </Button>
             </div>
           ) : open ? (
@@ -1178,25 +1197,25 @@ export function InstanceFiles({
                     <span className="font-mono text-xs break-all">{open.name}</span>
                     {dirty ? (
                       <Badge variant="secondary" className="px-1.5 py-0 text-[10px] font-normal">
-                        Unsaved
+                        {t("files.unsaved")}
                       </Badge>
                     ) : null}
                     {open.isNew ? (
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
-                        New
+                        {t("env.new")}
                       </Badge>
                     ) : null}
                     {open.rendered ? (
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
-                        Rendered
+                        {t("files.renderedBadge")}
                       </Badge>
                     ) : !canEdit ? (
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
-                        Read-only account
+                        {t("files.readOnlyAccount")}
                       </Badge>
                     ) : !open.editable ? (
                       <Badge variant="outline" className="px-1.5 py-0 text-[10px] font-normal">
-                        Read-only
+                        {t("files.readOnlyBadge")}
                       </Badge>
                     ) : null}
                   </div>
@@ -1206,15 +1225,17 @@ export function InstanceFiles({
                   className="shrink-0 text-[11px] text-muted-foreground"
                   title={formatDateTime(open.mtime)}
                 >
-                  {open.isNew ? "not saved yet" : `${formatBytes(open.size)} · ${formatRelative(open.mtime)}`}
+                  {open.isNew
+                    ? t("files.notSavedYet")
+                    : `${formatBytes(open.size)} · ${formatRelative(open.mtime, lang)}`}
                 </span>
                 <div className="flex shrink-0 items-center gap-0.5">
                   {!open.isNew ? (
                     <Button
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={`Download ${open.name}`}
-                      title="Download file"
+                      aria-label={t("files.downloadAria", { name: open.name })}
+                      title={t("files.downloadTitle")}
                       onClick={() => void downloadFile(open.path)}
                       disabled={downloading !== null}
                     >
@@ -1229,8 +1250,8 @@ export function InstanceFiles({
                     <Button
                       variant="ghost"
                       size="icon-sm"
-                      aria-label={`Delete ${open.name}`}
-                      title="Delete file"
+                      aria-label={t("files.deleteAria", { name: open.name })}
+                      title={t("files.deleteTitle")}
                       onClick={() => {
                         setDialogError(null);
                         setDialog("delete");
@@ -1242,8 +1263,8 @@ export function InstanceFiles({
                   <Button
                     variant="ghost"
                     size="icon-sm"
-                    aria-label="Close file"
-                    title="Close file"
+                    aria-label={t("files.closeFile")}
+                    title={t("files.closeFile")}
                     onClick={closeFile}
                   >
                     <X aria-hidden />
@@ -1254,35 +1275,29 @@ export function InstanceFiles({
               {open.rendered ? (
                 <Alert className="m-3 mb-0">
                   <Info aria-hidden />
-                  <AlertTitle>Rendered by fleett</AlertTitle>
+                  <AlertTitle>{t("files.renderedTitle")}</AlertTitle>
                   <AlertDescription>
                     <p>
                       {open.note
                         ? `${open.note.charAt(0).toUpperCase()}${open.note.slice(1)}`
-                        : "fleett regenerates this file from the instance configuration on every change. A manual write is refused: change the instance instead."}
+                        : t("files.renderedNote")}
                     </p>
                   </AlertDescription>
                 </Alert>
               ) : !canEdit ? (
                 <Alert className="m-3 mb-0">
                   <Lock aria-hidden />
-                  <AlertTitle>Read-only account</AlertTitle>
+                  <AlertTitle>{t("files.readOnlyAccount")}</AlertTitle>
                   <AlertDescription>
-                    <p>
-                      This role can browse, read and copy files but not save them. Ask an admin for
-                      the change, or sign in with a write-capable account.
-                    </p>
+                    <p>{t("files.readOnlyAccountBody")}</p>
                   </AlertDescription>
                 </Alert>
               ) : !open.editable ? (
                 <Alert className="m-3 mb-0">
                   <Lock aria-hidden />
-                  <AlertTitle>Read-only file</AlertTitle>
+                  <AlertTitle>{t("files.readOnlyFileTitle")}</AlertTitle>
                   <AlertDescription>
-                    <p>
-                      Only {EDITABLE_EXTENSIONS_LABEL} files can be edited here. This one can be
-                      read, copied and deleted, not saved.
-                    </p>
+                    <p>{t("files.readOnlyFileBody", { extensions: EDITABLE_EXTENSIONS_LABEL })}</p>
                   </AlertDescription>
                 </Alert>
               ) : null}
@@ -1291,28 +1306,28 @@ export function InstanceFiles({
                 <Alert variant="destructive" className="m-3 mb-0 items-start">
                   <TriangleAlert aria-hidden className="mt-0.5" />
                   <AlertTitle>
-                    {conflict.current ? "This file changed since you opened it" : "This file no longer exists"}
+                    {conflict.current
+                      ? t("files.changedTitle")
+                      : t("files.deletedTitle")}
                   </AlertTitle>
                   <AlertDescription>
                     <p>
-                      {conflict.current
-                        ? "Another tab, or a change on the host, wrote a newer version. Nothing has been saved. Reload to take it, or keep your text and overwrite it (the previous bytes go to a .bak copy)."
-                        : "It was deleted on disk. Reload, or keep your text by creating the file again."}
+                      {conflict.current ? t("files.changedBody") : t("files.deletedBody")}
                     </p>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
                       <Button size="sm" variant="outline" onClick={() => setDialog("reload")}>
-                        Reload
+                        {t("files.reload")}
                       </Button>
                       {conflict.current ? (
                         <Button size="sm" variant="outline" onClick={() => setDialog("force")}>
-                          Keep my version
+                          {t("files.keepMine")}
                         </Button>
                       ) : (
                         <Button size="sm" onClick={() => void save({ etag: null })} disabled={saving !== null}>
-                          Save as new file
+                          {t("files.saveAsNew")}
                         </Button>
                       )}
-                      <CopyButton value={draft} label="Copy my text" showLabel size="sm" />
+                      <CopyButton value={draft} label={t("files.copyMine")} showLabel size="sm" />
                     </div>
                   </AlertDescription>
                 </Alert>
@@ -1321,7 +1336,7 @@ export function InstanceFiles({
               {conflict?.kind === "rendered" ? (
                 <Alert variant="destructive" className="m-3 mb-0 items-start">
                   <TriangleAlert aria-hidden className="mt-0.5" />
-                  <AlertTitle>Rendered by fleett</AlertTitle>
+                  <AlertTitle>{t("files.renderedTitle")}</AlertTitle>
                   <AlertDescription>
                     <p>{conflict.message}</p>
                   </AlertDescription>
@@ -1331,7 +1346,7 @@ export function InstanceFiles({
               {conflict?.kind === "not_editable" ? (
                 <Alert variant="destructive" className="m-3 mb-0 items-start">
                   <TriangleAlert aria-hidden className="mt-0.5" />
-                  <AlertTitle>This file cannot be saved</AlertTitle>
+                  <AlertTitle>{t("files.notEditableTitle")}</AlertTitle>
                   <AlertDescription>
                     <p>{conflict.message}</p>
                   </AlertDescription>
@@ -1348,16 +1363,16 @@ export function InstanceFiles({
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/20 px-3 py-1.5">
                   <span className="text-[11px] text-muted-foreground">
                     {showsRendered
-                      ? "Rendered Markdown · images, tables and raw HTML stay text."
+                      ? t("files.viewRendered")
                       : showsHighlight && language
-                        ? `Coloured ${language.toUpperCase()} · reading view, edit in Source`
-                        : "Plain source view"}
+                        ? t("files.viewColoured", { language: language.toUpperCase() })
+                        : t("files.viewPlain")}
                   </span>
                   <Segmented
                     value={view}
                     options={viewOptions}
                     onChange={setView}
-                    label={`${open.name} view`}
+                    label={t("files.viewAria", { name: open.name })}
                   />
                 </div>
               ) : null}
@@ -1366,10 +1381,8 @@ export function InstanceFiles({
                 <>
                   <MarkdownView value={draft} maxHeight={`${editorHeight}px`} />
                   <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
-                    {externalLinks
-                      ? "Links to web addresses open in a new tab."
-                      : "Plain preview: images, tables and raw HTML are not rendered."}
-                    {dirty ? " Showing your unsaved text." : null}
+                    {externalLinks ? t("files.linksNewTab") : t("files.plainPreview")}
+                    {dirty ? t("files.showingUnsaved") : null}
                   </p>
                 </>
               ) : showsHighlight && language ? (
@@ -1378,16 +1391,15 @@ export function InstanceFiles({
                 preview && diff ? (
                   <div>
                     <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5 text-xs text-muted-foreground">
-                      <span>Changes not saved yet</span>
+                      <span>{t("files.changesNotSaved")}</span>
                       <span className="font-mono">
                         +{diff.added} −{diff.removed}
                       </span>
                     </div>
-                    <LineDiff hunks={diff.hunks} empty="No changes yet." />
+                    <LineDiff hunks={diff.hunks} empty={t("files.noChangesYet")} />
                     {diff.coarse ? (
                       <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
-                        The file is too large to align line by line: the preview shows a full
-                        replacement.
+                        {t("files.coarsePreview")}
                       </p>
                     ) : null}
                   </div>
@@ -1407,7 +1419,7 @@ export function InstanceFiles({
                     spellCheck={false}
                     autoCapitalize="off"
                     autoCorrect="off"
-                    aria-label={`Edit ${open.name}`}
+                    aria-label={t("files.editAria", { name: open.name })}
                     aria-describedby="editor-hint"
                     className="h-full min-w-0 flex-1 resize-none bg-transparent px-3 py-3 font-mono text-xs leading-5 outline-none"
                     onChange={(event) => setDraft(event.target.value)}
@@ -1431,7 +1443,7 @@ export function InstanceFiles({
                   ref={readOnlyRef}
                   tabIndex={0}
                   role="region"
-                  aria-label={`${open.name} content`}
+                  aria-label={t("files.contentAria", { name: open.name })}
                   className="overflow-auto rounded-none outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:-outline-offset-2"
                   style={{ maxHeight: editorHeight }}
                 >
@@ -1449,16 +1461,25 @@ export function InstanceFiles({
 
               <div className="flex flex-wrap items-center gap-2 border-t px-3 py-2">
                 <span className="text-[11px] text-muted-foreground">
-                  {lineCount} {lineCount === 1 ? "line" : "lines"} · {formatBytes(draftBytes)}
+                  {t(lineCount === 1 ? "files.lineOne" : "files.lineMany", {
+                    count: lineCount,
+                  })}{" "}
+                  · {formatBytes(draftBytes)}
                 </span>
                 {editableFile && !preview && view === "source" ? (
                   <span id="editor-hint" className="hidden text-[11px] text-muted-foreground sm:inline">
-                    Tab inserts two spaces · Esc leaves the editor
+                    {t("files.tabHint")}
                   </span>
                 ) : null}
                 <div className="ml-auto flex flex-wrap items-center gap-2">
                   {view !== "source" ? (
-                    <CopyButton value={draft} label="Copy file" showLabel size="sm" variant="outline" />
+                    <CopyButton
+                      value={draft}
+                      label={t("files.copyFile")}
+                      showLabel
+                      size="sm"
+                      variant="outline"
+                    />
                   ) : editableFile ? (
                     <Button
                       variant="ghost"
@@ -1467,16 +1488,22 @@ export function InstanceFiles({
                       onClick={() => setPreview((value) => !value)}
                     >
                       <FileDiff aria-hidden />
-                      {preview ? "Hide changes" : "Preview changes"}
+                      {preview ? t("files.hideChanges") : t("files.previewChanges")}
                     </Button>
                   ) : (
-                    <CopyButton value={draft} label="Copy file" showLabel size="sm" variant="outline" />
+                    <CopyButton
+                      value={draft}
+                      label={t("files.copyFile")}
+                      showLabel
+                      size="sm"
+                      variant="outline"
+                    />
                   )}
                   {canEdit && editableFile ? (
                     <>
                       <Button size="sm" disabled={!canSave || saving !== null} onClick={() => void save()}>
                         {saving === "save" ? <Loader2 aria-hidden className="animate-spin" /> : <Save aria-hidden />}
-                        Save
+                        {t("common.save")}
                       </Button>
                       <Button
                         size="sm"
@@ -1489,7 +1516,7 @@ export function InstanceFiles({
                         ) : (
                           <RotateCw aria-hidden />
                         )}
-                        Save & restart
+                        {t("files.saveAndRestart")}
                       </Button>
                     </>
                   ) : null}
@@ -1501,8 +1528,10 @@ export function InstanceFiles({
             <div className="rounded-md border">
               <EmptyState
                 icon={FileText}
-                title="No file open"
-                description={`Pick a file on the left. Editable files (${EDITABLE_EXTENSIONS_LABEL}) open in the editor; the rest open read-only.`}
+                title={t("files.noFileTitle")}
+                description={t("files.noFileDescription", {
+                  extensions: EDITABLE_EXTENSIONS_LABEL,
+                })}
                 action={
                   canEdit ? (
                     <Button
@@ -1516,7 +1545,7 @@ export function InstanceFiles({
                       }}
                     >
                       <FilePlus2 aria-hidden />
-                      New file
+                      {t("files.newFile")}
                     </Button>
                   ) : undefined
                 }
@@ -1530,17 +1559,20 @@ export function InstanceFiles({
       <Dialog open={dialog === "new-file" || dialog === "new-folder"} onOpenChange={handleDialogOpenChange}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{dialog === "new-folder" ? "New folder" : "New file"}</DialogTitle>
+            <DialogTitle>
+              {dialog === "new-folder" ? t("files.newFolder") : t("files.newFile")}
+            </DialogTitle>
             <DialogDescription>
-              {dialog === "new-folder" ? "Creates one folder in " : "Created in "}
-              <span className="font-mono">{cwd}</span>
               {dialog === "new-folder"
-                ? ". Nothing is committed until a file inside it changes."
-                : ` on the first save. Editable extensions: ${EDITABLE_EXTENSIONS_LABEL}.`}
+                ? t("files.newFolderDescription", { cwd })
+                : t("files.newFileDescription", {
+                    cwd,
+                    extensions: EDITABLE_EXTENSIONS_LABEL,
+                  })}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
-            <Label htmlFor="file-name">Name</Label>
+            <Label htmlFor="file-name">{t("common.name")}</Label>
             <Input
               id="file-name"
               value={name}
@@ -1569,15 +1601,15 @@ export function InstanceFiles({
           {dialog === "new-folder" && dialogError ? <ErrorAlert error={dialogError} /> : null}
           <DialogFooter>
             <Button variant="outline" onClick={closeDialog} disabled={dialogPending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             {dialog === "new-folder" ? (
               <Button onClick={() => void createFolder()} disabled={dialogPending}>
                 {dialogPending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-                Create folder
+                {t("files.createFolder")}
               </Button>
             ) : (
-              <Button onClick={createFile}>Create file</Button>
+              <Button onClick={createFile}>{t("files.createFile")}</Button>
             )}
           </DialogFooter>
         </DialogContent>
@@ -1586,15 +1618,9 @@ export function InstanceFiles({
       <ConfirmDialog
         open={dialog === "delete"}
         onOpenChange={handleDialogOpenChange}
-        title={`Delete ${open?.name ?? "file"}?`}
-        description={
-          <>
-            <span className="font-mono">{open?.path}</span> is removed from the instance home.
-            Editable files are versioned, so an earlier copy can be restored from the History
-            tab.
-          </>
-        }
-        confirmLabel="Delete file"
+        title={t("files.deleteConfirmTitle", { name: open?.name ?? t("files.fileWord") })}
+        description={t("files.deleteConfirmDescription", { path: open?.path ?? "" })}
+        confirmLabel={t("files.deleteFile")}
         destructive
         pending={dialogPending}
         error={dialogError}
@@ -1604,9 +1630,9 @@ export function InstanceFiles({
       <ConfirmDialog
         open={dialog === "force"}
         onOpenChange={handleDialogOpenChange}
-        title="Overwrite the newer version?"
-        description="Your text replaces what is on disk now. The current bytes are copied to a .bak sibling first, and the overwrite is recorded as a new commit."
-        confirmLabel="Overwrite"
+        title={t("files.forceTitle")}
+        description={t("files.forceDescription")}
+        confirmLabel={t("files.overwrite")}
         pending={saving !== null}
         onConfirm={() => {
           closeDialog();
@@ -1617,9 +1643,9 @@ export function InstanceFiles({
       <ConfirmDialog
         open={dialog === "reload"}
         onOpenChange={handleDialogOpenChange}
-        title="Reload from disk?"
-        description="Your text is discarded and the version on disk is loaded. Copy your text first if you want to keep it."
-        confirmLabel="Reload"
+        title={t("files.reloadTitle")}
+        description={t("files.reloadDescription")}
+        confirmLabel={t("files.reload")}
         onConfirm={() => {
           const path = open?.path;
           closeDialog();

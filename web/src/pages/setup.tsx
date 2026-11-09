@@ -4,6 +4,7 @@ import { DoctorPanel } from "@/components/doctor";
 import { MockPreviewBar } from "@/components/mock-preview";
 import { OnboardingSection } from "@/components/onboarding";
 import { PageHeader } from "@/components/page-header";
+import { useI18n } from "@/lib/i18n";
 
 /** Scroll to the diagnostics section, respecting reduced motion. */
 function revealDiagnostics() {
@@ -19,13 +20,14 @@ function revealDiagnostics() {
  * broken fleet without an admin account.
  */
 export function SetupPage() {
+  const { t } = useI18n();
   const [nonce, setNonce] = useState(0);
 
   return (
     <>
       <PageHeader
-        title="Setup"
-        description="The first-run checklist and a read-only report of the host. Open to every role; running a fix is up to an operator with shell access."
+        title={t("nav.setup")}
+        description={t("setup.pageDescription")}
       />
 
       {isMock ? (
@@ -37,12 +39,9 @@ export function SetupPage() {
       <section id="diagnostics" aria-labelledby="diagnostics-heading" className="scroll-mt-20 space-y-3">
         <div className="space-y-1">
           <h2 id="diagnostics-heading" className="text-base font-semibold">
-            Diagnostics
+            {t("health.title")}
           </h2>
-          <p className="text-sm text-muted-foreground">
-            Ten checks of the host and the fleet: API, Docker, agent image, secrets, egress,
-            providers, instances, permissions, disk and DNS.
-          </p>
+          <p className="text-sm text-muted-foreground">{t("health.pageDescription")}</p>
         </div>
         <div className="rounded-lg border p-4 sm:p-5">
           <DoctorPanel nonce={nonce} />

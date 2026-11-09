@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import {
   MemoryDetailSheet,
   MemoryFormDialog,
@@ -39,21 +40,23 @@ import {
   messagePreview,
   SendMessageDialog,
 } from "@/components/messages";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 const ALL = "all";
 
 function ViewSelect({ value, onChange }: { value: MessageBox; onChange: (value: MessageBox) => void }) {
+  const { t } = useI18n();
   return (
     <Select value={value} onValueChange={(next) => onChange(next as MessageBox)}>
-      <SelectTrigger className="w-32" aria-label="Mailbox view">
+      <SelectTrigger className="w-32" aria-label={t("instance.bus.viewAria")}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value="inbox">Inbox</SelectItem>
-        <SelectItem value="outbox">Outbox</SelectItem>
-        <SelectItem value="all">Both</SelectItem>
+        <SelectItem value="inbox">{t("instance.bus.inbox")}</SelectItem>
+        <SelectItem value="outbox">{t("instance.bus.outbox")}</SelectItem>
+        <SelectItem value="all">{t("instance.bus.both")}</SelectItem>
       </SelectContent>
     </Select>
   );
@@ -66,16 +69,17 @@ function StatusSelect({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <Select value={value} onValueChange={onChange}>
-      <SelectTrigger className="w-36" aria-label="Filter by delivery status">
+      <SelectTrigger className="w-36" aria-label={t("instance.bus.statusAria")}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value={ALL}>Any status</SelectItem>
-        <SelectItem value="queued">queued</SelectItem>
-        <SelectItem value="delivered">delivered</SelectItem>
-        <SelectItem value="read">read</SelectItem>
+        <SelectItem value={ALL}>{t("instance.bus.anyStatus")}</SelectItem>
+        <SelectItem value="queued">{t("messageStatus.queued")}</SelectItem>
+        <SelectItem value="delivered">{t("messageStatus.delivered")}</SelectItem>
+        <SelectItem value="read">{t("messageStatus.read")}</SelectItem>
       </SelectContent>
     </Select>
   );
@@ -86,6 +90,7 @@ function StatusSelect({
  * controller, so the tab is both a view and the delivery trigger.
  */
 export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: boolean }) {
+  const { t, lang } = useI18n();
   const [view, setView] = useState<MessageBox>("inbox");
   const [status, setStatus] = useState(ALL);
   const [nonce, setNonce] = useState(0);
@@ -119,7 +124,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
     setActionError(null);
     try {
       await api.ackMessage(message.to, message.id);
-      toast.success(`Acknowledged as ${message.to}.`);
+      toast.success(t("instance.bus.acknowledged", { instance: message.to }));
       refresh();
     } catch (cause) {
       setActionError(toApiError(cause));
@@ -135,7 +140,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
         <StatusSelect value={status} onChange={setStatus} />
         <Button variant="outline" size="sm" onClick={refresh}>
           <RefreshCw aria-hidden className={messages.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
         {canEdit ? (
           <Button
@@ -145,17 +150,22 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
             disabled={!instances.data || instances.data.length === 0}
           >
             <Send aria-hidden />
-            Send message
+            {t("messages.send")}
           </Button>
         ) : null}
       </div>
 
       <p className="text-xs text-muted-foreground">
         {messages.data
-          ? `${rows.length} ${plural(rows.length, "message")} · ${
-              view === "inbox" ? "received by" : view === "outbox" ? "sent by" : "exchanged with"
-            } ${id}`
-          : "Loading messages."}
+          ? t(
+              view === "inbox"
+                ? "instance.bus.received"
+                : view === "outbox"
+                  ? "instance.bus.sent"
+                  : "instance.bus.exchanged",
+              { count: rows.length, id },
+            )
+          : t("common.loading")}
       </p>
 
       {actionError ? <ErrorAlert error={actionError} /> : null}
@@ -173,15 +183,13 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
             icon={view === "inbox" ? Inbox : MessagesSquare}
             title={
               view === "inbox"
-                ? "The inbox is empty"
+                ? t("instance.bus.emptyInbox")
                 : view === "outbox"
-                  ? "Nothing sent yet"
-                  : "No messages for this instance"
+                  ? t("instance.bus.emptyOutbox")
+                  : t("instance.bus.emptyBoth")
             }
             description={
-              canEdit
-                ? "Queue a message to another instance; it stays here until the recipient reads and acknowledges it."
-                : "No message matches this view. The read-only account cannot send or acknowledge messages."
+              canEdit ? t("instance.bus.emptyCanEdit") : t("instance.bus.emptyReadOnly")
             }
             action={
               canEdit ? (
@@ -191,7 +199,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                   disabled={!instances.data || instances.data.length === 0}
                 >
                   <Send aria-hidden />
-                  Send message
+                  {t("messages.send")}
                 </Button>
               ) : undefined
             }
@@ -202,14 +210,14 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[170px]">Time</TableHead>
-                    <TableHead className="w-[190px]">From → To</TableHead>
-                    <TableHead className="w-[80px]">Kind</TableHead>
-                    <TableHead className="w-[110px]">Status</TableHead>
-                    <TableHead className="w-[60px] text-center">Hops</TableHead>
-                    <TableHead>Body</TableHead>
+                    <TableHead className="w-[170px]">{t("audit.time")}</TableHead>
+                    <TableHead className="w-[190px]">{t("messages.route")}</TableHead>
+                    <TableHead className="w-[80px]">{t("messages.kind")}</TableHead>
+                    <TableHead className="w-[110px]">{t("common.status")}</TableHead>
+                    <TableHead className="w-[60px] text-center">{t("messages.hops")}</TableHead>
+                    <TableHead>{t("messages.body")}</TableHead>
                     <TableHead className="w-[150px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -226,7 +234,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                         <TableCell>
                           <span
                             className="font-mono text-xs"
-                            title={formatRelative(message.created_at)}
+                            title={formatRelative(message.created_at, lang)}
                           >
                             {formatDateTime(message.created_at)}
                           </span>
@@ -254,8 +262,10 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                               <Button
                                 variant="outline"
                                 size="icon-sm"
-                                aria-label={`Acknowledge message from ${message.from}`}
-                                title={`Acknowledge as ${id}`}
+                                aria-label={t("instance.bus.ackFromAria", {
+                                  from: message.from,
+                                })}
+                                title={t("messages.acknowledge", { instance: id })}
                                 disabled={acking === message.id}
                                 onClick={(event) => {
                                   event.stopPropagation();
@@ -268,13 +278,15 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                             <Button
                               variant="outline"
                               size="sm"
-                              aria-label={`Open message from ${message.from}`}
+                              aria-label={t("instance.bus.openFromAria", {
+                                from: message.from,
+                              })}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 open(message);
                               }}
                             >
-                              Open
+                              {t("common.open")}
                             </Button>
                           </div>
                         </TableCell>
@@ -293,7 +305,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                     <button
                       type="button"
                       className="block w-full space-y-2 text-left"
-                      aria-label={`Open message from ${message.from}`}
+                      aria-label={t("instance.bus.openFromAria", { from: message.from })}
                       onClick={() => open(message)}
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -306,7 +318,10 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                         <MessageKindBadge kind={message.kind} />
                         <MessageStatusBadge status={message.status} />
                         <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                          {message.hops} hop{message.hops === 1 ? "" : "s"}
+                          {t(
+                            message.hops === 1 ? "messages.hopOne" : "messages.hopMany",
+                            { count: message.hops },
+                          )}
                         </Badge>
                       </div>
                       <span className="block text-sm text-muted-foreground">
@@ -321,7 +336,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
                         onClick={() => void ack(message)}
                       >
                         <CheckCheck aria-hidden />
-                        Acknowledge
+                        {t("instance.bus.acknowledge")}
                       </Button>
                     ) : null}
                   </div>
@@ -357,6 +372,7 @@ export function InstanceMessagesTab({ id, canEdit }: { id: string; canEdit: bool
 
 /** Private notes of one instance (`instance:<id>`), newest first. */
 export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolean }) {
+  const { t, lang } = useI18n();
   const namespace = `instance:${id}`;
   const [nonce, setNonce] = useState(0);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -383,13 +399,12 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <p className="min-w-0 text-xs text-muted-foreground">
-          Namespace <span className="font-mono">{namespace}</span> · private notes, readable by every
-          authenticated client
+          <RichText text={t("instance.memory.namespace", { namespace })} />
         </p>
         <div className="flex w-full flex-wrap gap-2 sm:ml-auto sm:w-auto">
           <Button variant="outline" size="sm" onClick={refresh}>
             <RefreshCw aria-hidden className={entries.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
           {canEdit ? (
             <Button
@@ -400,7 +415,7 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
               }}
             >
               <Plus aria-hidden />
-              New entry
+              {t("memory.newEntry")}
             </Button>
           ) : null}
         </div>
@@ -418,11 +433,9 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
         ) : rows.length === 0 ? (
           <EmptyState
             icon={Brain}
-            title="No notes in this namespace"
+            title={t("instance.memory.emptyTitle")}
             description={
-              canEdit
-                ? "Store what this agent learned: a runbook, a contract or a lesson. Promote a durable one to global later."
-                : "This instance has not written a private note yet."
+              canEdit ? t("instance.memory.emptyCanEdit") : t("instance.memory.emptyReadOnly")
             }
             action={
               canEdit ? (
@@ -434,7 +447,7 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
                   }}
                 >
                   <Plus aria-hidden />
-                  New entry
+                  {t("memory.newEntry")}
                 </Button>
               ) : undefined
             }
@@ -445,14 +458,14 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[170px]">Key</TableHead>
-                    <TableHead className="w-[150px]">Namespace</TableHead>
-                    <TableHead className="w-[55px]">Version</TableHead>
-                    <TableHead className="w-[140px]">Tags</TableHead>
-                    <TableHead className="w-[150px]">Updated</TableHead>
-                    <TableHead>Value</TableHead>
+                    <TableHead className="w-[170px]">{t("personas.vars.key")}</TableHead>
+                    <TableHead className="w-[150px]">{t("memory.namespace")}</TableHead>
+                    <TableHead className="w-[55px]">{t("common.version")}</TableHead>
+                    <TableHead className="w-[140px]">{t("memory.tags")}</TableHead>
+                    <TableHead className="w-[150px]">{t("common.updated")}</TableHead>
+                    <TableHead>{t("assistant.proposal.value")}</TableHead>
                     <TableHead className="w-[70px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -479,7 +492,7 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
                       <TableCell>
                         <span
                           className="font-mono text-xs"
-                          title={formatRelative(entry.updated_at)}
+                          title={formatRelative(entry.updated_at, lang)}
                         >
                           {formatDateTime(entry.updated_at)}
                         </span>
@@ -493,13 +506,13 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
                         <Button
                           variant="outline"
                           size="sm"
-                          aria-label={`Open memory entry ${entry.key}`}
+                          aria-label={t("memory.openAria", { key: entry.key })}
                           onClick={(event) => {
                             event.stopPropagation();
                             open(entry);
                           }}
                         >
-                          Open
+                          {t("common.open")}
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -514,7 +527,7 @@ export function InstanceMemoryTab({ id, canEdit }: { id: string; canEdit: boolea
                   key={entry.id}
                   type="button"
                   className="block w-full space-y-2 p-4 text-left transition-colors hover:bg-muted/40 focus-visible:bg-muted/40"
-                  aria-label={`Open memory entry ${entry.key}`}
+                  aria-label={t("memory.openAria", { key: entry.key })}
                   onClick={() => open(entry)}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">

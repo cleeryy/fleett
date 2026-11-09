@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { CopyPlus, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { CloneInstanceInput, CloneTokenDetails, InstanceDetail } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,10 +17,12 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PersonaPreviewPanel } from "@/components/persona-preview";
 import { PersonaSelect } from "@/components/persona-select";
 import { PersonaVariableInputs } from "@/components/persona-vars";
 import { ProviderSelect } from "@/components/provider-select";
+import { useI18n } from "@/lib/i18n";
 import { compactVariables } from "@/lib/personas";
 import { isValidSlug } from "@/lib/validation";
 import { useResource } from "@/lib/use-resource";
@@ -55,10 +57,10 @@ function defaultCloneId(id: string): string {
   return `${id.slice(0, ID_MAX - suffix.length).replace(/-+$/, "")}${suffix}`;
 }
 
-function defaultCloneName(name: string): string {
-  const suffix = " copy";
+function defaultCloneName(name: string, copyWord: string): string {
+  const suffix = ` ${copyWord}`;
   const base = name.trim().slice(0, 128 - suffix.length);
-  return base ? `${base}${suffix}` : "copy";
+  return base ? `${base}${suffix}` : copyWord;
 }
 
 /** `details.missing` of a `400 clone_token_required`. */
@@ -88,6 +90,7 @@ export function DuplicateInstanceDialog({
   onOpenChange: (open: boolean) => void;
   onCloned: (clone: InstanceDetail) => void;
 }) {
+  const { t } = useI18n();
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
@@ -115,7 +118,7 @@ export function DuplicateInstanceDialog({
     if (!open) return;
     const current = sourceRef.current;
     setId(defaultCloneId(current.id));
-    setName(defaultCloneName(current.name));
+    setName(defaultCloneName(current.name, t("clone.copyWord")));
     setModel("");
     setProviderId(current.provider ?? "");
     // A diverged SOUL.md is hand-written: default to keeping it rather than
@@ -135,6 +138,8 @@ export function DuplicateInstanceDialog({
     setError(null);
     setMissing([]);
     setIdConflict(null);
+    // Seeded once per opening; `t` only supplies the localized name suffix.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const providerKeys = gateKeys(source);
@@ -162,27 +167,27 @@ export function DuplicateInstanceDialog({
 
   const errors: Record<string, string> = {};
   const trimmedId = id.trim();
-  if (!trimmedId) errors.id = "Enter an id.";
-  else if (!isValidSlug(trimmedId)) errors.id = "Use 2-32 characters: lowercase letters, digits, hyphens.";
-  else if (trimmedId === source.id) errors.id = "Use an id other than the source id.";
-  if (!name.trim()) errors.name = "Enter a name.";
+  if (!trimmedId) errors.id = t("clone.idRequired");
+  else if (!isValidSlug(trimmedId)) errors.id = t("clone.idFormat");
+  else if (trimmedId === source.id) errors.id = t("clone.idSame");
+  if (!name.trim()) errors.name = t("clone.nameRequired");
   if (providerNeeded && !gateToken.trim()) {
-    errors.gate_token = "Enter a replacement provider token.";
+    errors.gate_token = t("clone.providerTokenRequired");
   }
   if (botNeeded && !channelToken.trim()) {
-    errors.channel_token = "Enter a replacement bot token.";
+    errors.channel_token = t("clone.botTokenRequired");
   }
 
   const providerError = !providerSelected && !gateToken.trim()
     ? missingProvider.length > 0
-      ? `The source holds ${missingProvider.join(", ")}. Clones never inherit secrets; enter a replacement.`
+      ? t("clone.sourceHolds", { keys: missingProvider.join(", ") })
       : attempted
         ? errors.gate_token
         : undefined
     : undefined;
   const channelError = !channelToken.trim()
     ? missingChannel.length > 0
-      ? `The source holds ${missingChannel.join(", ")}. Clones never inherit secrets; enter a replacement.`
+      ? t("clone.sourceHolds", { keys: missingChannel.join(", ") })
       : attempted
         ? errors.channel_token
         : undefined
@@ -252,7 +257,9 @@ export function DuplicateInstanceDialog({
             persona_vars: compactVariables(personaVars),
           });
         } catch (cause) {
-          toast.error(`Clone created, but the persona was not applied: ${toApiError(cause).message}`);
+          toast.error(
+            t("clone.personaNotApplied", { message: apiErrorMessage(toApiError(cause), t) }),
+          );
         }
       }
       onOpenChange(false);
@@ -261,7 +268,7 @@ export function DuplicateInstanceDialog({
       const failure = toApiError(cause);
       if (failure.status === 409 && failure.code === "instance_exists") {
         // The only id-specific refusal: that slug is taken.
-        setIdConflict(failure.message);
+        setIdConflict(apiErrorMessage(failure, t));
         window.requestAnimationFrame(() => focusField("id"));
       } else if (failure.status === 400 && failure.code === "clone_token_required") {
         // Keep every field as typed; mark the keys the source is holding.
@@ -286,18 +293,15 @@ export function DuplicateInstanceDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent className="max-h-[calc(100dvh_-_2rem)] grid-rows-[auto_minmax(0,1fr)]">
         <DialogHeader>
-          <DialogTitle>Duplicate {source.id}</DialogTitle>
-          <DialogDescription>
-            Creates an independent instance with its own compose project, container and data
-            directory. Secrets are never copied.
-          </DialogDescription>
+          <DialogTitle>{t("clone.title", { id: source.id })}</DialogTitle>
+          <DialogDescription>{t("clone.description")}</DialogDescription>
         </DialogHeader>
 
         <form onSubmit={onSubmit} noValidate className="flex min-h-0 flex-col gap-4">
           <div className="-mr-2 min-h-0 flex-1 space-y-4 overflow-y-auto pr-2">
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="duplicate-id">New id</Label>
+                <Label htmlFor="duplicate-id">{t("clone.newId")}</Label>
                 <Input
                   id="duplicate-id"
                   value={id}
@@ -312,7 +316,7 @@ export function DuplicateInstanceDialog({
                   }}
                 />
                 <p id="duplicate-id-help" className="text-xs text-muted-foreground">
-                  Compose project
+                  {t("clone.composeProject")}
                   <span className="block font-mono break-all">fleett-{trimmedId || "…"}</span>
                 </p>
                 {idError ? (
@@ -323,7 +327,7 @@ export function DuplicateInstanceDialog({
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="duplicate-name">Name</Label>
+                <Label htmlFor="duplicate-name">{t("common.name")}</Label>
                 <Input
                   id="duplicate-name"
                   value={name}
@@ -342,7 +346,8 @@ export function DuplicateInstanceDialog({
 
             <div className="space-y-2">
               <Label htmlFor="duplicate-model">
-                Model <span className="font-normal text-muted-foreground">(optional)</span>
+                {t("clone.model")}{" "}
+                <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
               </Label>
               <Input
                 id="duplicate-model"
@@ -355,21 +360,18 @@ export function DuplicateInstanceDialog({
                 onChange={(event) => setModel(event.target.value)}
               />
               <p id="duplicate-model-help" className="text-xs text-muted-foreground">
-                Leave empty to keep <span className="font-mono">{source.model}</span>.
+                <RichText text={t("clone.modelHint", { model: source.model })} />
               </p>
             </div>
 
             <div className="space-y-4 rounded-md border p-4">
               <div className="space-y-1">
-                <p className="text-sm font-medium">Credential</p>
-                <p className="text-xs text-muted-foreground">
-                  A provider is a reference, not a secret: the clone can keep the source provider without a
-                  token. The chat bot token stays per instance.
-                </p>
+                <p className="text-sm font-medium">{t("clone.credential")}</p>
+                <p className="text-xs text-muted-foreground">{t("clone.credentialHint")}</p>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="duplicate-provider">Provider</Label>
+                <Label htmlFor="duplicate-provider">{t("clone.providerLabel")}</Label>
                 <ProviderSelect
                   id="duplicate-provider"
                   value={providerId}
@@ -379,27 +381,21 @@ export function DuplicateInstanceDialog({
                   describedBy="duplicate-provider-help"
                 />
                 <p id="duplicate-provider-help" className="text-xs text-muted-foreground">
-                  {source.provider ? (
-                    <>
-                      The source uses a provider and the clone inherits it by default. Choosing{" "}
-                      <span className="text-foreground">None</span> requires a replacement token.
-                    </>
-                  ) : (
-                    <>
-                      The source has no provider. Pick one to share a credential, or leave{" "}
-                      <span className="text-foreground">None</span> to give the clone its own token.
-                    </>
-                  )}
+                  {source.provider
+                    ? t("clone.providerHintInherits")
+                    : t("clone.providerHintNone")}
                 </p>
                 {providers.error ? (
                   <p className="text-xs text-destructive">
-                    Providers could not be loaded: {providers.error.message}{" "}
+                    {t("clone.providersLoadFailed", {
+                      message: apiErrorMessage(providers.error, t),
+                    })}{" "}
                     <button
                       type="button"
                       className="underline underline-offset-4"
                       onClick={providers.reload}
                     >
-                      Retry
+                      {t("common.retry")}
                     </button>
                   </p>
                 ) : null}
@@ -408,20 +404,16 @@ export function DuplicateInstanceDialog({
               {providerSelected ? (
                 <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
                   <p className="text-sm">
-                    Credential supplied by provider{" "}
-                    <span className="font-mono">{providerLabel}</span>.
+                    {t("clone.suppliedBy")} <span className="font-mono">{providerLabel}</span>.
                   </p>
-                  <p className="text-xs text-muted-foreground">
-                    No token is copied or required. Rotating that secret later restarts every attached
-                    instance, this clone included.
-                  </p>
+                  <p className="text-xs text-muted-foreground">{t("clone.suppliedByHint")}</p>
                 </div>
               ) : (
                 <div className="space-y-2">
                   <Label htmlFor="duplicate-gate-token">
-                    Provider token{" "}
+                    {t("clone.providerToken")}{" "}
                     <span className="font-normal text-muted-foreground">
-                      {providerNeeded ? "(required)" : "(optional)"}
+                      {providerNeeded ? `(${t("env.required")})` : `(${t("common.optional")})`}
                     </span>
                   </Label>
                   <Input
@@ -452,21 +444,16 @@ export function DuplicateInstanceDialog({
                   <p id="duplicate-gate-token-help" className="text-xs text-muted-foreground">
                     {providerError ? null : gateEnvPresent ? (
                       <>
-                        The source holds{" "}
-                        <span className="font-mono break-all">
-                          {providerKeys.filter((key) => holdsEnv(source, key)).join(", ")}
-                        </span>
-                        .{" "}
+                        {t("clone.sourceHolds", {
+                          keys: providerKeys.filter((key) => holdsEnv(source, key)).join(", "),
+                        })}{" "}
                       </>
                     ) : source.provider ? (
-                      <>The source draws its key from a provider; detaching needs a replacement token. </>
+                      <>{t("clone.sourceUsesProvider")} </>
                     ) : missingProvider.length > 0 ? (
-                      <>
-                        The source holds{" "}
-                        <span className="font-mono break-all">{missingProvider.join(", ")}</span>.{" "}
-                      </>
+                      <>{t("clone.sourceHolds", { keys: missingProvider.join(", ") })} </>
                     ) : null}
-                    Encrypted at rest and never returned by the API.
+                    {t("clone.encryptedNote")}
                   </p>
                 </div>
               )}
@@ -474,7 +461,8 @@ export function DuplicateInstanceDialog({
               {showBotField && botKey ? (
                 <div className="space-y-2">
                   <Label htmlFor="duplicate-channel-token">
-                    Bot token <span className="font-normal text-muted-foreground">(required)</span>
+                    {t("clone.botToken")}{" "}
+                    <span className="font-normal text-muted-foreground">({t("env.required")})</span>
                   </Label>
                   <Input
                     id="duplicate-channel-token"
@@ -502,8 +490,12 @@ export function DuplicateInstanceDialog({
                     </p>
                   ) : null}
                   <p id="duplicate-channel-token-help" className="text-xs text-muted-foreground">
-                    Replaces <span className="font-mono">{botKey}</span> for the {source.channel} bot. A
-                    bot can only serve one instance at a time.
+                    <RichText
+                      text={t("clone.botTokenHint", {
+                        key: botKey,
+                        channel: t(`channel.${source.channel}`),
+                      })}
+                    />
                   </p>
                 </div>
               ) : null}
@@ -512,12 +504,11 @@ export function DuplicateInstanceDialog({
             <div className="space-y-4 rounded-md border p-4">
               <div className="space-y-1">
                 <p className="text-sm font-medium">
-                  Persona <span className="font-normal text-muted-foreground">(optional)</span>
+                  {t("clone.personaLabel")}{" "}
+                  <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  Replaces the copied <span className="font-mono">SOUL.md</span> with a rendered
-                  persona. The clone keeps its own variable values, so the same persona can read
-                  differently here.
+                  <RichText text={t("clone.personaHint")} />
                 </p>
               </div>
 
@@ -533,21 +524,23 @@ export function DuplicateInstanceDialog({
                 <p id="duplicate-persona-help" className="text-xs text-muted-foreground">
                   {source.persona
                     ? source.persona_state === "diverged"
-                      ? "The source SOUL.md was edited by hand, so None is selected by default: the copy's SOUL.md is not replaced. Picking a persona overwrites it with the rendered template."
+                      ? t("clone.personaDiverged")
                       : personaId === source.persona
-                        ? "Inherited from the source. Choose None to keep the copied SOUL.md instead."
-                        : "The source persona is replaced; the rendered template is written after the copy."
-                    : "The source has no persona. Pick one to render its SOUL.md into the clone."}
+                        ? t("clone.personaInherited")
+                        : t("clone.personaReplaced")
+                    : t("clone.personaNone")}
                 </p>
                 {personas.error ? (
                   <p className="text-xs text-destructive">
-                    Personas could not be loaded: {personas.error.message}{" "}
+                    {t("clone.personasLoadFailed", {
+                      message: apiErrorMessage(personas.error, t),
+                    })}{" "}
                     <button
                       type="button"
                       className="underline underline-offset-4"
                       onClick={personas.reload}
                     >
-                      Retry
+                      {t("common.retry")}
                     </button>
                   </p>
                 ) : null}
@@ -565,15 +558,13 @@ export function DuplicateInstanceDialog({
                   <PersonaPreviewPanel
                     personaId={selectedPersona.id}
                     variables={personaVars}
-                    description="Rendered from the saved persona; then stored on the clone."
+                    description={t("clone.previewDescription")}
                     maxHeight="26vh"
                   />
                 </>
               ) : (
                 <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
-                  No persona: the clone keeps{" "}
-                  <span className="font-mono">data/SOUL.md</span> from the copy, or the template
-                  default when data is not copied.
+                  <RichText text={t("clone.noPersonaHint")} />
                 </p>
               )}
             </div>
@@ -590,11 +581,10 @@ export function DuplicateInstanceDialog({
                 />
                 <div className="min-w-0 space-y-1">
                   <Label htmlFor="duplicate-copy-data" className="cursor-pointer">
-                    Copy data
+                    {t("clone.copyData")}
                   </Label>
                   <p id="duplicate-copy-data-help" className="text-xs text-muted-foreground">
-                    Copies <span className="font-mono">data/</span> so the clone keeps the same
-                    memory and state. Turn off for an empty profile.
+                    <RichText text={t("clone.copyDataHint")} />
                   </p>
                 </div>
               </div>
@@ -610,11 +600,10 @@ export function DuplicateInstanceDialog({
                 />
                 <div className="min-w-0 space-y-1">
                   <Label htmlFor="duplicate-inherit-shares" className="cursor-pointer">
-                    Inherit shares
+                    {t("clone.inheritShares")}
                   </Label>
                   <p id="duplicate-inherit-shares-help" className="text-xs text-muted-foreground">
-                    Attaches the shares the source has today, with the same modes. Shares removed
-                    on this host are skipped.
+                    {t("clone.inheritSharesHint")}
                   </p>
                 </div>
               </div>
@@ -631,11 +620,11 @@ export function DuplicateInstanceDialog({
                 onClick={() => onOpenChange(false)}
                 disabled={pending}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="submit" disabled={pending}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <CopyPlus aria-hidden />}
-                Duplicate instance
+                {t("clone.confirm")}
               </Button>
             </DialogFooter>
           </div>

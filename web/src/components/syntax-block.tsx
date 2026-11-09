@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { useI18n } from "@/lib/i18n";
 import {
   tokenizeLine,
   type SyntaxKind,
@@ -33,6 +34,7 @@ export function SyntaxBlock({
   language: SyntaxLanguage;
   maxHeight?: number | string;
 }) {
+  const { t } = useI18n();
   const lines = useMemo(() => value.split("\n"), [value]);
   const coloured = value.length <= MAX_COLOURED_CHARS;
 
@@ -40,7 +42,7 @@ export function SyntaxBlock({
     <div
       tabIndex={0}
       role="region"
-      aria-label={`${language} preview`}
+      aria-label={t("files.syntaxPreview", { language })}
       className="overflow-auto rounded-none outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:-outline-offset-2"
       style={{ maxHeight }}
     >

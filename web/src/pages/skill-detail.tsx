@@ -29,12 +29,14 @@ import { DataList, Section } from "@/components/data-list";
 import { PatchView } from "@/components/diff-view";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { MarkdownView } from "@/components/markdown-view";
 import { PageHeader } from "@/components/page-header";
 import { SkillCreateDialog } from "@/components/skill-create-dialog";
 import { SkillDeleteDialog } from "@/components/skill-delete-dialog";
 import { SkillPromoteDialog } from "@/components/skill-promote-dialog";
-import { formatBytes, formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import {
@@ -50,6 +52,7 @@ import { cn } from "@/lib/utils";
  * -------------------------------------------------------------------------- */
 
 function SkillFileViewer({ file }: { file: SkillFile }) {
+  const { t } = useI18n();
   const markdown = isMarkdownSkillFile(file.path);
   const [view, setView] = useState<"preview" | "source">(markdown ? "preview" : "source");
 
@@ -73,12 +76,17 @@ function SkillFileViewer({ file }: { file: SkillFile }) {
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
-                  {option === "preview" ? "Preview" : "Source"}
+                  {option === "preview" ? t("skills.detail.preview") : t("skills.detail.source")}
                 </button>
               ))}
             </div>
           ) : null}
-          <CopyButton value={file.content} label={`Copy ${file.path}`} variant="ghost" size="icon-xs" />
+          <CopyButton
+            value={file.content}
+            label={t("skills.detail.copyFile", { path: file.path })}
+            variant="ghost"
+            size="icon-xs"
+          />
         </div>
       </div>
 
@@ -164,6 +172,7 @@ function VersionContent({
   historyLoading: boolean;
   nonce: number;
 }) {
+  const { t } = useI18n();
   const files = detail.latest === version ? detail.files : null;
   const [activePath, setActivePath] = useState<string | null>(null);
   const commit = files ? null : versionCommit(commits, detail.name, version);
@@ -182,7 +191,7 @@ function VersionContent({
 
     if (!file) {
       return (
-        <p className="p-4 text-sm text-muted-foreground">This version has no readable file.</p>
+        <p className="p-4 text-sm text-muted-foreground">{t("skills.detail.noReadableFile")}</p>
       );
     }
 
@@ -197,15 +206,13 @@ function VersionContent({
   return (
     <div className="min-w-0">
       <p className="border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        The registry serves the files of the version it points at (
-        <span className="font-mono">{detail.latest ?? "none"}</span>). An earlier version is read
-        through the change it introduced.
+        <RichText text={t("skills.detail.servedVersion", { latest: detail.latest ?? "none" })} />
       </p>
       {historyLoading || (diff.loading && !diff.data) || diff.refreshing ? (
         <Skeleton className="m-3 h-40 rounded-md" />
       ) : !commit ? (
         <p className="px-3 py-6 text-sm text-muted-foreground">
-          No commit records this version: it was copied into the registry by hand.
+          {t("skills.detail.noCommit")}
         </p>
       ) : diff.error ? (
         <div className="p-3">
@@ -214,7 +221,7 @@ function VersionContent({
       ) : (
         <PatchView
           patch={diff.data?.diff ?? ""}
-          empty="This version did not change a text file."
+          empty={t("skills.detail.noTextVersion")}
         />
       )}
     </div>
@@ -240,6 +247,7 @@ function SkillHistory({
   onRetry: () => void;
   nonce: number;
 }) {
+  const { t, lang } = useI18n();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected =
     commits.find((commit) => commit.id === selectedId) ?? commits[0] ?? null;
@@ -250,8 +258,8 @@ function SkillHistory({
 
   return (
     <Section
-      title="History"
-      description="One commit per publish and per promote, authored by the operator."
+      title={t("skills.detail.history")}
+      description={t("skills.detail.historyDescription")}
     >
       {loading ? (
         <Skeleton className="h-32 w-full rounded-md" />
@@ -259,7 +267,7 @@ function SkillHistory({
         <ErrorAlert error={error} onRetry={onRetry} />
       ) : commits.length === 0 ? (
         <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-          No commit yet. Publishing a version creates the first one.
+          {t("skills.detail.noCommitYet")}
         </p>
       ) : (
         <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)]">
@@ -285,12 +293,10 @@ function SkillHistory({
                     <span className="max-w-40 truncate">{commit.author}</span>
                     <span aria-hidden>·</span>
                     <time dateTime={commit.at} title={formatDateTime(commit.at)}>
-                      {formatRelative(commit.at)}
+                      {formatRelative(commit.at, lang)}
                     </time>
                     <span aria-hidden>·</span>
-                    <span>
-                      {commit.paths.length} {plural(commit.paths.length, "file")}
-                    </span>
+                    <span>{t("history.fileCount", { count: commit.paths.length })}</span>
                   </span>
                 </button>
               </li>
@@ -312,7 +318,7 @@ function SkillHistory({
             ) : (
               <PatchView
                 patch={diff.data?.diff ?? ""}
-                empty="This commit did not change a text file."
+                empty={t("skills.detail.noTextCommit")}
               />
             )}
           </div>
@@ -327,6 +333,7 @@ function SkillHistory({
  * -------------------------------------------------------------------------- */
 
 export function SkillDetailPage({ name }: { name: string }) {
+  const { t, lang } = useI18n();
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
@@ -359,7 +366,7 @@ export function SkillDetailPage({ name }: { name: string }) {
           title={name}
           actions={
             <Button asChild variant="outline">
-              <a href="#/skills">Back to skills</a>
+              <a href="#/skills">{t("skills.detail.back")}</a>
             </Button>
           }
         />
@@ -399,25 +406,43 @@ export function SkillDetailPage({ name }: { name: string }) {
             <span className="font-mono">{skill.name}</span>
             {latestInfo ? (
               <Badge variant="secondary" className="font-mono text-xs font-normal">
-                latest {latestInfo.version}
+                {t("skills.picker.latestBadge", { version: latestInfo.version })}
               </Badge>
             ) : null}
           </span>
         }
         description={
           <span className="space-y-1">
-            <span className="block">{skill.description || "No description."}</span>
+            <span className="block">
+              {skill.description || t("skills.picker.noDescription")}
+            </span>
             <span className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-xs">
               <span>
-                {skill.versions.length} {plural(skill.versions.length, "version")}
+                {t(
+                  skill.versions.length === 1
+                    ? "skills.picker.versionOne"
+                    : "skills.picker.versionMany",
+                  { count: skill.versions.length },
+                )}
               </span>
               <span aria-hidden>·</span>
               <span>
-                {skill.instances_count} {plural(skill.instances_count, "instance")}
+                {t(
+                  skill.instances_count === 1
+                    ? "skills.picker.instanceOne"
+                    : "skills.picker.instanceMany",
+                  { count: skill.instances_count },
+                )}
               </span>
               <span aria-hidden>·</span>
-              <span title={`Updated ${formatDateTime(skill.updated_at)}`}>
-                updated {formatRelative(skill.updated_at)}
+              <span
+                title={t("skills.detail.updatedTitle", {
+                  time: formatDateTime(skill.updated_at),
+                })}
+              >
+                {t("skills.picker.updated", {
+                  time: formatRelative(skill.updated_at, lang),
+                })}
               </span>
             </span>
           </span>
@@ -428,8 +453,8 @@ export function SkillDetailPage({ name }: { name: string }) {
               variant="outline"
               size="icon-sm"
               onClick={() => setNonce((value) => value + 1)}
-              aria-label="Refresh skill"
-              title="Refresh skill"
+              aria-label={t("skills.detail.refresh")}
+              title={t("skills.detail.refresh")}
             >
               <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
             </Button>
@@ -437,19 +462,19 @@ export function SkillDetailPage({ name }: { name: string }) {
               <>
                 <Button size="sm" variant="outline" onClick={() => setPromoteOpen(true)}>
                   <RotateCw aria-hidden />
-                  Promote version
+                  {t("skills.detail.promote")}
                 </Button>
                 <Button size="sm" onClick={() => setCreateOpen(true)}>
                   <Sparkles aria-hidden />
-                  Publish version
+                  {t("skills.detail.publish")}
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
                       size="icon-sm"
-                      aria-label="More actions"
-                      title="More actions"
+                      aria-label={t("providers.detail.moreActions")}
+                      title={t("providers.detail.moreActions")}
                     >
                       <MoreHorizontal aria-hidden />
                     </Button>
@@ -457,7 +482,7 @@ export function SkillDetailPage({ name }: { name: string }) {
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                       <Trash2 aria-hidden />
-                      Delete skill…
+                      {t("skills.detail.delete")}
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -471,13 +496,15 @@ export function SkillDetailPage({ name }: { name: string }) {
 
       <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
         <Section
-          title="Versions"
+          title={t("skills.detail.versions")}
           description={
             activeInfo
-              ? `${activeInfo.files_count} ${plural(activeInfo.files_count, "file")} · ${formatBytes(
-                  activeInfo.size_bytes,
-                )} · published ${formatRelative(activeInfo.published_at)}`
-              : "Pick a version to read it."
+              ? t("skills.detail.versionSummary", {
+                  count: activeInfo.files_count,
+                  size: formatBytes(activeInfo.size_bytes),
+                  time: formatRelative(activeInfo.published_at, lang),
+                })
+              : t("skills.detail.pickVersion")
           }
         >
           <ul className="divide-y overflow-hidden rounded-md border">
@@ -500,24 +527,22 @@ export function SkillDetailPage({ name }: { name: string }) {
                       <span className="font-mono text-sm font-medium">{entry.version}</span>
                       {isLatest ? (
                         <Badge variant="secondary" className="font-mono text-[11px] font-normal">
-                          latest
+                          {t("skills.picker.latest")}
                         </Badge>
                       ) : null}
                       {pins > 0 ? (
                         <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                          {pins} pinned
+                          {t("skills.detail.pinned", { count: pins })}
                         </Badge>
                       ) : null}
                     </span>
                     <span className="flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground">
-                      <span>
-                        {entry.files_count} {plural(entry.files_count, "file")}
-                      </span>
+                      <span>{t("history.fileCount", { count: entry.files_count })}</span>
                       <span aria-hidden>·</span>
                       <span>{formatBytes(entry.size_bytes)}</span>
                       <span aria-hidden>·</span>
                       <time dateTime={entry.published_at} title={formatDateTime(entry.published_at)}>
-                        {formatRelative(entry.published_at)}
+                        {formatRelative(entry.published_at, lang)}
                       </time>
                     </span>
                   </button>
@@ -526,17 +551,20 @@ export function SkillDetailPage({ name }: { name: string }) {
             })}
           </ul>
           <p className="text-xs text-muted-foreground">
-            Publishing never overwrites a version. <span className="font-mono">latest</span> moves
-            only on a promote.
+            <RichText text={t("skills.detail.publishHint")} />
           </p>
         </Section>
 
         <Section
-          title={activeVersion ? `Content · ${activeVersion}` : "Content"}
+          title={
+            activeVersion
+              ? t("skills.detail.contentVersion", { version: activeVersion })
+              : t("skills.detail.content")
+          }
           description={
             activeVersion === skill.latest
-              ? "Read-only files of the version the registry serves."
-              : "An earlier version is read through the change it introduced."
+              ? t("skills.detail.contentLatest")
+              : t("skills.detail.contentEarlier")
           }
         >
           {activeVersion ? (
@@ -551,15 +579,15 @@ export function SkillDetailPage({ name }: { name: string }) {
             </div>
           ) : (
             <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-              This skill has no published version.
+              {t("skills.detail.noVersion")}
             </p>
           )}
         </Section>
       </div>
 
       <Section
-        title="Linked instances"
-        description="Every instance that declares this skill, with its pin and the version it mounts."
+        title={t("providers.detail.linkedInstances")}
+        description={t("skills.detail.linkedDescription")}
       >
         {instances.loading && !instances.data ? (
           <Skeleton className="h-24 w-full rounded-md" />
@@ -569,12 +597,12 @@ export function SkillDetailPage({ name }: { name: string }) {
           <div className="rounded-md border">
             <EmptyState
               icon={Users}
-              title="No instance mounts this skill"
-              description="Declare it in the Skills list of an instance, or pick it when you create the next one."
+              title={t("skills.detail.noLinkedTitle")}
+              description={t("skills.detail.noLinkedDescription")}
               action={
                 canEdit ? (
                   <Button asChild variant="outline" size="sm">
-                    <a href={hrefFor("/instances/new")}>New instance</a>
+                    <a href={hrefFor("/instances/new")}>{t("nav.newInstance")}</a>
                   </Button>
                 ) : undefined
               }
@@ -602,20 +630,22 @@ export function SkillDetailPage({ name }: { name: string }) {
                       </span>
                     </a>
                     <Badge variant="outline" className="shrink-0 font-mono text-[11px] font-normal">
-                      {pin ?? "follows latest"}
+                      {pin ?? t("skills.detail.followsLatest")}
                     </Badge>
                     <Badge
                       variant={mounted === null ? "destructive" : "secondary"}
                       className="shrink-0 gap-1 font-mono text-[11px] font-normal"
-                      title={mounted === null ? "the reference cannot be resolved" : undefined}
+                      title={
+                        mounted === null ? t("skills.picker.unresolvedTitle") : undefined
+                      }
                     >
                       {mounted === null ? (
                         <>
                           <TriangleAlert aria-hidden />
-                          unresolved
+                          {t("skills.picker.unresolved")}
                         </>
                       ) : (
-                        `mounted ${mounted}`
+                        t("skills.picker.mounted", { version: mounted })
                       )}
                     </Badge>
                   </li>
@@ -623,10 +653,14 @@ export function SkillDetailPage({ name }: { name: string }) {
               })}
             </ul>
             <p className="text-xs text-muted-foreground">
-              {followers.length} {plural(followers.length, "instance")}{" "}
-              {followers.length === 1 ? "follows" : "follow"}{" "}
-              <span className="font-mono">latest</span> and restarts on a promote. Instances that
-              pin a version keep it.
+              <RichText
+                text={t(
+                  followers.length === 1
+                    ? "skills.detail.followersOne"
+                    : "skills.detail.followersMany",
+                  { count: followers.length },
+                )}
+              />
             </p>
           </>
         )}
@@ -641,20 +675,20 @@ export function SkillDetailPage({ name }: { name: string }) {
         nonce={nonce}
       />
 
-      <Section title="Registry">
+      <Section title={t("skills.detail.registry")}>
         <DataList
           items={[
-            { label: "Name", value: <span className="font-mono">{skill.name}</span> },
+            { label: t("common.name"), value: <span className="font-mono">{skill.name}</span> },
             {
-              label: "Latest",
+              label: t("skills.detail.latestHeader"),
               value: skill.latest ? (
                 <span className="font-mono">{skill.latest}</span>
               ) : (
-                <span className="text-muted-foreground">Unset</span>
+                <span className="text-muted-foreground">{t("skills.create.unset")}</span>
               ),
             },
             {
-              label: "Path",
+              label: t("shares.path"),
               value: (
                 <span className="font-mono text-xs break-all">
                   skills/{skill.name}/{skill.latest ?? "latest"}
@@ -662,7 +696,7 @@ export function SkillDetailPage({ name }: { name: string }) {
               ),
             },
             {
-              label: "Versions",
+              label: t("skills.detail.versions"),
               value: (
                 <span className="flex flex-wrap gap-1">
                   {skill.versions.map((entry) => (
@@ -671,24 +705,30 @@ export function SkillDetailPage({ name }: { name: string }) {
                       variant={entry.version === skill.latest ? "secondary" : "outline"}
                       className="font-mono text-[11px] font-normal"
                     >
-                      {entry.version} · {entry.files_count} {plural(entry.files_count, "file")}
+                      {entry.version} · {t("history.fileCount", { count: entry.files_count })}
                     </Badge>
                   ))}
                 </span>
               ),
             },
             {
-              label: "Created",
+              label: t("common.created"),
               value: (
-                <span className="font-mono text-xs" title={formatRelative(skill.created_at)}>
+                <span
+                  className="font-mono text-xs"
+                  title={formatRelative(skill.created_at, lang)}
+                >
                   {formatDateTime(skill.created_at)}
                 </span>
               ),
             },
             {
-              label: "Updated",
+              label: t("common.updated"),
               value: (
-                <span className="font-mono text-xs" title={formatRelative(skill.updated_at)}>
+                <span
+                  className="font-mono text-xs"
+                  title={formatRelative(skill.updated_at, lang)}
+                >
                   {formatDateTime(skill.updated_at)}
                 </span>
               ),
@@ -697,7 +737,7 @@ export function SkillDetailPage({ name }: { name: string }) {
         />
         <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <FileArchive aria-hidden className="size-3.5" />
-          The registry lives in one git repository; the agent never gets a write mount.
+          {t("skills.detail.registryHint")}
         </p>
       </Section>
 
@@ -714,8 +754,11 @@ export function SkillDetailPage({ name }: { name: string }) {
               const published = detailNext.versions[detailNext.versions.length - 1];
               toast.success(
                 published
-                  ? `Published ${detailNext.name} ${published.version}. Promote it to move latest.`
-                  : `Published ${detailNext.name}.`,
+                  ? t("skills.detail.publishedVersion", {
+                      name: detailNext.name,
+                      version: published.version,
+                    })
+                  : t("skills.detail.published", { name: detailNext.name }),
               );
               setSelectedVersion(published?.version ?? null);
               setNonce((value) => value + 1);
@@ -733,7 +776,7 @@ export function SkillDetailPage({ name }: { name: string }) {
             open={deleteOpen}
             onOpenChange={setDeleteOpen}
             onDeleted={() => {
-              toast.success(`Skill ${skill.name} deleted.`);
+              toast.success(t("skills.detail.deleted", { name: skill.name }));
               navigate("/skills");
             }}
           />

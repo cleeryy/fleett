@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { FilePlus2, Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { PublishSkillInput, SkillDetail, SkillFile, SkillSummary } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,12 +17,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import {
   MAX_SKILL_DESCRIPTION,
   MAX_SKILL_FILES,
   MAX_SKILL_FILE_BYTES,
   MAX_SKILL_VERSION_BYTES,
   SKILL_FILE,
+  SKILL_PLACEHOLDER,
   SKILL_SKELETON,
   byteLength,
   isValidSkillName,
@@ -66,6 +69,7 @@ export function SkillCreateDialog({
   knownSkills?: SkillSummary[];
   onPublished: (detail: SkillDetail) => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const [version, setVersion] = useState("");
   const [description, setDescription] = useState("");
@@ -100,13 +104,13 @@ export function SkillCreateDialog({
   let totalBytes = byteLength(skillMd);
   for (const row of rows) {
     const path = row.path.trim();
-    let message = path ? skillPathError(path) : null;
+    let message = path ? skillPathError(path, t) : null;
     if (message) {
       // keep the message
     } else if (path === SKILL_FILE) {
-      message = `${SKILL_FILE} is the main editor above.`;
+      message = t("skills.create.pathMainEditor", { file: SKILL_FILE });
     } else if (seenPaths.has(path)) {
-      message = "This path is already listed.";
+      message = t("skills.create.pathDuplicate");
     }
     pathErrors[row.id] = message;
     if (path && !message) seenPaths.add(path);
@@ -114,28 +118,32 @@ export function SkillCreateDialog({
   }
 
   const errors: Record<string, string> = {};
-  if (!trimmedName) errors.name = "Enter a name.";
+  if (!trimmedName) errors.name = t("skills.create.nameRequired");
   else if (!isValidSkillName(trimmedName)) {
-    errors.name = "Use 2-32 characters: lowercase letters, digits, hyphens.";
+    errors.name = t("skills.create.nameFormat");
   }
-  if (!trimmedVersion) errors.version = "Enter a version, for example v1.";
-  else if (!isValidSkillVersion(trimmedVersion)) errors.version = "Use v1, v2, v3…";
+  if (!trimmedVersion) errors.version = t("skills.create.versionRequired");
+  else if (!isValidSkillVersion(trimmedVersion)) errors.version = t("skills.create.versionFormat");
   if (description.trim().length > MAX_SKILL_DESCRIPTION) {
-    errors.description = `Use ${MAX_SKILL_DESCRIPTION} characters or fewer.`;
+    errors.description = t("skills.create.descriptionTooLong", { max: MAX_SKILL_DESCRIPTION });
   }
-  if (!skillMd.trim()) errors.skill = `Write ${SKILL_FILE}. It must not be empty.`;
-  else if (byteLength(skillMd) > MAX_SKILL_FILE_BYTES) {
-    errors.skill = `A file is at most ${Math.round(MAX_SKILL_FILE_BYTES / 1024)} KiB.`;
+  const fileLimitKib = Math.round(MAX_SKILL_FILE_BYTES / 1024);
+  if (!skillMd.trim()) {
+    errors.skill = t("skills.create.skillRequired", { file: SKILL_FILE });
+  } else if (byteLength(skillMd) > MAX_SKILL_FILE_BYTES) {
+    errors.skill = t("skills.create.fileTooLarge", { limit: fileLimitKib });
   }
   const rowInvalid = Object.values(pathErrors).some((message) => !!message);
   if (rows.some((row) => byteLength(row.content) > MAX_SKILL_FILE_BYTES)) {
-    errors.files = `A file is at most ${Math.round(MAX_SKILL_FILE_BYTES / 1024)} KiB.`;
+    errors.files = t("skills.create.fileTooLarge", { limit: fileLimitKib });
   }
   if (totalBytes > MAX_SKILL_VERSION_BYTES) {
-    errors.files = `A version is at most ${Math.round(MAX_SKILL_VERSION_BYTES / 1024)} KiB in total.`;
+    errors.files = t("skills.create.versionTooLarge", {
+      limit: Math.round(MAX_SKILL_VERSION_BYTES / 1024),
+    });
   }
   if (rows.length + 1 > MAX_SKILL_FILES) {
-    errors.files = `A version holds at most ${MAX_SKILL_FILES} files.`;
+    errors.files = t("skills.create.tooManyFiles", { max: MAX_SKILL_FILES });
   }
   const showErrors = attempted;
 
@@ -185,7 +193,7 @@ export function SkillCreateDialog({
     } catch (cause) {
       const failure = toApiError(cause);
       if (failure.status === 409 && failure.code === "skill_version_exists") {
-        setVersionConflict(failure.message);
+        setVersionConflict(apiErrorMessage(failure, t));
         window.requestAnimationFrame(() => focusField("version"));
       } else {
         setError(failure);
@@ -199,11 +207,13 @@ export function SkillCreateDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent className="grid max-h-[calc(100dvh_-_2rem)] grid-rows-[auto_minmax(0,1fr)] sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{preset ? `Publish a new version of ${preset.name}` : "Publish a skill"}</DialogTitle>
+          <DialogTitle>
+            {preset
+              ? t("skills.create.titleVersion", { name: preset.name })
+              : t("skills.create.title")}
+          </DialogTitle>
           <DialogDescription>
-            One version is a tree of text files an agent reads at{" "}
-            <span className="font-mono">/opt/data/skills/&lt;name&gt;</span>. Publishing never
-            overwrites an existing version.
+            <RichText text={t("skills.create.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -211,7 +221,7 @@ export function SkillCreateDialog({
           <div className="-mr-2 min-h-0 flex-1 space-y-4 overflow-y-auto pr-2">
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="skill-name">Name</Label>
+                <Label htmlFor="skill-name">{t("common.name")}</Label>
                 <Input
                   id="skill-name"
                   value={name}
@@ -219,7 +229,7 @@ export function SkillCreateDialog({
                   spellCheck={false}
                   readOnly={!!preset}
                   className="font-mono"
-                  placeholder="homelab"
+                  placeholder={t("skills.create.namePlaceholder")}
                   aria-invalid={showErrors && !!errors.name}
                   aria-describedby={
                     (showErrors && errors.name) || existing ? "skill-name-help" : undefined
@@ -242,14 +252,17 @@ export function SkillCreateDialog({
                     {showErrors && errors.name
                       ? errors.name
                       : existing
-                        ? `${existing.versions.length} version(s) published; latest is ${existing.latest ?? "unset"}.`
+                        ? t("skills.create.existing", {
+                            count: existing.versions.length,
+                            latest: existing.latest ?? t("skills.create.unset"),
+                          })
                         : ""}
                   </p>
                 ) : null}
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="skill-version">Version</Label>
+                <Label htmlFor="skill-version">{t("common.version")}</Label>
                 <Input
                   id="skill-version"
                   value={version}
@@ -271,22 +284,21 @@ export function SkillCreateDialog({
                   className={versionConflict ? "text-xs text-destructive" : "text-xs text-muted-foreground"}
                 >
                   {versionConflict ??
-                    (preset
-                      ? "The next free version; importing the same archive twice never conflicts."
-                      : "v1, v2, v3… A version that already exists is refused.")}
+                    (preset ? t("skills.create.versionHintPreset") : t("skills.create.versionHint"))}
                 </p>
               </div>
             </div>
 
             <div className="space-y-2">
               <Label htmlFor="skill-description">
-                Description <span className="font-normal text-muted-foreground">(optional)</span>
+                {t("common.description")}{" "}
+                <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
               </Label>
               <Textarea
                 id="skill-description"
                 rows={2}
                 value={description}
-                placeholder="What the skill covers, and when an agent should read it."
+                placeholder={t("skills.create.descriptionPlaceholder")}
                 aria-invalid={showErrors && !!errors.description}
                 aria-describedby={
                   showErrors && errors.description ? "skill-description-error" : "skill-description-help"
@@ -294,8 +306,7 @@ export function SkillCreateDialog({
                 onChange={(event) => setDescription(event.target.value)}
               />
               <p id="skill-description-help" className="text-xs text-muted-foreground">
-                Shown in the registry list. Stored in the generated{" "}
-                <span className="font-mono">skill.yaml</span>.
+                <RichText text={t("skills.create.descriptionHint")} />
               </p>
               {showErrors && errors.description ? (
                 <p id="skill-description-error" className="text-xs text-destructive">
@@ -316,10 +327,10 @@ export function SkillCreateDialog({
                     onClick={() => setSkillMd(SKILL_SKELETON)}
                   >
                     <Sparkles aria-hidden />
-                    Insert a skeleton
+                    {t("personas.create.insertSkeleton")}
                   </Button>
                   <Badge variant="secondary" className="font-mono text-[11px] font-normal">
-                    required
+                    {t("env.required")}
                   </Badge>
                 </div>
               </div>
@@ -329,17 +340,17 @@ export function SkillCreateDialog({
                 value={skillMd}
                 spellCheck={false}
                 className="min-h-56 font-mono text-xs leading-relaxed"
-                placeholder={"# Skill name\n\nUse this skill when…"}
+                placeholder={SKILL_PLACEHOLDER}
                 aria-invalid={showErrors && !!errors.skill}
                 aria-describedby={showErrors && errors.skill ? "skill-md-error" : "skill-md-help"}
                 onChange={(event) => setSkillMd(event.target.value)}
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p id="skill-md-help" className="text-xs text-muted-foreground">
-                  Markdown read by the agent. Every other file is optional.
+                  {t("skills.create.skillHint")}
                 </p>
                 <span className="font-mono text-xs text-muted-foreground">
-                  {byteLength(skillMd)} bytes
+                  {t("skills.create.bytes", { count: byteLength(skillMd) })}
                 </span>
               </div>
               {showErrors && errors.skill ? (
@@ -352,9 +363,9 @@ export function SkillCreateDialog({
             <div id="skill-files" className="scroll-mt-24 space-y-3">
               <div className="flex items-center justify-between gap-2">
                 <div>
-                  <p className="text-sm font-medium">Other files</p>
+                  <p className="text-sm font-medium">{t("skills.create.otherFiles")}</p>
                   <p className="text-xs text-muted-foreground">
-                    Notes the skill references. Paths are relative to the version directory.
+                    {t("skills.create.otherFilesHint")}
                   </p>
                 </div>
                 <Button
@@ -365,14 +376,13 @@ export function SkillCreateDialog({
                   onClick={() => setRows((current) => [...current, newSkillFileRow(nextRowId())])}
                 >
                   <Plus aria-hidden />
-                  Add file
+                  {t("skills.create.addFile")}
                 </Button>
               </div>
 
               {rows.length === 0 ? (
                 <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
-                  No extra files. One <span className="font-mono">SKILL.md</span> is a valid
-                  version.
+                  <RichText text={t("skills.create.noExtraFiles")} />
                 </p>
               ) : (
                 <ul className="space-y-3">
@@ -389,7 +399,7 @@ export function SkillCreateDialog({
                             spellCheck={false}
                             className="font-mono text-xs"
                             placeholder="notes/proxmox.md"
-                            aria-label="File path"
+                            aria-label={t("skills.create.filePath")}
                             aria-invalid={showErrors && !!message}
                             onChange={(event) => updateRow(row.id, { path: event.target.value })}
                           />
@@ -397,8 +407,8 @@ export function SkillCreateDialog({
                             type="button"
                             variant="ghost"
                             size="icon-sm"
-                            aria-label="Remove file"
-                            title="Remove file"
+                            aria-label={t("skills.create.removeFile")}
+                            title={t("skills.create.removeFile")}
                             disabled={pending}
                             onClick={() =>
                               setRows((current) => current.filter((entry) => entry.id !== row.id))
@@ -413,7 +423,9 @@ export function SkillCreateDialog({
                           value={row.content}
                           spellCheck={false}
                           className="font-mono text-xs leading-relaxed"
-                          aria-label={`Content of ${row.path || "the new file"}`}
+                          aria-label={t("skills.create.contentOf", {
+                            path: row.path || t("skills.create.newFile"),
+                          })}
                           onChange={(event) => updateRow(row.id, { content: event.target.value })}
                         />
                         {showErrors && message ? (
@@ -438,11 +450,11 @@ export function SkillCreateDialog({
               onClick={() => onOpenChange(false)}
               disabled={pending}
             >
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Publish {trimmedVersion || "version"}
+              {t("skills.create.confirm", { version: trimmedVersion || t("common.version") })}
             </Button>
           </DialogFooter>
         </form>

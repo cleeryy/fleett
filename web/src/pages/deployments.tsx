@@ -58,19 +58,19 @@ import {
   formatMinuteOfDay,
   formatRelative,
   formatUtcDateTime,
-  plural,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useIdentity } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 const DAYS = [
-  { value: "mon", label: "Mon" },
-  { value: "tue", label: "Tue" },
-  { value: "wed", label: "Wed" },
-  { value: "thu", label: "Thu" },
-  { value: "fri", label: "Fri" },
-  { value: "sat", label: "Sat" },
-  { value: "sun", label: "Sun" },
+  { value: "mon", labelKey: "day.mon" },
+  { value: "tue", labelKey: "day.tue" },
+  { value: "wed", labelKey: "day.wed" },
+  { value: "thu", labelKey: "day.thu" },
+  { value: "fri", labelKey: "day.fri" },
+  { value: "sat", labelKey: "day.sat" },
+  { value: "sun", labelKey: "day.sun" },
 ];
 
 const STATUSES: Array<"" | DeploymentStatus> = [
@@ -106,6 +106,7 @@ function DeploymentSheet({
     () => (deploymentId ? api.getDeployment(deploymentId) : Promise.resolve<Deployment | null>(null)),
     [deploymentId, open],
   );
+  const { t, lang } = useI18n();
   const data = deployment.data;
   const rows = data ? results(data) : [];
 
@@ -113,12 +114,12 @@ function DeploymentSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full sm:max-w-xl">
         <SheetHeader>
-          <SheetTitle>Deployment</SheetTitle>
+          <SheetTitle>{t("deployments.detailTitle")}</SheetTitle>
           <SheetDescription>
             {data ? (
               <span className="font-mono">{data.id}</span>
             ) : (
-              "Loading the journal row."
+              t("deployments.loadingRow")
             )}
           </SheetDescription>
         </SheetHeader>
@@ -133,49 +134,51 @@ function DeploymentSheet({
                 <OpsBadge status={data.status} />
                 {data.rollback ? (
                   <Badge variant="outline" className="font-normal">
-                    rollback
+                    {t("deployments.rollback")}
                   </Badge>
                 ) : null}
                 {data.canary > 0 ? (
                   <Badge variant="outline" className="font-normal">
-                    canary {data.canary}
+                    {t("deployments.canaryBadge", { count: data.canary })}
                   </Badge>
                 ) : null}
                 {data.soak_s > 0 ? (
                   <Badge variant="outline" className="font-normal">
-                    soak {data.soak_s}s
+                    {t("deployments.soakBadge", { seconds: data.soak_s })}
                   </Badge>
                 ) : null}
               </div>
 
               <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-md border p-3 text-xs">
                 <div className="col-span-2">
-                  <dt className="text-muted-foreground">Image</dt>
+                  <dt className="text-muted-foreground">{t("deployments.image")}</dt>
                   <dd className="font-mono break-all">{data.image}</dd>
                 </div>
                 <div>
-                  <dt className="text-muted-foreground">Started</dt>
+                  <dt className="text-muted-foreground">{t("deployments.started")}</dt>
                   <dd className="font-mono">
                     {data.started_at ? formatDateTime(data.started_at) : "—"}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-muted-foreground">Finished</dt>
+                  <dt className="text-muted-foreground">{t("deployments.finished")}</dt>
                   <dd className="font-mono">
-                    {data.finished_at ? formatRelative(data.finished_at) : "in progress"}
+                    {data.finished_at
+                      ? formatRelative(data.finished_at, lang)
+                      : t("deployments.inProgress")}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-muted-foreground">Created by</dt>
+                  <dt className="text-muted-foreground">{t("deployments.createdBy")}</dt>
                   <dd className="font-mono break-all">{data.created_by}</dd>
                 </div>
                 <div>
-                  <dt className="text-muted-foreground">Instances</dt>
+                  <dt className="text-muted-foreground">{t("nav.instances")}</dt>
                   <dd className="font-mono">{data.instances.length}</dd>
                 </div>
                 {data.started_at && data.finished_at ? (
                   <div>
-                    <dt className="text-muted-foreground">Wall time</dt>
+                    <dt className="text-muted-foreground">{t("deployments.wallTime")}</dt>
                     <dd className="font-mono">
                       {shift(Date.parse(data.finished_at) - Date.parse(data.started_at))}
                     </dd>
@@ -191,7 +194,7 @@ function DeploymentSheet({
 
               {data.status === "scheduled" && !Array.isArray(data.result) ? (
                 <div className="space-y-1 rounded-md border p-3">
-                  <p className="text-sm font-medium">Deferred request</p>
+                  <p className="text-sm font-medium">{t("deployments.deferredRequest")}</p>
                   <pre className="overflow-auto font-mono text-[11px] whitespace-pre-wrap">
                     {JSON.stringify(data.result?.request ?? {}, null, 2)}
                   </pre>
@@ -199,10 +202,10 @@ function DeploymentSheet({
               ) : null}
 
               <div className="space-y-2">
-                <h3 className="text-sm font-medium">Per-instance result</h3>
+                <h3 className="text-sm font-medium">{t("deployments.perInstance")}</h3>
                 {rows.length === 0 ? (
                   <p className="rounded-md border px-3 py-4 text-sm text-muted-foreground">
-                    No per-instance result recorded yet.
+                    {t("deployments.noResult")}
                   </p>
                 ) : (
                   <ul className="divide-y rounded-md border">
@@ -218,7 +221,7 @@ function DeploymentSheet({
                           <OpsBadge status={row.status} />
                         </div>
                         <p className="font-mono text-[11px] break-all text-muted-foreground">
-                          {row.from ?? "no previous image"} → {row.to}
+                          {row.from ?? t("deployments.noPreviousImage")} → {row.to}
                         </p>
                         {row.error ? (
                           <p className="font-mono text-[11px] break-words whitespace-pre-wrap text-destructive">
@@ -262,6 +265,7 @@ function WindowDialog({
   window: MaintenanceWindow | null;
   onSaved: () => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const [days, setDays] = useState<string[]>(["mon", "tue", "wed", "thu", "fri"]);
   const [start, setStart] = useState("02:00");
@@ -291,15 +295,15 @@ function WindowDialog({
     const startMinute = parseTime(start);
     const endMinute = parseTime(end);
     if (!name.trim()) {
-      setError(toApiError(new Error("Enter a window name.")));
+      setError(toApiError(new Error(t("deployments.window.nameRequired"))));
       return;
     }
     if (days.length === 0) {
-      setError(toApiError(new Error("Pick at least one day.")));
+      setError(toApiError(new Error(t("deployments.window.dayRequired"))));
       return;
     }
     if (startMinute === null || endMinute === null) {
-      setError(toApiError(new Error("Use HH:MM for the start and end times.")));
+      setError(toApiError(new Error(t("deployments.window.timeInvalid"))));
       return;
     }
     const input: MaintenanceWindowInput = {
@@ -314,7 +318,9 @@ function WindowDialog({
     try {
       if (target) await api.patchMaintenanceWindow(target.id, input);
       else await api.createMaintenanceWindow(input);
-      toast.success(target ? "Maintenance window saved." : "Maintenance window created.");
+      toast.success(
+        target ? t("deployments.window.saved") : t("deployments.window.created"),
+      );
       onOpenChange(false);
       onSaved();
     } catch (cause) {
@@ -328,18 +334,20 @@ function WindowDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{target ? `Edit ${target.name}` : "New maintenance window"}</DialogTitle>
+          <DialogTitle>
+            {target ? t("deployments.window.editTitle", { name: target.name }) : t("deployments.window.title")}
+          </DialogTitle>
           <DialogDescription>
-            Recurring UTC ranges. Destructive operations are refused while no enabled window is open.
+            {t("deployments.window.description")}
             <span className="mt-1 block font-mono text-[11px]">
-              start inclusive · end exclusive · end before start means overnight
+              {t("deployments.window.bounds")}
             </span>
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="space-y-2">
-            <Label htmlFor="window-name">Name</Label>
+            <Label htmlFor="window-name">{t("common.name")}</Label>
             <Input
               id="window-name"
               value={name}
@@ -348,7 +356,7 @@ function WindowDialog({
             />
           </div>
           <fieldset className="space-y-2">
-            <legend className="text-sm font-medium">Days</legend>
+            <legend className="text-sm font-medium">{t("deployments.window.days")}</legend>
             <div className="flex flex-wrap gap-3">
               {DAYS.map((day) => (
                 <div key={day.value} className="flex items-center gap-1.5">
@@ -361,7 +369,7 @@ function WindowDialog({
                     htmlFor={`window-day-${day.value}`}
                     className="cursor-pointer text-sm font-normal"
                   >
-                    {day.label}
+                    {t(day.labelKey)}
                   </Label>
                 </div>
               ))}
@@ -369,7 +377,7 @@ function WindowDialog({
           </fieldset>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="window-start">Start (UTC)</Label>
+              <Label htmlFor="window-start">{t("deployments.window.start")}</Label>
               <Input
                 id="window-start"
                 type="time"
@@ -379,7 +387,7 @@ function WindowDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="window-end">End (UTC)</Label>
+              <Label htmlFor="window-end">{t("deployments.window.end")}</Label>
               <Input
                 id="window-end"
                 type="time"
@@ -396,16 +404,16 @@ function WindowDialog({
               onCheckedChange={(value) => setEnabled(value === true)}
             />
             <Label htmlFor="window-enabled" className="cursor-pointer text-sm font-normal">
-              Enabled
+              {t("common.enabled")}
             </Label>
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Save window
+              {t("deployments.window.save")}
             </Button>
           </DialogFooter>
         </form>
@@ -415,6 +423,7 @@ function WindowDialog({
 }
 
 export function DeploymentsPage() {
+  const { t } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [tab, setTab] = useState("deployments");
@@ -447,7 +456,7 @@ export function DeploymentsPage() {
     setDeleteError(null);
     try {
       await api.deleteMaintenanceWindow(deleteTarget.id);
-      toast.success(`Window ${deleteTarget.name} deleted.`);
+      toast.success(t("deployments.window.deleted", { name: deleteTarget.name }));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -460,11 +469,16 @@ export function DeploymentsPage() {
   return (
     <>
       <PageHeader
-        title="Deployments"
+        title={t("nav.deployments")}
         description={
           deployments.data
-            ? `${rows.length} ${plural(rows.length, "deployment")} in the journal · ${windowStatus.data?.open ? "maintenance window open" : "maintenance gated"}`
-            : "Loading the deployment journal."
+            ? t("deployments.summary", {
+                count: rows.length,
+                gate: windowStatus.data?.open
+                  ? t("deployments.windowOpen")
+                  : t("deployments.maintenanceGated"),
+              })
+            : t("deployments.loading")
         }
         actions={
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
@@ -472,7 +486,7 @@ export function DeploymentsPage() {
               aria-hidden
               className={deployments.refreshing || windows.refreshing ? "animate-spin" : undefined}
             />
-            Refresh
+            {t("common.refresh")}
           </Button>
         }
       />
@@ -480,8 +494,8 @@ export function DeploymentsPage() {
       <Tabs value={tab} onValueChange={setTab}>
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
-            <TabsTrigger value="deployments">Deployments</TabsTrigger>
-            <TabsTrigger value="windows">Maintenance windows</TabsTrigger>
+            <TabsTrigger value="deployments">{t("nav.deployments")}</TabsTrigger>
+            <TabsTrigger value="windows">{t("deployments.windowsTab")}</TabsTrigger>
           </TabsList>
         </div>
 
@@ -494,29 +508,29 @@ export function DeploymentsPage() {
               value={status || "all"}
               onValueChange={(value) => setStatus(value === "all" ? "" : (value as DeploymentStatus))}
             >
-              <SelectTrigger className="w-full sm:w-44" aria-label="Filter by status">
+              <SelectTrigger className="w-full sm:w-44" aria-label={t("fleet.filterAria")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All statuses</SelectItem>
+                <SelectItem value="all">{t("incidents.allStatuses")}</SelectItem>
                 {STATUSES.filter(Boolean).map((value) => (
                   <SelectItem key={value} value={value}>
-                    {value}
+                    {t(`status.${value}`)}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
             <Select value={limit} onValueChange={setLimit}>
-              <SelectTrigger className="w-full sm:w-36" aria-label="Rows to load">
+              <SelectTrigger className="w-full sm:w-36" aria-label={t("deployments.rowsAria")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="50">50 rows</SelectItem>
-                <SelectItem value="200">200 rows</SelectItem>
+                <SelectItem value="50">{t("deployments.rowsN", { count: 50 })}</SelectItem>
+                <SelectItem value="200">{t("deployments.rowsN", { count: 200 })}</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground sm:ml-auto" aria-live="polite">
-              {rows.length} shown
+              {t("schedules.shown", { count: rows.length })}
             </p>
           </div>
 
@@ -530,8 +544,8 @@ export function DeploymentsPage() {
             ) : rows.length === 0 ? (
               <EmptyState
                 icon={Rocket}
-                title="No deployment recorded"
-                description="Every upgrade — immediate, canary or scheduled — lands in this journal."
+                title={t("deployments.emptyTitle")}
+                description={t("deployments.emptyDescription")}
               />
             ) : (
               <>
@@ -539,13 +553,13 @@ export function DeploymentsPage() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="w-[160px]">Started / planned</TableHead>
-                        <TableHead>Image</TableHead>
-                        <TableHead className="w-[120px]">Status</TableHead>
-                        <TableHead className="w-[130px]">Instances</TableHead>
-                        <TableHead className="w-[130px]">Canary / soak</TableHead>
+                        <TableHead className="w-[160px]">{t("deployments.startedPlanned")}</TableHead>
+                        <TableHead>{t("deployments.image")}</TableHead>
+                        <TableHead className="w-[120px]">{t("common.status")}</TableHead>
+                        <TableHead className="w-[130px]">{t("nav.instances")}</TableHead>
+                        <TableHead className="w-[130px]">{t("deployments.canarySoak")}</TableHead>
                         <TableHead className="w-[90px]">
-                          <span className="sr-only">Open</span>
+                          <span className="sr-only">{t("common.open")}</span>
                         </TableHead>
                       </TableRow>
                     </TableHeader>
@@ -576,7 +590,7 @@ export function DeploymentsPage() {
                           </TableCell>
                           <TableCell className="text-right">
                             <Button variant="outline" size="sm" onClick={() => setSelected(deployment.id)}>
-                              Open
+                              {t("common.open")}
                             </Button>
                           </TableCell>
                         </TableRow>
@@ -597,11 +611,14 @@ export function DeploymentsPage() {
                         <OpsBadge status={deployment.status} />
                       </div>
                       <p className="text-xs text-muted-foreground">
-                        {deployment.instances.length} instances · canary {deployment.canary} · soak{" "}
-                        {deployment.soak_s}s
+                        {t("deployments.mobileSummary", {
+                          count: deployment.instances.length,
+                          canary: deployment.canary,
+                          soak: deployment.soak_s,
+                        })}
                       </p>
                       <Button variant="outline" size="sm" onClick={() => setSelected(deployment.id)}>
-                        Open deployment
+                        {t("deployments.openDeployment")}
                       </Button>
                     </li>
                   ))}
@@ -615,16 +632,22 @@ export function DeploymentsPage() {
           <div className="flex flex-wrap items-center gap-2">
             <OpsBadge
               status={windowStatus.data?.open ? "open" : "closed"}
-              label={windowStatus.data?.open ? "window open" : "closed"}
+              label={
+                windowStatus.data?.open
+                  ? t("deployments.windowOpen")
+                  : t("deployments.windowClosed")
+              }
             />
             <span className="text-xs text-muted-foreground">
               {windowStatus.data?.enforce
-                ? "Enforcement active: an operation outside a window is refused."
-                : "No enabled window: the gate is inert."}
+                ? t("deployments.enforceActive")
+                : t("deployments.gateInert")}
             </span>
             {windowStatus.data?.next_open ? (
               <span className="font-mono text-xs text-muted-foreground">
-                next open {formatUtcDateTime(windowStatus.data.next_open)}
+                {t("deployments.nextOpen", {
+                  time: formatUtcDateTime(windowStatus.data.next_open),
+                })}
               </span>
             ) : null}
             <div className="ml-auto">
@@ -637,7 +660,7 @@ export function DeploymentsPage() {
                   }}
                 >
                   <Plus aria-hidden />
-                  New window
+                  {t("deployments.newWindow")}
                 </Button>
               ) : null}
             </div>
@@ -654,8 +677,8 @@ export function DeploymentsPage() {
             ) : windowRows.length === 0 ? (
               <EmptyState
                 icon={CalendarClock}
-                title="No maintenance window"
-                description="Without an enabled window, destructive operations are not gated."
+                title={t("deployments.noWindowTitle")}
+                description={t("deployments.noWindowDescription")}
                 action={
                   admin ? (
                     <Button
@@ -666,7 +689,7 @@ export function DeploymentsPage() {
                       }}
                     >
                       <Plus aria-hidden />
-                      New window
+                      {t("deployments.newWindow")}
                     </Button>
                   ) : undefined
                 }
@@ -680,7 +703,7 @@ export function DeploymentsPage() {
                         {window.name}{" "}
                         {!window.enabled ? (
                           <Badge variant="outline" className="ml-1 text-[11px] font-normal">
-                            disabled
+                            {t("common.disabled")}
                           </Badge>
                         ) : null}
                       </p>
@@ -694,8 +717,8 @@ export function DeploymentsPage() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={`Edit ${window.name}`}
-                          title={`Edit ${window.name}`}
+                          aria-label={t("deployments.editWindowAria", { name: window.name })}
+                          title={t("deployments.editWindowAria", { name: window.name })}
                           onClick={() => {
                             setWindowTarget(window);
                             setWindowOpen(true);
@@ -706,8 +729,8 @@ export function DeploymentsPage() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={`Delete ${window.name}`}
-                          title={`Delete ${window.name}`}
+                          aria-label={t("deployments.deleteWindowAria", { name: window.name })}
+                          title={t("deployments.deleteWindowAria", { name: window.name })}
                           onClick={() => {
                             setDeleteError(null);
                             setDeleteTarget(window);
@@ -723,8 +746,7 @@ export function DeploymentsPage() {
             )}
           </div>
           <p className="text-xs text-muted-foreground">
-            Minutes are UTC: start inclusive, end exclusive. An end before the start is an overnight
-            window owned by its start day.
+            {t("deployments.windowFootnote")}
           </p>
         </TabsContent>
       </Tabs>
@@ -747,13 +769,13 @@ export function DeploymentsPage() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title="Delete maintenance window"
+        title={t("deployments.deleteWindowTitle")}
         description={
           deleteTarget
-            ? `Delete ${deleteTarget.name}? Future upgrades lose this gate.`
+            ? t("deployments.deleteWindowDescription", { name: deleteTarget.name })
             : undefined
         }
-        confirmLabel="Delete window"
+        confirmLabel={t("deployments.deleteWindow")}
         destructive
         pending={deleting}
         error={deleteError}

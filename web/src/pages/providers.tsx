@@ -18,7 +18,8 @@ import { ProviderFormDialog } from "@/components/provider-form-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor, navigate, useRoute } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -32,11 +33,14 @@ function KindBadge({ kind }: { kind: string }) {
 }
 
 function InstancesCount({ count }: { count: number }) {
+  const { t } = useI18n();
   if (count === 0) return <span className="font-mono text-xs text-muted-foreground">0</span>;
   return (
     <span className="flex items-center gap-1.5 text-sm">
       <span className="font-mono">{count}</span>
-      <span className="text-xs text-muted-foreground">{plural(count, "instance")}</span>
+      <span className="text-xs text-muted-foreground">
+        {t(count === 1 ? "providers.list.instanceOne" : "providers.list.instanceMany")}
+      </span>
     </span>
   );
 }
@@ -50,17 +54,18 @@ function ProviderActions({
   canEdit: boolean;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex items-center gap-1.5">
       <Button asChild variant="outline" size="sm">
-        <a href={hrefFor(`/providers/${provider.id}`)}>Manage</a>
+        <a href={hrefFor(`/providers/${provider.id}`)}>{t("providers.list.manage")}</a>
       </Button>
       {canEdit ? (
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label={`Delete provider ${provider.name}`}
-          title={`Delete provider ${provider.name}`}
+          aria-label={t("providers.list.deleteAria", { name: provider.name })}
+          title={t("providers.list.deleteAria", { name: provider.name })}
           onClick={onDelete}
         >
           <Trash2 aria-hidden />
@@ -71,6 +76,7 @@ function ProviderActions({
 }
 
 export function ProvidersPage() {
+  const { t, lang } = useI18n();
   const canEdit = useCanEdit();
   const route = useRoute();
   const createRequested = route.query.get("new") === "1";
@@ -96,25 +102,22 @@ export function ProvidersPage() {
   return (
     <>
       <PageHeader
-        title="Providers"
+        title={t("nav.providers")}
         description={
           providers.data
-            ? `${rows.length} ${plural(rows.length, "provider")} · ${linked} linked ${plural(
-                linked,
-                "instance",
-              )}`
-            : "Loading providers."
+            ? t("providers.list.summary", { providers: rows.length, instances: linked })
+            : t("providers.list.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={providers.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <Button size="sm" onClick={() => setCreateOpen(true)}>
                 <Plus aria-hidden />
-                New provider
+                {t("providers.form.newTitle")}
               </Button>
             ) : null}
           </>
@@ -133,17 +136,15 @@ export function ProvidersPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={Plug}
-            title="No providers yet"
+            title={t("providers.list.emptyTitle")}
             description={
-              canEdit
-                ? "A provider is one API credential several agents can share. Create it once, then pick it when you create or duplicate an instance."
-                : "No provider exists. Your role is read-only; ask an admin to create one."
+              canEdit ? t("providers.list.emptyCreate") : t("providers.list.emptyReadOnly")
             }
             action={
               canEdit ? (
                 <Button onClick={() => setCreateOpen(true)}>
                   <Plus aria-hidden />
-                  New provider
+                  {t("providers.form.newTitle")}
                 </Button>
               ) : undefined
             }
@@ -154,14 +155,18 @@ export function ProvidersPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead className="w-[140px]">Kind</TableHead>
-                    <TableHead>Base URL</TableHead>
-                    <TableHead className="hidden lg:table-cell">API key env</TableHead>
-                    <TableHead className="w-[130px]">Instances</TableHead>
-                    <TableHead className="hidden w-[150px] lg:table-cell">Updated</TableHead>
+                    <TableHead>{t("common.name")}</TableHead>
+                    <TableHead className="w-[140px]">{t("providers.form.kind")}</TableHead>
+                    <TableHead>{t("providers.form.baseUrl")}</TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      {t("providers.form.apiKeyEnv")}
+                    </TableHead>
+                    <TableHead className="w-[130px]">{t("nav.instances")}</TableHead>
+                    <TableHead className="hidden w-[150px] lg:table-cell">
+                      {t("common.updated")}
+                    </TableHead>
                     <TableHead className="w-[150px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -206,7 +211,7 @@ export function ProvidersPage() {
                           className="font-mono text-xs"
                           title={formatDateTime(provider.updated_at)}
                         >
-                          {formatRelative(provider.updated_at)}
+                          {formatRelative(provider.updated_at, lang)}
                         </span>
                       </TableCell>
                       <TableCell className="text-right">
@@ -246,25 +251,25 @@ export function ProvidersPage() {
                   </div>
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
                     <div className="col-span-2 min-w-0">
-                      <dt className="text-muted-foreground">Base URL</dt>
+                      <dt className="text-muted-foreground">{t("providers.form.baseUrl")}</dt>
                       <dd className="truncate font-mono" title={provider.base_url}>
                         {provider.base_url}
                       </dd>
                     </div>
                     <div className="min-w-0">
-                      <dt className="text-muted-foreground">API key env</dt>
+                      <dt className="text-muted-foreground">{t("providers.form.apiKeyEnv")}</dt>
                       <dd className="truncate font-mono">{provider.api_key_env}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Instances</dt>
+                      <dt className="text-muted-foreground">{t("nav.instances")}</dt>
                       <dd>
                         <InstancesCount count={provider.instances_count} />
                       </dd>
                     </div>
                     <div className="col-span-2">
-                      <dt className="text-muted-foreground">Updated</dt>
+                      <dt className="text-muted-foreground">{t("common.updated")}</dt>
                       <dd className="font-mono" title={formatDateTime(provider.updated_at)}>
-                        {formatRelative(provider.updated_at)}
+                        {formatRelative(provider.updated_at, lang)}
                       </dd>
                     </div>
                   </dl>

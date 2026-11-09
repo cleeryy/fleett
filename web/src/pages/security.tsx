@@ -9,6 +9,8 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
+import { RichText } from "@/components/rich-text";
+import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 function Card({ title, children }: { title: string; children: ReactNode }) {
@@ -39,22 +41,27 @@ function HeaderValue({ label, value }: { label: string; value: string }) {
 }
 
 export function SecurityPage() {
+  const { t } = useI18n();
   const status = useResource(() => api.securityStatus(), []);
+  const authMode = (mode: string) => {
+    const key = `authMode.${mode}`;
+    return hasTranslation(key) ? t(key) : mode;
+  };
   const data: SecurityStatus | null = status.data;
 
   return (
     <>
       <PageHeader
-        title="Security"
+        title={t("nav.security")}
         description={
           data
-            ? `Read-only posture · auth mode ${data.auth_mode} · admins only`
-            : "Reading the security posture."
+            ? t("security.summary", { mode: authMode(data.auth_mode) })
+            : t("security.loading")
         }
         actions={
           <Button variant="outline" size="sm" onClick={status.reload}>
             <RefreshCw aria-hidden className={status.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
         }
       />
@@ -71,71 +78,77 @@ export function SecurityPage() {
       ) : !data ? (
         <EmptyState
           icon={ShieldCheck}
-          title="Security posture unavailable"
-          description="The controller did not answer /api/security/status."
+          title={t("security.unavailableTitle")}
+          description={t("security.unavailableDescription")}
         />
       ) : (
         <>
           <div className="grid gap-4 lg:grid-cols-2">
-            <Card title="Rate limits">
+            <Card title={t("security.rateLimits")}>
               <div className="flex items-center gap-2">
                 <OpsBadge
                   status={data.rate_limit.enabled ? "ok" : "closed"}
-                  label={data.rate_limit.enabled ? "enabled" : "disabled"}
+                  label={
+                    data.rate_limit.enabled ? t("common.enabled") : t("common.disabled")
+                  }
                 />
                 <span className="text-xs text-muted-foreground">
-                  per client IP, credential and route class
+                  {t("security.perClient")}
                 </span>
               </div>
               <dl>
-                <Row label="API bucket" value={<span className="font-mono">{data.rate_limit.limits.per_min} / min</span>} />
+                <Row label={t("security.apiBucket")} value={<span className="font-mono">{data.rate_limit.limits.per_min} / min</span>} />
                 <Row
-                  label="Auth bucket"
+                  label={t("security.authBucket")}
                   value={<span className="font-mono">{data.rate_limit.limits.auth_per_min} / min</span>}
                 />
                 <Row
-                  label="Heavy bucket"
+                  label={t("security.heavyBucket")}
                   value={<span className="font-mono">{data.rate_limit.limits.heavy_per_min} / min</span>}
                 />
               </dl>
               <p className="text-xs text-muted-foreground">
-                A <span className="font-mono">0</span> limit disables that bucket. Logs, exec, files
-                and exports use the heavy bucket.
+                <RichText text={t("security.rateLimitHint")} />
               </p>
             </Card>
 
-            <Card title="Authentication lockout">
+            <Card title={t("security.lockout")}>
               <div className="flex flex-wrap items-center gap-2">
                 <OpsBadge
                   status={data.lockout.failures === 0 ? "closed" : "ok"}
-                  label={data.lockout.failures === 0 ? "disabled" : "enabled"}
+                  label={
+                    data.lockout.failures === 0 ? t("common.disabled") : t("common.enabled")
+                  }
                 />
                 <span className="text-xs text-muted-foreground">
-                  {data.lockout.locked_ips} distinct address
-                  {data.lockout.locked_ips === 1 ? "" : "es"} currently locked
+                  {t(
+                    data.lockout.locked_ips === 1
+                      ? "security.lockedOne"
+                      : "security.lockedMany",
+                    { count: data.lockout.locked_ips },
+                  )}
                 </span>
               </div>
               <dl>
                 <Row
-                  label="Failures tolerated"
+                  label={t("security.failuresTolerated")}
                   value={<span className="font-mono">{data.lockout.failures}</span>}
                 />
                 <Row
-                  label="Sliding window"
+                  label={t("security.slidingWindow")}
                   value={<span className="font-mono">{data.lockout.window_s} s</span>}
                 />
                 <Row
-                  label="Lockout duration"
+                  label={t("security.lockoutDuration")}
                   value={<span className="font-mono">{data.lockout.lockout_s} s</span>}
                 />
               </dl>
               <p className="text-xs text-muted-foreground">
-                Failed authentications feed a progressive lockout; the lock itself is audited as{" "}
-                <span className="font-mono">auth.lockout</span>.
+                <RichText text={t("security.lockoutHint")} />
               </p>
             </Card>
 
-            <Card title="Response headers">
+            <Card title={t("security.headers")}>
               <div className="flex items-center gap-2">
                 <Badge variant="outline" className="font-mono text-xs font-normal">
                   {data.headers.x_content_type_options}
@@ -145,7 +158,7 @@ export function SecurityPage() {
                 </Badge>
                 <OpsBadge
                   status={data.headers.hsts ? "ok" : "closed"}
-                  label={data.headers.hsts ? "HSTS" : "no HSTS"}
+                  label={data.headers.hsts ? t("security.hsts") : t("security.noHsts")}
                 />
               </div>
               <div>
@@ -154,37 +167,34 @@ export function SecurityPage() {
                 <HeaderValue label="Permissions-Policy" value={data.headers.permissions_policy} />
               </div>
               <p className="text-xs text-muted-foreground">
-                HSTS is sent only when <span className="font-mono">FLEETT_PUBLIC_URL</span> is https.
-                Every console, API and error response carries these headers.
+                <RichText text={t("security.headersHint")} />
               </p>
             </Card>
 
-            <Card title="Tokens and credentials">
+            <Card title={t("security.tokens")}>
               <div className="flex items-center gap-2">
                 <KeyRound aria-hidden className="size-4 text-muted-foreground" />
                 <span className="text-xs text-muted-foreground">
-                  Tokens are stored as SHA-256 digests only
+                  {t("security.tokensDigest")}
                 </span>
               </div>
               <dl>
-                <Row label="Active tokens" value={<span className="font-mono">{data.tokens.active}</span>} />
+                <Row label={t("security.activeTokens")} value={<span className="font-mono">{data.tokens.active}</span>} />
                 <Row
-                  label="Expired or revoked"
+                  label={t("security.expiredTokens")}
                   value={<span className="font-mono">{data.tokens.expired_or_revoked}</span>}
                 />
-                <Row label="Auth mode" value={<span className="font-mono">{data.auth_mode}</span>} />
+                <Row
+                  label={t("security.authMode")}
+                  value={<span className="font-mono">{authMode(data.auth_mode)}</span>}
+                />
               </dl>
-              <p className="text-xs text-muted-foreground">
-                Manage credentials on the Tokens page. A revoked token stays addressable until it is
-                purged, but never authenticates again.
-              </p>
+              <p className="text-xs text-muted-foreground">{t("security.tokensHint")}</p>
             </Card>
           </div>
 
           <p className="text-xs text-muted-foreground">
-            This page is read-only. The limits and lockout windows come from the controller
-            environment (<span className="font-mono">FLEETT_RATE_LIMIT_*</span>,{" "}
-            <span className="font-mono">FLEETT_AUTH_LOCKOUT_*</span>).
+            <RichText text={t("security.footer")} />
           </p>
         </>
       )}

@@ -42,15 +42,17 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { RichText } from "@/components/rich-text";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 const SINCE_OPTIONS = [
-  { value: "all", label: "Any time" },
-  { value: "30m", label: "Last 30 min" },
-  { value: "1h", label: "Last hour" },
-  { value: "24h", label: "Last 24 h" },
-  { value: "7d", label: "Last 7 days" },
+  { value: "all", labelKey: "logs.sinceAll" },
+  { value: "30m", labelKey: "logs.since30m" },
+  { value: "1h", labelKey: "logs.since1h" },
+  { value: "24h", labelKey: "logs.since24h" },
+  { value: "7d", labelKey: "logs.since7d" },
 ];
 
 function Highlight({ text, needle }: { text: string; needle: string }) {
@@ -91,6 +93,7 @@ function toIso(value: string): string | undefined {
 }
 
 export function LogsPage() {
+  const { t, lang } = useI18n();
   const [instances, setInstances] = useState<string[]>([]);
   const [q, setQ] = useState("");
   const [level, setLevel] = useState<"all" | LogLevel>("all");
@@ -201,17 +204,19 @@ export function LogsPage() {
 
   const instanceLabel =
     instances.length === 0
-      ? "All instances"
-      : `${instances.length} ${plural(instances.length, "instance")}`;
+      ? t("logs.allInstances")
+      : t(instances.length === 1 ? "fleet.countOne" : "fleet.countMany", {
+          count: instances.length,
+        });
 
   return (
     <>
       <PageHeader
-        title="Logs"
+        title={t("nav.logs")}
         description={
           logs.data
-            ? `${rows.length} ${plural(rows.length, "line")} · newest first · redacted on ingestion`
-            : "Searching the persisted log center."
+            ? t(rows.length === 1 ? "logs.countOne" : "logs.countMany", { count: rows.length })
+            : t("logs.loading")
         }
         actions={
           <>
@@ -219,7 +224,7 @@ export function LogsPage() {
               variant={follow ? "default" : "outline"}
               size="sm"
               aria-pressed={follow}
-              title="Poll the latest lines every 2 seconds. SSE is not used because EventSource cannot send the bearer header."
+              title={t("logs.followTitle")}
               onClick={() => setFollow((value) => !value)}
             >
               {follow ? (
@@ -227,23 +232,27 @@ export function LogsPage() {
               ) : (
                 <Activity aria-hidden />
               )}
-              {follow ? "Following" : "Follow"}
+              {follow ? t("logs.following") : t("logs.follow")}
             </Button>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={logs.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" size="sm" disabled={exporting !== null}>
                   {exporting ? <Loader2 aria-hidden className="animate-spin" /> : <Download aria-hidden />}
-                  Export
+                  {t("logs.export")}
                   <ChevronDown aria-hidden />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => void download("json")}>Export JSON</DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => void download("csv")}>Export CSV</DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => void download("json")}>
+                  {t("logs.exportJson")}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => void download("csv")}>
+                  {t("logs.exportCsv")}
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </>
@@ -252,9 +261,7 @@ export function LogsPage() {
 
       {follow ? (
         <p className="text-xs text-muted-foreground" role="status">
-          Live follow polls every 2 seconds (latest cursor). The SSE stream exists, but{" "}
-          <span className="font-mono">EventSource</span> cannot send the bearer header, so this console
-          deliberately uses the search endpoint instead.
+          <RichText text={t("logs.followHint")} />
         </p>
       ) : null}
 
@@ -271,8 +278,8 @@ export function LogsPage() {
           <Input
             value={q}
             onChange={(event) => setQ(event.target.value)}
-            placeholder="Search message text"
-            aria-label="Search log messages"
+            placeholder={t("logs.searchPlaceholder")}
+            aria-label={t("logs.searchAria")}
             className="pl-8"
           />
         </div>
@@ -285,17 +292,19 @@ export function LogsPage() {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="max-h-80 w-60 overflow-y-auto">
-            <DropdownMenuLabel>Instances</DropdownMenuLabel>
+            <DropdownMenuLabel>{t("nav.instances")}</DropdownMenuLabel>
             <DropdownMenuCheckboxItem
               checked={instances.length === 0}
               onSelect={(event) => event.preventDefault()}
               onCheckedChange={() => setInstances([])}
             >
-              All instances
+              {t("logs.allInstances")}
             </DropdownMenuCheckboxItem>
             <DropdownMenuSeparator />
             {instanceOptions.length === 0 ? (
-              <p className="px-2 py-1.5 text-xs text-muted-foreground">No instance reported yet.</p>
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                {t("logs.noInstance")}
+              </p>
             ) : (
               instanceOptions.map((id) => (
                 <DropdownMenuCheckboxItem
@@ -312,25 +321,25 @@ export function LogsPage() {
         </DropdownMenu>
 
         <Select value={level} onValueChange={(value) => setLevel(value as "all" | LogLevel)}>
-          <SelectTrigger className="w-full lg:w-36" aria-label="Minimum level">
+          <SelectTrigger className="w-full lg:w-36" aria-label={t("logs.levelAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All levels</SelectItem>
-            <SelectItem value="info">info and up</SelectItem>
-            <SelectItem value="warn">warn and up</SelectItem>
-            <SelectItem value="error">error only</SelectItem>
+            <SelectItem value="all">{t("logs.levelAll")}</SelectItem>
+            <SelectItem value="info">{t("logs.levelInfo")}</SelectItem>
+            <SelectItem value="warn">{t("logs.levelWarn")}</SelectItem>
+            <SelectItem value="error">{t("logs.levelError")}</SelectItem>
           </SelectContent>
         </Select>
 
         <Select value={since} onValueChange={setSince}>
-          <SelectTrigger className="w-full lg:w-40" aria-label="Since when">
+          <SelectTrigger className="w-full lg:w-40" aria-label={t("logs.sinceAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {SINCE_OPTIONS.map((option) => (
               <SelectItem key={option.value} value={option.value}>
-                {option.label}
+                {t(option.labelKey)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -338,7 +347,7 @@ export function LogsPage() {
 
         <div className="flex items-center gap-2">
           <label htmlFor="logs-until" className="text-xs whitespace-nowrap text-muted-foreground">
-            Until
+            {t("logs.until")}
           </label>
           <Input
             id="logs-until"
@@ -350,18 +359,18 @@ export function LogsPage() {
         </div>
 
         <Select value={limit} onValueChange={setLimit}>
-          <SelectTrigger className="w-full lg:w-32" aria-label="Lines to load">
+          <SelectTrigger className="w-full lg:w-32" aria-label={t("logs.limitAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="100">100 lines</SelectItem>
-            <SelectItem value="250">250 lines</SelectItem>
-            <SelectItem value="500">500 lines</SelectItem>
+            <SelectItem value="100">{t("logs.limitN", { count: 100 })}</SelectItem>
+            <SelectItem value="250">{t("logs.limitN", { count: 250 })}</SelectItem>
+            <SelectItem value="500">{t("logs.limitN", { count: 500 })}</SelectItem>
           </SelectContent>
         </Select>
 
         <p className="text-xs text-muted-foreground lg:ml-auto" aria-live="polite">
-          {logs.data ? `${logs.data.count} matched` : "…"}
+          {logs.data ? t("logs.matched", { count: logs.data.count }) : "…"}
         </p>
       </div>
 
@@ -375,8 +384,8 @@ export function LogsPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={ScrollText}
-            title="No log line matches"
-            description="Widen the time window, clear the query, or pick another level. The log center keeps a bounded retention window."
+            title={t("logs.emptyTitle")}
+            description={t("logs.emptyDescription")}
             action={
               <Button
                 variant="outline"
@@ -388,7 +397,7 @@ export function LogsPage() {
                   setUntil("");
                 }}
               >
-                Clear filters
+                {t("common.clearFilters")}
               </Button>
             }
           />
@@ -398,17 +407,20 @@ export function LogsPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[180px]">Time</TableHead>
-                    <TableHead className="w-[120px]">Instance</TableHead>
-                    <TableHead className="w-[90px]">Level</TableHead>
-                    <TableHead>Message</TableHead>
+                    <TableHead className="w-[180px]">{t("audit.time")}</TableHead>
+                    <TableHead className="w-[120px]">{t("messages.instance")}</TableHead>
+                    <TableHead className="w-[90px]">{t("logs.level")}</TableHead>
+                    <TableHead>{t("logs.message")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {rows.map((entry) => (
                     <TableRow key={entry.id}>
                       <TableCell>
-                        <span className="block font-mono text-xs" title={formatRelative(entry.at)}>
+                        <span
+                          className="block font-mono text-xs"
+                          title={formatRelative(entry.at, lang)}
+                        >
                           {formatDateTime(entry.at)}
                         </span>
                       </TableCell>

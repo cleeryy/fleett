@@ -58,6 +58,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { OpsBadge } from "@/components/ops-badge";
 import {
   formatBytes,
@@ -65,12 +66,14 @@ import {
   formatDurationMs,
   formatRelative,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useIdentity } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 const ROLE_OPTIONS: AclRole[] = ["owner", "operator", "viewer"];
 
 export function InstanceIncidents({ id }: { id: string }) {
+  const { t, lang } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [nonce, setNonce] = useState(0);
@@ -84,7 +87,7 @@ export function InstanceIncidents({ id }: { id: string }) {
     setError(null);
     try {
       await api.closeIncident(incident.id);
-      toast.success("Incident closed; the heal budget was reset.");
+      toast.success(t("ops.incidents.closed"));
       setNonce((value) => value + 1);
     } catch (cause) {
       setError(toApiError(cause));
@@ -98,12 +101,15 @@ export function InstanceIncidents({ id }: { id: string }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           {rows.length === 0
-            ? "No incident recorded for this instance."
-            : `${rows.filter((incident) => incident.status === "open").length} open · ${rows.length} recorded`}
+            ? t("ops.incidents.none")
+            : t("ops.incidents.summary", {
+                open: rows.filter((incident) => incident.status === "open").length,
+                total: rows.length,
+              })}
         </p>
         <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
           <RefreshCw aria-hidden className={incidents.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
       </div>
       {error ? <ErrorAlert error={error} /> : null}
@@ -118,8 +124,8 @@ export function InstanceIncidents({ id }: { id: string }) {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={TriangleAlert}
-            title="No incidents"
-            description="A clean stop never opens an incident. An unhealthy container opens one after the configured streak."
+            title={t("ops.incidents.emptyTitle")}
+            description={t("ops.incidents.emptyDescription")}
           />
         ) : (
           <ul className="divide-y">
@@ -129,16 +135,22 @@ export function InstanceIncidents({ id }: { id: string }) {
                   <div className="min-w-0">
                     <p className="font-mono text-xs">{incident.cause.replace(/_/g, " ")}</p>
                     <p className="text-[11px] text-muted-foreground">
-                      opened {formatDateTime(incident.opened_at)} · last seen{" "}
-                      {formatRelative(incident.last_seen_at)}
+                      {t("ops.incidents.opened", {
+                        time: formatDateTime(incident.opened_at),
+                        seen: formatRelative(incident.last_seen_at, lang),
+                      })}
                     </p>
                   </div>
                   <OpsBadge status={incident.status} />
                 </div>
                 <p className="text-sm">{incident.detail}</p>
                 <p className="text-xs text-muted-foreground">
-                  {incident.actions.length} watchdog action
-                  {incident.actions.length === 1 ? "" : "s"} · restart count {incident.restart_count}
+                  {t(
+                    incident.actions.length === 1
+                      ? "ops.incidents.actionsOne"
+                      : "ops.incidents.actionsMany",
+                    { count: incident.actions.length, restarts: incident.restart_count },
+                  )}
                 </p>
                 {incident.status === "open" && admin ? (
                   <Button
@@ -148,7 +160,7 @@ export function InstanceIncidents({ id }: { id: string }) {
                     onClick={() => void close(incident)}
                   >
                     {closing === incident.id ? <Loader2 aria-hidden className="animate-spin" /> : null}
-                    Close incident
+                    {t("incidents.closeIncident")}
                   </Button>
                 ) : null}
               </li>
@@ -171,6 +183,7 @@ function CreateSnapshotDialog({
   instanceId: string;
   onCreated: () => void;
 }) {
+  const { t } = useI18n();
   const [label, setLabel] = useState("");
   const [ttl, setTtl] = useState("604800");
   const [pending, setPending] = useState(false);
@@ -192,7 +205,7 @@ function CreateSnapshotDialog({
         ...(label.trim() ? { label: label.trim() } : {}),
         ttl_s: Number(ttl),
       });
-      toast.success("Snapshot created.");
+      toast.success(t("ops.snapshots.created"));
       onOpenChange(false);
       onCreated();
     } catch (cause) {
@@ -206,45 +219,44 @@ function CreateSnapshotDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Take a snapshot</DialogTitle>
+          <DialogTitle>{t("ops.snapshots.takeTitle")}</DialogTitle>
           <DialogDescription>
-            Captures <span className="font-mono">data/</span>, the compose file, rendered config and
-            environment rows. Secrets stay encrypted.
+            <RichText text={t("ops.snapshots.takeDescription")} />
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="space-y-2">
-            <Label htmlFor="snapshot-label">Label</Label>
+            <Label htmlFor="snapshot-label">{t("ops.snapshots.label")}</Label>
             <Input
               id="snapshot-label"
               value={label}
-              placeholder="before upgrade"
+              placeholder={t("ops.snapshots.labelPlaceholder")}
               maxLength={128}
               onChange={(event) => setLabel(event.target.value)}
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="snapshot-ttl">Keep for</Label>
+            <Label htmlFor="snapshot-ttl">{t("ops.snapshots.keepFor")}</Label>
             <Select value={ttl} onValueChange={setTtl}>
               <SelectTrigger id="snapshot-ttl" className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="86400">1 day</SelectItem>
-                <SelectItem value="604800">7 days</SelectItem>
-                <SelectItem value="2592000">30 days</SelectItem>
-                <SelectItem value="7776000">90 days</SelectItem>
+                <SelectItem value="86400">{t("memory.ttl1d")}</SelectItem>
+                <SelectItem value="604800">{t("memory.ttl7d")}</SelectItem>
+                <SelectItem value="2592000">{t("memory.ttl30d")}</SelectItem>
+                <SelectItem value="7776000">{t("ops.snapshots.days90")}</SelectItem>
               </SelectContent>
             </Select>
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Camera aria-hidden />}
-              Take snapshot
+              {t("ops.snapshots.take")}
             </Button>
           </DialogFooter>
         </form>
@@ -264,6 +276,7 @@ function CompareDialog({
   instanceId: string;
   snapshots: Snapshot[];
 }) {
+  const { t } = useI18n();
   const [a, setA] = useState("");
   const [b, setB] = useState("");
   const [diff, setDiff] = useState<SnapshotDiff | null>(null);
@@ -280,11 +293,11 @@ function CompareDialog({
 
   async function compare() {
     if (!a || !b) {
-      setError(toApiError(new Error("Pick two snapshots.")));
+      setError(toApiError(new Error(t("ops.compare.pickTwo"))));
       return;
     }
     if (a === b) {
-      setError(toApiError(new Error("Pick two different snapshots.")));
+      setError(toApiError(new Error(t("ops.compare.pickDifferent"))));
       return;
     }
     setPending(true);
@@ -300,23 +313,23 @@ function CompareDialog({
 
   const label = (id: string) => {
     const snapshot = snapshots.find((candidate) => candidate.id === id);
-    return snapshot ? `${snapshot.label || "snapshot"} · ${formatDateTime(snapshot.created_at)}` : id;
+    return snapshot
+      ? `${snapshot.label || t("ops.snapshots.untitled")} · ${formatDateTime(snapshot.created_at)}`
+      : id;
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Compare snapshots</DialogTitle>
-          <DialogDescription>
-            File-level comparison, no extraction. A is the left side, B the right side.
-          </DialogDescription>
+          <DialogTitle>{t("ops.compare.title")}</DialogTitle>
+          <DialogDescription>{t("ops.compare.description")}</DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="compare-a">Snapshot A</Label>
+              <Label htmlFor="compare-a">{t("ops.compare.snapshotA")}</Label>
               <Select value={a} onValueChange={setA}>
                 <SelectTrigger id="compare-a" className="w-full">
                   <SelectValue />
@@ -324,14 +337,15 @@ function CompareDialog({
                 <SelectContent>
                   {snapshots.map((snapshot) => (
                     <SelectItem key={snapshot.id} value={snapshot.id}>
-                      {snapshot.label || "snapshot"} · {formatDateTime(snapshot.created_at)}
+                      {snapshot.label || t("ops.snapshots.untitled")} ·{" "}
+                      {formatDateTime(snapshot.created_at)}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="compare-b">Snapshot B</Label>
+              <Label htmlFor="compare-b">{t("ops.compare.snapshotB")}</Label>
               <Select value={b} onValueChange={setB}>
                 <SelectTrigger id="compare-b" className="w-full">
                   <SelectValue />
@@ -339,7 +353,8 @@ function CompareDialog({
                 <SelectContent>
                   {snapshots.map((snapshot) => (
                     <SelectItem key={snapshot.id} value={snapshot.id}>
-                      {snapshot.label || "snapshot"} · {formatDateTime(snapshot.created_at)}
+                      {snapshot.label || t("ops.snapshots.untitled")} ·{" "}
+                      {formatDateTime(snapshot.created_at)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -348,7 +363,7 @@ function CompareDialog({
           </div>
           <Button type="button" size="sm" disabled={pending} onClick={() => void compare()}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : <ArrowRightLeft aria-hidden />}
-            Compare
+            {t("ops.compare.compare")}
           </Button>
 
           {diff ? (
@@ -360,21 +375,21 @@ function CompareDialog({
               <div className="grid grid-cols-3 gap-2 text-center">
                 <div className="rounded-md border p-2">
                   <p className="font-mono text-lg">{diff.added.length}</p>
-                  <p className="text-xs text-muted-foreground">added</p>
+                  <p className="text-xs text-muted-foreground">{t("ops.compare.added")}</p>
                 </div>
                 <div className="rounded-md border p-2">
                   <p className="font-mono text-lg">{diff.removed.length}</p>
-                  <p className="text-xs text-muted-foreground">removed</p>
+                  <p className="text-xs text-muted-foreground">{t("ops.compare.removed")}</p>
                 </div>
                 <div className="rounded-md border p-2">
                   <p className="font-mono text-lg">{diff.changed.length}</p>
-                  <p className="text-xs text-muted-foreground">changed</p>
+                  <p className="text-xs text-muted-foreground">{t("ops.compare.changed")}</p>
                 </div>
               </div>
               {[
-                { title: "Added", paths: diff.added.map((file) => file.path) },
-                { title: "Removed", paths: diff.removed.map((file) => file.path) },
-                { title: "Changed", paths: diff.changed.map((file) => file.path) },
+                { title: t("ops.compare.added"), paths: diff.added.map((file) => file.path) },
+                { title: t("ops.compare.removed"), paths: diff.removed.map((file) => file.path) },
+                { title: t("ops.compare.changed"), paths: diff.changed.map((file) => file.path) },
               ].map((group) =>
                 group.paths.length > 0 ? (
                   <div key={group.title} className="space-y-1">
@@ -389,7 +404,9 @@ function CompareDialog({
                   </div>
                 ) : null,
               )}
-              <p className="text-xs text-muted-foreground">{diff.unchanged} unchanged files.</p>
+              <p className="text-xs text-muted-foreground">
+                {t("ops.compare.unchanged", { count: diff.unchanged })}
+              </p>
             </div>
           ) : null}
         </div>
@@ -399,6 +416,7 @@ function CompareDialog({
 }
 
 export function InstanceSnapshots({ id }: { id: string }) {
+  const { t } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [nonce, setNonce] = useState(0);
@@ -419,7 +437,10 @@ export function InstanceSnapshots({ id }: { id: string }) {
     try {
       const report = await api.restoreSnapshot(restoreTarget.id);
       toast.success(
-        `Restored ${report.files} files. Previous data kept at ${report.previous_data_dir ?? "the .pre-restore directory"}.`,
+        t("ops.snapshots.restored", {
+          count: report.files,
+          path: report.previous_data_dir ?? t("ops.snapshots.preRestoreDir"),
+        }),
       );
       setRestoreTarget(null);
       setApproach(report.instance_id);
@@ -437,7 +458,7 @@ export function InstanceSnapshots({ id }: { id: string }) {
     setError(null);
     try {
       await api.deleteSnapshot(deleteTarget.id);
-      toast.success("Snapshot deleted.");
+      toast.success(t("ops.snapshots.deleted"));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -452,8 +473,13 @@ export function InstanceSnapshots({ id }: { id: string }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           {rows.length === 0
-            ? "No restore point yet."
-            : `${rows.length} restore point${rows.length === 1 ? "" : "s"} · newest first`}
+            ? t("ops.snapshots.none")
+            : t(
+                rows.length === 1
+                  ? "ops.snapshots.summaryOne"
+                  : "ops.snapshots.summaryMany",
+                { count: rows.length },
+              )}
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <Button
@@ -463,16 +489,16 @@ export function InstanceSnapshots({ id }: { id: string }) {
             onClick={() => setCompareOpen(true)}
           >
             <ArrowRightLeft aria-hidden />
-            Compare
+            {t("ops.compare.compare")}
           </Button>
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
             <RefreshCw aria-hidden className={snapshots.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
           {admin ? (
             <Button size="sm" onClick={() => setCreateOpen(true)}>
               <Camera aria-hidden />
-              Take snapshot
+              {t("ops.snapshots.take")}
             </Button>
           ) : null}
         </div>
@@ -480,7 +506,7 @@ export function InstanceSnapshots({ id }: { id: string }) {
 
       {approach ? (
         <p className="text-xs text-muted-foreground" role="status">
-          Restore finished: {approach} was stopped, data moved aside, restored, and started again.
+          {t("ops.snapshots.restoreFinished", { instance: approach })}
         </p>
       ) : null}
       {error ? <ErrorAlert error={error} /> : null}
@@ -496,13 +522,13 @@ export function InstanceSnapshots({ id }: { id: string }) {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={Camera}
-            title="No snapshots"
-            description="An auto snapshot is taken before upgrades, environment writes and git reverts. Take one by hand before a risky change."
+            title={t("ops.snapshots.emptyTitle")}
+            description={t("ops.snapshots.emptyDescription")}
             action={
               admin ? (
                 <Button size="sm" onClick={() => setCreateOpen(true)}>
                   <Camera aria-hidden />
-                  Take snapshot
+                  {t("ops.snapshots.take")}
                 </Button>
               ) : undefined
             }
@@ -513,13 +539,13 @@ export function InstanceSnapshots({ id }: { id: string }) {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Label</TableHead>
-                    <TableHead className="w-[170px]">Created</TableHead>
-                    <TableHead className="w-[100px]">Size</TableHead>
-                    <TableHead className="w-[170px]">Expires</TableHead>
-                    <TableHead className="w-[110px]">Status</TableHead>
+                    <TableHead>{t("ops.snapshots.label")}</TableHead>
+                    <TableHead className="w-[170px]">{t("common.created")}</TableHead>
+                    <TableHead className="w-[100px]">{t("ops.snapshots.size")}</TableHead>
+                    <TableHead className="w-[170px]">{t("messages.expires")}</TableHead>
+                    <TableHead className="w-[110px]">{t("common.status")}</TableHead>
                     <TableHead className="w-[130px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -527,7 +553,9 @@ export function InstanceSnapshots({ id }: { id: string }) {
                   {rows.map((snapshot) => (
                     <TableRow key={snapshot.id}>
                       <TableCell>
-                        <span className="block text-sm">{snapshot.label || "untitled"}</span>
+                        <span className="block text-sm">
+                          {snapshot.label || t("ops.snapshots.untitled")}
+                        </span>
                         <span className="block font-mono text-[11px] text-muted-foreground">
                           {snapshot.id}
                         </span>
@@ -546,8 +574,10 @@ export function InstanceSnapshots({ id }: { id: string }) {
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label={`Restore ${snapshot.label || snapshot.id}`}
-                              title="Restore this snapshot"
+                              aria-label={t("ops.snapshots.restoreAria", {
+                                name: snapshot.label || snapshot.id,
+                              })}
+                              title={t("ops.snapshots.restoreTitle")}
                               onClick={() => {
                                 setError(null);
                                 setRestoreTarget(snapshot);
@@ -558,8 +588,10 @@ export function InstanceSnapshots({ id }: { id: string }) {
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label={`Delete ${snapshot.label || snapshot.id}`}
-                              title="Delete this snapshot"
+                              aria-label={t("ops.snapshots.deleteAria", {
+                                name: snapshot.label || snapshot.id,
+                              })}
+                              title={t("ops.snapshots.deleteTitle")}
                               onClick={() => {
                                 setError(null);
                                 setDeleteTarget(snapshot);
@@ -580,7 +612,7 @@ export function InstanceSnapshots({ id }: { id: string }) {
                 <li key={snapshot.id} className="space-y-2 p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="text-sm">{snapshot.label || "untitled"}</p>
+                      <p className="text-sm">{snapshot.label || t("ops.snapshots.untitled")}</p>
                       <p className="font-mono text-[11px] text-muted-foreground">
                         {formatDateTime(snapshot.created_at)}
                       </p>
@@ -588,7 +620,10 @@ export function InstanceSnapshots({ id }: { id: string }) {
                     <OpsBadge status={snapshot.status} />
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {formatBytes(snapshot.size_bytes)} · expires {formatDateTime(snapshot.expires_at)}
+                    {t("ops.snapshots.mobileSummary", {
+                      size: formatBytes(snapshot.size_bytes),
+                      expires: formatDateTime(snapshot.expires_at),
+                    })}
                   </p>
                   {admin ? (
                     <div className="flex justify-end gap-1">
@@ -600,7 +635,7 @@ export function InstanceSnapshots({ id }: { id: string }) {
                           setRestoreTarget(snapshot);
                         }}
                       >
-                        Restore
+                        {t("ops.snapshots.restore")}
                       </Button>
                       <Button
                         variant="outline"
@@ -610,7 +645,7 @@ export function InstanceSnapshots({ id }: { id: string }) {
                           setDeleteTarget(snapshot);
                         }}
                       >
-                        Delete
+                        {t("common.delete")}
                       </Button>
                     </div>
                   ) : null}
@@ -638,18 +673,17 @@ export function InstanceSnapshots({ id }: { id: string }) {
         onOpenChange={(open) => {
           if (!open) setRestoreTarget(null);
         }}
-        title="Restore snapshot"
+        title={t("ops.snapshots.restoreConfirmTitle")}
         description={
           restoreTarget ? (
-            <>
-              Restore <span className="font-mono">{restoreTarget.label || restoreTarget.id}</span>?
-              The instance is stopped, its current data is moved to a kept{" "}
-              <span className="font-mono">.pre-restore-*</span> directory, then restored and started.
-              Environment and compose are restored too.
-            </>
+            <RichText
+              text={t("ops.snapshots.restoreConfirmDescription", {
+                name: restoreTarget.label || restoreTarget.id,
+              })}
+            />
           ) : undefined
         }
-        confirmLabel="Restore snapshot"
+        confirmLabel={t("ops.snapshots.restoreConfirm")}
         destructive
         pending={pending}
         error={error}
@@ -660,13 +694,15 @@ export function InstanceSnapshots({ id }: { id: string }) {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title="Delete snapshot"
+        title={t("ops.snapshots.deleteConfirmTitle")}
         description={
           deleteTarget
-            ? `Delete ${deleteTarget.label || deleteTarget.id} and its archive? This cannot be undone.`
+            ? t("ops.snapshots.deleteConfirmDescription", {
+                name: deleteTarget.label || deleteTarget.id,
+              })
             : undefined
         }
-        confirmLabel="Delete snapshot"
+        confirmLabel={t("ops.snapshots.deleteConfirm")}
         destructive
         pending={pending}
         error={error}
@@ -708,6 +744,7 @@ function tokenizeCommand(input: string): string[] {
 const QUICK_COMMANDS = ["pwd", "ls /opt/data", "df -h", "ps", "env", "uname -a"];
 
 export function InstanceTerminal({ id }: { id: string }) {
+  const { t } = useI18n();
   const [command, setCommand] = useState("ls /opt/data");
   const [timeout, setTimeoutValue] = useState("30");
   const [result, setResult] = useState<ExecResult | null>(null);
@@ -719,7 +756,7 @@ export function InstanceTerminal({ id }: { id: string }) {
     event?.preventDefault();
     const argv = tokenizeCommand(command);
     if (argv.length === 0) {
-      setError(toApiError(new Error("Enter a command.")));
+      setError(toApiError(new Error(t("ops.terminal.commandRequired"))));
       return;
     }
     setPending(true);
@@ -743,17 +780,14 @@ export function InstanceTerminal({ id }: { id: string }) {
     <div className="space-y-3">
       <Alert>
         <Terminal aria-hidden />
-        <AlertTitle>One-shot command</AlertTitle>
-        <AlertDescription>
-          Runs an allowlisted binary with argv, no shell, no stdin and no PTY. Timeout is 1–300 s;
-          each stream is capped at 256 KiB. Every attempt is audited.
-        </AlertDescription>
+        <AlertTitle>{t("ops.terminal.title")}</AlertTitle>
+        <AlertDescription>{t("ops.terminal.description")}</AlertDescription>
       </Alert>
 
       <form onSubmit={run} className="space-y-3">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="min-w-0 flex-1 space-y-2">
-            <Label htmlFor="exec-command">Command</Label>
+            <Label htmlFor="exec-command">{t("ops.terminal.command")}</Label>
             <Input
               ref={inputRef}
               id="exec-command"
@@ -766,7 +800,7 @@ export function InstanceTerminal({ id }: { id: string }) {
             />
           </div>
           <div className="w-full space-y-2 sm:w-28">
-            <Label htmlFor="exec-timeout">Timeout (s)</Label>
+            <Label htmlFor="exec-timeout">{t("schedules.form.timeout")}</Label>
             <Input
               id="exec-timeout"
               type="number"
@@ -779,7 +813,7 @@ export function InstanceTerminal({ id }: { id: string }) {
           </div>
           <Button type="submit" disabled={pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Play aria-hidden />}
-            Run
+            {t("common.runNow")}
           </Button>
         </div>
         <div className="flex flex-wrap gap-1.5">
@@ -810,10 +844,10 @@ export function InstanceTerminal({ id }: { id: string }) {
               status={result.timed_out ? "timeout" : result.exit_code === 0 ? "ok" : "error"}
               label={
                 result.timed_out
-                  ? "timed out"
+                  ? t("ops.terminal.timedOut")
                   : result.exit_code === null
-                    ? "no exit code"
-                    : `exit ${result.exit_code}`
+                    ? t("ops.terminal.noExitCode")
+                    : t("ops.terminal.exit", { code: result.exit_code })
               }
             />
             <span className="font-mono text-xs text-muted-foreground">
@@ -826,9 +860,11 @@ export function InstanceTerminal({ id }: { id: string }) {
             ) : null}
           </div>
           <div className="rounded-md border bg-muted/20">
-            <p className="border-b px-3 py-1.5 text-xs font-medium text-muted-foreground">stdout</p>
+            <p className="border-b px-3 py-1.5 text-xs font-medium text-muted-foreground">
+              stdout
+            </p>
             <pre className="max-h-96 overflow-auto p-3 font-mono text-xs whitespace-pre-wrap">
-              {result.stdout || "(empty)"}
+              {result.stdout || t("ops.terminal.empty")}
             </pre>
           </div>
           {result.stderr ? (
@@ -846,6 +882,7 @@ export function InstanceTerminal({ id }: { id: string }) {
 }
 
 export function InstanceAccess({ id }: { id: string }) {
+  const { t } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [nonce, setNonce] = useState(0);
@@ -869,11 +906,11 @@ export function InstanceAccess({ id }: { id: string }) {
     for (const row of rows) {
       const subject = row.subject.trim();
       if (!subject) {
-        setError(toApiError(new Error("Every grant needs a subject (e-mail, group or token name).")));
+        setError(toApiError(new Error(t("ops.access.subjectRequired"))));
         return;
       }
       if (seen.has(subject)) {
-        setError(toApiError(new Error(`Subject ${subject} is listed twice.`)));
+        setError(toApiError(new Error(t("ops.access.subjectDuplicate", { subject }))));
         return;
       }
       seen.add(subject);
@@ -886,7 +923,7 @@ export function InstanceAccess({ id }: { id: string }) {
         rows.map((row) => ({ subject: row.subject.trim(), role: row.role })),
       );
       setDraft(saved.acl.map((item) => ({ subject: item.subject, role: item.role })));
-      toast.success("Instance grants saved.");
+      toast.success(t("ops.access.saved"));
       setNonce((value) => value + 1);
     } catch (cause) {
       setError(toApiError(cause));
@@ -899,8 +936,7 @@ export function InstanceAccess({ id }: { id: string }) {
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
-          Per-instance grants. The level is read from SQLite on every request, so a save applies to
-          the next call.
+          {t("ops.access.description")}
         </p>
         <div className="flex items-center gap-2">
           {admin ? (
@@ -912,12 +948,12 @@ export function InstanceAccess({ id }: { id: string }) {
               }
             >
               <Plus aria-hidden />
-              Add grant
+              {t("ops.access.add")}
             </Button>
           ) : null}
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
             <RefreshCw aria-hidden className={acl.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
         </div>
       </div>
@@ -925,10 +961,8 @@ export function InstanceAccess({ id }: { id: string }) {
       {!admin ? (
         <Alert>
           <ShieldCheck aria-hidden />
-          <AlertTitle>Read-only for this account</AlertTitle>
-          <AlertDescription>
-            Only an admin or an owner of the instance can change its ACL.
-          </AlertDescription>
+          <AlertTitle>{t("ops.access.readOnlyTitle")}</AlertTitle>
+          <AlertDescription>{t("ops.access.readOnlyBody")}</AlertDescription>
         </Alert>
       ) : null}
       {error ? <ErrorAlert error={error} /> : null}
@@ -943,13 +977,13 @@ export function InstanceAccess({ id }: { id: string }) {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={ShieldCheck}
-            title="No explicit grant"
-            description="Admins always reach every instance. A grant lets another subject read, operate or own this one."
+            title={t("ops.access.emptyTitle")}
+            description={t("ops.access.emptyDescription")}
             action={
               admin ? (
                 <Button size="sm" onClick={() => setDraft([{ subject: "", role: "viewer" }])}>
                   <Plus aria-hidden />
-                  Add grant
+                  {t("ops.access.add")}
                 </Button>
               ) : undefined
             }
@@ -961,8 +995,8 @@ export function InstanceAccess({ id }: { id: string }) {
                 {admin ? (
                   <Input
                     value={row.subject}
-                    aria-label={`Subject ${index + 1}`}
-                    placeholder="cle@example.com"
+                    aria-label={t("ops.access.subjectAria", { index: index + 1 })}
+                    placeholder={t("ops.access.subjectPlaceholder")}
                     className="font-mono text-xs"
                     onChange={(event) =>
                       setDraft(
@@ -988,28 +1022,34 @@ export function InstanceAccess({ id }: { id: string }) {
                       )
                     }
                   >
-                    <SelectTrigger aria-label={`Role for ${row.subject || `grant ${index + 1}`}`}>
+                    <SelectTrigger
+                      aria-label={t("ops.access.roleAria", {
+                        subject: row.subject || t("ops.access.grantN", { index: index + 1 }),
+                      })}
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       {ROLE_OPTIONS.map((role) => (
                         <SelectItem key={role} value={role}>
-                          {role}
+                          {t(`aclRole.${role}`)}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 ) : (
                   <Badge variant="outline" className="w-fit font-mono text-xs font-normal">
-                    {row.role}
+                    {t(`aclRole.${row.role}`)}
                   </Badge>
                 )}
                 {admin ? (
                   <Button
                     variant="ghost"
                     size="icon-sm"
-                    aria-label={`Remove ${row.subject || `grant ${index + 1}`}`}
-                    title="Remove this grant"
+                    aria-label={t("ops.access.removeAria", {
+                      subject: row.subject || t("ops.access.grantN", { index: index + 1 }),
+                    })}
+                    title={t("ops.access.removeTitle")}
                     onClick={() => setDraft(rows.filter((_, position) => position !== index))}
                   >
                     <X aria-hidden />
@@ -1025,7 +1065,7 @@ export function InstanceAccess({ id }: { id: string }) {
         <div className="flex flex-wrap items-center gap-2 border-t pt-3">
           <Button type="button" onClick={() => void save()} disabled={!dirty || pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Check aria-hidden />}
-            Save grants
+            {t("ops.access.save")}
           </Button>
           <Button
             type="button"
@@ -1038,11 +1078,9 @@ export function InstanceAccess({ id }: { id: string }) {
               setError(null);
             }}
           >
-            Discard
+            {t("env.discard")}
           </Button>
-          <p className="text-xs text-muted-foreground sm:ml-auto">
-            A save replaces every row. Duplicates and empty subjects are refused.
-          </p>
+          <p className="text-xs text-muted-foreground sm:ml-auto">{t("ops.access.saveHint")}</p>
         </div>
       ) : null}
     </div>
@@ -1057,6 +1095,7 @@ function egressList(value: string): string[] {
 }
 
 export function InstanceEgress({ id }: { id: string }) {
+  const { t } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [nonce, setNonce] = useState(0);
@@ -1100,7 +1139,7 @@ export function InstanceEgress({ id }: { id: string }) {
     if (!draft) return;
     const ports = egressList(draft.ports.replace(/\s/g, "")).map((value) => Number(value));
     if (ports.some((value) => !Number.isInteger(value) || value < 1 || value > 65_535)) {
-      setError(toApiError(new Error("Ports must be integers between 1 and 65535.")));
+      setError(toApiError(new Error(t("ops.egress.portsInvalid"))));
       return;
     }
     setPending(true);
@@ -1112,7 +1151,7 @@ export function InstanceEgress({ id }: { id: string }) {
         cidrs: egressList(draft.cidrs),
         ports,
       });
-      toast.success("Egress policy saved. The container was restarted.");
+      toast.success(t("ops.egress.saved"));
       setDraft({
         mode: saved.mode,
         fqdns: saved.fqdns.join("\n"),
@@ -1153,7 +1192,7 @@ export function InstanceEgress({ id }: { id: string }) {
           {data.warnings.length > 0 ? (
             <Alert className="border-amber-600/40">
               <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-              <AlertTitle>Enforcement notes</AlertTitle>
+              <AlertTitle>{t("ops.egress.warningsTitle")}</AlertTitle>
               <AlertDescription>
                 <ul className="list-disc space-y-1 pl-4">
                   {data.warnings.map((warning) => (
@@ -1166,17 +1205,17 @@ export function InstanceEgress({ id }: { id: string }) {
 
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className="font-mono text-xs font-normal">
-              source {data.source}
+              {t("ops.egress.source", { source: data.source })}
             </Badge>
             <Badge variant="outline" className="font-mono text-xs font-normal">
-              mode {data.mode}
+              {t("ops.egress.mode", { mode: data.mode })}
             </Badge>
             {data.proxy ? (
               <span className="font-mono text-xs text-muted-foreground">{data.proxy}</span>
             ) : null}
             {data.updated_at ? (
               <span className="text-xs text-muted-foreground">
-                updated {formatDateTime(data.updated_at)}
+                {t("skills.picker.updated", { time: formatDateTime(data.updated_at) })}
               </span>
             ) : null}
           </div>
@@ -1184,7 +1223,7 @@ export function InstanceEgress({ id }: { id: string }) {
           <form onSubmit={save} className="space-y-4 rounded-md border p-4">
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="egress-mode">Mode</Label>
+                <Label htmlFor="egress-mode">{t("ops.egress.modeLabel")}</Label>
                 <Select
                   value={draft?.mode ?? data.mode}
                   onValueChange={(value) =>
@@ -1198,21 +1237,18 @@ export function InstanceEgress({ id }: { id: string }) {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="deny">deny — allowlist</SelectItem>
-                    <SelectItem value="allow">allow — blocklist</SelectItem>
+                    <SelectItem value="deny">{t("ops.egress.modeDeny")}</SelectItem>
+                    <SelectItem value="allow">{t("ops.egress.modeAllow")}</SelectItem>
                   </SelectContent>
                 </Select>
-                <p className="text-xs text-muted-foreground">
-                  Deny with an empty policy blocks everything; allow with an empty policy permits
-                  everything.
-                </p>
+                <p className="text-xs text-muted-foreground">{t("ops.egress.modeHint")}</p>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="egress-ports">Ports</Label>
+                <Label htmlFor="egress-ports">{t("ops.egress.ports")}</Label>
                 <Input
                   id="egress-ports"
                   value={draft?.ports ?? data.ports.join(", ")}
-                  placeholder="443, 80 (empty = every port)"
+                  placeholder={t("ops.egress.portsPlaceholder")}
                   className="font-mono"
                   disabled={!admin}
                   onChange={(event) =>
@@ -1225,7 +1261,7 @@ export function InstanceEgress({ id }: { id: string }) {
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="egress-fqdns">Domains (one per line)</Label>
+                <Label htmlFor="egress-fqdns">{t("ops.egress.domains")}</Label>
                 <Textarea
                   id="egress-fqdns"
                   rows={5}
@@ -1241,7 +1277,7 @@ export function InstanceEgress({ id }: { id: string }) {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="egress-cidrs">CIDRs (one per line)</Label>
+                <Label htmlFor="egress-cidrs">{t("ops.egress.cidrs")}</Label>
                 <Textarea
                   id="egress-cidrs"
                   rows={5}
@@ -1261,7 +1297,7 @@ export function InstanceEgress({ id }: { id: string }) {
               <div className="flex flex-wrap items-center gap-2">
                 <Button type="submit" disabled={!dirty || pending}>
                   {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-                  Save policy
+                  {t("ops.egress.save")}
                 </Button>
                 <Button
                   type="button"
@@ -1276,10 +1312,10 @@ export function InstanceEgress({ id }: { id: string }) {
                     })
                   }
                 >
-                  Discard
+                  {t("env.discard")}
                 </Button>
                 <p className="text-xs text-muted-foreground sm:ml-auto">
-                  Saving rewrites compose and restarts the instance.
+                  {t("ops.egress.saveHint")}
                 </p>
               </div>
             ) : null}
@@ -1287,15 +1323,12 @@ export function InstanceEgress({ id }: { id: string }) {
 
           <form onSubmit={test} className="space-y-3 rounded-md border p-4">
             <div>
-              <p className="text-sm font-medium">Test a destination</p>
-              <p className="text-xs text-muted-foreground">
-                The policy decision and its enforcement are reported separately; a reachable proxy
-                does not prove the ACL matches.
-              </p>
+              <p className="text-sm font-medium">{t("ops.egress.testTitle")}</p>
+              <p className="text-xs text-muted-foreground">{t("ops.egress.testDescription")}</p>
             </div>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
               <div className="min-w-0 flex-1 space-y-2">
-                <Label htmlFor="egress-test-host">Host</Label>
+                <Label htmlFor="egress-test-host">{t("ops.egress.host")}</Label>
                 <Input
                   id="egress-test-host"
                   value={host}
@@ -1304,7 +1337,7 @@ export function InstanceEgress({ id }: { id: string }) {
                 />
               </div>
               <div className="w-full space-y-2 sm:w-28">
-                <Label htmlFor="egress-test-port">Port</Label>
+                <Label htmlFor="egress-test-port">{t("ops.egress.port")}</Label>
                 <Input
                   id="egress-test-port"
                   type="number"
@@ -1317,16 +1350,25 @@ export function InstanceEgress({ id }: { id: string }) {
               </div>
               <Button type="submit" variant="outline" disabled={testing}>
                 {testing ? <Loader2 aria-hidden className="animate-spin" /> : null}
-                Test
+                {t("common.test")}
               </Button>
             </div>
             {testResult ? (
               <div className="space-y-1 rounded-md border p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <OpsBadge status={testResult.allowed ? "ok" : "error"} label={testResult.allowed ? "allowed" : "denied"} />
+                  <OpsBadge
+                    status={testResult.allowed ? "ok" : "error"}
+                    label={
+                      testResult.allowed ? t("ops.egress.allowed") : t("ops.egress.denied")
+                    }
+                  />
                   <OpsBadge
                     status={testResult.enforced ? "ok" : "closed"}
-                    label={testResult.enforced ? "enforced" : "not enforced"}
+                    label={
+                      testResult.enforced
+                        ? t("status.enforced")
+                        : t("status.notEnforced")
+                    }
                   />
                   <span className="font-mono text-xs text-muted-foreground">
                     {testResult.host}:{testResult.port} · {testResult.mode}

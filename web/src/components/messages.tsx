@@ -36,6 +36,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ErrorAlert } from "@/components/error-alert";
 import { CopyButton } from "@/components/copy-button";
 import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /** `docs/BUS.md`: 16 KiB per body, counted in bytes, not characters. */
@@ -74,14 +75,16 @@ const STATUS_STYLES: Record<MessageStatus, { dot: string; className: string }> =
 };
 
 export function MessageKindBadge({ kind }: { kind: MessageKind }) {
+  const { t } = useI18n();
   return (
     <Badge variant="outline" className={cn("font-mono text-xs font-normal", KIND_STYLES[kind])}>
-      {kind}
+      {t(`messageKind.${kind}`)}
     </Badge>
   );
 }
 
 export function MessageStatusBadge({ status }: { status: MessageStatus }) {
+  const { t } = useI18n();
   const style = STATUS_STYLES[status] ?? STATUS_STYLES.queued;
   return (
     <Badge
@@ -89,7 +92,7 @@ export function MessageStatusBadge({ status }: { status: MessageStatus }) {
       className={cn("gap-1.5 font-mono text-xs font-normal", style.className)}
     >
       <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", style.dot)} />
-      {status}
+      {t(`messageStatus.${status}`)}
     </Badge>
   );
 }
@@ -123,6 +126,7 @@ export function MessageDetailSheet({
   canEdit: boolean;
   onChanged: () => void;
 }) {
+  const { t } = useI18n();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
 
@@ -138,7 +142,7 @@ export function MessageDetailSheet({
     setError(null);
     try {
       await api.ackMessage(message.to, message.id);
-      toast.success(`Message acknowledged as ${message.to}.`);
+      toast.success(t("messages.acknowledged", { instance: message.to }));
       onChanged();
       onOpenChange(false);
     } catch (cause) {
@@ -155,7 +159,7 @@ export function MessageDetailSheet({
       <SheetContent className="w-full gap-0 p-0 sm:max-w-xl">
         <SheetHeader className="border-b p-4 pr-12">
           <SheetTitle className="flex flex-wrap items-center gap-2">
-            Message
+            {t("messages.detailTitle")}
             {message ? <MessageKindBadge kind={message.kind} /> : null}
             {message ? <MessageStatusBadge status={message.status} /> : null}
           </SheetTitle>
@@ -172,7 +176,7 @@ export function MessageDetailSheet({
                   <span className="break-all text-muted-foreground">{message.id}</span>
                 </>
               ) : (
-                "No message selected."
+                t("messages.noSelection")
               )}
             </div>
           </SheetDescription>
@@ -182,62 +186,78 @@ export function MessageDetailSheet({
           <>
             <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
               <section className="space-y-2">
-                <h3 className="text-xs font-medium text-muted-foreground">Body</h3>
+                <h3 className="text-xs font-medium text-muted-foreground">
+                  {t("messages.body")}
+                </h3>
                 <pre
                   tabIndex={0}
                   role="region"
-                  aria-label="Message body"
+                  aria-label={t("messages.bodyAria")}
                   className="max-h-80 overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap"
                 >
                   {message.body}
                 </pre>
                 <p className="text-xs text-muted-foreground">
-                  {messageBytes(message.body).toLocaleString()} bytes · 16 KiB maximum
+                  {t("messages.bodySize", {
+                    bytes: messageBytes(message.body).toLocaleString(),
+                  })}
                 </p>
               </section>
 
               <DataList
                 items={[
-                  { label: "Correlation", value: <Mono>{message.correlation_id || "—"}</Mono> },
                   {
-                    label: "Hops",
+                    label: t("messages.correlation"),
+                    value: <Mono>{message.correlation_id || "—"}</Mono>,
+                  },
+                  {
+                    label: t("messages.hops"),
                     value: (
                       <span className="font-mono text-xs">
                         {message.hops} / 8
                         <span className="ml-2 text-muted-foreground">
                           {message.hops === 0
-                            ? "conversation start"
-                            : `${message.hops} round trip${message.hops === 1 ? "" : "s"}`}
+                            ? t("messages.conversationStart")
+                            : t(
+                                message.hops === 1
+                                  ? "messages.roundTripOne"
+                                  : "messages.roundTripMany",
+                                { count: message.hops },
+                              )}
                         </span>
                       </span>
                     ),
                   },
-                  { label: "Created", value: <When iso={message.created_at} /> },
-                  { label: "Expires", value: <When iso={message.expires_at} /> },
+                  { label: t("messages.created"), value: <When iso={message.created_at} /> },
+                  { label: t("messages.expires"), value: <When iso={message.expires_at} /> },
                   {
-                    label: "Delivered",
+                    label: t("messages.delivered"),
                     value: message.delivered_at ? (
                       <When iso={message.delivered_at} />
                     ) : (
-                      <span className="text-xs text-muted-foreground">not yet fetched</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t("messages.notFetched")}
+                      </span>
                     ),
                   },
                   {
-                    label: "Read",
+                    label: t("messages.read"),
                     value: message.read_at ? (
                       <When iso={message.read_at} />
                     ) : (
-                      <span className="text-xs text-muted-foreground">not acknowledged</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t("messages.notAcknowledged")}
+                      </span>
                     ),
                   },
                   {
-                    label: "Message ID",
+                    label: t("messages.messageId"),
                     value: (
                       <span className="flex items-start gap-2">
                         <span className="min-w-0 flex-1 font-mono text-xs break-all">{message.id}</span>
                         <CopyButton
                           value={message.id}
-                          label="Copy message id"
+                          label={t("messages.copyId")}
                           size="icon-xs"
                           className="-my-1 shrink-0"
                         />
@@ -254,13 +274,16 @@ export function MessageDetailSheet({
               {canAck ? (
                 <Button type="button" onClick={() => void acknowledge()} disabled={pending}>
                   {pending ? <Loader2 aria-hidden className="animate-spin" /> : <CheckCheck aria-hidden />}
-                  Acknowledge as {message.to}
+                  {t("messages.acknowledge", { instance: message.to })}
                 </Button>
               ) : (
                 <p className="text-xs text-muted-foreground">
                   {message.status === "read"
-                    ? `Read by ${message.to} on ${formatDateTime(message.read_at ?? message.created_at)}.`
-                    : "Sign in with a role that can change the fleet to acknowledge messages."}
+                    ? t("messages.readBy", {
+                        instance: message.to,
+                        time: formatDateTime(message.read_at ?? message.created_at),
+                      })
+                    : t("messages.ackHint")}
                 </p>
               )}
             </SheetFooter>
@@ -276,19 +299,20 @@ function Mono({ children }: { children: ReactNode }) {
 }
 
 function When({ iso }: { iso: string }) {
+  const { lang } = useI18n();
   return (
-    <span className="font-mono text-xs" title={formatRelative(iso)}>
+    <span className="font-mono text-xs" title={formatRelative(iso, lang)}>
       {formatDateTime(iso)}
     </span>
   );
 }
 
 const TTL_OPTIONS = [
-  { value: "300", label: "5 minutes" },
-  { value: "3600", label: "1 hour" },
-  { value: "86400", label: "24 hours (default)" },
-  { value: "604800", label: "7 days" },
-  { value: "2592000", label: "30 days" },
+  { value: "300", labelKey: "messages.ttl5m" },
+  { value: "3600", labelKey: "messages.ttl1h" },
+  { value: "86400", labelKey: "messages.ttl24h" },
+  { value: "604800", labelKey: "messages.ttl7d" },
+  { value: "2592000", labelKey: "messages.ttl30d" },
 ];
 
 /**
@@ -310,6 +334,7 @@ export function SendMessageDialog({
   lockSender?: boolean;
   onSent: (message: Message) => void;
 }) {
+  const { t } = useI18n();
   const ordered = useMemo(
     () => [...instances].sort((left, right) => left.id.localeCompare(right.id)),
     [instances],
@@ -347,13 +372,13 @@ export function SendMessageDialog({
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nextErrors: { to?: string; body?: string } = {};
-    if (!from) nextErrors.to = "Choose a sending instance.";
-    if (!to) nextErrors.to = "Choose a recipient instance.";
-    if (from && to && from === to) nextErrors.to = "An instance cannot message itself.";
+    if (!from) nextErrors.to = t("messages.chooseSender");
+    if (!to) nextErrors.to = t("messages.chooseRecipient");
+    if (from && to && from === to) nextErrors.to = t("messages.selfMessage");
     const trimmed = body.trim();
-    if (!trimmed) nextErrors.body = "Write the message body.";
+    if (!trimmed) nextErrors.body = t("messages.bodyRequired");
     else if (messageBytes(trimmed) > MESSAGE_BODY_LIMIT) {
-      nextErrors.body = "The body is larger than 16 KiB.";
+      nextErrors.body = t("messages.bodyTooLarge");
     }
     setFieldErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
@@ -368,7 +393,7 @@ export function SendMessageDialog({
         correlation_id: correlation.trim() || undefined,
         ttl_s: Number(ttl),
       });
-      toast.success(`Message queued for ${to}.`);
+      toast.success(t("messages.queued", { instance: to }));
       onSent(created);
       onOpenChange(false);
     } catch (cause) {
@@ -383,16 +408,13 @@ export function SendMessageDialog({
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg">
         <form onSubmit={onSubmit} noValidate className="space-y-4">
           <DialogHeader>
-            <DialogTitle>Send message</DialogTitle>
-            <DialogDescription>
-              The recipient reads it from its inbox; the bus keeps a queued message for the TTL you
-              choose.
-            </DialogDescription>
+            <DialogTitle>{t("messages.send")}</DialogTitle>
+            <DialogDescription>{t("messages.sendDescription")}</DialogDescription>
           </DialogHeader>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="message-from">From</Label>
+              <Label htmlFor="message-from">{t("messages.from")}</Label>
               {lockSender && defaultFrom ? (
                 <p
                   id="message-from"
@@ -409,8 +431,12 @@ export function SendMessageDialog({
                   }}
                   disabled={ordered.length === 0}
                 >
-                  <SelectTrigger id="message-from" className="w-full" aria-label="Sending instance">
-                    <SelectValue placeholder="Choose an instance" />
+                  <SelectTrigger
+                    id="message-from"
+                    className="w-full"
+                    aria-label={t("messages.sendingInstance")}
+                  >
+                    <SelectValue placeholder={t("messages.chooseInstance")} />
                   </SelectTrigger>
                   <SelectContent>
                     {ordered.map((instance) => (
@@ -425,16 +451,16 @@ export function SendMessageDialog({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="message-to">To</Label>
+              <Label htmlFor="message-to">{t("messages.to")}</Label>
               <Select value={to} onValueChange={setTo} disabled={ordered.length === 0}>
                 <SelectTrigger
                   id="message-to"
                   className="w-full"
-                  aria-label="Recipient instance"
+                  aria-label={t("messages.recipientInstance")}
                   aria-invalid={!!fieldErrors.to}
                   aria-describedby={fieldErrors.to ? "message-to-error" : undefined}
                 >
-                  <SelectValue placeholder="Choose an instance" />
+                  <SelectValue placeholder={t("messages.chooseInstance")} />
                 </SelectTrigger>
                 <SelectContent>
                   {ordered
@@ -455,29 +481,37 @@ export function SendMessageDialog({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="message-kind">Kind</Label>
+              <Label htmlFor="message-kind">{t("messages.kind")}</Label>
               <Select value={kind} onValueChange={(value) => setKind(value as MessageKind)}>
-                <SelectTrigger id="message-kind" className="w-full" aria-label="Message kind">
+                <SelectTrigger
+                  id="message-kind"
+                  className="w-full"
+                  aria-label={t("messages.kindAria")}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="ask">ask — expects a result</SelectItem>
-                  <SelectItem value="tell">tell — one-way</SelectItem>
-                  <SelectItem value="result">result — answers an ask</SelectItem>
+                  <SelectItem value="ask">{t("messages.kindAsk")}</SelectItem>
+                  <SelectItem value="tell">{t("messages.kindTell")}</SelectItem>
+                  <SelectItem value="result">{t("messages.kindResult")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="message-ttl">Time to live</Label>
+              <Label htmlFor="message-ttl">{t("messages.ttl")}</Label>
               <Select value={ttl} onValueChange={setTtl}>
-                <SelectTrigger id="message-ttl" className="w-full" aria-label="Time to live">
+                <SelectTrigger
+                  id="message-ttl"
+                  className="w-full"
+                  aria-label={t("messages.ttl")}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   {TTL_OPTIONS.map((option) => (
                     <SelectItem key={option.value} value={option.value}>
-                      {option.label}
+                      {t(option.labelKey)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -487,7 +521,7 @@ export function SendMessageDialog({
 
           <div className="space-y-2">
             <div className="flex items-baseline justify-between gap-3">
-              <Label htmlFor="message-body">Body</Label>
+              <Label htmlFor="message-body">{t("messages.body")}</Label>
               <span
                 className={cn(
                   "font-mono text-xs",
@@ -502,7 +536,7 @@ export function SendMessageDialog({
               rows={6}
               value={body}
               autoFocus
-              placeholder="What changed in the last deploy?"
+              placeholder={t("messages.bodyPlaceholder")}
               aria-invalid={!!fieldErrors.body || overLimit}
               aria-describedby={fieldErrors.body ? "message-body-error" : "message-body-help"}
               onChange={(event) => setBody(event.target.value)}
@@ -513,24 +547,24 @@ export function SendMessageDialog({
               </p>
             ) : (
               <p id="message-body-help" className="text-xs text-muted-foreground">
-                Plain text, trimmed before sending. Files belong in a share, not in a message.
+                {t("messages.bodyHint")}
               </p>
             )}
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="message-correlation">Correlation ID</Label>
+            <Label htmlFor="message-correlation">{t("messages.correlationId")}</Label>
             <Input
               id="message-correlation"
               value={correlation}
               autoComplete="off"
               spellCheck={false}
               className="font-mono"
-              placeholder="deploy-42 (optional)"
+              placeholder={t("messages.correlationPlaceholder")}
               onChange={(event) => setCorrelation(event.target.value)}
             />
             <p className="text-xs text-muted-foreground">
-              Ties a question to its answer and stops a conversation at 8 hops.
+              {t("messages.correlationHint")}
             </p>
           </div>
 
@@ -543,11 +577,11 @@ export function SendMessageDialog({
               onClick={() => onOpenChange(false)}
               disabled={pending}
             >
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending || ordered.length === 0}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Send aria-hidden />}
-              Send message
+              {t("messages.send")}
             </Button>
           </DialogFooter>
         </form>

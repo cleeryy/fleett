@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
+import { useI18n } from "@/lib/i18n";
 import { navigate, useRoute } from "@/lib/router";
 import { SessionContext } from "@/lib/session";
 import { tokenStore } from "@/lib/token";
@@ -45,33 +46,35 @@ const THEME_KEY = "fleett.theme";
 // Key written before the rename; still read so an open tab keeps its theme.
 const LEGACY_THEME_KEY = "fleet.theme";
 
-function titleFor(path: string): string {
-  if (path === "/") return "Instances";
-  if (path === "/instances") return "Instances";
-  if (path === "/instances/new") return "New instance";
+type Translate = ReturnType<typeof useI18n>["t"];
+
+function titleFor(path: string, t: Translate): string {
+  if (path === "/") return t("nav.instances");
+  if (path === "/instances") return t("nav.instances");
+  if (path === "/instances/new") return t("nav.newInstance");
   if (path.startsWith("/instances/")) return decodeURIComponent(path.slice("/instances/".length));
-  if (path === "/providers") return "Providers";
-  if (path.startsWith("/providers/")) return "Provider details";
-  if (path === "/shares") return "Shares";
-  if (path === "/templates") return "Templates";
-  if (path === "/personas") return "Personas";
-  if (path.startsWith("/personas/")) return "Persona details";
-  if (path === "/skills") return "Skills";
-  if (path.startsWith("/skills/")) return "Skill details";
-  if (path === "/tokens") return "Tokens";
-  if (path === "/audit") return "Audit log";
-  if (path === "/schedules") return "Schedules";
-  if (path === "/pipelines") return "Pipelines";
-  if (path === "/incidents") return "Incidents";
-  if (path === "/cost") return "Cost";
-  if (path === "/logs") return "Logs";
-  if (path === "/security") return "Security";
-  if (path === "/deployments") return "Deployments";
-  if (path === "/messages") return "Messages";
-  if (path === "/memory") return "Memory";
-  if (path === "/setup") return "Setup";
-  if (path === "/login") return "Sign in";
-  return "Not found";
+  if (path === "/providers") return t("nav.providers");
+  if (path.startsWith("/providers/")) return t("nav.providerDetail");
+  if (path === "/shares") return t("nav.shares");
+  if (path === "/templates") return t("nav.templates");
+  if (path === "/personas") return t("nav.personas");
+  if (path.startsWith("/personas/")) return t("nav.personaDetail");
+  if (path === "/skills") return t("nav.skills");
+  if (path.startsWith("/skills/")) return t("nav.skillDetail");
+  if (path === "/tokens") return t("nav.tokens");
+  if (path === "/audit") return t("nav.audit");
+  if (path === "/schedules") return t("nav.schedules");
+  if (path === "/pipelines") return t("nav.pipelines");
+  if (path === "/incidents") return t("nav.incidents");
+  if (path === "/cost") return t("nav.cost");
+  if (path === "/logs") return t("nav.logs");
+  if (path === "/security") return t("nav.security");
+  if (path === "/deployments") return t("nav.deployments");
+  if (path === "/messages") return t("nav.messages");
+  if (path === "/memory") return t("nav.memory");
+  if (path === "/setup") return t("nav.setup");
+  if (path === "/login") return t("nav.login");
+  return t("nav.notFound");
 }
 
 function readTheme(): Theme {
@@ -84,28 +87,30 @@ function readTheme(): Theme {
 }
 
 function BootScreen() {
+  const { t } = useI18n();
   return (
     <div className="flex min-h-dvh items-center justify-center bg-background px-4">
       <div className="flex items-center gap-2 text-sm text-muted-foreground" aria-live="polite">
         <Boxes aria-hidden className="size-4" />
         <Loader2 aria-hidden className="size-4 animate-spin" />
-        Connecting…
+        {t("shell.bootConnecting")}
       </div>
     </div>
   );
 }
 
 function RestrictedScreen({ title, message }: { title: string; message: string }) {
+  const { t } = useI18n();
   return (
     <>
       <PageHeader title={title} description={message} />
       <div className="rounded-md border">
         <EmptyState
           icon={LockKeyhole}
-          title="Not available for this account"
+          title={t("shell.notAvailable")}
           action={
             <Button asChild variant="outline" size="sm">
-              <a href="#/instances">Back to instances</a>
+              <a href="#/instances">{t("shell.backToInstances")}</a>
             </Button>
           }
         />
@@ -115,6 +120,7 @@ function RestrictedScreen({ title, message }: { title: string; message: string }
 }
 
 export default function App() {
+  const { t, lang } = useI18n();
   const route = useRoute();
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [authConfig, setAuthConfig] = useState<AuthConfig>(FALLBACK_AUTH_CONFIG);
@@ -206,10 +212,12 @@ export default function App() {
       setIdentity(null);
       setBootError(null);
       setPaletteOpen(false);
-      toast.error("Session expired. Sign in again.");
+      toast.error(t("shell.sessionExpired"));
     }
     window.addEventListener("fleett:unauthorized", onUnauthorized);
     return () => window.removeEventListener("fleett:unauthorized", onUnauthorized);
+    // The listener is registered once; `t` is read from the latest render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -221,8 +229,8 @@ export default function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-    document.title = `${identity ? titleFor(route.path) : "Sign in"} · fleett`;
-  }, [identity, route.path]);
+    document.title = `${identity ? titleFor(route.path, t) : t("nav.login")} · fleett`;
+  }, [identity, route.path, t, lang]);
 
   function handleSignedIn(next: Identity) {
     identityRef.current = next;
@@ -283,134 +291,134 @@ export default function App() {
   const skillMatch = /^\/skills\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
-    crumbs = [{ label: "Instances" }];
+    crumbs = [{ label: t("nav.instances") }];
     screen = <FleetPage />;
   } else if (path === "/instances/new") {
-    crumbs = [{ label: "Instances", href: "#/instances" }, { label: "New instance" }];
+    crumbs = [{ label: t("nav.instances"), href: "#/instances" }, { label: t("nav.newInstance") }];
     screen = canEdit ? (
       <NewInstancePage />
     ) : (
       <RestrictedScreen
-        title="New instance"
-        message="Your account has the viewer role: creating an instance is disabled. Ask an admin to make the change."
+        title={t("nav.newInstance")}
+        message={t("shell.restricted.newInstance")}
       />
     );
   } else if (detailMatch) {
     const id = decodeURIComponent(detailMatch[1]);
-    crumbs = [{ label: "Instances", href: "#/instances" }, { label: id, mono: true }];
+    crumbs = [{ label: t("nav.instances"), href: "#/instances" }, { label: id, mono: true }];
     screen = <InstanceDetailPage key={id} id={id} />;
   } else if (path === "/providers") {
-    crumbs = [{ label: "Providers" }];
+    crumbs = [{ label: t("nav.providers") }];
     screen = <ProvidersPage />;
   } else if (providerMatch) {
     const id = decodeURIComponent(providerMatch[1]);
-    crumbs = [{ label: "Providers", href: "#/providers" }, { label: "Provider details" }];
+    crumbs = [{ label: t("nav.providers"), href: "#/providers" }, { label: t("nav.providerDetail") }];
     screen = <ProviderDetailPage key={id} id={id} />;
   } else if (path === "/shares") {
-    crumbs = [{ label: "Shares" }];
+    crumbs = [{ label: t("nav.shares") }];
     screen = <SharesPage />;
   } else if (path === "/templates") {
-    crumbs = [{ label: "Templates" }];
+    crumbs = [{ label: t("nav.templates") }];
     screen = <TemplatesPage />;
   } else if (path === "/personas") {
-    crumbs = [{ label: "Personas" }];
+    crumbs = [{ label: t("nav.personas") }];
     screen = <PersonasPage />;
   } else if (personaMatch) {
     const id = decodeURIComponent(personaMatch[1]);
-    crumbs = [{ label: "Personas", href: "#/personas" }, { label: id, mono: true }];
+    crumbs = [{ label: t("nav.personas"), href: "#/personas" }, { label: id, mono: true }];
     screen = <PersonaDetailPage key={id} id={id} />;
   } else if (path === "/skills") {
-    crumbs = [{ label: "Skills" }];
+    crumbs = [{ label: t("nav.skills") }];
     screen = <SkillsPage />;
   } else if (skillMatch) {
     const name = decodeURIComponent(skillMatch[1]);
-    crumbs = [{ label: "Skills", href: "#/skills" }, { label: name, mono: true }];
+    crumbs = [{ label: t("nav.skills"), href: "#/skills" }, { label: name, mono: true }];
     screen = <SkillDetailPage key={name} name={name} />;
   } else if (path === "/schedules") {
-    crumbs = [{ label: "Schedules" }];
+    crumbs = [{ label: t("nav.schedules") }];
     screen = admin ? (
       <SchedulesPage />
     ) : (
       <RestrictedScreen
-        title="Schedules"
-        message="The global schedule view is readable by admins only. Your account can still open an instance and read its Schedules tab."
+        title={t("nav.schedules")}
+        message={t("shell.restricted.schedules")}
       />
     );
   } else if (path === "/pipelines") {
-    crumbs = [{ label: "Pipelines" }];
+    crumbs = [{ label: t("nav.pipelines") }];
     screen = <PipelinesPage />;
   } else if (path === "/setup") {
-    crumbs = [{ label: "Setup" }];
+    crumbs = [{ label: t("nav.setup") }];
     screen = <SetupPage />;
   } else if (path === "/incidents") {
-    crumbs = [{ label: "Incidents" }];
+    crumbs = [{ label: t("nav.incidents") }];
     screen = <IncidentsPage />;
   } else if (path === "/cost") {
-    crumbs = [{ label: "Cost" }];
+    crumbs = [{ label: t("nav.cost") }];
     screen = <CostPage />;
   } else if (path === "/logs") {
-    crumbs = [{ label: "Logs" }];
+    crumbs = [{ label: t("nav.logs") }];
     screen = <LogsPage />;
   } else if (path === "/deployments") {
-    crumbs = [{ label: "Deployments" }];
+    crumbs = [{ label: t("nav.deployments") }];
     screen = <DeploymentsPage />;
   } else if (path === "/security") {
-    crumbs = [{ label: "Security" }];
+    crumbs = [{ label: t("nav.security") }];
     screen = admin ? (
       <SecurityPage />
     ) : (
       <RestrictedScreen
-        title="Security"
-        message="The security posture is readable by admins only."
+        title={t("nav.security")}
+        message={t("shell.restricted.security")}
       />
     );
   } else if (path === "/tokens") {
-    crumbs = [{ label: "Tokens" }];
+    crumbs = [{ label: t("nav.tokens") }];
     screen = admin ? (
       <TokensPage />
     ) : (
       <RestrictedScreen
-        title="Tokens"
-        message="Access tokens are managed by admins. Your account can browse the fleet but not issue credentials."
+        title={t("nav.tokens")}
+        message={t("shell.restricted.tokens")}
       />
     );
   } else if (path === "/audit") {
-    crumbs = [{ label: "Audit log" }];
+    crumbs = [{ label: t("nav.audit") }];
     screen = admin ? (
       <AuditPage />
     ) : (
       <RestrictedScreen
-        title="Audit log"
-        message="The audit trail is readable by admins only."
+        title={t("nav.audit")}
+        message={t("shell.restricted.audit")}
       />
     );
   } else if (path === "/messages") {
-    crumbs = [{ label: "Messages" }];
+    crumbs = [{ label: t("nav.messages") }];
     screen = admin ? (
       <MessagesPage />
     ) : (
       <RestrictedScreen
-        title="Messages"
-        message="The global bus view is readable by admins. Open an instance to read its own inbox and outbox."
+        title={t("nav.messages")}
+        message={t("shell.restricted.messages")}
       />
     );
   } else if (path === "/memory") {
-    crumbs = [{ label: "Memory" }];
+    crumbs = [{ label: t("nav.memory") }];
     screen = <MemoryPage />;
   } else {
-    crumbs = [{ label: "Not found" }];
+    crumbs = [{ label: t("nav.notFound") }];
     screen = (
       <div className="space-y-4">
         <PageHeader
-          title="Not found"
+          title={t("nav.notFound")}
           description={
             <span>
-              No screen at <span className="font-mono">{path}</span>.
+              {t("nav.notFoundPrefix")} <span className="font-mono">{path}</span>.
             </span>
           }
         />
         <Button asChild variant="outline">
-          <a href="#/instances">Back to instances</a>
+          <a href="#/instances">{t("shell.backToInstances")}</a>
         </Button>
       </div>
     );

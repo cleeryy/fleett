@@ -46,6 +46,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { formatDateTime, formatDurationMs, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 interface InstanceOption {
@@ -53,7 +54,7 @@ interface InstanceOption {
   name: string;
 }
 
-const CRON_HINT = "Five fields, UTC: minute hour day-of-month month day-of-week.";
+
 
 function ScheduleFormDialog({
   open,
@@ -70,6 +71,7 @@ function ScheduleFormDialog({
   schedule?: Schedule | null;
   onSaved: (schedule: Schedule) => void;
 }) {
+  const { t } = useI18n();
   const editing = schedule !== null && schedule !== undefined;
   const [instanceId, setInstanceId] = useState(fixedInstance ?? instances[0]?.id ?? "");
   const [name, setName] = useState("");
@@ -100,14 +102,14 @@ function ScheduleFormDialog({
   }, [open, schedule, fixedInstance]);
 
   const errors: Record<string, string> = {};
-  if (!instanceId) errors.instance = "Pick an instance.";
-  if (!name.trim()) errors.name = "Enter a name.";
-  if (!cron.trim()) errors.cron = "Enter a cron expression.";
-  else if (cron.trim().split(/\s+/).length !== 5) errors.cron = "Use exactly five fields.";
-  if (!prompt.trim()) errors.prompt = "Describe what the agent should do.";
+  if (!instanceId) errors.instance = t("schedules.form.instanceRequired");
+  if (!name.trim()) errors.name = t("schedules.form.nameRequired");
+  if (!cron.trim()) errors.cron = t("schedules.form.cronRequired");
+  else if (cron.trim().split(/\s+/).length !== 5) errors.cron = t("schedules.form.cronFields");
+  if (!prompt.trim()) errors.prompt = t("schedules.form.promptRequired");
   const timeoutNumber = Number(timeout);
   if (!Number.isInteger(timeoutNumber) || timeoutNumber < 1 || timeoutNumber > 3_600) {
-    errors.timeout = "Use 1 to 3600 seconds.";
+    errors.timeout = t("schedules.form.timeoutRange");
   }
   const showErrors = attempted;
 
@@ -135,7 +137,7 @@ function ScheduleFormDialog({
         editing && schedule
           ? await api.patchSchedule(schedule.id, input)
           : await api.createSchedule(instanceId, input);
-      toast.success(editing ? "Schedule saved." : "Schedule created.");
+      toast.success(editing ? t("schedules.form.saved") : t("schedules.form.created"));
       onOpenChange(false);
       onSaved(saved);
     } catch (cause) {
@@ -149,11 +151,10 @@ function ScheduleFormDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{editing ? "Edit schedule" : "New schedule"}</DialogTitle>
-          <DialogDescription>
-            The controller runs the prompt inside the instance container on the cron cadence. Times
-            are UTC.
-          </DialogDescription>
+          <DialogTitle>
+            {editing ? t("schedules.form.editTitle") : t("schedules.new")}
+          </DialogTitle>
+          <DialogDescription>{t("schedules.form.description")}</DialogDescription>
         </DialogHeader>
 
         <form onSubmit={submit} noValidate className="space-y-4">
@@ -161,14 +162,14 @@ function ScheduleFormDialog({
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="schedule-instance">Instance</Label>
+              <Label htmlFor="schedule-instance">{t("messages.instance")}</Label>
               <Select
                 value={instanceId}
                 onValueChange={setInstanceId}
                 disabled={editing || !!fixedInstance}
               >
                 <SelectTrigger id="schedule-instance" className="w-full">
-                  <SelectValue placeholder="Pick an instance" />
+                  <SelectValue placeholder={t("cost.budget.pickInstance")} />
                 </SelectTrigger>
                 <SelectContent>
                   {instances.map((instance) => (
@@ -184,7 +185,7 @@ function ScheduleFormDialog({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="schedule-name">Name</Label>
+              <Label htmlFor="schedule-name">{t("common.name")}</Label>
               <Input
                 id="schedule-name"
                 value={name}
@@ -213,7 +214,7 @@ function ScheduleFormDialog({
                 onChange={(event) => setCron(event.target.value)}
               />
               <p id="schedule-cron-help" className="text-xs text-muted-foreground">
-                {CRON_HINT}
+                {t("schedules.form.cronHint")}
               </p>
               {showErrors && errors.cron ? (
                 <p className="text-xs text-destructive">{errors.cron}</p>
@@ -221,7 +222,7 @@ function ScheduleFormDialog({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="schedule-timeout">Timeout (s)</Label>
+              <Label htmlFor="schedule-timeout">{t("schedules.form.timeout")}</Label>
               <Input
                 id="schedule-timeout"
                 type="number"
@@ -239,14 +240,14 @@ function ScheduleFormDialog({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="schedule-prompt">Prompt</Label>
+            <Label htmlFor="schedule-prompt">{t("schedules.form.prompt")}</Label>
             <Textarea
               id="schedule-prompt"
               rows={5}
               value={prompt}
               className="font-mono text-xs"
               aria-invalid={showErrors && !!errors.prompt}
-              placeholder="Summarize yesterday's sessions and send one digest."
+              placeholder={t("schedules.form.promptPlaceholder")}
               onChange={(event) => setPrompt(event.target.value)}
             />
             {showErrors && errors.prompt ? (
@@ -256,7 +257,7 @@ function ScheduleFormDialog({
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="schedule-timezone">Timezone</Label>
+              <Label htmlFor="schedule-timezone">{t("schedules.form.timezone")}</Label>
               <Input
                 id="schedule-timezone"
                 value={timezone}
@@ -267,19 +268,19 @@ function ScheduleFormDialog({
                 onChange={(event) => setTimezone(event.target.value)}
               />
               <p id="schedule-timezone-help" className="text-xs text-muted-foreground">
-                Stored for reference; cron evaluation is UTC for now.
+                {t("schedules.form.timezoneHint")}
               </p>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="schedule-overlap">When the previous run is late</Label>
+              <Label htmlFor="schedule-overlap">{t("schedules.form.overlap")}</Label>
               <Select value={overlap} onValueChange={(value) => setOverlap(value as "skip" | "queue")}>
                 <SelectTrigger id="schedule-overlap" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="skip">Skip the occurrence</SelectItem>
-                  <SelectItem value="queue">Queue one run</SelectItem>
+                  <SelectItem value="skip">{t("schedules.form.skip")}</SelectItem>
+                  <SelectItem value="queue">{t("schedules.form.queue")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -293,7 +294,7 @@ function ScheduleFormDialog({
                 onCheckedChange={(value) => setEnabled(value === true)}
               />
               <Label htmlFor="schedule-enabled" className="cursor-pointer text-sm font-normal">
-                Enabled
+                {t("common.enabled")}
               </Label>
             </div>
             <div className="flex items-center gap-2">
@@ -303,18 +304,18 @@ function ScheduleFormDialog({
                 onCheckedChange={(value) => setCatchup(value === true)}
               />
               <Label htmlFor="schedule-catchup" className="cursor-pointer text-sm font-normal">
-                Catch up one missed run
+                {t("schedules.form.catchup")}
               </Label>
             </div>
           </div>
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              {editing ? "Save schedule" : "Create schedule"}
+              {editing ? t("schedules.form.save") : t("schedules.form.create")}
             </Button>
           </DialogFooter>
         </form>
@@ -334,6 +335,7 @@ function RunHistorySheet({
   instanceId: string | null;
   schedules: Schedule[];
 }) {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const [status, setStatus] = useState("all");
   const runs = useResource(
@@ -350,36 +352,39 @@ function RunHistorySheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full sm:max-w-xl">
         <SheetHeader>
-          <SheetTitle>Run history</SheetTitle>
+          <SheetTitle>{t("schedules.historyTitle")}</SheetTitle>
           <SheetDescription>
             {instanceId ? (
               <>
-                Latest runs of <span className="font-mono">{instanceId}</span>, newest first.
+                {t("schedules.latestRunsOf")} <span className="font-mono">{instanceId}</span>,{" "}
+                {t("pipelines.newestFirst")}
               </>
             ) : (
-              "Pick an instance to read its runs."
+              t("schedules.pickInstance")
             )}
           </SheetDescription>
         </SheetHeader>
 
         <div className="flex items-center gap-2 px-4">
           <Select value={status} onValueChange={setStatus}>
-            <SelectTrigger className="w-40" aria-label="Filter runs by status">
+            <SelectTrigger className="w-40" aria-label={t("schedules.filterRunsAria")}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All statuses</SelectItem>
-              <SelectItem value="ok">ok</SelectItem>
-              <SelectItem value="error">error</SelectItem>
-              <SelectItem value="timeout">timeout</SelectItem>
-              <SelectItem value="skipped">skipped</SelectItem>
-              <SelectItem value="running">running</SelectItem>
+              <SelectItem value="all">{t("incidents.allStatuses")}</SelectItem>
+              <SelectItem value="ok">{t("status.ok")}</SelectItem>
+              <SelectItem value="error">{t("status.error")}</SelectItem>
+              <SelectItem value="timeout">{t("status.timeout")}</SelectItem>
+              <SelectItem value="skipped">{t("status.skipped")}</SelectItem>
+              <SelectItem value="running">{t("status.running")}</SelectItem>
             </SelectContent>
           </Select>
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
-            Refresh
+            {t("common.refresh")}
           </Button>
-          <span className="ml-auto text-xs text-muted-foreground">{rows.length} runs</span>
+          <span className="ml-auto text-xs text-muted-foreground">
+            {t("schedules.runsCount", { count: rows.length })}
+          </span>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
@@ -393,8 +398,8 @@ function RunHistorySheet({
           ) : rows.length === 0 ? (
             <EmptyState
               icon={History}
-              title="No runs recorded"
-              description="A run appears here after the schedule fires or you run it by hand."
+              title={t("schedules.noRunsTitle")}
+              description={t("schedules.noRunsDescription")}
             />
           ) : (
             <ul className="divide-y rounded-md border">
@@ -413,22 +418,22 @@ function RunHistorySheet({
                   </div>
                   <dl className="grid grid-cols-3 gap-2 text-xs">
                     <div>
-                      <dt className="text-muted-foreground">Exit</dt>
+                      <dt className="text-muted-foreground">{t("schedules.exit")}</dt>
                       <dd className="font-mono">{run.exit_code ?? "—"}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Duration</dt>
+                      <dt className="text-muted-foreground">{t("schedules.duration")}</dt>
                       <dd className="font-mono">{formatDurationMs(run.duration_ms)}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Started</dt>
-                      <dd className="font-mono">{formatRelative(run.started_at)}</dd>
+                      <dt className="text-muted-foreground">{t("deployments.started")}</dt>
+                      <dd className="font-mono">{formatRelative(run.started_at, lang)}</dd>
                     </div>
                   </dl>
                   {run.output ? (
                     <details className="group">
                       <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-                        Output
+                        {t("pipelines.run.output")}
                       </summary>
                       <pre className="mt-1 max-h-56 overflow-auto rounded-md border bg-muted/30 p-2 font-mono text-[11px] whitespace-pre-wrap">
                         {run.output}
@@ -447,6 +452,7 @@ function RunHistorySheet({
 
 /** Per-instance schedule management, used by the instance detail tab. */
 export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string; canEdit: boolean }) {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
@@ -465,7 +471,12 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
     try {
       const run = await api.runSchedule(schedule.id);
       toast.success(
-        run.status === "ok" ? `${schedule.name}: run finished ok.` : `${schedule.name}: run ${run.status}.`,
+        run.status === "ok"
+          ? t("schedules.runOk", { name: schedule.name })
+          : t("schedules.runOther", {
+              name: schedule.name,
+              status: t(`status.${run.status}`),
+            }),
       );
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -481,7 +492,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
     setDeleteError(null);
     try {
       await api.deleteSchedule(deleteTarget.id);
-      toast.success(`Schedule ${deleteTarget.name} deleted.`);
+      toast.success(t("schedules.deleted", { name: deleteTarget.name }));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -496,13 +507,16 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           {rows.length === 0
-            ? "No schedules yet."
-            : `${rows.length} schedule${rows.length === 1 ? "" : "s"} · cron fields are UTC`}
+            ? t("schedules.noneYet")
+            : t(
+                rows.length === 1 ? "schedules.inlineOne" : "schedules.inlineMany",
+                { count: rows.length },
+              )}
         </p>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
             <History aria-hidden />
-            Run history
+            {t("schedules.historyTitle")}
           </Button>
           {canEdit ? (
             <Button
@@ -513,7 +527,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
               }}
             >
               <Plus aria-hidden />
-              New schedule
+              {t("schedules.new")}
             </Button>
           ) : null}
         </div>
@@ -532,8 +546,8 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
         ) : rows.length === 0 ? (
           <EmptyState
             icon={CalendarClock}
-            title="No schedules"
-            description="A cron schedule runs a prompt inside this instance and keeps its run history."
+            title={t("schedules.emptyInlineTitle")}
+            description={t("schedules.emptyInlineDescription")}
             action={
               canEdit ? (
                 <Button
@@ -544,7 +558,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                   }}
                 >
                   <Plus aria-hidden />
-                  New schedule
+                  {t("schedules.new")}
                 </Button>
               ) : undefined
             }
@@ -555,12 +569,12 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Name</TableHead>
+                    <TableHead>{t("common.name")}</TableHead>
                     <TableHead className="w-[140px]">Cron</TableHead>
-                    <TableHead className="w-[160px]">Next run</TableHead>
-                    <TableHead className="w-[150px]">Last run</TableHead>
+                    <TableHead className="w-[160px]">{t("schedules.nextRun")}</TableHead>
+                    <TableHead className="w-[150px]">{t("schedules.lastRun")}</TableHead>
                     <TableHead className="w-[150px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -580,7 +594,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                         <span className="font-mono text-xs">{schedule.cron}</span>
                         {!schedule.enabled ? (
                           <Badge variant="outline" className="ml-1 text-[11px] font-normal">
-                            disabled
+                            {t("common.disabled")}
                           </Badge>
                         ) : null}
                       </TableCell>
@@ -589,7 +603,9 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                       </TableCell>
                       <TableCell>
                         <span className="font-mono text-xs">
-                          {schedule.last_run_at ? formatRelative(schedule.last_run_at) : "never"}
+                          {schedule.last_run_at
+                            ? formatRelative(schedule.last_run_at, lang)
+                            : t("common.never")}
                         </span>
                       </TableCell>
                       <TableCell>
@@ -598,8 +614,8 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label={`Run ${schedule.name} now`}
-                              title={`Run ${schedule.name} now`}
+                              aria-label={t("schedules.runNowAria", { name: schedule.name })}
+                              title={t("schedules.runNowAria", { name: schedule.name })}
                               disabled={runningId === schedule.id}
                               onClick={() => void runNow(schedule)}
                             >
@@ -613,8 +629,8 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                           <Button
                             variant="ghost"
                             size="icon-sm"
-                            aria-label={`History of ${schedule.name}`}
-                            title={`History of ${schedule.name}`}
+                            aria-label={t("schedules.historyAria", { name: schedule.name })}
+                            title={t("schedules.historyAria", { name: schedule.name })}
                             onClick={() => setHistoryOpen(true)}
                           >
                             <History aria-hidden />
@@ -624,8 +640,8 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                               <Button
                                 variant="ghost"
                                 size="icon-sm"
-                                aria-label={`Edit ${schedule.name}`}
-                                title={`Edit ${schedule.name}`}
+                                aria-label={t("deployments.editWindowAria", { name: schedule.name })}
+                                title={t("deployments.editWindowAria", { name: schedule.name })}
                                 onClick={() => {
                                   setEditing(schedule);
                                   setFormOpen(true);
@@ -636,8 +652,8 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                               <Button
                                 variant="ghost"
                                 size="icon-sm"
-                                aria-label={`Delete ${schedule.name}`}
-                                title={`Delete ${schedule.name}`}
+                                aria-label={t("deployments.deleteWindowAria", { name: schedule.name })}
+                                title={t("deployments.deleteWindowAria", { name: schedule.name })}
                                 onClick={() => {
                                   setDeleteError(null);
                                   setDeleteTarget(schedule);
@@ -665,26 +681,28 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                     </div>
                     {schedule.enabled ? (
                       <Badge variant="outline" className="text-[11px] font-normal">
-                        enabled
+                        {t("common.enabled")}
                       </Badge>
                     ) : (
                       <Badge variant="outline" className="text-[11px] font-normal text-muted-foreground">
-                        disabled
+                        {t("common.disabled")}
                       </Badge>
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground">{schedule.prompt}</p>
                   <dl className="grid grid-cols-2 gap-2 text-xs">
                     <div>
-                      <dt className="text-muted-foreground">Next</dt>
+                      <dt className="text-muted-foreground">{t("schedules.next")}</dt>
                       <dd className="font-mono">
                         {schedule.next_run_at ? formatDateTime(schedule.next_run_at) : "—"}
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Last</dt>
+                      <dt className="text-muted-foreground">{t("schedules.last")}</dt>
                       <dd className="font-mono">
-                        {schedule.last_run_at ? formatRelative(schedule.last_run_at) : "never"}
+                        {schedule.last_run_at
+                          ? formatRelative(schedule.last_run_at, lang)
+                          : t("common.never")}
                       </dd>
                     </div>
                   </dl>
@@ -701,11 +719,11 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                         ) : (
                           <Play aria-hidden />
                         )}
-                        Run
+                        {t("common.runNow")}
                       </Button>
                     ) : null}
                     <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
-                      History
+                      {t("schedules.history")}
                     </Button>
                     {canEdit ? (
                       <>
@@ -717,7 +735,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                             setFormOpen(true);
                           }}
                         >
-                          Edit
+                          {t("common.edit")}
                         </Button>
                         <Button
                           variant="outline"
@@ -727,7 +745,7 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
                             setDeleteTarget(schedule);
                           }}
                         >
-                          Delete
+                          {t("common.delete")}
                         </Button>
                       </>
                     ) : null}
@@ -758,13 +776,13 @@ export function InstanceSchedules({ instanceId, canEdit }: { instanceId: string;
         onOpenChange={(next) => {
           if (!next) setDeleteTarget(null);
         }}
-        title="Delete schedule"
+        title={t("schedules.deleteTitle")}
         description={
           deleteTarget
-            ? `Delete ${deleteTarget.name} and its run history? This cannot be undone.`
+            ? t("schedules.deleteInlineDescription", { name: deleteTarget.name })
             : undefined
         }
-        confirmLabel="Delete schedule"
+        confirmLabel={t("schedules.deleteTitle")}
         destructive
         pending={deleting}
         error={deleteError}
@@ -792,14 +810,15 @@ export function ScheduleRowActions({
   onDelete: () => void;
   running: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex justify-end gap-1">
       {canEdit ? (
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label={`Run ${schedule.name} now`}
-          title={`Run ${schedule.name} now`}
+          aria-label={t("schedules.runNowAria", { name: schedule.name })}
+          title={t("schedules.runNowAria", { name: schedule.name })}
           disabled={running}
           onClick={onRun}
         >
@@ -809,8 +828,8 @@ export function ScheduleRowActions({
       <Button
         variant="ghost"
         size="icon-sm"
-        aria-label={`History of ${schedule.name}`}
-        title={`History of ${schedule.name}`}
+        aria-label={t("schedules.historyAria", { name: schedule.name })}
+        title={t("schedules.historyAria", { name: schedule.name })}
         onClick={onHistory}
       >
         <History aria-hidden />
@@ -820,8 +839,8 @@ export function ScheduleRowActions({
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label={`Edit ${schedule.name}`}
-            title={`Edit ${schedule.name}`}
+            aria-label={t("deployments.editWindowAria", { name: schedule.name })}
+            title={t("deployments.editWindowAria", { name: schedule.name })}
             onClick={onEdit}
           >
             <Pencil aria-hidden />
@@ -829,8 +848,8 @@ export function ScheduleRowActions({
           <Button
             variant="ghost"
             size="icon-sm"
-            aria-label={`Delete ${schedule.name}`}
-            title={`Delete ${schedule.name}`}
+            aria-label={t("deployments.deleteWindowAria", { name: schedule.name })}
+            title={t("deployments.deleteWindowAria", { name: schedule.name })}
             onClick={onDelete}
           >
             <Trash2 aria-hidden />

@@ -19,7 +19,9 @@ import {
 } from "@/components/ui/table";
 import { Section } from "@/components/data-list";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import {
   envPayload,
   envRowsFromDetail,
@@ -52,6 +54,7 @@ export function InstanceEnvironment({
   onRowsChange: (rows: EnvRow[]) => void;
   onApplied: () => void;
 }) {
+  const { t, lang } = useI18n();
   const [editingId, setEditingId] = useState<number | null>(null);
   const [attempted, setAttempted] = useState(false);
   const [pending, setPending] = useState(false);
@@ -66,7 +69,7 @@ export function InstanceEnvironment({
     node?.focus();
   });
 
-  const errors = attempted ? validateEnvRows(rows, "apply", suggestions).rows : {};
+  const errors = attempted ? validateEnvRows(rows, "apply", suggestions, t).rows : {};
   const dirty = !envRowsMatch(detail.env, rows);
   const suggestionByKey = new Map(suggestions.map((suggestion) => [suggestion.key, suggestion]));
   const available = suggestions.filter(
@@ -95,7 +98,7 @@ export function InstanceEnvironment({
   }
 
   function doneRow(row: EnvRow) {
-    const rowErrors = validateEnvRows(rows, "apply", suggestions).rows[row.id];
+    const rowErrors = validateEnvRows(rows, "apply", suggestions, t).rows[row.id];
     if (rowErrors) {
       setAttempted(true);
       const suffix = rowErrors.key ? "key" : "value";
@@ -107,7 +110,7 @@ export function InstanceEnvironment({
 
   async function apply() {
     setAttempted(true);
-    const { rows: rowErrors, count } = validateEnvRows(rows, "apply", suggestions);
+    const { rows: rowErrors, count } = validateEnvRows(rows, "apply", suggestions, t);
     if (count > 0) {
       const [id, rowErrorsForRow] = Object.entries(rowErrors)[0] ?? [];
       if (id && rowErrorsForRow) {
@@ -122,7 +125,7 @@ export function InstanceEnvironment({
     setError(null);
     try {
       await api.putInstanceEnv(detail.id, envPayload(rows, "apply"));
-      toast.success("Environment applied. The container was recreated.");
+      toast.success(t("env.applied"));
       setEditingId(null);
       setAttempted(false);
       onApplied();
@@ -146,7 +149,7 @@ export function InstanceEnvironment({
     field: "key" | "value",
   ): ComponentProps<typeof Input> & { id: string } {
     const rowErrors = errors[row.id];
-    const name = row.key.trim() || "variable";
+    const name = row.key.trim() || t("env.variable");
     const hint = suggestionByKey.get(row.key.trim());
     return {
       id: `cfg-env-${row.id}-${field}`,
@@ -154,7 +157,8 @@ export function InstanceEnvironment({
       autoComplete: "off",
       spellCheck: false,
       className: "font-mono text-xs",
-      "aria-label": `${name} ${field === "key" ? "name" : "value"}`,
+      "aria-label":
+        field === "key" ? t("env.nameAria", { name }) : t("env.valueAria", { name }),
       "aria-invalid": !!rowErrors?.[field],
       "aria-describedby": rowErrors?.[field] ? `cfg-env-${row.id}-${field}-error` : undefined,
       onChange: (event: ChangeEvent<HTMLInputElement>) =>
@@ -170,24 +174,24 @@ export function InstanceEnvironment({
             type: row.secret ? "password" : "text",
             placeholder:
               row.secret && row.storedSecret
-                ? "Leave empty to keep"
+                ? t("env.keepSecretShort")
                 : row.secret
-                  ? "Secret value"
+                  ? t("env.secretValue")
                   : hint?.example
-                    ? `e.g. ${hint.example}`
-                    : "Value",
+                    ? t("env.examplePrefix", { value: hint.example })
+                    : t("env.value"),
           }),
     };
   }
 
   return (
     <Section
-      title="Environment"
-      description="Variables the agent receives. Secret values are encrypted at rest and never returned."
+      title={t("env.title")}
+      description={t("env.sectionDescription")}
       action={
         <Button type="button" variant="outline" size="sm" onClick={() => addRow()}>
           <Plus aria-hidden />
-          Add variable
+          {t("env.add")}
         </Button>
       }
     >
@@ -196,11 +200,13 @@ export function InstanceEnvironment({
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[38%]">Key</TableHead>
-                <TableHead>Value</TableHead>
-                <TableHead className="hidden w-[130px] sm:table-cell">Updated</TableHead>
+                <TableHead className="w-[38%]">{t("personas.vars.key")}</TableHead>
+                <TableHead>{t("env.value")}</TableHead>
+                <TableHead className="hidden w-[130px] sm:table-cell">
+                  {t("common.updated")}
+                </TableHead>
                 <TableHead className="w-[92px]">
-                  <span className="sr-only">Actions</span>
+                  <span className="sr-only">{t("common.actions")}</span>
                 </TableHead>
               </TableRow>
             </TableHeader>
@@ -208,13 +214,13 @@ export function InstanceEnvironment({
               {rows.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={4} className="py-8 text-center text-sm whitespace-normal text-muted-foreground">
-                    No variables. Add an allowlist or a token.
+                    {t("env.emptyTable")}
                   </TableCell>
                 </TableRow>
               ) : (
                 rows.map((row) => {
                   const rowErrors = errors[row.id];
-                  const name = row.key.trim() || "variable";
+                  const name = row.key.trim() || t("env.variable");
                   if (editingId === row.id) {
                     return (
                       <TableRow
@@ -244,7 +250,7 @@ export function InstanceEnvironment({
                                 htmlFor={`cfg-env-${row.id}-secret`}
                                 className="cursor-pointer text-xs font-normal text-muted-foreground"
                               >
-                                Secret
+                                {t("env.secret")}
                               </Label>
                             </div>
                             <Button
@@ -254,14 +260,14 @@ export function InstanceEnvironment({
                               onClick={() => doneRow(row)}
                             >
                               <Check aria-hidden />
-                              Done
+                              {t("common.done")}
                             </Button>
                             <Button
                               type="button"
                               variant="ghost"
                               size="icon-sm"
-                              aria-label={`Remove ${name}`}
-                              title={`Remove ${name}`}
+                              aria-label={t("env.removeAria", { name })}
+                              title={t("env.removeAria", { name })}
                               onClick={() => removeRow(row)}
                             >
                               <Trash2 aria-hidden />
@@ -295,7 +301,7 @@ export function InstanceEnvironment({
                         <span className="font-mono text-xs">{row.key}</span>
                         {row.storedKey === null ? (
                           <Badge variant="outline" className="ml-2 text-[11px] font-normal">
-                            new
+                            {t("env.new")}
                           </Badge>
                         ) : null}
                       </TableCell>
@@ -305,13 +311,15 @@ export function InstanceEnvironment({
                             <span aria-hidden className="font-mono text-xs tracking-widest">
                               ••••
                             </span>
-                            <span className="sr-only">Secret value hidden</span>
+                            <span className="sr-only">{t("env.secretHidden")}</span>
                             <Badge variant="outline" className="text-[11px] font-normal">
-                              secret
+                              {t("env.secret")}
                             </Badge>
                             {row.value ? (
                               <span className="text-[11px] text-muted-foreground">
-                                {row.storedSecret ? "replacement pending" : "value pending"}
+                                {row.storedSecret
+                                  ? t("env.replacementPending")
+                                  : t("env.valuePending")}
                               </span>
                             ) : null}
                           </span>
@@ -323,14 +331,14 @@ export function InstanceEnvironment({
                             {row.value}
                           </span>
                         ) : (
-                          <span className="text-xs text-muted-foreground">empty</span>
+                          <span className="text-xs text-muted-foreground">{t("env.emptyValue")}</span>
                         )}
                       </TableCell>
                       <TableCell
                         className="hidden text-xs text-muted-foreground sm:table-cell"
                         title={updated ? formatDateTime(updated) : undefined}
                       >
-                        {updated ? formatRelative(updated) : "Not saved"}
+                        {updated ? formatRelative(updated, lang) : t("env.notSaved")}
                       </TableCell>
                       <TableCell>
                         <div className="flex justify-end gap-1">
@@ -338,8 +346,8 @@ export function InstanceEnvironment({
                             type="button"
                             variant="ghost"
                             size="icon-sm"
-                            aria-label={`Edit ${name}`}
-                            title={`Edit ${name}`}
+                            aria-label={t("env.editAria", { name })}
+                            title={t("env.editAria", { name })}
                             onClick={() => editRow(row)}
                           >
                             <Pencil aria-hidden />
@@ -348,8 +356,8 @@ export function InstanceEnvironment({
                             type="button"
                             variant="ghost"
                             size="icon-sm"
-                            aria-label={`Remove ${name}`}
-                            title={`Remove ${name}`}
+                            aria-label={t("env.removeAria", { name })}
+                            title={t("env.removeAria", { name })}
                             onClick={() => removeRow(row)}
                           >
                             <Trash2 aria-hidden />
@@ -367,7 +375,7 @@ export function InstanceEnvironment({
         {available.length > 0 ? (
           <div className="space-y-2 rounded-md border border-dashed p-3">
             <p className="text-xs font-medium text-muted-foreground">
-              Suggested by the template
+              {t("env.suggestedByTemplate")}
             </p>
             <div className="grid gap-1.5">
               {available.map((suggestion) => (
@@ -393,12 +401,12 @@ export function InstanceEnvironment({
                           variant="outline"
                           className="border-amber-600/40 text-[11px] font-normal text-amber-700 dark:text-amber-400"
                         >
-                          required
+                          {t("env.required")}
                         </Badge>
                       ) : null}
                       {suggestion.secret ? (
                         <Badge variant="outline" className="text-[11px] font-normal">
-                          secret
+                          {t("env.secret")}
                         </Badge>
                       ) : null}
                     </span>
@@ -407,7 +415,7 @@ export function InstanceEnvironment({
                     ) : null}
                     {suggestion.example ? (
                       <span className="block font-mono text-[11px] text-muted-foreground">
-                        example: {suggestion.example}
+                        {t("env.exampleLine", { value: suggestion.example })}
                       </span>
                     ) : null}
                   </span>
@@ -426,15 +434,13 @@ export function InstanceEnvironment({
         <div className="flex flex-wrap items-center gap-2 border-t pt-4">
           <Button type="button" onClick={apply} disabled={!dirty || pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-            Apply environment
+            {t("env.apply")}
           </Button>
           <Button type="button" variant="outline" disabled={!dirty || pending} onClick={discard}>
-            Discard
+            {t("env.discard")}
           </Button>
           <p className="text-xs text-muted-foreground sm:ml-auto sm:max-w-md sm:text-right">
-            Apply replaces the whole list and runs{" "}
-            <span className="font-mono">docker compose up -d</span>: removed rows are deleted and the
-            container is recreated, so the agent is briefly offline.
+            <RichText text={t("env.applyHint")} />
           </p>
         </div>
       </div>

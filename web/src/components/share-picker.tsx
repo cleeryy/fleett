@@ -11,6 +11,8 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 
 export function SharePicker({
   shares,
@@ -27,6 +29,7 @@ export function SharePicker({
   error?: ApiError | null;
   onRetry?: () => void;
 }) {
+  const { t } = useI18n();
   function toggle(name: string, checked: boolean) {
     onChange(
       checked ? [...value, { name, mode: "rw" }] : value.filter((share) => share.name !== name),
@@ -40,9 +43,7 @@ export function SharePicker({
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        Shares are mounted at <span className="font-mono">/opt/data/shared/&lt;name&gt;</span>.{" "}
-        <span className="font-mono">rw</span> allows writes, <span className="font-mono">ro</span> is
-        read-only.
+        <RichText text={t("shares.picker.hint")} />
       </p>
 
       {error ? <ErrorAlert error={error} onRetry={onRetry} /> : null}
@@ -55,16 +56,16 @@ export function SharePicker({
         </div>
       ) : shares.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          No shares exist yet. Create them from{" "}
+          {t("shares.picker.emptyLead")}{" "}
           <a
             href="#/shares"
             target="_blank"
             rel="noreferrer"
             className="underline underline-offset-4 hover:text-foreground"
           >
-            Shares
+            {t("nav.shares")}
           </a>{" "}
-          in a second tab.
+          {t("shares.picker.emptyTail")}
         </p>
       ) : (
         <div className="divide-y rounded-md border">
@@ -81,8 +82,12 @@ export function SharePicker({
                   <span className="min-w-0">
                     <span className="block font-mono text-sm">{share.name}</span>
                     <span className="block text-xs font-normal text-muted-foreground">
-                      {share.instances.length}{" "}
-                      {share.instances.length === 1 ? "attachment" : "attachments"}
+                      {t(
+                        share.instances.length === 1
+                          ? "shares.picker.attachmentOne"
+                          : "shares.picker.attachmentMany",
+                        { count: share.instances.length },
+                      )}
                     </span>
                   </span>
                 </Label>
@@ -91,7 +96,7 @@ export function SharePicker({
                   onValueChange={(mode) => setMode(share.name, mode as "rw" | "ro")}
                   disabled={!selected}
                 >
-                  <SelectTrigger className="w-24" aria-label={`Mode for ${share.name}`}>
+                  <SelectTrigger className="w-24" aria-label={t("shares.picker.modeFor", { name: share.name })}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -107,8 +112,11 @@ export function SharePicker({
 
       <p className="text-xs text-muted-foreground">
         {value.length === 0
-          ? "No shares selected."
-          : `${value.length} ${value.length === 1 ? "share" : "shares"} selected.`}
+          ? t("shares.picker.selectedNone")
+          : t(
+              value.length === 1 ? "shares.picker.selectedOne" : "shares.picker.selectedMany",
+              { count: value.length },
+            )}
       </p>
     </div>
   );

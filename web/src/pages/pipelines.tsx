@@ -59,7 +59,9 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatDurationMs, formatRelative, plural } from "@/lib/format";
+import { RichText } from "@/components/rich-text";
+import { formatDateTime, formatDurationMs, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { parsePipelineYaml, pipelineToYaml, PipelineYamlError } from "@/lib/pipeline-yaml";
 import { useIdentity } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -98,6 +100,7 @@ function PipelineFormDialog({
   pipeline: Pipeline | null;
   onSaved: () => void;
 }) {
+  const { t } = useI18n();
   const [text, setText] = useState(SAMPLE);
   const [parseError, setParseError] = useState<string | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
@@ -118,14 +121,18 @@ function PipelineFormDialog({
     try {
       input = parsePipelineYaml(text);
     } catch (cause) {
-      setParseError(cause instanceof PipelineYamlError ? cause.message : "The definition is invalid.");
+      setParseError(
+        cause instanceof PipelineYamlError
+          ? cause.message
+          : t("pipelines.form.invalid"),
+      );
       return;
     }
     setPending(true);
     try {
       if (pipeline) await api.patchPipeline(pipeline.id, input);
       else await api.createPipeline(input);
-      toast.success(pipeline ? "Pipeline saved." : "Pipeline created.");
+      toast.success(pipeline ? t("pipelines.form.saved") : t("pipelines.form.created"));
       onOpenChange(false);
       onSaved();
     } catch (cause) {
@@ -139,18 +146,17 @@ function PipelineFormDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[88dvh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>{pipeline ? `Edit ${pipeline.name}` : "New pipeline"}</DialogTitle>
-          <DialogDescription>
-            YAML or JSON. Steps form a DAG: a step starts once every dependency is ok. The console
-            parses the document before sending it, so a syntax error is shown here.
-          </DialogDescription>
+          <DialogTitle>
+            {pipeline ? t("pipelines.form.editTitle", { name: pipeline.name }) : t("pipelines.form.newTitle")}
+          </DialogTitle>
+          <DialogDescription>{t("pipelines.form.description")}</DialogDescription>
         </DialogHeader>
 
         <form onSubmit={submit} className="space-y-3">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="space-y-1.5">
             <label htmlFor="pipeline-yaml" className="text-sm font-medium">
-              Definition
+              {t("pipelines.form.definition")}
             </label>
             <Textarea
               id="pipeline-yaml"
@@ -171,21 +177,17 @@ function PipelineFormDialog({
               </p>
             ) : (
               <p id="pipeline-yaml-help" className="text-xs text-muted-foreground">
-                <span className="font-mono">name</span>, <span className="font-mono">trigger</span>,{" "}
-                <span className="font-mono">cron</span>, <span className="font-mono">enabled</span> and a{" "}
-                <span className="font-mono">steps</span> list. Placeholders:{" "}
-                <span className="font-mono">{"{{steps.<id>.output}}"}</span>,{" "}
-                <span className="font-mono">{"{{context}}"}</span>.
+                <RichText text={t("pipelines.form.fieldsHint")} />
               </p>
             )}
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : <FileCode2 aria-hidden />}
-              {pipeline ? "Save pipeline" : "Create pipeline"}
+              {pipeline ? t("pipelines.form.save") : t("pipelines.form.create")}
             </Button>
           </DialogFooter>
         </form>
@@ -205,6 +207,7 @@ function RunDetailView({
   onBack: () => void;
   onCancelled: () => void;
 }) {
+  const { t, lang } = useI18n();
   const admin = useIdentity()?.role === "admin";
   const [nonce, setNonce] = useState(0);
   const [status, setStatus] = useState("all");
@@ -226,7 +229,7 @@ function RunDetailView({
     setError(null);
     try {
       await api.cancelPipelineRun(pipelineId, runId);
-      toast.success("Run cancelled.");
+      toast.success(t("pipelines.run.cancelled"));
       setNonce((value) => value + 1);
       onCancelled();
     } catch (cause) {
@@ -251,19 +254,19 @@ function RunDetailView({
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="ghost" size="sm" onClick={onBack}>
           <ArrowLeft aria-hidden />
-          Runs
+          {t("pipelines.runs")}
         </Button>
         <OpsBadge status={run.status} />
         <span className="font-mono text-xs text-muted-foreground">{run.id}</span>
         <div className="ml-auto flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
             <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
           {cancellable && admin ? (
             <Button variant="outline" size="sm" disabled={cancelling} onClick={() => void cancel()}>
               {cancelling ? <Loader2 aria-hidden className="animate-spin" /> : <Ban aria-hidden />}
-              Cancel run
+              {t("pipelines.run.cancel")}
             </Button>
           ) : null}
         </div>
@@ -278,19 +281,23 @@ function RunDetailView({
 
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-md border p-3 text-xs sm:grid-cols-4">
         <div>
-          <dt className="text-muted-foreground">Trigger</dt>
+          <dt className="text-muted-foreground">{t("pipelines.run.trigger")}</dt>
           <dd className="font-mono">{run.trigger}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Started</dt>
+          <dt className="text-muted-foreground">{t("deployments.started")}</dt>
           <dd className="font-mono">{run.started_at ? formatDateTime(run.started_at) : "—"}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Finished</dt>
-          <dd className="font-mono">{run.finished_at ? formatRelative(run.finished_at) : "running"}</dd>
+          <dt className="text-muted-foreground">{t("deployments.finished")}</dt>
+          <dd className="font-mono">
+            {run.finished_at
+              ? formatRelative(run.finished_at, lang)
+              : t("status.running")}
+          </dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Steps ok</dt>
+          <dt className="text-muted-foreground">{t("pipelines.run.stepsOk")}</dt>
           <dd className="font-mono">
             {run.steps.filter((step) => step.status === "ok").length}/{run.steps.length}
           </dd>
@@ -299,7 +306,9 @@ function RunDetailView({
 
       {run.context ? (
         <details className="rounded-md border">
-          <summary className="cursor-pointer px-3 py-2 text-sm">Run context</summary>
+          <summary className="cursor-pointer px-3 py-2 text-sm">
+            {t("pipelines.run.context")}
+          </summary>
           <pre className="overflow-auto border-t p-3 font-mono text-[11px] whitespace-pre-wrap">
             {run.context}
           </pre>
@@ -308,26 +317,26 @@ function RunDetailView({
 
       <div className="flex flex-wrap items-center gap-2">
         <Select value={status} onValueChange={setStatus}>
-          <SelectTrigger className="w-44" aria-label="Filter steps by status">
+          <SelectTrigger className="w-44" aria-label={t("pipelines.run.filterAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All steps</SelectItem>
-            <SelectItem value="ok">ok</SelectItem>
-            <SelectItem value="failed">failed</SelectItem>
-            <SelectItem value="running">running</SelectItem>
-            <SelectItem value="pending">pending</SelectItem>
-            <SelectItem value="skipped">skipped</SelectItem>
+            <SelectItem value="all">{t("pipelines.run.allSteps")}</SelectItem>
+            <SelectItem value="ok">{t("status.ok")}</SelectItem>
+            <SelectItem value="failed">{t("status.failed")}</SelectItem>
+            <SelectItem value="running">{t("status.running")}</SelectItem>
+            <SelectItem value="pending">{t("status.pending")}</SelectItem>
+            <SelectItem value="skipped">{t("status.skipped")}</SelectItem>
           </SelectContent>
         </Select>
         <span className="text-xs text-muted-foreground">
-          {steps.length} of {run.steps.length} steps
+          {t("pipelines.run.stepsShown", { shown: steps.length, total: run.steps.length })}
         </span>
       </div>
 
       {steps.length === 0 ? (
         <p className="rounded-md border px-3 py-6 text-center text-sm text-muted-foreground">
-          No step has this status.
+          {t("pipelines.run.noStep")}
         </p>
       ) : (
         <ul className="space-y-2">
@@ -337,7 +346,10 @@ function RunDetailView({
                 <div className="min-w-0">
                   <p className="font-mono text-sm font-medium">{step.step_id}</p>
                   <p className="font-mono text-[11px] text-muted-foreground">
-                    {step.instance_id} · attempt {step.attempt}
+                    {t("pipelines.run.attempt", {
+                      instance: step.instance_id,
+                      attempt: step.attempt,
+                    })}
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -359,7 +371,7 @@ function RunDetailView({
               {step.output ? (
                 <details>
                   <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-                    Output
+                    {t("pipelines.run.output")}
                   </summary>
                   <pre className="mt-1 max-h-64 overflow-auto rounded-md border bg-muted/30 p-2 font-mono text-[11px] whitespace-pre-wrap">
                     {step.output}
@@ -386,6 +398,7 @@ function PipelineRunsSheet({
   initialRunId?: string | null;
 }) {
   const [nonce, setNonce] = useState(0);
+  const { t } = useI18n();
   const [runId, setRunId] = useState<string | null>(null);
   const runs = useResource(
     () => (pipeline ? api.listPipelineRuns(pipeline.id, 50) : Promise.resolve<PipelineRun[]>([])),
@@ -406,14 +419,15 @@ function PipelineRunsSheet({
     >
       <SheetContent className="w-full sm:max-w-2xl">
         <SheetHeader>
-          <SheetTitle>{runId ? "Run detail" : "Pipeline runs"}</SheetTitle>
+          <SheetTitle>{runId ? t("pipelines.run.detailTitle") : t("pipelines.runsTitle")}</SheetTitle>
           <SheetDescription>
             {pipeline ? (
               <>
-                <span className="font-mono">{pipeline.name}</span>, newest first.
+                <span className="font-mono">{pipeline.name}</span>,{" "}
+                {t("pipelines.newestFirst")}
               </>
             ) : (
-              "Pick a pipeline."
+              t("pipelines.pickPipeline")
             )}
           </SheetDescription>
         </SheetHeader>
@@ -437,8 +451,8 @@ function PipelineRunsSheet({
           ) : (runs.data ?? []).length === 0 ? (
             <EmptyState
               icon={History}
-              title="No runs yet"
-              description="Run the pipeline to create its first run."
+              title={t("pipelines.run.emptyTitle")}
+              description={t("pipelines.run.emptyDescription")}
             />
           ) : (
             <ul className="divide-y rounded-md border">
@@ -452,8 +466,8 @@ function PipelineRunsSheet({
                     <span className="min-w-0">
                       <span className="block font-mono text-xs">{run.id}</span>
                       <span className="block text-xs text-muted-foreground">
-                        {run.started_at ? formatDateTime(run.started_at) : "not started"} ·{" "}
-                        {run.trigger}
+                        {run.started_at ? formatDateTime(run.started_at) : t("status.pending")}{" "}
+                        · {run.trigger}
                       </span>
                     </span>
                     <span className="flex shrink-0 items-center gap-2">
@@ -469,7 +483,7 @@ function PipelineRunsSheet({
             <div className="mt-3 flex justify-end">
               <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
                 <RefreshCw aria-hidden className={runs.refreshing ? "animate-spin" : undefined} />
-                Refresh
+                {t("common.refresh")}
               </Button>
             </div>
           ) : null}
@@ -480,6 +494,7 @@ function PipelineRunsSheet({
 }
 
 export function PipelinesPage() {
+  const { t, lang } = useI18n();
   const admin = useIdentity()?.role === "admin";
   const [nonce, setNonce] = useState(0);
   const [formOpen, setFormOpen] = useState(false);
@@ -504,7 +519,9 @@ export function PipelinesPage() {
     setActionError(null);
     try {
       const run = await api.runPipeline(pipeline.id);
-      toast.success(`${pipeline.name}: run ${run.status}.`);
+      toast.success(
+        t("pipelines.run.started", { name: pipeline.name, status: t(`status.${run.status}`) }),
+      );
       setRunsPipeline(pipeline);
       setInitialRunId(run.id);
       setNonce((value) => value + 1);
@@ -521,7 +538,7 @@ export function PipelinesPage() {
     setDeleteError(null);
     try {
       await api.deletePipeline(deleteTarget.id);
-      toast.success(`Pipeline ${deleteTarget.name} deleted.`);
+      toast.success(t("pipelines.deleted", { name: deleteTarget.name }));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -534,17 +551,20 @@ export function PipelinesPage() {
   return (
     <>
       <PageHeader
-        title="Pipelines"
+        title={t("nav.pipelines")}
         description={
           pipelines.data
-            ? `${rows.length} ${plural(rows.length, "pipeline")} · ${stepInstances.size} ${plural(stepInstances.size, "instance")} used · DAG of agent prompts`
-            : "Loading pipelines."
+            ? t("pipelines.summary", {
+                count: rows.length,
+                instances: stepInstances.size,
+              })
+            : t("pipelines.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={pipelines.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {admin ? (
               <Button
@@ -555,7 +575,7 @@ export function PipelinesPage() {
                 }}
               >
                 <Plus aria-hidden />
-                New pipeline
+                {t("pipelines.new")}
               </Button>
             ) : null}
           </>
@@ -575,8 +595,8 @@ export function PipelinesPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={Workflow}
-            title="No pipelines yet"
-            description="A pipeline chains prompts across instances: produce on one agent, verify on another, publish on a third."
+            title={t("pipelines.emptyTitle")}
+            description={t("pipelines.emptyDescription")}
             action={
               admin ? (
                 <Button
@@ -587,7 +607,7 @@ export function PipelinesPage() {
                   }}
                 >
                   <Plus aria-hidden />
-                  New pipeline
+                  {t("pipelines.new")}
                 </Button>
               ) : undefined
             }
@@ -598,12 +618,12 @@ export function PipelinesPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Pipeline</TableHead>
-                    <TableHead className="w-[150px]">Trigger</TableHead>
-                    <TableHead className="w-[110px]">Steps</TableHead>
-                    <TableHead className="w-[120px]">Updated</TableHead>
+                    <TableHead>{t("pipelines.pipeline")}</TableHead>
+                    <TableHead className="w-[150px]">{t("pipelines.run.trigger")}</TableHead>
+                    <TableHead className="w-[110px]">{t("pipelines.steps")}</TableHead>
+                    <TableHead className="w-[120px]">{t("common.updated")}</TableHead>
                     <TableHead className="w-[220px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -635,7 +655,7 @@ export function PipelinesPage() {
                         </span>
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
-                        {formatRelative(pipeline.updated_at)}
+                        {formatRelative(pipeline.updated_at, lang)}
                       </TableCell>
                       <TableCell>
                         <div className="flex justify-end gap-1">
@@ -644,8 +664,8 @@ export function PipelinesPage() {
                               <Button
                                 variant="ghost"
                                 size="icon-sm"
-                                aria-label={`Run ${pipeline.name}`}
-                                title={`Run ${pipeline.name}`}
+                                aria-label={t("pipelines.runAria", { name: pipeline.name })}
+                                title={t("pipelines.runAria", { name: pipeline.name })}
                                 disabled={!pipeline.enabled || runningId === pipeline.id}
                                 onClick={() => void run(pipeline)}
                               >
@@ -658,8 +678,8 @@ export function PipelinesPage() {
                               <Button
                                 variant="ghost"
                                 size="icon-sm"
-                                aria-label={`Edit ${pipeline.name}`}
-                                title={`Edit ${pipeline.name}`}
+                                aria-label={t("deployments.editWindowAria", { name: pipeline.name })}
+                                title={t("deployments.editWindowAria", { name: pipeline.name })}
                                 onClick={() => {
                                   setEditing(pipeline);
                                   setFormOpen(true);
@@ -672,8 +692,8 @@ export function PipelinesPage() {
                           <Button
                             variant="ghost"
                             size="icon-sm"
-                            aria-label={`Runs of ${pipeline.name}`}
-                            title={`Runs of ${pipeline.name}`}
+                            aria-label={t("pipelines.runsAria", { name: pipeline.name })}
+                            title={t("pipelines.runsAria", { name: pipeline.name })}
                             onClick={() => {
                               setInitialRunId(null);
                               setRunsPipeline(pipeline);
@@ -685,8 +705,8 @@ export function PipelinesPage() {
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label={`Delete ${pipeline.name}`}
-                              title={`Delete ${pipeline.name}`}
+                              aria-label={t("deployments.deleteWindowAria", { name: pipeline.name })}
+                              title={t("deployments.deleteWindowAria", { name: pipeline.name })}
                               onClick={() => {
                                 setDeleteError(null);
                                 setDeleteTarget(pipeline);
@@ -716,8 +736,12 @@ export function PipelinesPage() {
                     </Badge>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {pipeline.steps.length} steps on{" "}
-                    {[...new Set(pipeline.steps.map((step) => step.instance))].join(", ")}
+                    {t("pipelines.mobileSteps", {
+                      count: pipeline.steps.length,
+                      instances: [...new Set(pipeline.steps.map((step) => step.instance))].join(
+                        ", ",
+                      ),
+                    })}
                   </p>
                   {pipeline.cron ? (
                     <p className="font-mono text-xs text-muted-foreground">{pipeline.cron}</p>
@@ -735,7 +759,7 @@ export function PipelinesPage() {
                         ) : (
                           <Play aria-hidden />
                         )}
-                        Run
+                        {t("common.runNow")}
                       </Button>
                     ) : null}
                     <Button
@@ -746,7 +770,7 @@ export function PipelinesPage() {
                         setRunsPipeline(pipeline);
                       }}
                     >
-                      Runs
+                      {t("pipelines.runs")}
                     </Button>
                     {admin ? (
                       <>
@@ -758,7 +782,7 @@ export function PipelinesPage() {
                             setFormOpen(true);
                           }}
                         >
-                          Edit
+                          {t("common.edit")}
                         </Button>
                         <Button
                           variant="outline"
@@ -768,7 +792,7 @@ export function PipelinesPage() {
                             setDeleteTarget(pipeline);
                           }}
                         >
-                          Delete
+                          {t("common.delete")}
                         </Button>
                       </>
                     ) : null}
@@ -802,13 +826,13 @@ export function PipelinesPage() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title="Delete pipeline"
+        title={t("pipelines.deleteTitle")}
         description={
           deleteTarget
-            ? `Delete ${deleteTarget.name} and every recorded run? This cannot be undone.`
+            ? t("pipelines.deleteDescription", { name: deleteTarget.name })
             : undefined
         }
-        confirmLabel="Delete pipeline"
+        confirmLabel={t("pipelines.deleteTitle")}
         destructive
         pending={deleting}
         error={deleteError}

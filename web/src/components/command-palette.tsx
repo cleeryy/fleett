@@ -24,11 +24,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError } from "@/api/errors";
 import type { InstanceSummary } from "@/api/types";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Kbd } from "@/components/ui/kbd";
 import { notifyInstancesChanged } from "@/lib/events";
+import { useI18n } from "@/lib/i18n";
 import { navigate } from "@/lib/router";
 import { useCanEdit, useIdentity } from "@/lib/session";
 import { cn } from "@/lib/utils";
@@ -38,9 +39,9 @@ type GroupKey = "instances" | "navigation" | "actions";
 const GROUP_ORDER: GroupKey[] = ["instances", "navigation", "actions"];
 
 const GROUP_LABEL: Record<GroupKey, string> = {
-  instances: "Instances",
-  navigation: "Navigation",
-  actions: "Quick actions",
+  instances: "palette.groupInstances",
+  navigation: "palette.groupNavigation",
+  actions: "palette.groupActions",
 };
 
 interface Command {
@@ -66,19 +67,19 @@ interface NavigationItem {
  */
 const SKILLS_SCREEN = Object.keys(import.meta.glob("/src/pages/skills.tsx")).length > 0;
 
-function navigationItems(): NavigationItem[] {
+function navigationItems(t: (key: string) => string): NavigationItem[] {
   const items: NavigationItem[] = [
-    { label: "Instances", href: "/instances", icon: Boxes },
-    { label: "Providers", href: "/providers", icon: Plug },
-    { label: "Personas", href: "/personas", icon: Fingerprint },
-    { label: "Shares", href: "/shares", icon: FolderTree },
-    { label: "Templates", href: "/templates", icon: LayoutTemplate },
-    { label: "Setup", href: "/setup", icon: ListChecks },
-    { label: "Tokens", href: "/tokens", icon: KeyRound },
-    { label: "Audit log", href: "/audit", icon: FileClock },
+    { label: t("nav.instances"), href: "/instances", icon: Boxes },
+    { label: t("nav.providers"), href: "/providers", icon: Plug },
+    { label: t("nav.personas"), href: "/personas", icon: Fingerprint },
+    { label: t("nav.shares"), href: "/shares", icon: FolderTree },
+    { label: t("nav.templates"), href: "/templates", icon: LayoutTemplate },
+    { label: t("nav.setup"), href: "/setup", icon: ListChecks },
+    { label: t("nav.tokens"), href: "/tokens", icon: KeyRound },
+    { label: t("nav.audit"), href: "/audit", icon: FileClock },
   ];
   if (SKILLS_SCREEN) {
-    items.splice(4, 0, { label: "Skills", href: "/skills", icon: Sparkles });
+    items.splice(4, 0, { label: t("nav.skills"), href: "/skills", icon: Sparkles });
   }
   return items;
 }
@@ -109,6 +110,7 @@ export function CommandPalette({
   theme: "dark" | "light";
   onToggleTheme: () => void;
 }) {
+  const { t } = useI18n();
   const identity = useIdentity();
   const canEdit = useCanEdit();
   const admin = identity?.role === "admin";
@@ -151,7 +153,7 @@ export function CommandPalette({
       },
       (cause: unknown) => {
         if (!alive) return;
-        setInstancesError(toApiError(cause).message);
+        setInstancesError(apiErrorMessage(toApiError(cause), t));
         setLoadingInstances(false);
       },
     );
@@ -164,15 +166,20 @@ export function CommandPalette({
     async (instance: InstanceSummary, action: "start" | "stop" | "restart") => {
       try {
         await api.action(instance.id, action);
-        const past =
-          action === "stop" ? "stopped" : action === "start" ? "started" : "restarted";
-        toast.success(`${instance.id}: ${past}.`);
+        const past = t(
+          action === "stop"
+            ? "status.stopped"
+            : action === "start"
+              ? "status.started"
+              : "status.restarted",
+        );
+        toast.success(t("palette.actionDone", { id: instance.id, state: past }));
         notifyInstancesChanged();
       } catch (cause) {
-        toast.error(toApiError(cause).message);
+        toast.error(apiErrorMessage(toApiError(cause), t));
       }
     },
-    [],
+    [t],
   );
 
   const commands = useMemo<Command[]>(() => {
@@ -189,12 +196,12 @@ export function CommandPalette({
         instance.channel,
         instance.status,
       ];
-      const detail = `${instance.status} · ${instance.model}`;
+      const detail = `${t(`status.${instance.status}`)} · ${instance.model}`;
 
       list.push({
         id: `open:${instance.id}`,
         group: "instances",
-        label: `Open ${instance.name}`,
+        label: t("palette.open", { name: instance.name }),
         detail,
         keywords: [...base, "open", "details", "overview"],
         icon: ExternalLink,
@@ -206,7 +213,7 @@ export function CommandPalette({
           list.push({
             id: `start:${instance.id}`,
             group: "instances",
-            label: `Start ${instance.name}`,
+            label: t("palette.start", { name: instance.name }),
             detail: instance.id,
             keywords: [...base, "start", "run", "up"],
             icon: Play,
@@ -217,7 +224,7 @@ export function CommandPalette({
           list.push({
             id: `stop:${instance.id}`,
             group: "instances",
-            label: `Stop ${instance.name}`,
+            label: t("palette.stop", { name: instance.name }),
             detail: instance.id,
             keywords: [...base, "stop", "halt", "down"],
             icon: Square,
@@ -227,7 +234,7 @@ export function CommandPalette({
         list.push({
           id: `restart:${instance.id}`,
           group: "instances",
-          label: `Restart ${instance.name}`,
+          label: t("palette.restart", { name: instance.name }),
           detail: instance.id,
           keywords: [...base, "restart", "reload", "bounce"],
           icon: RotateCw,
@@ -238,7 +245,7 @@ export function CommandPalette({
       list.push({
         id: `logs:${instance.id}`,
         group: "instances",
-        label: `Logs for ${instance.name}`,
+        label: t("palette.logs", { name: instance.name }),
         detail: instance.id,
         keywords: [...base, "logs", "log", "output", "tail"],
         icon: ScrollText,
@@ -247,7 +254,7 @@ export function CommandPalette({
       list.push({
         id: `files:${instance.id}`,
         group: "instances",
-        label: `Files for ${instance.name}`,
+        label: t("palette.files", { name: instance.name }),
         detail: instance.id,
         keywords: [...base, "files", "file", "data", "soul"],
         icon: FolderTree,
@@ -256,7 +263,7 @@ export function CommandPalette({
       list.push({
         id: `env:${instance.id}`,
         group: "instances",
-        label: `Environment for ${instance.name}`,
+        label: t("palette.env", { name: instance.name }),
         detail: instance.id,
         keywords: [...base, "env", "environment", "variables", "secrets"],
         icon: SlidersHorizontal,
@@ -264,7 +271,7 @@ export function CommandPalette({
       });
     }
 
-    for (const item of navigationItems()) {
+    for (const item of navigationItems(t)) {
       if ((item.href === "/tokens" || item.href === "/audit") && !admin) continue;
       list.push({
         id: `go:${item.href}`,
@@ -280,8 +287,8 @@ export function CommandPalette({
       list.push({
         id: "new:instance",
         group: "actions",
-        label: "New instance",
-        detail: "compose project",
+        label: t("nav.newInstance"),
+        detail: t("palette.composeProject"),
         keywords: ["new", "create", "instance", "agent"],
         icon: Plus,
         perform: () => navigate("/instances/new"),
@@ -289,8 +296,8 @@ export function CommandPalette({
       list.push({
         id: "new:provider",
         group: "actions",
-        label: "New provider",
-        detail: "shared credentials",
+        label: t("providers.form.newTitle"),
+        detail: t("palette.sharedCredentials"),
         keywords: ["new", "create", "provider", "model", "key"],
         icon: Plug,
         perform: () => navigate("/providers?new=1"),
@@ -300,15 +307,15 @@ export function CommandPalette({
     list.push({
       id: "theme",
       group: "actions",
-      label: theme === "dark" ? "Switch to light theme" : "Switch to dark theme",
-      detail: "appearance",
+      label: theme === "dark" ? t("shell.switchToLight") : t("shell.switchToDark"),
+      detail: t("palette.appearance"),
       keywords: ["theme", "appearance", "dark", "light", "toggle"],
       icon: theme === "dark" ? Sun : Moon,
       perform: onToggleTheme,
     });
 
     return list;
-  }, [instances, canEdit, admin, theme, onToggleTheme, runInstanceAction]);
+  }, [instances, canEdit, admin, theme, onToggleTheme, runInstanceAction, t]);
 
   const groups = useMemo(() => {
     const phrase = query.trim().toLowerCase().replace(/\s+/g, " ");
@@ -326,9 +333,9 @@ export function CommandPalette({
           .sort((a, b) => b.score - a.score)
           .map((entry) => entry.command);
       }
-      return { key, label: GROUP_LABEL[key], items: items.slice(0, 12) };
+      return { key, label: t(GROUP_LABEL[key]), items: items.slice(0, 12) };
     }).filter((group) => group.items.length > 0);
-  }, [commands, query]);
+  }, [commands, query, t]);
 
   const rows = useMemo(
     () => groups.flatMap((group) => group.items.map((item) => ({ item, group: group.key }))),
@@ -381,11 +388,8 @@ export function CommandPalette({
           inputRef.current?.focus();
         }}
       >
-        <DialogTitle className="sr-only">Command palette</DialogTitle>
-        <DialogDescription className="sr-only">
-          Search instances, run a lifecycle action, or jump to a screen. Use the arrow keys to
-          move and Enter to run.
-        </DialogDescription>
+        <DialogTitle className="sr-only">{t("palette.title")}</DialogTitle>
+        <DialogDescription className="sr-only">{t("palette.description")}</DialogDescription>
 
         <div className="flex items-center gap-2 border-b px-3">
           <Search aria-hidden className="size-4 shrink-0 text-muted-foreground" />
@@ -397,8 +401,8 @@ export function CommandPalette({
             aria-controls="command-palette-list"
             aria-autocomplete="list"
             aria-activedescendant={activeIndex >= 0 ? rows[activeIndex]?.item.id : undefined}
-            aria-label="Search commands and instances"
-            placeholder="Search instances, actions, screens…"
+            aria-label={t("palette.inputAria")}
+            placeholder={t("palette.inputPlaceholder")}
             autoComplete="off"
             spellCheck={false}
             value={query}
@@ -415,7 +419,7 @@ export function CommandPalette({
         <div
           id="command-palette-list"
           role="listbox"
-          aria-label="Commands"
+          aria-label={t("palette.commands")}
           aria-busy={loadingInstances}
           className="max-h-[min(24rem,62dvh)] overflow-y-auto overscroll-contain p-1.5"
         >
@@ -425,13 +429,13 @@ export function CommandPalette({
               className="flex items-center gap-2 px-2 py-3 text-sm text-muted-foreground"
             >
               <Loader2 aria-hidden className="size-4 animate-spin" />
-              Loading instances…
+              {t("palette.loadingInstances")}
             </p>
           ) : null}
 
           {instancesError ? (
             <p role="status" className="px-2 py-3 text-sm text-destructive">
-              Instances unavailable: {instancesError}
+              {t("palette.instancesUnavailable", { message: instancesError })}
             </p>
           ) : null}
 
@@ -478,7 +482,7 @@ export function CommandPalette({
 
           {!loadingInstances && total === 0 ? (
             <p role="status" className="px-3 py-10 text-center text-sm text-muted-foreground">
-              No command matches “{query.trim()}”.
+              {t("palette.noMatch", { query: query.trim() })}
             </p>
           ) : null}
         </div>
@@ -488,15 +492,15 @@ export function CommandPalette({
             <span className="flex items-center gap-1">
               <Kbd aria-hidden>↑</Kbd>
               <Kbd aria-hidden>↓</Kbd>
-              <span className="ml-0.5">Navigate</span>
+              <span className="ml-0.5">{t("palette.navigate")}</span>
             </span>
             <span className="flex items-center gap-1">
               <Kbd aria-hidden>↵</Kbd>
-              <span className="ml-0.5">Run</span>
+              <span className="ml-0.5">{t("palette.run")}</span>
             </span>
           </span>
           <span className="truncate">
-            {total} result{total === 1 ? "" : "s"}
+            {t(total === 1 ? "palette.resultOne" : "palette.resultMany", { count: total })}
           </span>
         </div>
       </DialogContent>

@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Loader2, Plus, Save } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { ProviderSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,6 +23,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import { isValidProviderName } from "@/lib/validation";
 
 export const PROVIDER_KIND_OPTIONS = [
@@ -49,28 +51,33 @@ const EMPTY_DRAFT: Draft = {
   secret: "",
 };
 
-function validate(draft: Draft, creating: boolean): Record<string, string> {
+function validate(
+  draft: Draft,
+  creating: boolean,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): Record<string, string> {
   const errors: Record<string, string> = {};
   if (!isValidProviderName(draft.name.trim())) {
-    errors.name = "Use 2-63 characters: lowercase letters, digits and hyphens.";
+    errors.name = t("providers.form.nameInvalid");
   }
+  const invalidUrl = t("providers.form.urlInvalid");
   if (!draft.baseUrl.trim()) {
-    errors.baseUrl = "Enter a base URL.";
+    errors.baseUrl = t("providers.form.urlRequired");
   } else {
     try {
       const url = new URL(draft.baseUrl.trim());
       if (url.protocol !== "http:" && url.protocol !== "https:") {
-        errors.baseUrl = "Use an absolute http or https URL.";
+        errors.baseUrl = invalidUrl;
       }
     } catch {
-      errors.baseUrl = "Use an absolute http or https URL.";
+      errors.baseUrl = invalidUrl;
     }
   }
   if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(draft.apiKeyEnv.trim())) {
-    errors.apiKeyEnv = "Use uppercase letters, digits and underscores.";
+    errors.apiKeyEnv = t("providers.form.envInvalid");
   }
   if (creating && !draft.secret.trim()) {
-    errors.secret = "Enter the API key.";
+    errors.secret = t("providers.form.secretRequired");
   }
   return errors;
 }
@@ -98,6 +105,7 @@ export function ProviderFormDialog({
   onOpenChange: (open: boolean) => void;
   onSaved: (provider: ProviderSummary) => void;
 }) {
+  const { t } = useI18n();
   const editing = provider !== undefined && provider !== null;
   const editingProvider = provider ?? null;
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
@@ -125,7 +133,7 @@ export function ProviderFormDialog({
     setFieldError(null);
   }, [open, provider]);
 
-  const errors = validate(draft, !editing);
+  const errors = validate(draft, !editing, t);
 
   function update<K extends keyof Draft>(key: K, value: Draft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -158,22 +166,26 @@ export function ProviderFormDialog({
       const saved = editingProvider
         ? (await api.patchProvider(editingProvider.id, body)).provider
         : await api.createProvider({ ...body, secret: draft.secret });
-      toast.success(editing ? `Provider ${saved.name} saved.` : `Provider ${saved.name} created.`);
+      toast.success(
+        editing
+          ? t("providers.form.saved", { name: saved.name })
+          : t("providers.form.created", { name: saved.name }),
+      );
       onSaved(saved);
       onOpenChange(false);
     } catch (cause) {
       const failure = toApiError(cause);
       if (failure.code === "invalid_name" || failure.code === "provider_exists") {
-        setFieldError({ key: "name", message: failure.message });
+        setFieldError({ key: "name", message: apiErrorMessage(failure, t) });
         window.requestAnimationFrame(() => document.getElementById("provider-name")?.focus());
       } else if (failure.code === "invalid_base_url") {
-        setFieldError({ key: "baseUrl", message: failure.message });
+        setFieldError({ key: "baseUrl", message: apiErrorMessage(failure, t) });
         window.requestAnimationFrame(() => document.getElementById("provider-base-url")?.focus());
       } else if (failure.code === "invalid_api_key_env") {
-        setFieldError({ key: "apiKeyEnv", message: failure.message });
+        setFieldError({ key: "apiKeyEnv", message: apiErrorMessage(failure, t) });
         window.requestAnimationFrame(() => document.getElementById("provider-api-key-env")?.focus());
       } else if (failure.code === "invalid_secret") {
-        setFieldError({ key: "secret", message: failure.message });
+        setFieldError({ key: "secret", message: apiErrorMessage(failure, t) });
       } else {
         setError(failure);
       }
@@ -190,21 +202,22 @@ export function ProviderFormDialog({
             <DialogTitle>
               {editingProvider ? (
                 <>
-                  Edit <span className="font-mono">{editingProvider.name}</span>
+                  {t("providers.form.editTitle")}{" "}
+                  <span className="font-mono">{editingProvider.name}</span>
                 </>
               ) : (
-                "New provider"
+                t("providers.form.newTitle")
               )}
             </DialogTitle>
             <DialogDescription>
               {editing
-                ? "Metadata only. Attached instances keep their current endpoint and variable name; rotating the secret is a separate action that restarts them."
-                : "One credential several agents can share. Rotating it later restarts every attached instance."}
+                ? t("providers.form.editDescription")
+                : t("providers.form.createDescription")}
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-2">
-            <Label htmlFor="provider-name">Name</Label>
+            <Label htmlFor="provider-name">{t("common.name")}</Label>
             <Input
               id="provider-name"
               value={draft.name}
@@ -217,7 +230,7 @@ export function ProviderFormDialog({
               onChange={(event) => update("name", event.target.value.toLowerCase())}
             />
             <p id="provider-name-help" className="text-xs text-muted-foreground">
-              Lowercase slug, unique across the fleet.
+              {t("providers.form.nameHint")}
             </p>
             {messageFor("name") ? (
               <p id="provider-name-error" className="text-xs text-destructive">
@@ -227,7 +240,7 @@ export function ProviderFormDialog({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="provider-kind">Kind</Label>
+            <Label htmlFor="provider-kind">{t("providers.form.kind")}</Label>
             <Select value={draft.kind} onValueChange={(value) => update("kind", value)}>
               <SelectTrigger id="provider-kind" className="w-full">
                 <SelectValue />
@@ -241,13 +254,12 @@ export function ProviderFormDialog({
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground">
-              Metadata for the console; every kind is tested through its <span className="font-mono">/models</span>{" "}
-              endpoint.
+              <RichText text={t("providers.form.kindHint")} />
             </p>
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="provider-base-url">Base URL</Label>
+            <Label htmlFor="provider-base-url">{t("providers.form.baseUrl")}</Label>
             <Input
               id="provider-base-url"
               value={draft.baseUrl}
@@ -260,8 +272,7 @@ export function ProviderFormDialog({
               onChange={(event) => update("baseUrl", event.target.value)}
             />
             <p id="provider-base-url-help" className="text-xs text-muted-foreground">
-              Endpoint new instances inherit. Test connection probes{" "}
-              <span className="font-mono">/models</span>.
+              <RichText text={t("providers.form.baseUrlHint")} />
             </p>
             {messageFor("baseUrl") ? (
               <p id="provider-base-url-error" className="text-xs text-destructive">
@@ -271,7 +282,7 @@ export function ProviderFormDialog({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="provider-api-key-env">API key env</Label>
+            <Label htmlFor="provider-api-key-env">{t("providers.form.apiKeyEnv")}</Label>
             <Input
               id="provider-api-key-env"
               value={draft.apiKeyEnv}
@@ -286,7 +297,7 @@ export function ProviderFormDialog({
               onChange={(event) => update("apiKeyEnv", event.target.value)}
             />
             <p id="provider-api-key-env-help" className="text-xs text-muted-foreground">
-              Container variable the secret is injected under. New instances inherit it.
+              {t("providers.form.apiKeyEnvHint")}
             </p>
             {messageFor("apiKeyEnv") ? (
               <p id="provider-api-key-env-error" className="text-xs text-destructive">
@@ -297,7 +308,7 @@ export function ProviderFormDialog({
 
           {!editing ? (
             <div className="space-y-2">
-              <Label htmlFor="provider-secret">API key</Label>
+              <Label htmlFor="provider-secret">{t("providers.form.apiKey")}</Label>
               <Input
                 id="provider-secret"
                 type="password"
@@ -310,8 +321,7 @@ export function ProviderFormDialog({
                 onChange={(event) => update("secret", event.target.value)}
               />
               <p id="provider-secret-help" className="text-xs text-muted-foreground">
-                Write-only: encrypted at rest and never returned by the API. The host needs its secrets key
-                (<span className="font-mono">sudo fleett secrets init</span>).
+                <RichText text={t("providers.form.secretHint")} />
               </p>
               {messageFor("secret") ? (
                 <p id="provider-secret-error" className="text-xs text-destructive">
@@ -330,7 +340,7 @@ export function ProviderFormDialog({
               onClick={() => onOpenChange(false)}
               disabled={pending}
             >
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? (
@@ -340,7 +350,7 @@ export function ProviderFormDialog({
               ) : (
                 <Plus aria-hidden />
               )}
-              {editing ? "Save provider" : "Create provider"}
+              {editing ? t("providers.form.save") : t("providers.form.create")}
             </Button>
           </DialogFooter>
         </form>

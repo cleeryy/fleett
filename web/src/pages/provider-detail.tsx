@@ -40,7 +40,8 @@ import { DeleteProviderDialog } from "@/components/provider-delete-dialog";
 import { ProviderFormDialog } from "@/components/provider-form-dialog";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -51,15 +52,22 @@ function Mono({ children, className }: { children: ReactNode; className?: string
 }
 
 function CopyValue({ value, label }: { value: string; label: string }) {
+  const { t } = useI18n();
   return (
     <span className="flex min-w-0 items-center gap-1">
       <span className="min-w-0 flex-1 font-mono text-xs break-all">{value}</span>
-      <CopyButton value={value} label={`Copy ${label}`} size="icon-xs" className="-my-1 shrink-0" />
+      <CopyButton
+        value={value}
+        label={t("providers.detail.copyLabel", { label })}
+        size="icon-xs"
+        className="-my-1 shrink-0"
+      />
     </span>
   );
 }
 
 function TestResultPanel({ result, baseUrl }: { result: ProviderTestResult; baseUrl: string }) {
+  const { t } = useI18n();
   const probeUrl = `${baseUrl.replace(/\/+$/, "")}/models`;
   return (
     <div
@@ -75,9 +83,14 @@ function TestResultPanel({ result, baseUrl }: { result: ProviderTestResult; base
         ) : (
           <XCircle aria-hidden className="size-4 text-destructive" />
         )}
-        <p className="text-sm font-medium">{result.ok ? "Connection OK" : "Connection failed"}</p>
+        <p className="text-sm font-medium">
+          {result.ok ? t("providers.detail.testOk") : t("providers.detail.testFailed")}
+        </p>
         <span className="font-mono text-xs text-muted-foreground sm:ml-auto">
-          {result.status === 0 ? "no response" : `HTTP ${result.status}`} · {result.latency_ms} ms
+          {result.status === 0
+            ? t("providers.detail.noResponse")
+            : `HTTP ${result.status}`}{" "}
+          · {result.latency_ms} ms
         </span>
       </div>
       {result.error ? (
@@ -101,6 +114,7 @@ function RotateSecretDialog({
   onOpenChange: (open: boolean) => void;
   onRotated: () => void;
 }) {
+  const { t } = useI18n();
   const [secret, setSecret] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -122,7 +136,7 @@ function RotateSecretDialog({
     try {
       const result = await api.patchProvider(provider.id, { secret });
       setReport(result.restarted);
-      toast.success(`Secret rotated for ${provider.name}.`);
+      toast.success(t("providers.detail.rotated", { name: provider.name }));
       onRotated();
     } catch (cause) {
       setError(toApiError(cause));
@@ -138,22 +152,20 @@ function RotateSecretDialog({
       <DialogContent className="max-h-[calc(100dvh_-_2rem)] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
-            Rotate secret for <span className="font-mono">{provider.name}</span>
+            {t("providers.detail.rotateTitle")}{" "}
+            <span className="font-mono">{provider.name}</span>
           </DialogTitle>
           <DialogDescription>
             {provider.instances_count === 0
-              ? "No instance uses this provider: the new secret applies to the next instance that picks it."
-              : `Re-encrypts the credential, then restarts ${provider.instances_count} ${plural(
-                  provider.instances_count,
-                  "instance",
-                )} one by one. The report below says which came back.`}
+              ? t("providers.detail.rotateNone")
+              : t("providers.detail.rotateMany", { count: provider.instances_count })}
           </DialogDescription>
         </DialogHeader>
 
         {report === null ? (
           <form onSubmit={onSubmit} noValidate className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="rotate-secret">New API key</Label>
+              <Label htmlFor="rotate-secret">{t("providers.detail.newApiKey")}</Label>
               <Input
                 id="rotate-secret"
                 type="password"
@@ -166,8 +178,7 @@ function RotateSecretDialog({
                 onChange={(event) => setSecret(event.target.value)}
               />
               <p id="rotate-secret-help" className="text-xs text-muted-foreground">
-                Write-only: never returned by the API. The old secret is not kept, so a failed instance
-                stays on the new credential until you fix it.
+                {t("providers.detail.rotateHint")}
               </p>
             </div>
 
@@ -180,21 +191,21 @@ function RotateSecretDialog({
                 onClick={() => onOpenChange(false)}
                 disabled={pending}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="submit" disabled={pending || !secret.trim()}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <RotateCw aria-hidden />}
-                Rotate secret
+                {t("providers.detail.rotateSecret")}
               </Button>
             </DialogFooter>
           </form>
         ) : (
           <div className="space-y-4">
             <div className="space-y-2">
-              <p className="text-sm font-medium">Restart report</p>
+              <p className="text-sm font-medium">{t("providers.detail.restartReport")}</p>
               {report.length === 0 ? (
                 <p className="rounded-md border px-3 py-4 text-sm text-muted-foreground">
-                  No instance uses this provider. The new secret is ready.
+                  {t("providers.detail.reportEmpty")}
                 </p>
               ) : (
                 <ul className="divide-y rounded-md border">
@@ -211,7 +222,7 @@ function RotateSecretDialog({
                           variant={entry.status === "healthy" ? "secondary" : "destructive"}
                           className="font-mono text-xs font-normal"
                         >
-                          {entry.status}
+                          {t(`health.${entry.status}`)}
                         </Badge>
                       </div>
                       {entry.error ? (
@@ -225,15 +236,19 @@ function RotateSecretDialog({
               )}
               {failed > 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  {failed} {plural(failed, "instance")} did not come back. The new credential is active;
-                  check the error, then restart or fix the instance.
+                  {t(
+                    failed === 1
+                      ? "providers.detail.failedOne"
+                      : "providers.detail.failedMany",
+                    { count: failed },
+                  )}
                 </p>
               ) : null}
             </div>
 
             <DialogFooter>
               <Button autoFocus onClick={() => onOpenChange(false)}>
-                Done
+                {t("common.done")}
               </Button>
             </DialogFooter>
           </div>
@@ -260,6 +275,7 @@ function DetailSkeleton() {
 }
 
 export function ProviderDetailPage({ id }: { id: string }) {
+  const { t, lang } = useI18n();
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [editOpen, setEditOpen] = useState(false);
@@ -292,7 +308,7 @@ export function ProviderDetailPage({ id }: { id: string }) {
           title={id}
           actions={
             <Button asChild variant="outline">
-              <a href="#/providers">Back to providers</a>
+              <a href="#/providers">{t("providers.detail.back")}</a>
             </Button>
           }
         />
@@ -320,7 +336,9 @@ export function ProviderDetailPage({ id }: { id: string }) {
             <span>{provider.id}</span>
             <span aria-hidden>·</span>
             <span>
-              {linked} linked {plural(linked, "instance")}
+              {t(linked === 1 ? "providers.detail.linkedOne" : "providers.detail.linkedMany", {
+                count: linked,
+              })}
             </span>
           </span>
         }
@@ -334,8 +352,8 @@ export function ProviderDetailPage({ id }: { id: string }) {
                 setTestResult(null);
                 setTestError(null);
               }}
-              aria-label="Refresh provider"
-              title="Refresh provider"
+              aria-label={t("providers.detail.refresh")}
+              title={t("providers.detail.refresh")}
             >
               <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
             </Button>
@@ -343,19 +361,19 @@ export function ProviderDetailPage({ id }: { id: string }) {
               <>
                 <Button variant="outline" size="sm" onClick={testConnection} disabled={testing}>
                   {testing ? <Loader2 aria-hidden className="animate-spin" /> : <Plug aria-hidden />}
-                  Test connection
+                  {t("providers.detail.testConnection")}
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => setRotateOpen(true)}>
                   <RotateCw aria-hidden />
-                  Rotate secret
+                  {t("providers.detail.rotateSecret")}
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
                       size="icon-sm"
-                      aria-label="More actions"
-                      title="More actions"
+                      aria-label={t("providers.detail.moreActions")}
+                      title={t("providers.detail.moreActions")}
                     >
                       <MoreHorizontal aria-hidden />
                     </Button>
@@ -363,11 +381,11 @@ export function ProviderDetailPage({ id }: { id: string }) {
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem onSelect={() => setEditOpen(true)}>
                       <Pencil aria-hidden />
-                      Edit details…
+                      {t("providers.detail.editDetails")}
                     </DropdownMenuItem>
                     <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                       <Trash2 aria-hidden />
-                      Delete provider…
+                      {t("providers.detail.deleteProvider")}
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -382,45 +400,60 @@ export function ProviderDetailPage({ id }: { id: string }) {
 
       {!canEdit ? (
         <p className="text-xs text-muted-foreground">
-          Read-only: testing, rotating and deleting a provider needs the admin role.
+          {t("providers.detail.readOnly")}
         </p>
       ) : null}
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <Section title="Metadata">
+        <Section title={t("providers.detail.metadata")}>
           <DataList
             items={[
-              { label: "Name", value: <Mono>{provider.name}</Mono> },
-              { label: "Id", value: <CopyValue value={provider.id} label="provider id" /> },
+              { label: t("common.name"), value: <Mono>{provider.name}</Mono> },
               {
-                label: "Kind",
+                label: t("providers.detail.id"),
+                value: <CopyValue value={provider.id} label={t("providers.detail.providerId")} />,
+              },
+              {
+                label: t("providers.form.kind"),
                 value: (
                   <Badge variant="outline" className="font-mono text-xs font-normal">
                     {provider.kind}
                   </Badge>
                 ),
               },
-              { label: "Base URL", value: <CopyValue value={provider.base_url} label="base URL" /> },
-              { label: "API key env", value: <Mono>{provider.api_key_env}</Mono> },
               {
-                label: "Instances",
-                value:
-                  linked === 0
-                    ? "None"
-                    : `${linked} ${plural(linked, "instance")} linked`,
+                label: t("providers.form.baseUrl"),
+                value: <CopyValue value={provider.base_url} label={t("providers.detail.baseUrl")} />,
               },
               {
-                label: "Created",
+                label: t("providers.form.apiKeyEnv"),
+                value: <Mono>{provider.api_key_env}</Mono>,
+              },
+              {
+                label: t("nav.instances"),
+                value:
+                  linked === 0
+                    ? t("providers.detail.noneLinked")
+                    : t("providers.detail.linkedValue", { count: linked }),
+              },
+              {
+                label: t("common.created"),
                 value: (
-                  <span className="font-mono text-xs" title={formatRelative(provider.created_at)}>
+                  <span
+                    className="font-mono text-xs"
+                    title={formatRelative(provider.created_at, lang)}
+                  >
                     {formatDateTime(provider.created_at)}
                   </span>
                 ),
               },
               {
-                label: "Updated",
+                label: t("common.updated"),
                 value: (
-                  <span className="font-mono text-xs" title={formatRelative(provider.updated_at)}>
+                  <span
+                    className="font-mono text-xs"
+                    title={formatRelative(provider.updated_at, lang)}
+                  >
                     {formatDateTime(provider.updated_at)}
                   </span>
                 ),
@@ -430,8 +463,8 @@ export function ProviderDetailPage({ id }: { id: string }) {
         </Section>
 
         <Section
-          title="Linked instances"
-          description="Instances that draw their API key from this credential."
+          title={t("providers.detail.linkedInstances")}
+          description={t("providers.detail.linkedDescription")}
         >
           {provider.instances.length ? (
             <>
@@ -457,14 +490,12 @@ export function ProviderDetailPage({ id }: { id: string }) {
                 ))}
               </div>
               <p className="text-xs text-muted-foreground">
-                Rotating the secret restarts every instance in this list, one at a time. The model stays
-                per instance.
+                {t("providers.detail.rotatingHint")}
               </p>
             </>
           ) : (
             <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-              No instance uses this provider yet. Pick it when you create or duplicate an agent; its
-              endpoint and variable name are inherited.
+              {t("providers.detail.noLinked")}
             </p>
           )}
         </Section>

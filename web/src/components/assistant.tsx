@@ -51,7 +51,9 @@ import {
   useAssistantScopeValue,
   type QuickTask,
 } from "@/lib/assistant";
+import { apiErrorMessage } from "@/api/errors";
 import { formatBytes, formatTokens } from "@/lib/format";
+import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useRoute } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 
@@ -126,6 +128,7 @@ function DisclosureList({
 
 /** Floating entry point plus the contextual side panel (a sheet on phones). */
 export function AssistantPanel() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const route = useRoute();
   const scope = useAssistantScopeValue();
@@ -229,18 +232,20 @@ export function AssistantPanel() {
   const composerDisabled = busy || config === null || notConfigured || budgetExceeded;
 
   const expectedSent = useMemo(() => {
-    const sent = [`Page: ${page}`];
-    if (scope.instance) sent.push(`Instance: ${scope.instance}`);
+    const sent = [t("assistant.pageContext", { page })];
+    if (scope.instance) sent.push(t("assistant.instanceContext", { instance: scope.instance }));
     if (scope.path) {
       const size = scope.fileContent
         ? ` (${formatBytes(new TextEncoder().encode(scope.fileContent).length)})`
         : "";
-      sent.push(`File: ${scope.path}${size}`);
+      sent.push(t("assistant.fileContext", { path: `${scope.path}${size}` }));
     }
-    if (liveSelection) sent.push(`Selection: ${liveSelection.length} characters`);
-    if (schema) sent.push("Object schema");
+    if (liveSelection) {
+      sent.push(t("assistant.selectionContext", { count: liveSelection.length }));
+    }
+    if (schema) sent.push(t("assistant.schemaContext"));
     return sent;
-  }, [page, scope.instance, scope.path, scope.fileContent, liveSelection, schema]);
+  }, [page, scope.instance, scope.path, scope.fileContent, liveSelection, schema, t]);
 
   function clearConversation(): void {
     setThreads((previous) => ({ ...previous, [threadKey]: newConversation() }));
@@ -318,7 +323,7 @@ export function AssistantPanel() {
 
   if (hidden) return null;
 
-  const providerName = config?.provider?.name ?? "No provider";
+  const providerName = config?.provider?.name ?? t("assistant.noProvider");
   const model = config?.model?.trim();
   const budget = config?.budget_tokens ?? 0;
   const percent = budget > 0 ? Math.min(100, Math.round((usedTokens / budget) * 100)) : 0;
@@ -338,23 +343,30 @@ export function AssistantPanel() {
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="flex items-center gap-1.5 text-sm font-semibold">
               <Sparkles aria-hidden className="size-4 text-muted-foreground" />
-              Assistant
+              {t("assistant.title")}
             </h2>
             <Badge variant="secondary" className="max-w-40 font-normal">
               <span className="truncate">{providerName}</span>
             </Badge>
           </div>
           <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
-            {model ? <span className="truncate font-mono">{model}</span> : <span>No model</span>}
+            {model ? (
+              <span className="truncate font-mono">{model}</span>
+            ) : (
+              <span>{t("assistant.noModel")}</span>
+            )}
             <span aria-hidden>·</span>
             <span className="flex items-center gap-1.5">
               <span>
-                {formatTokens(usedTokens)} / {formatTokens(budget)} tokens
+                {t("assistant.tokenUsage", {
+                  used: formatTokens(usedTokens),
+                  budget: formatTokens(budget),
+                })}
               </span>
               <span
                 className="h-1 w-14 overflow-hidden rounded-full bg-muted"
                 role="progressbar"
-                aria-label="Assistant token budget"
+                aria-label={t("assistant.budgetAria")}
                 aria-valuemin={0}
                 aria-valuemax={Math.max(budget, 1)}
                 aria-valuenow={Math.min(usedTokens, budget)}
@@ -371,42 +383,45 @@ export function AssistantPanel() {
               <PopoverTrigger asChild>
                 <Button type="button" variant="outline" size="xs" className="gap-1.5 font-normal">
                   <ShieldCheck aria-hidden />
-                  What is sent
+                  {t("assistant.whatIsSent")}
                 </Button>
               </PopoverTrigger>
               <PopoverContent align="end" className="w-80 p-0">
                 <div className="border-b px-3 py-2">
-                  <p className="text-xs font-medium">Context of this request</p>
+                  <p className="text-xs font-medium">{t("assistant.contextTitle")}</p>
                   <p className="text-[11px] text-muted-foreground">
                     {lastRedaction
-                      ? "What the controller sent with the last message."
-                      : "What the controller will send. Secret values never leave the host."}
+                      ? t("assistant.contextSent")
+                      : t("assistant.contextWillSend")}
                   </p>
                 </div>
                 <div className="space-y-3 px-3 py-3">
                   <DisclosureList
-                    title="Included"
+                    title={t("assistant.included")}
                     items={lastRedaction ? lastRedaction.sent : expectedSent}
-                    empty="No page context is available."
+                    empty={t("assistant.noContext")}
                   />
                   <DisclosureList
-                    title="Left on the host"
+                    title={t("assistant.leftOnHost")}
                     items={
                       lastRedaction
                         ? lastRedaction.omitted
                         : [
-                            "Environment values marked secret",
-                            "Provider credentials",
-                            "Binary files and logs larger than the context budget",
+                            t("assistant.withheldEnv"),
+                            t("assistant.withheldCredentials"),
+                            t("assistant.withheldFiles"),
                           ]
                     }
-                    empty="Nothing was withheld."
+                    empty={t("assistant.nothingWithheld")}
                   />
                   {lastRedaction?.redacted ? (
                     <p className="border-t pt-2 text-[11px] text-muted-foreground">
-                      {lastRedaction.redacted} known secret{" "}
-                      {lastRedaction.redacted === 1 ? "pattern was" : "patterns were"} replaced by{" "}
-                      <span className="font-mono">[REDACTED]</span> before the request.
+                      {t(
+                        lastRedaction.redacted === 1
+                          ? "assistant.redactedOne"
+                          : "assistant.redactedMany",
+                        { count: lastRedaction.redacted },
+                      )}
                     </p>
                   ) : null}
                 </div>
@@ -419,8 +434,8 @@ export function AssistantPanel() {
             type="button"
             variant="ghost"
             size="icon-sm"
-            aria-label="Clear conversation"
-            title="Clear conversation"
+            aria-label={t("assistant.clearAria")}
+            title={t("assistant.clearAria")}
             onClick={clearConversation}
             disabled={turns.length === 0 && !error}
           >
@@ -430,8 +445,8 @@ export function AssistantPanel() {
             type="button"
             variant="ghost"
             size="icon-sm"
-            aria-label="Close assistant"
-            title="Close assistant"
+            aria-label={t("assistant.closeAria")}
+            title={t("assistant.closeAria")}
             onClick={() => setOpen(false)}
           >
             <X aria-hidden />
@@ -452,15 +467,12 @@ export function AssistantPanel() {
         <div className="shrink-0 px-4 pt-3">
           <Alert className="items-start">
             <Plug aria-hidden className="mt-0.5" />
-            <AlertTitle>No provider yet</AlertTitle>
+            <AlertTitle>{t("assistant.noProviderTitle")}</AlertTitle>
             <AlertDescription>
-              <p>
-                The assistant borrows the credentials of a provider you already created. It never
-                stores a key of its own.
-              </p>
+              <p>{t("assistant.noProviderBody")}</p>
               <Button asChild variant="outline" size="sm" className="mt-2">
                 <a href="#/providers" onClick={() => setOpen(false)}>
-                  Open Providers
+                  {t("assistant.openProviders")}
                 </a>
               </Button>
             </AlertDescription>
@@ -471,16 +483,16 @@ export function AssistantPanel() {
         <div className="shrink-0 px-4 pt-3">
           <Alert variant="destructive" className="items-start">
             <TriangleAlert aria-hidden className="mt-0.5" />
-            <AlertTitle>Token budget exhausted</AlertTitle>
+            <AlertTitle>{t("assistant.budgetTitle")}</AlertTitle>
             <AlertDescription>
-              <p>{error?.message ?? "This conversation used its whole token budget."}</p>
+              <p>{error ? apiErrorMessage(error, t) : t("assistant.budgetBody")}</p>
               <Button
                 size="sm"
                 variant="outline"
                 className="mt-2"
                 onClick={clearConversation}
               >
-                Start a new conversation
+                {t("assistant.newConversation")}
               </Button>
             </AlertDescription>
           </Alert>
@@ -502,10 +514,8 @@ export function AssistantPanel() {
     >
       {turns.length === 0 ? (
         <div className="space-y-1 py-6 text-center">
-          <p className="text-sm font-medium">Draft configuration, not code</p>
-          <p className="text-xs text-muted-foreground">
-            Pick a task below or ask a question. Nothing is written until you press Apply.
-          </p>
+          <p className="text-sm font-medium">{t("assistant.emptyTitle")}</p>
+          <p className="text-xs text-muted-foreground">{t("assistant.emptyBody")}</p>
         </div>
       ) : null}
 
@@ -529,8 +539,11 @@ export function AssistantPanel() {
             ) : null}
             {turn.usage ? (
               <p className="text-[11px] text-muted-foreground">
-                {formatTokens(turn.usage.total)} tokens · {formatTokens(turn.usage.prompt)} prompt ·{" "}
-                {formatTokens(turn.usage.completion)} completion
+                {t("assistant.usageLine", {
+                  total: formatTokens(turn.usage.total),
+                  prompt: formatTokens(turn.usage.prompt),
+                  completion: formatTokens(turn.usage.completion),
+                })}
               </p>
             ) : null}
           </div>
@@ -540,7 +553,7 @@ export function AssistantPanel() {
       {busy ? (
         <p className="flex items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
           <Loader2 aria-hidden className="size-3 animate-spin" />
-          Thinking…
+          {t("assistant.thinking")}
         </p>
       ) : null}
     </div>
@@ -550,14 +563,16 @@ export function AssistantPanel() {
     <div className="shrink-0 space-y-2 border-t px-4 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
       <div
         className="flex items-center gap-1.5 rounded-md border bg-muted/30 px-2 py-1.5 text-[11px] text-muted-foreground"
-        title="Context attached to the next message"
+        title={t("assistant.attachedContext")}
       >
         <Paperclip aria-hidden className="size-3 shrink-0" />
         <span className="min-w-0 flex-1 truncate font-mono text-foreground/80">
-          {contextLabel || "Fleett"}
+          {contextLabel || "fleett"}
         </span>
         {liveSelection ? (
-          <span className="shrink-0">{liveSelection.length} chars selected</span>
+          <span className="shrink-0">
+            {t("assistant.charsSelected", { count: liveSelection.length })}
+          </span>
         ) : null}
       </div>
 
@@ -573,7 +588,9 @@ export function AssistantPanel() {
             onClick={() => runQuickTask(task)}
             disabled={composerDisabled}
           >
-            {task.label}
+            {hasTranslation(`assistant.task.${task.id}`)
+              ? t(`assistant.task.${task.id}`)
+              : task.label}
           </Button>
         ))}
       </div>
@@ -583,13 +600,13 @@ export function AssistantPanel() {
           ref={composerRef}
           value={draft}
           rows={2}
-          aria-label="Message the assistant"
+          aria-label={t("assistant.inputAria")}
           placeholder={
             notConfigured
-              ? "Connect a provider to start."
+              ? t("assistant.placeholderNoProvider")
               : budgetExceeded
-                ? "Start a new conversation to keep going."
-                : "Ask for a draft, an allowlist or an explanation…"
+                ? t("assistant.placeholderBudget")
+                : t("assistant.placeholder")
           }
           className="max-h-40 min-h-16 resize-none"
           disabled={composerDisabled}
@@ -599,18 +616,15 @@ export function AssistantPanel() {
         <Button
           type="button"
           size="icon"
-          aria-label="Send message"
-          title="Send message"
+          aria-label={t("messages.send")}
+          title={t("messages.send")}
           onClick={submit}
           disabled={composerDisabled || draft.trim().length === 0}
         >
           {busy ? <Loader2 aria-hidden className="animate-spin" /> : <ArrowUp aria-hidden />}
         </Button>
       </div>
-      <p className="text-[11px] text-muted-foreground">
-        Enter sends · Shift+Enter adds a line. Applied proposals keep the audit trail and git
-        history of the console.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{t("assistant.footerHint")}</p>
     </div>
   );
 
@@ -629,11 +643,11 @@ export function AssistantPanel() {
         <Button
           type="button"
           onClick={() => setOpen(true)}
-          aria-label="Open assistant"
+          aria-label={t("assistant.openAria")}
           className="fixed right-4 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-30 h-11 rounded-full px-3.5 shadow-lg"
         >
           <Sparkles aria-hidden />
-          <span className="hidden sm:inline">Assistant</span>
+          <span className="hidden sm:inline">{t("assistant.title")}</span>
         </Button>
       ) : null}
 
@@ -641,7 +655,7 @@ export function AssistantPanel() {
         open ? (
           <aside
             role="dialog"
-            aria-label="Assistant"
+            aria-label={t("assistant.title")}
             aria-modal={false}
             className="fixed inset-y-0 right-0 z-40 flex w-[420px] max-w-full flex-col border-l bg-background shadow-xl"
           >
@@ -656,11 +670,8 @@ export function AssistantPanel() {
             className="w-full gap-0 p-0 pt-[env(safe-area-inset-top)] sm:max-w-md"
           >
             <SheetHeader className="sr-only">
-              <SheetTitle>Assistant</SheetTitle>
-              <SheetDescription>
-                Contextual drafts for the current page. Nothing is written until you apply a
-                proposal.
-              </SheetDescription>
+              <SheetTitle>{t("assistant.title")}</SheetTitle>
+              <SheetDescription>{t("assistant.sheetDescription")}</SheetDescription>
             </SheetHeader>
             {panel}
           </SheetContent>

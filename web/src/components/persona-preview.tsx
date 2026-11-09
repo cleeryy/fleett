@@ -1,11 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { PersonaPreview } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/copy-button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useI18n } from "@/lib/i18n";
 import { compactVariables } from "@/lib/personas";
 import { cn } from "@/lib/utils";
 
@@ -19,7 +20,7 @@ export function PersonaPreviewPanel({
   personaId,
   variables = {},
   instance,
-  title = "Rendered SOUL.md",
+  title,
   description,
   maxHeight = "48vh",
   className,
@@ -35,12 +36,14 @@ export function PersonaPreviewPanel({
   /** Change this value to re-render after the saved persona changed. */
   refreshKey?: string | number;
 }) {
+  const { t } = useI18n();
   const [result, setResult] = useState<PersonaPreview | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [loading, setLoading] = useState(false);
   const [nonce, setNonce] = useState(0);
   const variablesKey = JSON.stringify(compactVariables(variables));
   const missing = result?.missing ?? [];
+  const heading = title ?? t("personas.preview.title");
 
   useEffect(() => {
     if (!personaId) {
@@ -79,7 +82,7 @@ export function PersonaPreviewPanel({
     <div className={cn("overflow-hidden rounded-md border", className)}>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-3 py-2">
         <div className="min-w-0">
-          <p className="text-sm font-medium">{title}</p>
+          <p className="text-sm font-medium">{heading}</p>
           {description ? (
             <p className="text-xs text-muted-foreground">{description}</p>
           ) : null}
@@ -91,15 +94,15 @@ export function PersonaPreviewPanel({
               className="flex items-center gap-1.5 text-xs text-muted-foreground"
             >
               <Loader2 aria-hidden className="size-3.5 animate-spin" />
-              Rendering…
+              {t("personas.preview.rendering")}
             </span>
           ) : (
             <Button
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Refresh preview"
-              title="Refresh preview"
+              aria-label={t("personas.preview.refresh")}
+              title={t("personas.preview.refresh")}
               onClick={() => setNonce((value) => value + 1)}
               disabled={!personaId}
             >
@@ -108,7 +111,7 @@ export function PersonaPreviewPanel({
           )}
           <CopyButton
             value={result?.rendered ?? ""}
-            label="Copy rendered SOUL.md"
+            label={t("personas.preview.copy")}
             size="icon-xs"
             disabled={!result?.rendered}
           />
@@ -117,11 +120,13 @@ export function PersonaPreviewPanel({
 
       {!personaId ? (
         <p className="px-4 py-8 text-sm text-muted-foreground">
-          Pick a persona to see the rendered SOUL.md.
+          {t("personas.preview.pick")}
         </p>
       ) : error ? (
         <div className="space-y-2 px-4 py-4">
-          <p className="text-sm text-destructive">Preview unavailable: {error.message}</p>
+          <p className="text-sm text-destructive">
+            {t("personas.preview.unavailable", { message: apiErrorMessage(error, t) })}
+          </p>
           <Button
             type="button"
             variant="outline"
@@ -129,7 +134,7 @@ export function PersonaPreviewPanel({
             onClick={() => setNonce((value) => value + 1)}
           >
             <RefreshCw aria-hidden />
-            Retry
+            {t("common.retry")}
           </Button>
         </div>
       ) : result ? (
@@ -137,16 +142,17 @@ export function PersonaPreviewPanel({
           <pre
             tabIndex={0}
             role="region"
-            aria-label={title}
+            aria-label={heading}
             className="overflow-auto bg-muted/10 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words"
             style={{ maxHeight }}
           >
-            {result.rendered || "This SOUL.md is empty."}
+            {result.rendered || t("personas.preview.empty")}
           </pre>
           {missing.length > 0 ? (
             <p className="border-t px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-              Missing: {missing.map((key) => `{{${key}}}`).join(", ")}. They stay visible in the
-              text until a value or a default is set.
+              {t("personas.preview.missing", {
+                keys: missing.map((key) => `{{${key}}}`).join(", "),
+              })}
             </p>
           ) : null}
           {loading ? (

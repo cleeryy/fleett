@@ -39,6 +39,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
+import { RichText } from "@/components/rich-text";
 import {
   dateInputValue,
   formatCost,
@@ -48,6 +49,7 @@ import {
   formatRelative,
   formatTokens,
 } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useIdentity } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
@@ -74,6 +76,7 @@ function BudgetDialog({
   instances: { id: string; name: string }[];
   onSaved: () => void;
 }) {
+  const { t } = useI18n();
   const [instanceId, setInstanceId] = useState("");
   const [monthly, setMonthly] = useState("25");
   const [enabled, setEnabled] = useState(true);
@@ -92,14 +95,14 @@ function BudgetDialog({
     event.preventDefault();
     const value = Number(monthly);
     if (!instanceId || !Number.isFinite(value) || value < 0 || value > 100_000) {
-      setError(toApiError(new Error("Pick an instance and enter a limit between 0 and 100000.")));
+      setError(toApiError(new Error(t("cost.budget.invalid"))));
       return;
     }
     setPending(true);
     setError(null);
     try {
       await api.setBudget(instanceId, { monthly_usd: value, enabled });
-      toast.success(`Budget saved for ${instanceId}.`);
+      toast.success(t("cost.budget.saved", { instance: instanceId }));
       onOpenChange(false);
       onSaved();
     } catch (cause) {
@@ -119,19 +122,18 @@ function BudgetDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{budget ? `Budget · ${budget.instance_id}` : "Set a budget"}</DialogTitle>
-          <DialogDescription>
-            A monthly USD limit per instance. Crossing it emits a cost event; it does not stop the
-            agent.
-          </DialogDescription>
+          <DialogTitle>
+            {budget ? t("cost.budget.titleEdit", { instance: budget.instance_id }) : t("cost.budget.titleNew")}
+          </DialogTitle>
+          <DialogDescription>{t("cost.budget.description")}</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="space-y-2">
-            <Label htmlFor="budget-instance">Instance</Label>
+            <Label htmlFor="budget-instance">{t("messages.instance")}</Label>
             <Select value={instanceId} onValueChange={setInstanceId} disabled={!!budget}>
               <SelectTrigger id="budget-instance" className="w-full">
-                <SelectValue placeholder="Pick an instance" />
+                <SelectValue placeholder={t("cost.budget.pickInstance")} />
               </SelectTrigger>
               <SelectContent>
                 {instances.map((instance) => (
@@ -143,7 +145,7 @@ function BudgetDialog({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="budget-monthly">Monthly limit (USD)</Label>
+            <Label htmlFor="budget-monthly">{t("cost.budget.monthlyLimit")}</Label>
             <Input
               id="budget-monthly"
               type="number"
@@ -162,16 +164,16 @@ function BudgetDialog({
               onCheckedChange={(value) => setEnabled(value === true)}
             />
             <Label htmlFor="budget-enabled" className="cursor-pointer text-sm font-normal">
-              Enabled
+              {t("common.enabled")}
             </Label>
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Save budget
+              {t("cost.budget.save")}
             </Button>
           </DialogFooter>
         </form>
@@ -191,6 +193,7 @@ function PricingDialog({
   pricing: Pricing | null;
   onSaved: () => void;
 }) {
+  const { t } = useI18n();
   const [model, setModel] = useState("");
   const [inputPrice, setInputPrice] = useState("0.27");
   const [outputPrice, setOutputPrice] = useState("1.10");
@@ -219,18 +222,18 @@ function PricingDialog({
       effective_from: effective,
     };
     if (!input.model) {
-      setError(toApiError(new Error("Enter a model name.")));
+      setError(toApiError(new Error(t("cost.pricing.modelRequired"))));
       return;
     }
     if (!Number.isFinite(input.input_per_mtok) || !Number.isFinite(input.output_per_mtok)) {
-      setError(toApiError(new Error("Enter numeric prices per million tokens.")));
+      setError(toApiError(new Error(t("cost.pricing.priceInvalid"))));
       return;
     }
     setPending(true);
     setError(null);
     try {
       await api.setPricing(input);
-      toast.success(`Price saved for ${input.model}.`);
+      toast.success(t("cost.pricing.saved", { model: input.model }));
       onOpenChange(false);
       onSaved();
     } catch (cause) {
@@ -244,16 +247,19 @@ function PricingDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{pricing ? `New price version · ${pricing.model}` : "Add a price"}</DialogTitle>
+          <DialogTitle>
+            {pricing
+              ? t("cost.pricing.titleEdit", { model: pricing.model })
+              : t("cost.pricing.titleNew")}
+          </DialogTitle>
           <DialogDescription>
-            Prices are versioned by <span className="font-mono">effective_from</span>. A new date adds
-            a row; historical reports keep the price effective on each event day.
+            <RichText text={t("cost.pricing.description")} />
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           <div className="space-y-2">
-            <Label htmlFor="pricing-model">Model</Label>
+            <Label htmlFor="pricing-model">{t("fleet.model")}</Label>
             <Input
               id="pricing-model"
               value={model}
@@ -266,7 +272,7 @@ function PricingDialog({
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="pricing-input">Input / Mtok</Label>
+              <Label htmlFor="pricing-input">{t("cost.pricing.input")}</Label>
               <Input
                 id="pricing-input"
                 type="number"
@@ -278,7 +284,7 @@ function PricingDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="pricing-output">Output / Mtok</Label>
+              <Label htmlFor="pricing-output">{t("cost.pricing.output")}</Label>
               <Input
                 id="pricing-output"
                 type="number"
@@ -292,7 +298,7 @@ function PricingDialog({
           </div>
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="pricing-currency">Currency</Label>
+              <Label htmlFor="pricing-currency">{t("cost.pricing.currency")}</Label>
               <Input
                 id="pricing-currency"
                 value={currency}
@@ -302,7 +308,7 @@ function PricingDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="pricing-effective">Effective from</Label>
+              <Label htmlFor="pricing-effective">{t("cost.pricing.effective")}</Label>
               <Input
                 id="pricing-effective"
                 type="date"
@@ -314,11 +320,11 @@ function PricingDialog({
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Save price
+              {t("cost.pricing.save")}
             </Button>
           </DialogFooter>
         </form>
@@ -328,6 +334,7 @@ function PricingDialog({
 }
 
 export function CostPage() {
+  const { t, lang } = useI18n();
   const identity = useIdentity();
   const admin = identity?.role === "admin";
   const [tab, setTab] = useState("usage");
@@ -370,7 +377,7 @@ export function CostPage() {
     setDeleteError(null);
     try {
       await api.deletePricing(deleteTarget.model);
-      toast.success(`Price for ${deleteTarget.model} deleted.`);
+      toast.success(t("cost.pricing.deleted", { model: deleteTarget.model }));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -383,16 +390,21 @@ export function CostPage() {
   return (
     <>
       <PageHeader
-        title="Cost"
+        title={t("nav.cost")}
         description={
           data
-            ? `${formatCost(data.totals.cost_usd, data.currency)} across ${formatTokens(data.totals.total_tokens)} tokens · ${data.groups.length} groups · ${data.group_by}`
-            : "Loading the cost report."
+            ? t("cost.summary", {
+                cost: formatCost(data.totals.cost_usd, data.currency),
+                tokens: formatTokens(data.totals.total_tokens),
+                groups: data.groups.length,
+                groupBy: t(`cost.groupBy.${data.group_by}`),
+              })
+            : t("cost.loading")
         }
         actions={
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
             <RefreshCw aria-hidden className={report.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
         }
       />
@@ -400,15 +412,15 @@ export function CostPage() {
       <Tabs value={tab} onValueChange={setTab}>
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
-            <TabsTrigger value="usage">Usage</TabsTrigger>
-            <TabsTrigger value="pricing">Pricing</TabsTrigger>
+            <TabsTrigger value="usage">{t("cost.usageTab")}</TabsTrigger>
+            <TabsTrigger value="pricing">{t("cost.pricingTab")}</TabsTrigger>
           </TabsList>
         </div>
 
         <TabsContent value="usage" className="mt-4 space-y-4">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <div className="space-y-1">
-              <Label htmlFor="cost-from">From</Label>
+              <Label htmlFor="cost-from">{t("cost.from")}</Label>
               <Input
                 id="cost-from"
                 type="date"
@@ -418,7 +430,7 @@ export function CostPage() {
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="cost-to">To</Label>
+              <Label htmlFor="cost-to">{t("cost.to")}</Label>
               <Input
                 id="cost-to"
                 type="date"
@@ -428,23 +440,21 @@ export function CostPage() {
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="cost-group">Group by</Label>
+              <Label htmlFor="cost-group">{t("cost.groupByLabel")}</Label>
               <Select value={groupBy} onValueChange={(value) => setGroupBy(value as CostGroupBy)}>
                 <SelectTrigger id="cost-group" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="instance">Instance</SelectItem>
-                  <SelectItem value="model">Model</SelectItem>
-                  <SelectItem value="day">Day</SelectItem>
+                  <SelectItem value="instance">{t("cost.groupBy.instance")}</SelectItem>
+                  <SelectItem value="model">{t("cost.groupBy.model")}</SelectItem>
+                  <SelectItem value="day">{t("cost.groupBy.day")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="flex items-end">
               <p className="text-xs text-muted-foreground">
-                Dates are interpreted in UTC. The range is inclusive at{" "}
-                <span className="font-mono">from</span>; a date <span className="font-mono">to</span>{" "}
-                covers the whole day.
+                <RichText text={t("cost.dateHint")} />
               </p>
             </div>
           </div>
@@ -455,39 +465,57 @@ export function CostPage() {
             <>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <StatCard
-                  label="Cost in range"
+                  label={t("cost.stat.range")}
                   value={formatCost(data.totals.cost_usd, data.currency)}
-                  hint={`${formatTokens(data.totals.total_tokens)} tokens`}
+                  hint={t("cost.stat.tokensHint", {
+                    count: formatTokens(data.totals.total_tokens),
+                  })}
                 />
                 <StatCard
-                  label="Prompt / completion"
+                  label={t("cost.stat.promptCompletion")}
                   value={`${formatTokens(data.totals.prompt_tokens)} / ${formatTokens(data.totals.completion_tokens)}`}
-                  hint={`${data.totals.events} events`}
+                  hint={t("cost.stat.eventsHint", { count: data.totals.events })}
                 />
                 <StatCard
-                  label="Projected month"
+                  label={t("cost.stat.projected")}
                   value={formatCost(data.projection.projected_usd, data.currency)}
-                  hint={`${formatRate(data.projection.elapsed_fraction)} of ${data.projection.month} elapsed`}
+                  hint={t("cost.stat.elapsed", {
+                    rate: formatRate(data.projection.elapsed_fraction),
+                    month: data.projection.month,
+                  })}
                 />
                 <StatCard
-                  label="Budgets exceeded"
+                  label={t("cost.stat.budgetsExceeded")}
                   value={String(data.budgets.filter((budget) => budget.exceeded).length)}
-                  hint={data.budgets.length > 0 ? `${data.budgets.length} configured` : "none configured"}
+                  hint={
+                    data.budgets.length > 0
+                      ? t("cost.stat.configured", { count: data.budgets.length })
+                      : t("cost.stat.noneConfigured")
+                  }
                 />
               </div>
 
               <div className="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                 <section className="space-y-2">
                   <div className="flex items-center justify-between gap-2">
-                    <h2 className="text-sm font-medium">Breakdown by {data.group_by}</h2>
-                    <span className="text-xs text-muted-foreground">{data.groups.length} groups</span>
+                    <h2 className="text-sm font-medium">
+                      {t("cost.breakdown", { groupBy: t(`cost.groupBy.${data.group_by}`) })}
+                    </h2>
+                    <span className="text-xs text-muted-foreground">
+                      {t(
+                        data.groups.length === 1
+                          ? "cost.groupCountOne"
+                          : "cost.groupCountMany",
+                        { count: data.groups.length },
+                      )}
+                    </span>
                   </div>
                   <div className="rounded-md border">
                     {data.groups.length === 0 ? (
                       <EmptyState
                         icon={CircleDollarSign}
-                        title="No usage in this range"
-                        description="The controller records a cost event when an instance ingests usage."
+                        title={t("cost.noUsageTitle")}
+                        description={t("cost.noUsageDescription")}
                       />
                     ) : (
                       <>
@@ -495,11 +523,11 @@ export function CostPage() {
                           <Table>
                             <TableHeader>
                               <TableRow>
-                                <TableHead>{data.group_by}</TableHead>
-                                <TableHead className="w-[120px]">Tokens</TableHead>
-                                <TableHead className="w-[100px]">Events</TableHead>
-                                <TableHead className="w-[110px]">Cost</TableHead>
-                                <TableHead className="w-[90px]">Share</TableHead>
+                                <TableHead>{t(`cost.groupBy.${data.group_by}`)}</TableHead>
+                                <TableHead className="w-[120px]">{t("cost.tokens")}</TableHead>
+                                <TableHead className="w-[100px]">{t("cost.events")}</TableHead>
+                                <TableHead className="w-[110px]">{t("cost.cost")}</TableHead>
+                                <TableHead className="w-[90px]">{t("cost.share")}</TableHead>
                               </TableRow>
                             </TableHeader>
                             <TableBody>
@@ -527,7 +555,10 @@ export function CostPage() {
                               <div className="min-w-0">
                                 <p className="truncate font-mono text-xs">{group.key}</p>
                                 <p className="text-xs text-muted-foreground">
-                                  {formatTokens(group.total_tokens)} tokens · {group.events} events
+                                  {t("cost.groupLine", {
+                                    tokens: formatTokens(group.total_tokens),
+                                    events: group.events,
+                                  })}
                                 </p>
                               </div>
                               <span className="font-mono text-xs">
@@ -542,11 +573,11 @@ export function CostPage() {
                 </section>
 
                 <section className="space-y-2">
-                  <h2 className="text-sm font-medium">Top agents</h2>
+                  <h2 className="text-sm font-medium">{t("cost.topAgents")}</h2>
                   <div className="rounded-md border">
                     {data.top_agents.length === 0 ? (
                       <p className="px-3 py-6 text-center text-sm text-muted-foreground">
-                        No agent spent tokens in this range.
+                        {t("cost.noAgents")}
                       </p>
                     ) : (
                       <ul className="divide-y">
@@ -558,7 +589,9 @@ export function CostPage() {
                             <div className="min-w-0 flex-1">
                               <p className="truncate font-mono text-xs">{agent.instance_id}</p>
                               <p className="text-[11px] text-muted-foreground">
-                                {formatTokens(agent.total_tokens)} tokens
+                                {t("cost.tokensOnly", {
+                                  tokens: formatTokens(agent.total_tokens),
+                                })}
                               </p>
                             </div>
                             <span className="font-mono text-xs">
@@ -574,7 +607,7 @@ export function CostPage() {
 
               <section className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h2 className="text-sm font-medium">Budgets</h2>
+                  <h2 className="text-sm font-medium">{t("cost.budgets")}</h2>
                   {admin ? (
                     <Button
                       variant="outline"
@@ -585,7 +618,7 @@ export function CostPage() {
                       }}
                     >
                       <Plus aria-hidden />
-                      Set budget
+                      {t("cost.setBudget")}
                     </Button>
                   ) : null}
                 </div>
@@ -594,8 +627,8 @@ export function CostPage() {
                   {budgetRows.length === 0 ? (
                     <EmptyState
                       icon={CircleDollarSign}
-                      title="No budget configured"
-                      description="A budget emits a cost event once an instance reaches its monthly limit."
+                      title={t("cost.noBudgetTitle")}
+                      description={t("cost.noBudgetDescription")}
                       action={
                         admin ? (
                           <Button
@@ -606,7 +639,7 @@ export function CostPage() {
                             }}
                           >
                             <Plus aria-hidden />
-                            Set budget
+                            {t("cost.setBudget")}
                           </Button>
                         ) : undefined
                       }
@@ -617,14 +650,14 @@ export function CostPage() {
                         <Table>
                           <TableHeader>
                             <TableRow>
-                              <TableHead>Instance</TableHead>
-                              <TableHead className="w-[110px]">Month</TableHead>
-                              <TableHead className="w-[110px]">Limit</TableHead>
-                              <TableHead className="w-[110px]">Used</TableHead>
-                              <TableHead className="w-[160px]">Usage</TableHead>
-                              <TableHead className="w-[110px]">Projected</TableHead>
+                              <TableHead>{t("messages.instance")}</TableHead>
+                              <TableHead className="w-[110px]">{t("cost.month")}</TableHead>
+                              <TableHead className="w-[110px]">{t("cost.limit")}</TableHead>
+                              <TableHead className="w-[110px]">{t("cost.used")}</TableHead>
+                              <TableHead className="w-[160px]">{t("cost.usage")}</TableHead>
+                              <TableHead className="w-[110px]">{t("cost.projected")}</TableHead>
                               <TableHead className="w-[90px]">
-                                <span className="sr-only">Actions</span>
+                                <span className="sr-only">{t("common.actions")}</span>
                               </TableHead>
                             </TableRow>
                           </TableHeader>
@@ -637,7 +670,7 @@ export function CostPage() {
                                     <OpsBadge status="exceeded" />
                                   ) : (
                                     <span className="text-[11px] text-muted-foreground">
-                                      {budget.enabled ? "enabled" : "disabled"}
+                                      {budget.enabled ? t("common.enabled") : t("common.disabled")}
                                     </span>
                                   )}
                                 </TableCell>
@@ -653,7 +686,9 @@ export function CostPage() {
                                     <progress
                                       value={Math.min(100, budget.percent)}
                                       max={100}
-                                      aria-label={`${budget.instance_id} budget usage`}
+                                      aria-label={t("cost.budgetUsageAria", {
+                                        instance: budget.instance_id,
+                                      })}
                                       className="h-1.5 w-20 overflow-hidden rounded-full accent-emerald-600"
                                     >
                                       {formatPercentValue(budget.percent)}
@@ -669,8 +704,12 @@ export function CostPage() {
                                     <Button
                                       variant="ghost"
                                       size="icon-sm"
-                                      aria-label={`Edit budget for ${budget.instance_id}`}
-                                      title={`Edit budget for ${budget.instance_id}`}
+                                      aria-label={t("cost.editBudgetAria", {
+                                        instance: budget.instance_id,
+                                      })}
+                                      title={t("cost.editBudgetAria", {
+                                        instance: budget.instance_id,
+                                      })}
                                       onClick={() => {
                                         setBudgetTarget(budget);
                                         setBudgetOpen(true);
@@ -694,19 +733,19 @@ export function CostPage() {
                             </div>
                             <dl className="grid grid-cols-2 gap-2 text-xs">
                               <div>
-                                <dt className="text-muted-foreground">Limit</dt>
+                                <dt className="text-muted-foreground">{t("cost.limit")}</dt>
                                 <dd className="font-mono">{formatCost(budget.monthly_usd)}</dd>
                               </div>
                               <div>
-                                <dt className="text-muted-foreground">Used</dt>
+                                <dt className="text-muted-foreground">{t("cost.used")}</dt>
                                 <dd className="font-mono">{formatCost(budget.used_usd)}</dd>
                               </div>
                               <div>
-                                <dt className="text-muted-foreground">Percent</dt>
+                                <dt className="text-muted-foreground">{t("cost.percent")}</dt>
                                 <dd className="font-mono">{formatPercentValue(budget.percent)}</dd>
                               </div>
                               <div>
-                                <dt className="text-muted-foreground">Projected</dt>
+                                <dt className="text-muted-foreground">{t("cost.projected")}</dt>
                                 <dd className="font-mono">{formatCost(budget.projected_month_usd)}</dd>
                               </div>
                             </dl>
@@ -719,7 +758,7 @@ export function CostPage() {
                                   setBudgetOpen(true);
                                 }}
                               >
-                                Edit budget
+                                {t("cost.editBudget")}
                               </Button>
                             ) : null}
                           </li>
@@ -741,7 +780,7 @@ export function CostPage() {
         <TabsContent value="pricing" className="mt-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm text-muted-foreground">
-              Prices per million tokens. Historical reports use the price effective on each event day.
+              {t("cost.pricingHint")}
             </p>
             {admin ? (
               <Button
@@ -752,7 +791,7 @@ export function CostPage() {
                 }}
               >
                 <Plus aria-hidden />
-                Add price
+                {t("cost.addPrice")}
               </Button>
             ) : null}
           </div>
@@ -767,8 +806,8 @@ export function CostPage() {
             ) : (pricing.data ?? []).length === 0 ? (
               <EmptyState
                 icon={CircleDollarSign}
-                title="No prices configured"
-                description="An unpriced model records tokens but costs zero."
+                title={t("cost.noPricesTitle")}
+                description={t("cost.noPricesDescription")}
               />
             ) : (
               <>
@@ -776,14 +815,14 @@ export function CostPage() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead>Model</TableHead>
-                        <TableHead className="w-[130px]">Input / Mtok</TableHead>
-                        <TableHead className="w-[130px]">Output / Mtok</TableHead>
-                        <TableHead className="w-[100px]">Currency</TableHead>
-                        <TableHead className="w-[140px]">Effective from</TableHead>
-                        <TableHead className="w-[150px]">Updated</TableHead>
+                        <TableHead>{t("fleet.model")}</TableHead>
+                        <TableHead className="w-[130px]">{t("cost.pricing.input")}</TableHead>
+                        <TableHead className="w-[130px]">{t("cost.pricing.output")}</TableHead>
+                        <TableHead className="w-[100px]">{t("cost.pricing.currency")}</TableHead>
+                        <TableHead className="w-[140px]">{t("cost.pricing.effective")}</TableHead>
+                        <TableHead className="w-[150px]">{t("common.updated")}</TableHead>
                         <TableHead className="w-[110px]">
-                          <span className="sr-only">Actions</span>
+                          <span className="sr-only">{t("common.actions")}</span>
                         </TableHead>
                       </TableRow>
                     </TableHeader>
@@ -804,7 +843,7 @@ export function CostPage() {
                           </TableCell>
                           <TableCell className="font-mono text-xs">{price.effective_from}</TableCell>
                           <TableCell className="text-xs text-muted-foreground">
-                            {formatRelative(price.updated_at)}
+                            {formatRelative(price.updated_at, lang)}
                           </TableCell>
                           <TableCell>
                             {admin ? (
@@ -812,8 +851,8 @@ export function CostPage() {
                                 <Button
                                   variant="ghost"
                                   size="icon-sm"
-                                  aria-label={`New price version for ${price.model}`}
-                                  title={`New price version for ${price.model}`}
+                                  aria-label={t("cost.newPriceAria", { model: price.model })}
+                                  title={t("cost.newPriceAria", { model: price.model })}
                                   onClick={() => {
                                     setPricingTarget(price);
                                     setPricingOpen(true);
@@ -824,8 +863,8 @@ export function CostPage() {
                                 <Button
                                   variant="ghost"
                                   size="icon-sm"
-                                  aria-label={`Delete price for ${price.model}`}
-                                  title={`Delete price for ${price.model}`}
+                                  aria-label={t("cost.deletePriceAria", { model: price.model })}
+                                  title={t("cost.deletePriceAria", { model: price.model })}
                                   onClick={() => {
                                     setDeleteError(null);
                                     setDeleteTarget(price);
@@ -847,19 +886,19 @@ export function CostPage() {
                       <p className="font-mono text-sm break-all">{price.model}</p>
                       <dl className="grid grid-cols-2 gap-2 text-xs">
                         <div>
-                          <dt className="text-muted-foreground">Input / Mtok</dt>
+                          <dt className="text-muted-foreground">{t("cost.pricing.input")}</dt>
                           <dd className="font-mono">{formatCost(price.input_per_mtok, price.currency)}</dd>
                         </div>
                         <div>
-                          <dt className="text-muted-foreground">Output / Mtok</dt>
+                          <dt className="text-muted-foreground">{t("cost.pricing.output")}</dt>
                           <dd className="font-mono">{formatCost(price.output_per_mtok, price.currency)}</dd>
                         </div>
                         <div>
-                          <dt className="text-muted-foreground">Effective</dt>
+                          <dt className="text-muted-foreground">{t("cost.effective")}</dt>
                           <dd className="font-mono">{price.effective_from}</dd>
                         </div>
                         <div>
-                          <dt className="text-muted-foreground">Updated</dt>
+                          <dt className="text-muted-foreground">{t("common.updated")}</dt>
                           <dd className="font-mono">{formatDateTime(price.updated_at)}</dd>
                         </div>
                       </dl>
@@ -873,7 +912,7 @@ export function CostPage() {
                               setPricingOpen(true);
                             }}
                           >
-                            New version
+                            {t("cost.newVersion")}
                           </Button>
                           <Button
                             variant="outline"
@@ -883,7 +922,7 @@ export function CostPage() {
                               setDeleteTarget(price);
                             }}
                           >
-                            Delete
+                            {t("common.delete")}
                           </Button>
                         </div>
                       ) : null}
@@ -894,11 +933,10 @@ export function CostPage() {
             )}
           </div>
           <p className="text-xs text-muted-foreground">
-            Budgets:{" "}
-            {budgetRows.length === 0
-              ? "none configured"
-              : `${budgetRows.length} configured, ${budgetRows.filter((row) => row.enabled).length} enabled`}
-            .
+            {t("cost.budgetFooter", {
+              count: budgetRows.length,
+              enabled: budgetRows.filter((row) => row.enabled).length,
+            })}
           </p>
         </TabsContent>
       </Tabs>
@@ -921,13 +959,13 @@ export function CostPage() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title="Delete model price"
+        title={t("cost.deletePriceTitle")}
         description={
           deleteTarget
-            ? `Delete every price version for ${deleteTarget.model}? Reports then value new events at zero.`
+            ? t("cost.deletePriceDescription", { model: deleteTarget.model })
             : undefined
         }
-        confirmLabel="Delete price"
+        confirmLabel={t("cost.deletePrice")}
         destructive
         pending={deleting}
         error={deleteError}

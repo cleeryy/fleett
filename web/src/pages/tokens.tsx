@@ -37,13 +37,15 @@ import { CopyButton } from "@/components/copy-button";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 function RoleBadge({ role }: { role: Role }) {
+  const { t } = useI18n();
   return (
     <Badge variant="outline" className="font-mono text-xs font-normal">
-      {role}
+      {t(`role.${role}`)}
     </Badge>
   );
 }
@@ -57,6 +59,7 @@ function CreateTokenDialog({
   onOpenChange: (open: boolean) => void;
   onCreated: () => void;
 }) {
+  const { t } = useI18n();
   const [name, setName] = useState("");
   const [role, setRole] = useState<Role>("viewer");
   const [pending, setPending] = useState(false);
@@ -78,11 +81,11 @@ function CreateTokenDialog({
     event.preventDefault();
     const value = name.trim();
     if (!value) {
-      setFieldError("Enter a name.");
+      setFieldError(t("tokens.nameRequired"));
       return;
     }
     if (value.length > 64) {
-      setFieldError("64 characters maximum.");
+      setFieldError(t("tokens.nameTooLong"));
       return;
     }
     setPending(true);
@@ -105,23 +108,20 @@ function CreateTokenDialog({
         {created ? (
           <div className="space-y-4">
             <DialogHeader>
-              <DialogTitle>Token created</DialogTitle>
+              <DialogTitle>{t("tokens.createdTitle")}</DialogTitle>
               <DialogDescription>
-                <span className="font-mono">{created.name}</span> · {created.role}
+                <span className="font-mono">{created.name}</span> · {t(`role.${created.role}`)}
               </DialogDescription>
             </DialogHeader>
 
             <Alert>
               <TriangleAlert aria-hidden className="size-4" />
-              <AlertTitle>Copy it now</AlertTitle>
-              <AlertDescription>
-                This token cannot be shown again: the host stores a SHA-256 digest, not the secret. If
-                you lose it, revoke it and create a new one.
-              </AlertDescription>
+              <AlertTitle>{t("tokens.copyNow")}</AlertTitle>
+              <AlertDescription>{t("tokens.copyNowBody")}</AlertDescription>
             </Alert>
 
             <div className="space-y-2">
-              <Label htmlFor="created-token">Access token</Label>
+              <Label htmlFor="created-token">{t("login.accessToken")}</Label>
               <div className="flex items-center gap-2">
                 <Input
                   id="created-token"
@@ -133,7 +133,7 @@ function CreateTokenDialog({
                 />
                 <CopyButton
                   value={created.token}
-                  label="Copy token"
+                  label={t("tokens.copyToken")}
                   showLabel
                   size="sm"
                   variant="outline"
@@ -144,22 +144,19 @@ function CreateTokenDialog({
 
             <DialogFooter>
               <Button type="button" onClick={() => onOpenChange(false)}>
-                Done
+                {t("common.done")}
               </Button>
             </DialogFooter>
           </div>
         ) : (
           <form onSubmit={onSubmit} noValidate className="space-y-4">
             <DialogHeader>
-              <DialogTitle>New access token</DialogTitle>
-              <DialogDescription>
-                For scripts and CI. The role decides what the token may do, and the secret is shown
-                once.
-              </DialogDescription>
+              <DialogTitle>{t("tokens.newTitle")}</DialogTitle>
+              <DialogDescription>{t("tokens.newDescription")}</DialogDescription>
             </DialogHeader>
 
             <div className="space-y-2">
-              <Label htmlFor="token-name">Name</Label>
+              <Label htmlFor="token-name">{t("common.name")}</Label>
               <Input
                 id="token-name"
                 value={name}
@@ -167,7 +164,7 @@ function CreateTokenDialog({
                 autoComplete="off"
                 spellCheck={false}
                 className="font-mono"
-                placeholder="ci-nightly"
+                placeholder={t("tokens.namePlaceholder")}
                 aria-invalid={!!fieldError}
                 aria-describedby={fieldError ? "token-name-error" : "token-name-help"}
                 onChange={(event) => setName(event.target.value)}
@@ -178,25 +175,24 @@ function CreateTokenDialog({
                 </p>
               ) : (
                 <p id="token-name-help" className="text-xs text-muted-foreground">
-                  Recorded as the actor of every request made with this token.
+                  {t("tokens.nameHint")}
                 </p>
               )}
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="token-role">Role</Label>
+              <Label htmlFor="token-role">{t("audit.role")}</Label>
               <Select value={role} onValueChange={(value) => setRole(value as Role)}>
                 <SelectTrigger id="token-role" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="viewer">viewer · read-only</SelectItem>
-                  <SelectItem value="admin">admin · full access</SelectItem>
+                  <SelectItem value="viewer">{t("tokens.roleViewer")}</SelectItem>
+                  <SelectItem value="admin">{t("tokens.roleAdmin")}</SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                A viewer token can read the API only. An admin token can also mutate and manage
-                tokens.
+                {t("tokens.roleHint")}
               </p>
             </div>
 
@@ -209,11 +205,11 @@ function CreateTokenDialog({
                 onClick={() => onOpenChange(false)}
                 disabled={pending}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="submit" disabled={pending}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Plus aria-hidden />}
-                Create token
+                {t("tokens.create")}
               </Button>
             </DialogFooter>
           </form>
@@ -234,6 +230,7 @@ function RevokeTokenDialog({
   onOpenChange: (open: boolean) => void;
   onRevoked: () => void;
 }) {
+  const { t } = useI18n();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
 
@@ -251,7 +248,7 @@ function RevokeTokenDialog({
     setError(null);
     try {
       await api.revokeToken(token.id);
-      toast.success(`Token ${token.name} revoked.`);
+      toast.success(t("tokens.revoked", { name: token.name }));
       onRevoked();
       onOpenChange(false);
     } catch (cause) {
@@ -266,23 +263,20 @@ function RevokeTokenDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            Revoke token <span className="font-mono">{token.name}</span>?
+            {t("tokens.revokeTitle")} <span className="font-mono">{token.name}</span>?
           </DialogTitle>
-          <DialogDescription>
-            The token stops working on its next request. The row and its name stay in the list and in
-            the audit trail.
-          </DialogDescription>
+          <DialogDescription>{t("tokens.revokeDescription")}</DialogDescription>
         </DialogHeader>
 
         {error ? <ErrorAlert error={error} /> : null}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button variant="destructive" onClick={onRevoke} disabled={pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-            Revoke token
+            {t("tokens.revoke")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -291,6 +285,7 @@ function RevokeTokenDialog({
 }
 
 export function TokensPage() {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const tokens = useResource(() => api.listTokens(), [nonce]);
   const [createOpen, setCreateOpen] = useState(false);
@@ -303,21 +298,21 @@ export function TokensPage() {
   return (
     <>
       <PageHeader
-        title="Access tokens"
+        title={t("tokens.title")}
         description={
           tokens.data
-            ? `${rows.length} ${plural(rows.length, "token")} · ${active} active · shown once, stored as a digest`
-            : "Loading tokens."
+            ? t("tokens.summary", { count: rows.length, active })
+            : t("tokens.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={tokens.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             <Button size="sm" onClick={() => setCreateOpen(true)}>
               <Plus aria-hidden />
-              New token
+              {t("tokens.new")}
             </Button>
           </>
         }
@@ -335,12 +330,12 @@ export function TokensPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={KeyRound}
-            title="No tokens yet"
-            description="Create one for CI or a script. It is shown once, then only its digest stays on the host."
+            title={t("tokens.emptyTitle")}
+            description={t("tokens.emptyDescription")}
             action={
               <Button onClick={() => setCreateOpen(true)}>
                 <Plus aria-hidden />
-                New token
+                {t("tokens.new")}
               </Button>
             }
           />
@@ -350,13 +345,13 @@ export function TokensPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead className="w-[100px]">Role</TableHead>
-                    <TableHead className="w-[190px]">Created</TableHead>
-                    <TableHead className="w-[120px]">Last used</TableHead>
-                    <TableHead className="w-[190px]">Revoked</TableHead>
+                    <TableHead>{t("common.name")}</TableHead>
+                    <TableHead className="w-[100px]">{t("audit.role")}</TableHead>
+                    <TableHead className="w-[190px]">{t("common.created")}</TableHead>
+                    <TableHead className="w-[120px]">{t("tokens.lastUsed")}</TableHead>
+                    <TableHead className="w-[190px]">{t("tokens.revokedHeader")}</TableHead>
                     <TableHead className="w-[100px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -383,7 +378,7 @@ export function TokensPage() {
                       <TableCell>
                         <span
                           className="font-mono text-xs"
-                          title={formatRelative(token.created_at)}
+                          title={formatRelative(token.created_at, lang)}
                         >
                           {formatDateTime(token.created_at)}
                         </span>
@@ -391,7 +386,7 @@ export function TokensPage() {
                       <TableCell>
                         <span
                           className="text-xs text-muted-foreground"
-                          title="Not recorded by the controller yet."
+                          title={t("tokens.lastUsedHint")}
                         >
                           —
                         </span>
@@ -400,7 +395,7 @@ export function TokensPage() {
                         {token.revoked_at ? (
                           <span
                             className="font-mono text-xs"
-                            title={formatRelative(token.revoked_at)}
+                            title={formatRelative(token.revoked_at, lang)}
                           >
                             {formatDateTime(token.revoked_at)}
                           </span>
@@ -411,16 +406,16 @@ export function TokensPage() {
                       <TableCell className="text-right">
                         {token.revoked_at ? (
                           <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                            revoked
+                            {t("status.revoked")}
                           </Badge>
                         ) : (
                           <Button
                             variant="ghost"
                             size="sm"
                             onClick={() => setRevokeId(token.id)}
-                            aria-label={`Revoke token ${token.name}`}
+                            aria-label={t("tokens.revokeAria", { name: token.name })}
                           >
-                            Revoke
+                            {t("tokens.revoke")}
                           </Button>
                         )}
                       </TableCell>
@@ -450,17 +445,17 @@ export function TokensPage() {
                   </div>
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
                     <div>
-                      <dt className="text-muted-foreground">Created</dt>
+                      <dt className="text-muted-foreground">{t("common.created")}</dt>
                       <dd className="font-mono">{formatDateTime(token.created_at)}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Last used</dt>
-                      <dd className="text-muted-foreground" title="Not recorded by the controller yet.">
+                      <dt className="text-muted-foreground">{t("tokens.lastUsed")}</dt>
+                      <dd className="text-muted-foreground" title={t("tokens.lastUsedHint")}>
                         —
                       </dd>
                     </div>
                     <div className="col-span-2">
-                      <dt className="text-muted-foreground">Revoked</dt>
+                      <dt className="text-muted-foreground">{t("tokens.revokedHeader")}</dt>
                       <dd className="font-mono">
                         {token.revoked_at ? formatDateTime(token.revoked_at) : "—"}
                       </dd>
@@ -468,7 +463,7 @@ export function TokensPage() {
                   </dl>
                   {token.revoked_at ? (
                     <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                      revoked
+                      {t("status.revoked")}
                     </Badge>
                   ) : (
                     <Button
@@ -476,9 +471,9 @@ export function TokensPage() {
                       size="sm"
                       className="w-full"
                       onClick={() => setRevokeId(token.id)}
-                      aria-label={`Revoke token ${token.name}`}
+                      aria-label={t("tokens.revokeAria", { name: token.name })}
                     >
-                      Revoke
+                      {t("tokens.revoke")}
                     </Button>
                   )}
                 </div>
@@ -490,8 +485,7 @@ export function TokensPage() {
 
       {rows.length > 0 ? (
         <p className="text-xs text-muted-foreground">
-          Last used is not tracked by the controller yet. Token creation and revocation appear in the
-          audit log.
+          {t("tokens.footer")}
         </p>
       ) : null}
 

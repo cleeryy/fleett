@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { copyText } from "@/lib/clipboard";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 export function CopyButton({
   value,
-  label = "Copy",
+  label,
   showLabel = false,
   size = "icon-sm",
   variant = "ghost",
@@ -21,6 +22,7 @@ export function CopyButton({
   className?: string;
   disabled?: boolean;
 }) {
+  const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | null>(null);
 
@@ -29,6 +31,8 @@ export function CopyButton({
       if (timer.current !== null) window.clearTimeout(timer.current);
     };
   }, []);
+
+  const labelText = label ?? t("common.copy");
 
   async function onCopy() {
     const ok = await copyText(value);
@@ -45,16 +49,16 @@ export function CopyButton({
         variant={variant}
         size={showLabel ? "sm" : size}
         className={cn(showLabel && "gap-1.5", className)}
-        aria-label={label}
-        title={label}
+        aria-label={labelText}
+        title={labelText}
         onClick={onCopy}
         disabled={disabled}
       >
         {copied ? <Check aria-hidden /> : <Copy aria-hidden />}
-        {showLabel ? <span>{copied ? "Copied" : "Copy"}</span> : null}
+        {showLabel ? <span>{copied ? t("common.copied") : t("common.copy")}</span> : null}
       </Button>
       <span className="sr-only" aria-live="polite">
-        {copied ? "Copied to clipboard" : ""}
+        {copied ? t("common.copiedToClipboard") : ""}
       </span>
     </>
   );

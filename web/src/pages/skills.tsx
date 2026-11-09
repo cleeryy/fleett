@@ -8,15 +8,18 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PageHeader } from "@/components/page-header";
 import { SkillCreateDialog } from "@/components/skill-create-dialog";
 import { SkillImportDialog } from "@/components/skill-import-dialog";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 function SkillRow({ skill }: { skill: SkillSummary }) {
+  const { t, lang } = useI18n();
   return (
     <li>
       <a
@@ -26,21 +29,33 @@ function SkillRow({ skill }: { skill: SkillSummary }) {
         <div className="min-w-0">
           <p className="truncate font-mono text-sm font-medium">{skill.name}</p>
           <p className="line-clamp-2 text-sm text-muted-foreground">
-            {skill.description || "No description."}
+            {skill.description || t("skills.picker.noDescription")}
           </p>
           <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground sm:hidden">
-            <span>latest {skill.latest ?? "unset"}</span>
-            <span aria-hidden>·</span>
             <span>
-              {skill.versions.length} {plural(skill.versions.length, "version")}
+              {t("skills.list.latest")} {skill.latest ?? t("skills.create.unset")}
             </span>
             <span aria-hidden>·</span>
             <span>
-              {skill.instances_count} {plural(skill.instances_count, "instance")}
+              {t(
+                skill.versions.length === 1
+                  ? "skills.picker.versionOne"
+                  : "skills.picker.versionMany",
+                { count: skill.versions.length },
+              )}
+            </span>
+            <span aria-hidden>·</span>
+            <span>
+              {t(
+                skill.instances_count === 1
+                  ? "skills.picker.instanceOne"
+                  : "skills.picker.instanceMany",
+                { count: skill.instances_count },
+              )}
             </span>
             <span aria-hidden>·</span>
             <span title={formatDateTime(skill.updated_at)}>
-              updated {formatRelative(skill.updated_at)}
+              {t("skills.picker.updated", { time: formatRelative(skill.updated_at, lang) })}
             </span>
           </p>
         </div>
@@ -50,23 +65,23 @@ function SkillRow({ skill }: { skill: SkillSummary }) {
               {skill.latest}
             </Badge>
           ) : (
-            <span className="text-xs text-muted-foreground">unset</span>
+            <span className="text-xs text-muted-foreground">{t("skills.create.unset")}</span>
           )}
         </div>
         <div className="hidden font-mono text-xs sm:block">
           {skill.versions.length}
-          <span className="sr-only"> versions</span>
+          <span className="sr-only"> {t("skills.list.versionsSr")}</span>
         </div>
         <div className="hidden items-center gap-1 font-mono text-xs sm:flex">
           <Users aria-hidden className="size-3.5 text-muted-foreground" />
           {skill.instances_count}
-          <span className="sr-only"> instances</span>
+          <span className="sr-only"> {t("skills.list.instancesSr")}</span>
         </div>
         <div
           className="hidden truncate text-xs text-muted-foreground sm:block"
           title={formatDateTime(skill.updated_at)}
         >
-          {formatRelative(skill.updated_at)}
+          {formatRelative(skill.updated_at, lang)}
         </div>
       </a>
     </li>
@@ -74,6 +89,7 @@ function SkillRow({ skill }: { skill: SkillSummary }) {
 }
 
 export function SkillsPage() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
@@ -84,10 +100,8 @@ export function SkillsPage() {
   return (
     <>
       <PageHeader
-        title="Skills"
-        description={
-          skillSummaryText(rows, skills.data !== null)
-        }
+        title={t("nav.skills")}
+        description={skillSummaryText(rows, skills.data !== null, t)}
         actions={
           <>
             <Button
@@ -97,17 +111,17 @@ export function SkillsPage() {
               disabled={skills.refreshing}
             >
               <RefreshCw aria-hidden className={skills.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <>
                 <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
                   <FileArchive aria-hidden />
-                  Import zip
+                  {t("skills.list.importZip")}
                 </Button>
                 <Button size="sm" onClick={() => setCreateOpen(true)}>
                   <Plus aria-hidden />
-                  Publish skill
+                  {t("skills.list.publish")}
                 </Button>
               </>
             ) : null}
@@ -117,7 +131,7 @@ export function SkillsPage() {
 
       {!canEdit ? (
         <p className="text-xs text-muted-foreground">
-          Read-only: publishing, promoting and deleting a skill needs a write-capable account.
+          {t("skills.list.readOnly")}
         </p>
       ) : null}
 
@@ -136,18 +150,18 @@ export function SkillsPage() {
         <div className="rounded-md border">
           <EmptyState
             icon={Sparkles}
-            title="No skills yet"
-            description="A skill is one small tree of text files an agent reads while it works: a SKILL.md plus whatever it references. The registry keeps one copy, versions it, and mounts it read-only in every instance that declares it."
+            title={t("skills.list.emptyTitle")}
+            description={t("skills.list.emptyDescription")}
             action={
               canEdit ? (
                 <div className="flex flex-wrap items-center justify-center gap-2">
                   <Button onClick={() => setCreateOpen(true)}>
                     <Plus aria-hidden />
-                    Publish the first skill
+                    {t("skills.list.emptyAction")}
                   </Button>
                   <Button variant="outline" onClick={() => setImportOpen(true)}>
                     <FileArchive aria-hidden />
-                    Import a zip
+                    {t("skills.list.importAction")}
                   </Button>
                 </div>
               ) : undefined
@@ -157,11 +171,11 @@ export function SkillsPage() {
       ) : (
         <div className="rounded-md border">
           <div className="hidden grid-cols-[minmax(0,1fr)_96px_92px_96px_116px] gap-x-4 border-b bg-muted/30 px-4 py-2 text-xs font-medium text-muted-foreground sm:grid">
-            <span>Skill</span>
-            <span>Latest</span>
-            <span>Versions</span>
-            <span>Instances</span>
-            <span>Updated</span>
+            <span>{t("skills.list.skill")}</span>
+            <span>{t("skills.list.latestHeader")}</span>
+            <span>{t("skills.list.versions")}</span>
+            <span>{t("nav.instances")}</span>
+            <span>{t("common.updated")}</span>
           </div>
           <ul className="divide-y">
             {rows.map((skill) => (
@@ -173,9 +187,7 @@ export function SkillsPage() {
 
       {rows.length > 0 ? (
         <p className="text-xs text-muted-foreground">
-          Open a skill to read its versions, compare commits and promote one. A publish never
-          overwrites: the registry keeps every version, and instances follow{" "}
-          <span className="font-mono">latest</span> until they pin one.
+          <RichText text={t("skills.list.footerHint")} />
         </p>
       ) : null}
 
@@ -187,7 +199,10 @@ export function SkillsPage() {
             knownSkills={rows}
             onPublished={(detail) => {
               toast.success(
-                `Published ${detail.name} ${detail.versions[detail.versions.length - 1]?.version ?? ""}.`,
+                t("skills.list.published", {
+                  name: detail.name,
+                  version: detail.versions[detail.versions.length - 1]?.version ?? "",
+                }),
               );
               navigate(`/skills/${detail.name}`);
             }}
@@ -204,15 +219,18 @@ export function SkillsPage() {
   );
 }
 
-function skillSummaryText(rows: SkillSummary[], loaded: boolean): string {
-  if (!loaded) return "Loading the skill registry.";
-  if (rows.length === 0) {
-    return "One versioned registry, mounted read-only in the instances that declare it.";
-  }
+function skillSummaryText(
+  rows: SkillSummary[],
+  loaded: boolean,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (!loaded) return t("skills.list.loading");
+  if (rows.length === 0) return t("skills.list.summaryEmpty");
   const versions = rows.reduce((total, skill) => total + skill.versions.length, 0);
   const mounts = rows.reduce((total, skill) => total + skill.instances_count, 0);
-  return `${rows.length} ${plural(rows.length, "skill")} · ${versions} ${plural(
+  return t("skills.list.summary", {
+    skills: rows.length,
     versions,
-    "version",
-  )} · ${mounts} ${plural(mounts, "mount")} · mounted read-only at /opt/data/skills`;
+    mounts,
+  });
 }

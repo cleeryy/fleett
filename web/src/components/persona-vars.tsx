@@ -3,6 +3,8 @@ import { Plus, Trash2 } from "lucide-react";
 import type { PersonaVariable } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import { newVariableRow, type PersonaVariableRow } from "@/lib/personas";
 
 /**
@@ -24,11 +26,12 @@ export function PersonaVariableInputs({
   disabled?: boolean;
   className?: string;
 }) {
+  const { t } = useI18n();
   if (variables.length === 0) {
     return (
       <div className={className}>
         <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
-          This persona takes no variables: the same text is used everywhere.
+          {t("personas.vars.noVariables")}
         </p>
       </div>
     );
@@ -56,17 +59,17 @@ export function PersonaVariableInputs({
                 disabled={disabled}
                 placeholder={
                   variable.default !== undefined && variable.default !== ""
-                    ? `Default: ${variable.default}`
-                    : "No default: a value is required for a clean render"
+                    ? t("personas.vars.defaultValue", { value: variable.default })
+                    : t("personas.vars.noDefault")
                 }
-                aria-label={`Value for ${variable.key}`}
+                aria-label={t("personas.vars.valueFor", { key: variable.key })}
                 aria-describedby={`${id}-help`}
                 onChange={(event) =>
                   onChange({ ...values, [variable.key]: event.target.value })
                 }
               />
               <p id={`${id}-help`} className="sr-only">
-                {variable.description} Leave empty to use the persona default.
+                {t("personas.vars.help", { description: variable.description })}
               </p>
             </div>
           );
@@ -90,6 +93,7 @@ export function PersonaVariableEditor({
   idPrefix: string;
   disabled?: boolean;
 }) {
+  const { t } = useI18n();
   const focusId = useRef<string | null>(null);
 
   useEffect(() => {
@@ -113,34 +117,32 @@ export function PersonaVariableEditor({
     <div className="space-y-3 rounded-md border p-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <p className="text-sm font-medium">Variables</p>
+          <p className="text-sm font-medium">{t("personas.vars.title")}</p>
           <p className="text-xs text-muted-foreground">
-            Placeholders written as <span className="font-mono">{"{{key}}"}</span> in SOUL.md:
-            lowercase letters, digits and underscores, starting with a letter. The value is stored on
-            each instance, never on the persona.
+            <RichText text={t("personas.vars.editorHint")} />
           </p>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={addRow} disabled={disabled}>
           <Plus aria-hidden />
-          Add variable
+          {t("env.add")}
         </Button>
       </div>
 
       {rows.length === 0 ? (
         <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
-          No variables. The SOUL.md is the same for every instance that uses this persona.
+          {t("personas.vars.editorEmpty")}
         </p>
       ) : (
         <div className="space-y-3">
           <div className="hidden gap-2 px-0 text-[11px] text-muted-foreground sm:grid sm:grid-cols-[minmax(0,180px)_minmax(0,1fr)_minmax(0,160px)_2.25rem]">
-            <span>Key</span>
-            <span>Description</span>
-            <span>Default (optional)</span>
-            <span className="sr-only">Remove</span>
+            <span>{t("personas.vars.key")}</span>
+            <span>{t("common.description")}</span>
+            <span>{t("personas.vars.defaultOptional")}</span>
+            <span className="sr-only">{t("common.remove")}</span>
           </div>
           {rows.map((row, index) => {
             const rowErrors = errors[row.id];
-            const label = row.key.trim() || `variable ${index + 1}`;
+            const label = row.key.trim() || t("env.variableN", { index: index + 1 });
             return (
               <div key={row.id} className="space-y-1">
                 <div className="grid gap-2 sm:grid-cols-[minmax(0,180px)_minmax(0,1fr)_minmax(0,160px)_2.25rem] sm:items-start">
@@ -152,7 +154,7 @@ export function PersonaVariableEditor({
                     disabled={disabled}
                     className="font-mono text-xs"
                     placeholder="agent_name"
-                    aria-label={`${label} key`}
+                    aria-label={t("personas.vars.keyAria", { name: label })}
                     aria-invalid={!!rowErrors?.key}
                     aria-describedby={rowErrors?.key ? `${idPrefix}-${row.id}-key-error` : undefined}
                     onChange={(event) => patch(row.id, { key: event.target.value })}
@@ -162,8 +164,8 @@ export function PersonaVariableEditor({
                     value={row.description}
                     autoComplete="off"
                     disabled={disabled}
-                    placeholder="What the variable is for"
-                    aria-label={`${label} description`}
+                    placeholder={t("personas.vars.descriptionPlaceholder")}
+                    aria-label={t("personas.vars.descriptionAria", { name: label })}
                     aria-invalid={!!rowErrors?.description}
                     aria-describedby={
                       rowErrors?.description ? `${idPrefix}-${row.id}-description-error` : undefined
@@ -175,16 +177,16 @@ export function PersonaVariableEditor({
                     value={row.default}
                     autoComplete="off"
                     disabled={disabled}
-                    placeholder="Used when empty"
-                    aria-label={`${label} default value`}
+                    placeholder={t("personas.vars.defaultPlaceholder")}
+                    aria-label={t("personas.vars.defaultAria", { name: label })}
                     onChange={(event) => patch(row.id, { default: event.target.value })}
                   />
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label={`Remove ${label}`}
-                    title={`Remove ${label}`}
+                    aria-label={t("env.removeAria", { name: label })}
+                    title={t("env.removeAria", { name: label })}
                     disabled={disabled}
                     onClick={() => onChange(rows.filter((candidate) => candidate.id !== row.id))}
                   >

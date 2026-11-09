@@ -60,7 +60,8 @@ import {
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
-import { formatClock, formatUptime, plural } from "@/lib/format";
+import { formatClock, formatUptime } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import {
   readOnboardingMemory,
   writeOnboardingMemory,
@@ -84,12 +85,13 @@ function ChannelIcon({ channel }: { channel: string }) {
 
 /** Quiet marker for the exception: this agent can reach the LAN. */
 function LanBadge() {
+  const { t } = useI18n();
   return (
     <Badge
       variant="secondary"
       className="gap-1 px-1.5 font-mono text-[11px] font-normal"
-      aria-label="LAN access enabled"
-      title="LAN access enabled: can reach 10/8, 172.16/12 and 192.168/16"
+      aria-label={t("fleet.lanBadge")}
+      title={t("fleet.lanBadgeTitle")}
     >
       <Network aria-hidden />
       LAN
@@ -99,6 +101,7 @@ function LanBadge() {
 
 /** Persona name plus drift, shown next to the instance name. */
 function PersonaBadge({ row, name }: { row: InstanceSummary; name?: string }) {
+  const { t } = useI18n();
   if (!row.persona) return null;
   const diverged = row.persona_state === "diverged";
   return (
@@ -110,13 +113,13 @@ function PersonaBadge({ row, name }: { row: InstanceSummary; name?: string }) {
       )}
       title={
         diverged
-          ? `Persona ${name ?? row.persona}: SOUL.md was edited by hand`
-          : `Persona ${name ?? row.persona}`
+          ? t("fleet.personaDiverged", { name: name ?? row.persona })
+          : t("fleet.personaTitle", { name: name ?? row.persona })
       }
     >
       <Fingerprint aria-hidden />
       <span className="truncate">{name ?? row.persona}</span>
-      {diverged ? <span className="shrink-0">· diverged</span> : null}
+      {diverged ? <span className="shrink-0">· {t("status.diverged")}</span> : null}
     </Badge>
   );
 }
@@ -132,14 +135,15 @@ function RowMenu({
   onAction: (action: "start" | "stop" | "restart") => void;
   onDelete: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label={`Actions for ${row.name}`}
-          title={`Actions for ${row.name}`}
+          aria-label={t("fleet.rowActions", { name: row.name })}
+          title={t("fleet.rowActions", { name: row.name })}
           disabled={pending}
         >
           {pending ? <Loader2 aria-hidden className="animate-spin" /> : <MoreHorizontal aria-hidden />}
@@ -148,26 +152,26 @@ function RowMenu({
       <DropdownMenuContent align="end" className="w-44">
         <DropdownMenuItem disabled={row.status === "running"} onSelect={() => onAction("start")}>
           <Play aria-hidden />
-          Start
+          {t("action.start")}
         </DropdownMenuItem>
         <DropdownMenuItem disabled={row.status !== "running"} onSelect={() => onAction("stop")}>
           <Square aria-hidden />
-          Stop
+          {t("action.stop")}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => onAction("restart")}>
           <RotateCw aria-hidden />
-          Restart
+          {t("action.restart")}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
           <a href={hrefFor(`/instances/${row.id}`)}>
             <ExternalLink aria-hidden />
-            Open
+            {t("common.open")}
           </a>
         </DropdownMenuItem>
         <DropdownMenuItem variant="destructive" onSelect={onDelete}>
           <Trash2 aria-hidden />
-          Delete…
+          {t("common.deleteEllipsis")}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -175,6 +179,7 @@ function RowMenu({
 }
 
 export function FleetPage() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const [q, setQ] = useState(persisted.q);
   const [status, setStatus] = useState<Filter>(persisted.status);
@@ -331,7 +336,18 @@ export function FleetPage() {
     setActionError(null);
     try {
       await api.action(id, action);
-      toast.success(`${id}: ${action === "stop" ? "stopped" : action === "start" ? "started" : "restarted"}.`);
+      toast.success(
+        t("palette.actionDone", {
+          id,
+          state: t(
+            action === "stop"
+              ? "status.stopped"
+              : action === "start"
+                ? "status.started"
+                : "status.restarted",
+          ),
+        }),
+      );
       setNonce((value) => value + 1);
     } catch (cause) {
       setActionError(toApiError(cause));
@@ -343,13 +359,13 @@ export function FleetPage() {
   const emptyState = !hasAny ? (
     <EmptyState
       icon={Boxes}
-      title="No instances yet"
+      title={t("fleet.emptyTitle")}
       description={
         setupPending
-          ? `${setupDone} of ${setupTotal} setup steps are done. The getting-started steps cover Docker, the agent image, a provider and the first instance.`
+          ? t("fleet.emptySetup", { done: setupDone, total: setupTotal })
           : canEdit
-            ? "Create one to start a container. Each instance is its own compose project."
-            : "No instance exists. Your role is read-only; ask an admin to create one."
+            ? t("fleet.emptyCreate")
+            : t("fleet.emptyReadOnly")
       }
       action={
         canEdit || setupDismissed ? (
@@ -358,13 +374,13 @@ export function FleetPage() {
               <Button asChild>
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  New instance
+                  {t("nav.newInstance")}
                 </a>
               </Button>
             ) : null}
             {setupDismissed ? (
               <Button variant="outline" onClick={showOnboardingAgain}>
-                Show getting started
+                {t("fleet.showGettingStarted")}
               </Button>
             ) : null}
           </div>
@@ -374,8 +390,8 @@ export function FleetPage() {
   ) : (
     <EmptyState
       icon={Search}
-      title="No instances match the filters"
-      description="Clear the search or pick another status."
+      title={t("fleet.noMatchTitle")}
+      description={t("fleet.noMatchDescription")}
       action={
         <Button
           variant="outline"
@@ -384,7 +400,7 @@ export function FleetPage() {
             setStatus("all");
           }}
         >
-          Clear filters
+          {t("common.clearFilters")}
         </Button>
       }
     />
@@ -393,25 +409,26 @@ export function FleetPage() {
   return (
     <>
       <PageHeader
-        title="Instances"
+        title={t("nav.instances")}
         description={
           list.data
-            ? `${list.data.length} ${plural(list.data.length, "instance")}${
-                errorCount > 0 ? ` · ${errorCount} in error` : ""
-              }`
-            : "Loading instances."
+            ? `${t(
+                list.data.length === 1 ? "fleet.countOne" : "fleet.countMany",
+                { count: list.data.length },
+              )}${errorCount > 0 ? t("fleet.inErrorSuffix", { count: errorCount }) : ""}`
+            : t("common.loadingInstances")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={list.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <Button asChild size="sm">
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  New instance
+                  {t("nav.newInstance")}
                 </a>
               </Button>
             ) : null}
@@ -442,19 +459,21 @@ export function FleetPage() {
         <Alert className="border-destructive/40 bg-destructive/5">
           <TriangleAlert aria-hidden className="text-destructive" />
           <AlertTitle>
-            {openIncidents.data?.length} open{" "}
-            {openIncidents.data?.length === 1 ? "incident" : "incidents"}
+            {t(
+              openIncidents.data?.length === 1 ? "fleet.openIncidentOne" : "fleet.openIncidentMany",
+              { count: openIncidents.data?.length ?? 0 },
+            )}
           </AlertTitle>
           <AlertDescription>
             <p>
-              Affected:{" "}
+              {t("fleet.affected")}{" "}
               <span className="font-mono">
                 {[...new Set((openIncidents.data ?? []).map((incident) => incident.instance_id))].join(", ")}
               </span>
               .
             </p>
             <a href="#/incidents" className="mt-1 text-sm font-medium underline-offset-4 hover:underline">
-              Open the incident list
+              {t("fleet.openIncidentList")}
             </a>
           </AlertDescription>
         </Alert>
@@ -467,25 +486,26 @@ export function FleetPage() {
             ref={searchRef}
             value={q}
             onChange={(event) => setQ(event.target.value)}
-            placeholder="Search name, id, model"
-            aria-label="Search instances"
+            placeholder={t("fleet.searchPlaceholder")}
+            aria-label={t("fleet.searchAria")}
             className="pl-8"
           />
         </div>
         <Select value={status} onValueChange={(value) => setStatus(value as Filter)} disabled={!list.data}>
-          <SelectTrigger className="w-full sm:w-44" aria-label="Filter by status">
+          <SelectTrigger className="w-full sm:w-44" aria-label={t("fleet.filterAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {FILTERS.map((filter) => (
               <SelectItem key={filter} value={filter}>
-                {filter === "all" ? "All" : filter} ({counts[filter] ?? 0})
+                {filter === "all" ? t("common.all") : t(`status.${filter}`)} (
+                {counts[filter] ?? 0})
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
         <p className="text-xs text-muted-foreground sm:ml-auto" aria-live="polite">
-          {refreshedAt ? `Updated ${formatClock(refreshedAt)}` : "…"}
+          {refreshedAt ? t("common.updatedAt", { time: formatClock(refreshedAt) }) : "…"}
         </p>
       </div>
 
@@ -496,13 +516,13 @@ export function FleetPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[120px]">Status</TableHead>
-                    <TableHead>Name</TableHead>
-                    <TableHead className="hidden lg:table-cell">Model</TableHead>
-                    <TableHead className="hidden md:table-cell">Channel</TableHead>
-                    <TableHead className="hidden lg:table-cell">Shares</TableHead>
+                    <TableHead className="w-[120px]">{t("common.status")}</TableHead>
+                    <TableHead>{t("common.name")}</TableHead>
+                    <TableHead className="hidden lg:table-cell">{t("fleet.model")}</TableHead>
+                    <TableHead className="hidden md:table-cell">{t("fleet.channel")}</TableHead>
+                    <TableHead className="hidden lg:table-cell">{t("nav.shares")}</TableHead>
                     <TableHead className="w-[90px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -558,13 +578,13 @@ export function FleetPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[120px]">Status</TableHead>
-                    <TableHead>Name</TableHead>
-                    <TableHead className="hidden lg:table-cell">Model</TableHead>
-                    <TableHead className="hidden md:table-cell">Channel</TableHead>
-                    <TableHead className="hidden lg:table-cell">Shares</TableHead>
+                    <TableHead className="w-[120px]">{t("common.status")}</TableHead>
+                    <TableHead>{t("common.name")}</TableHead>
+                    <TableHead className="hidden lg:table-cell">{t("fleet.model")}</TableHead>
+                    <TableHead className="hidden md:table-cell">{t("fleet.channel")}</TableHead>
+                    <TableHead className="hidden lg:table-cell">{t("nav.shares")}</TableHead>
                     <TableHead className="w-[90px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -612,7 +632,7 @@ export function FleetPage() {
                         <TableCell className="hidden md:table-cell">
                           <span className="flex items-center gap-1.5 text-sm">
                             <ChannelIcon channel={row.channel} />
-                            {row.channel}
+                            {t(`channel.${row.channel}`)}
                           </span>
                         </TableCell>
                         <TableCell className="hidden lg:table-cell">
@@ -651,7 +671,7 @@ export function FleetPage() {
                             />
                           ) : (
                             <Button asChild variant="outline" size="sm">
-                              <a href={hrefFor(`/instances/${row.id}`)}>Open</a>
+                              <a href={hrefFor(`/instances/${row.id}`)}>{t("common.open")}</a>
                             </Button>
                           )}
                         </TableCell>
@@ -697,22 +717,22 @@ export function FleetPage() {
                     </div>
                     <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
                       <div className="min-w-0">
-                        <dt className="text-muted-foreground">Model</dt>
+                        <dt className="text-muted-foreground">{t("fleet.model")}</dt>
                         <dd className="truncate font-mono">{row.model}</dd>
                       </div>
                       <div>
-                        <dt className="text-muted-foreground">Channel</dt>
+                        <dt className="text-muted-foreground">{t("fleet.channel")}</dt>
                         <dd className="flex items-center gap-1.5">
                           <ChannelIcon channel={row.channel} />
-                          {row.channel}
+                          {t(`channel.${row.channel}`)}
                         </dd>
                       </div>
                       <div>
-                        <dt className="text-muted-foreground">Uptime</dt>
+                        <dt className="text-muted-foreground">{t("fleet.uptime")}</dt>
                         <dd className="font-mono">{uptime}</dd>
                       </div>
                       <div className="min-w-0">
-                        <dt className="text-muted-foreground">Shares</dt>
+                        <dt className="text-muted-foreground">{t("nav.shares")}</dt>
                         <dd className="truncate font-mono">
                           {row.shares.length ? row.shares.join(", ") : "—"}
                         </dd>
@@ -720,7 +740,7 @@ export function FleetPage() {
                     </dl>
                     <div className="flex items-center justify-end gap-2">
                       <Button asChild variant="outline" size="sm">
-                        <a href={hrefFor(`/instances/${row.id}`)}>Open</a>
+                        <a href={hrefFor(`/instances/${row.id}`)}>{t("common.open")}</a>
                       </Button>
                       {canEdit ? (
                         <RowMenu
@@ -740,11 +760,12 @@ export function FleetPage() {
       </div>
 
       <p className="hidden text-xs text-muted-foreground md:block">
-        <span className="font-mono">j</span> <span className="font-mono">k</span> move · Enter open ·{" "}
-        <span className="font-mono">/</span> search
+        <span className="font-mono">j</span> <span className="font-mono">k</span>{" "}
+        {t("fleet.keysMove")} · {t("fleet.keysEnter")} ·{" "}
+        <span className="font-mono">/</span> {t("fleet.keysSearch")}
         {canEdit ? (
           <>
-            {" "}· <span className="font-mono">c</span> create
+            {" "}· <span className="font-mono">c</span> {t("fleet.keysCreate")}
           </>
         ) : null}
       </p>
@@ -762,7 +783,9 @@ export function FleetPage() {
         onDeleted={() => {
           const id = deleteTarget?.id;
           setDeleteTarget(null);
-          toast.success(id ? `Instance ${id} deleted.` : "Instance deleted.");
+          toast.success(
+            id ? t("fleet.deletedId", { id }) : t("fleet.deleted"),
+          );
           setNonce((value) => value + 1);
         }}
       />

@@ -24,7 +24,8 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorAlert } from "@/components/error-alert";
-import { plural } from "@/lib/format";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 
 function followerOf(instance: InstanceSummary, name: string): boolean {
@@ -52,6 +53,7 @@ export function SkillPromoteDialog({
   onOpenChange: (open: boolean) => void;
   onPromoted: (latest: string) => void;
 }) {
+  const { t } = useI18n();
   const [version, setVersion] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -105,10 +107,14 @@ export function SkillPromoteDialog({
       const restarted = response.results.length - failed;
       if (failed === 0) {
         toast.success(
-          `latest is ${response.latest}${restarted ? ` · ${restarted} restarted` : ""}.`,
+          restarted === 0
+            ? t("skills.promote.toastOkNoRestart", { version: response.latest })
+            : t("skills.promote.toastOk", { version: response.latest, restarted }),
         );
       } else {
-        toast.error(`${failed} of ${response.results.length} restarts failed.`);
+        toast.error(
+          t("skills.promote.toastFailed", { failed, total: response.results.length }),
+        );
       }
       onPromoted(response.latest);
     } catch (cause) {
@@ -122,10 +128,9 @@ export function SkillPromoteDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Promote {skill.name}</DialogTitle>
+          <DialogTitle>{t("skills.promote.title", { name: skill.name })}</DialogTitle>
           <DialogDescription>
-            Moves <span className="font-mono">latest</span> to the chosen version, then restarts
-            every instance that follows it, one at a time. Pinned instances are not touched.
+            <RichText text={t("skills.promote.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -134,21 +139,24 @@ export function SkillPromoteDialog({
             <p className="flex flex-wrap items-center gap-2 text-sm">
               <CheckCircle2 aria-hidden className="size-4 text-emerald-600 dark:text-emerald-400" />
               <span>
-                <span className="font-mono">latest</span> is now{" "}
+                {t("skills.promote.nowLatest")}{" "}
                 <span className="font-mono font-medium">{result.latest}</span>
               </span>
               <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                {result.results.filter((entry) => entry.status !== "failed").length} restarted
+                {t("skills.promote.restartedCount", {
+                  count: result.results.filter((entry) => entry.status !== "failed").length,
+                })}
                 {result.results.some((entry) => entry.status === "failed")
-                  ? ` · ${result.results.filter((entry) => entry.status === "failed").length} failed`
+                  ? t("skills.promote.failedSuffix", {
+                      count: result.results.filter((entry) => entry.status === "failed").length,
+                    })
                   : ""}
               </Badge>
             </p>
 
             {result.results.length === 0 ? (
               <p className="rounded-md border px-3 py-2.5 text-sm text-muted-foreground">
-                No instance follows <span className="font-mono">latest</span>: nothing was
-                restarted. Pinned instances keep their version until you change the pin.
+                <RichText text={t("skills.promote.noFollowers")} />
               </p>
             ) : (
               <ul className="divide-y rounded-md border">
@@ -168,7 +176,9 @@ export function SkillPromoteDialog({
                           className="shrink-0 gap-1 font-mono text-[11px] font-normal"
                         >
                           {failed ? <XCircle aria-hidden /> : <CheckCircle2 aria-hidden />}
-                          {entry.status}
+                          {failed
+                            ? t("skills.promote.statusFailed")
+                            : t("skills.promote.statusRestarted")}
                         </Badge>
                       </div>
                       {entry.error ? (
@@ -184,24 +194,30 @@ export function SkillPromoteDialog({
 
             {pinned.length > 0 ? (
               <p className="text-xs text-muted-foreground">
-                {pinned.length} {plural(pinned.length, "instance")} pinned to a version and left
-                untouched.
+                {t(
+                  pinned.length === 1
+                    ? "skills.promote.pinnedOne"
+                    : "skills.promote.pinnedMany",
+                  { count: pinned.length },
+                )}
               </p>
             ) : null}
           </div>
         ) : (
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="skill-promote-version">Version to promote</Label>
+              <Label htmlFor="skill-promote-version">{t("skills.promote.versionLabel")}</Label>
               <Select value={version} onValueChange={setVersion} disabled={pending}>
                 <SelectTrigger id="skill-promote-version" className="w-full font-mono">
-                  <SelectValue placeholder="Pick a version" />
+                  <SelectValue placeholder={t("skills.promote.versionPlaceholder")} />
                 </SelectTrigger>
                 <SelectContent>
                   {options.map((entry) => (
                     <SelectItem key={entry.version} value={entry.version}>
                       {entry.version}
-                      {entry.version === skill.latest ? " (current latest)" : ""}
+                      {entry.version === skill.latest
+                        ? t("skills.promote.currentLatest")
+                        : ""}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -209,8 +225,7 @@ export function SkillPromoteDialog({
               {alreadyLatest ? (
                 <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
                   <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-                  This version is already latest: promoting it restarts the followers again without
-                  changing what they mount.
+                  {t("skills.promote.alreadyLatest")}
                 </p>
               ) : null}
             </div>
@@ -218,10 +233,13 @@ export function SkillPromoteDialog({
             <div className="space-y-2">
               <p className="text-sm font-medium">
                 {instances === null
-                  ? "Loading instances…"
-                  : `${followers.length} ${plural(followers.length, "instance")} ${
-                      followers.length === 1 ? "follows" : "follow"
-                    } latest and will restart`}
+                  ? t("skills.promote.loadingInstances")
+                  : t(
+                      followers.length === 1
+                        ? "skills.promote.followersOne"
+                        : "skills.promote.followersMany",
+                      { count: followers.length },
+                    )}
               </p>
               {instancesError ? (
                 <ErrorAlert error={instancesError} onRetry={() => setReloadKey((value) => value + 1)} />
@@ -229,7 +247,7 @@ export function SkillPromoteDialog({
                 <Skeleton className="h-16 w-full rounded-md" />
               ) : followers.length === 0 ? (
                 <p className="rounded-md border px-3 py-2.5 text-sm text-muted-foreground">
-                  No instance follows latest. The pointer moves; nothing restarts.
+                  {t("skills.promote.noFollowersShort")}
                 </p>
               ) : (
                 <ul className="max-h-48 divide-y overflow-auto rounded-md border">
@@ -250,7 +268,12 @@ export function SkillPromoteDialog({
               )}
               {pinned.length > 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  {pinned.length} {plural(pinned.length, "instance")} pinned:{" "}
+                  {t(
+                    pinned.length === 1
+                      ? "skills.promote.pinnedListOne"
+                      : "skills.promote.pinnedListMany",
+                    { count: pinned.length },
+                  )}{" "}
                   {pinned
                     .map(
                       (instance) =>
@@ -271,18 +294,18 @@ export function SkillPromoteDialog({
 
         <DialogFooter>
           {result ? (
-            <Button onClick={() => onOpenChange(false)}>Close</Button>
+            <Button onClick={() => onOpenChange(false)}>{t("common.close")}</Button>
           ) : (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 onClick={() => void confirm()}
                 disabled={pending || !version}
               >
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <RotateCw aria-hidden />}
-                Promote and restart {followers.length}
+                {t("skills.promote.confirm", { count: followers.length })}
               </Button>
             </>
           )}

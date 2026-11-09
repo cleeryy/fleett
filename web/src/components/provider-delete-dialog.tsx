@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ErrorAlert } from "@/components/error-alert";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 
 /** `details.instances` of a `409 provider_in_use`, defensively parsed. */
@@ -46,6 +47,7 @@ export function DeleteProviderDialog({
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
+  const { t } = useI18n();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
 
@@ -65,7 +67,7 @@ export function DeleteProviderDialog({
     setError(null);
     try {
       await api.deleteProvider(provider.id);
-      toast.success(`Provider ${provider.name} deleted.`);
+      toast.success(t("providers.delete.done", { name: provider.name }));
       onDeleted();
       onOpenChange(false);
     } catch (cause) {
@@ -80,21 +82,26 @@ export function DeleteProviderDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            Delete provider <span className="font-mono">{provider.name}</span>?
+            {t("providers.delete.title")}{" "}
+            <span className="font-mono">{provider.name}</span>?
           </DialogTitle>
           <DialogDescription>
-            Removes the stored credential. Instances that still reference it block the deletion.
+            {t("providers.delete.description")}
           </DialogDescription>
         </DialogHeader>
 
         {attached ? (
           <Alert variant="destructive" className="items-start">
             <AlertCircle aria-hidden className="mt-0.5 size-4" />
-            <AlertTitle>Provider still in use</AlertTitle>
+            <AlertTitle>{t("providers.delete.inUseTitle")}</AlertTitle>
             <AlertDescription>
               <p>
-                {attached.length} {attached.length === 1 ? "instance still references" : "instances still reference"}{" "}
-                this credential. The controller refuses to delete it until they are reassigned.
+                {t(
+                  attached.length === 1
+                    ? "providers.delete.inUseOne"
+                    : "providers.delete.inUseMany",
+                  { count: attached.length },
+                )}
               </p>
               <ul className="mt-2 divide-y rounded-md border border-destructive/30">
                 {attached.map((instance) => (
@@ -117,12 +124,12 @@ export function DeleteProviderDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-            {attached ? "Close" : "Cancel"}
+            {attached ? t("common.close") : t("common.cancel")}
           </Button>
           {attached ? null : (
             <Button variant="destructive" onClick={onDelete} disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Trash2 aria-hidden />}
-              Delete provider
+              {t("providers.delete.confirm")}
             </Button>
           )}
         </DialogFooter>

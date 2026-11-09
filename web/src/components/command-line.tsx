@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
  */
 export function CommandLine({
   value,
-  label = "Copy command",
+  label,
   badge,
   className,
 }: {

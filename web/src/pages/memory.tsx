@@ -34,13 +34,15 @@ import {
   NamespaceBadge,
   memoryPreview,
 } from "@/components/memory";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 const ALL = "all";
 
 export function MemoryPage() {
+  const { t, lang } = useI18n();
   const canEdit = useCanEdit();
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
@@ -126,8 +128,11 @@ export function MemoryPage() {
       const result = await api.purgeExpiredMemory();
       toast.success(
         result.removed === 0
-          ? "No expired entry to remove."
-          : `${result.removed} expired ${plural(result.removed, "entry", "entries")} removed.`,
+          ? t("memory.noExpired")
+          : t(
+              result.removed === 1 ? "memory.purgedOne" : "memory.purgedMany",
+              { count: result.removed },
+            ),
       );
       setPurgeOpen(false);
       setNonce((value) => value + 1);
@@ -154,19 +159,19 @@ export function MemoryPage() {
   const emptyState = filtering ? (
     <EmptyState
       icon={Search}
-      title="No entry matches"
-      description="Try fewer words, another namespace or remove the tag filter. Search covers keys, values and tags."
+      title={t("memory.noMatchTitle")}
+      description={t("memory.noMatchDescription")}
       action={
         <Button variant="outline" size="sm" onClick={clearFilters}>
-          Clear filters
+          {t("common.clearFilters")}
         </Button>
       }
     />
   ) : (
     <EmptyState
       icon={Brain}
-      title="The fleet memory is empty"
-      description="Store a durable lesson, a contract or a runbook. Every agent can read it; entries are searchable by key, value and tags."
+      title={t("memory.emptyTitle")}
+      description={t("memory.emptyDescription")}
       action={
         canEdit ? (
           <Button
@@ -177,7 +182,7 @@ export function MemoryPage() {
             }}
           >
             <Plus aria-hidden />
-            New entry
+            {t("memory.newEntry")}
           </Button>
         ) : undefined
       }
@@ -187,17 +192,19 @@ export function MemoryPage() {
   return (
     <>
       <PageHeader
-        title="Memory"
+        title={t("nav.memory")}
         description={
           entries.data
-            ? `${rows.length} ${plural(rows.length, "entry", "entries")} · searchable by every agent · plaintext, never secrets`
-            : "Loading fleet memory."
+            ? t(rows.length === 1 ? "memory.countOne" : "memory.countMany", {
+                count: rows.length,
+              })
+            : t("memory.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={entries.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <>
@@ -210,7 +217,7 @@ export function MemoryPage() {
                   }}
                 >
                   <Trash2 aria-hidden />
-                  Purge expired
+                  {t("memory.purge")}
                 </Button>
                 <Button
                   size="sm"
@@ -220,7 +227,7 @@ export function MemoryPage() {
                   }}
                 >
                   <Plus aria-hidden />
-                  New entry
+                  {t("memory.newEntry")}
                 </Button>
               </>
             ) : null}
@@ -231,12 +238,12 @@ export function MemoryPage() {
       {entries.error ? <ErrorAlert error={entries.error} onRetry={entries.reload} /> : null}
 
       <section
-        aria-label="Memory filters"
+        aria-label={t("memory.filtersAria")}
         className="grid gap-3 rounded-md border p-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1fr)_220px_200px]"
       >
         <div className="space-y-1.5 sm:col-span-2 lg:col-span-1">
           <Label htmlFor="memory-search" className="text-xs text-muted-foreground">
-            Search
+            {t("common.search")}
           </Label>
           <div className="relative">
             <Search
@@ -247,7 +254,7 @@ export function MemoryPage() {
               id="memory-search"
               value={q}
               onChange={(event) => setQ(event.target.value)}
-              placeholder="Search keys, values and tags"
+              placeholder={t("memory.searchPlaceholder")}
               className="pl-8"
               autoComplete="off"
               spellCheck={false}
@@ -257,18 +264,18 @@ export function MemoryPage() {
 
         <div className="space-y-1.5">
           <Label htmlFor="memory-namespace-filter" className="text-xs text-muted-foreground">
-            Namespace
+            {t("memory.namespace")}
           </Label>
           <Select value={namespace} onValueChange={setNamespace}>
             <SelectTrigger
               id="memory-namespace-filter"
               className="w-full"
-              aria-label="Filter by namespace"
+              aria-label={t("memory.namespaceAria")}
             >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={ALL}>All namespaces</SelectItem>
+              <SelectItem value={ALL}>{t("memory.allNamespaces")}</SelectItem>
               {knownNamespaces.map((value) => (
                 <SelectItem key={value} value={value}>
                   <span className="font-mono">{value}</span>
@@ -280,13 +287,13 @@ export function MemoryPage() {
 
         <div className="space-y-1.5">
           <Label htmlFor="memory-tag-filter" className="text-xs text-muted-foreground">
-            Tags
+            {t("memory.tags")}
           </Label>
           <Input
             id="memory-tag-filter"
             value={tag}
             onChange={(event) => setTag(event.target.value)}
-            placeholder="ops, backup"
+            placeholder={t("memory.tagsPlaceholder")}
             autoComplete="off"
             spellCheck={false}
             aria-describedby="memory-tag-hint"
@@ -295,8 +302,8 @@ export function MemoryPage() {
       </section>
 
       <p id="memory-tag-hint" className="text-xs text-muted-foreground">
-        {entries.refreshing ? "Searching…" : "Tags are comma-separated and all must match."}
-        {filtering ? " Filters applied." : ""}
+        {entries.refreshing ? t("memory.searching") : t("memory.tagsHint")}
+        {filtering ? t("memory.filtersApplied") : ""}
       </p>
 
       <div className="rounded-md border" aria-busy={entries.loading || entries.refreshing}>
@@ -325,14 +332,14 @@ export function MemoryPage() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[170px]">Key</TableHead>
-                    <TableHead className="w-[150px]">Namespace</TableHead>
-                    <TableHead className="w-[55px]">Version</TableHead>
-                    <TableHead className="w-[140px]">Tags</TableHead>
-                    <TableHead className="w-[150px]">Updated</TableHead>
-                    <TableHead>Value</TableHead>
+                    <TableHead className="w-[170px]">{t("personas.vars.key")}</TableHead>
+                    <TableHead className="w-[150px]">{t("memory.namespace")}</TableHead>
+                    <TableHead className="w-[55px]">{t("common.version")}</TableHead>
+                    <TableHead className="w-[140px]">{t("memory.tags")}</TableHead>
+                    <TableHead className="w-[150px]">{t("common.updated")}</TableHead>
+                    <TableHead>{t("assistant.proposal.value")}</TableHead>
                     <TableHead className="w-[70px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -359,7 +366,7 @@ export function MemoryPage() {
                       <TableCell>
                         <span
                           className="font-mono text-xs"
-                          title={formatRelative(entry.updated_at)}
+                          title={formatRelative(entry.updated_at, lang)}
                         >
                           {formatDateTime(entry.updated_at)}
                         </span>
@@ -373,13 +380,13 @@ export function MemoryPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          aria-label={`Open memory entry ${entry.key}`}
+                          aria-label={t("memory.openAria", { key: entry.key })}
                           onClick={(event) => {
                             event.stopPropagation();
                             open(entry);
                           }}
                         >
-                          Open
+                          {t("common.open")}
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -394,7 +401,7 @@ export function MemoryPage() {
                   key={entry.id}
                   type="button"
                   className="block w-full space-y-2 p-4 text-left transition-colors hover:bg-muted/40 focus-visible:bg-muted/40"
-                  aria-label={`Open memory entry ${entry.key}`}
+                  aria-label={t("memory.openAria", { key: entry.key })}
                   onClick={() => open(entry)}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -454,14 +461,9 @@ export function MemoryPage() {
             setPurgeError(null);
           }
         }}
-        title="Purge expired memory?"
-        description={
-          <>
-            Removes every entry whose expiry has passed, with its history and search index. Entries
-            that never expire are untouched.
-          </>
-        }
-        confirmLabel="Purge expired"
+        title={t("memory.purgeTitle")}
+        description={t("memory.purgeDescription")}
+        confirmLabel={t("memory.purge")}
         destructive
         pending={purging}
         error={purgeError}

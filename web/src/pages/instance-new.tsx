@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { Check, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { ChannelType, EnvSuggestion, ShareRef, SkillRef } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { EnvironmentRows } from "@/components/env-rows";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PageHeader } from "@/components/page-header";
 import { PersonaPreviewPanel } from "@/components/persona-preview";
 import { PersonaSelect } from "@/components/persona-select";
@@ -33,27 +34,27 @@ import { envPayload, validateEnvRows, type EnvRow } from "@/lib/env";
 import { compactVariables } from "@/lib/personas";
 import { MAX_SKILLS_PER_INSTANCE, skillRefPayload, tooManySkills } from "@/lib/skills";
 import { isHttpUrl, isValidSlug, slugify } from "@/lib/validation";
-import { plural } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { navigate, setRouteGuard, hrefFor, useRoute } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
 const STEPS = [
-  "Identity",
-  "Template",
-  "Persona",
-  "Model & network",
-  "Channel",
-  "Shares",
-  "Skills",
-  "Review",
+  "create.step.identity",
+  "create.step.template",
+  "create.step.persona",
+  "create.step.model",
+  "create.step.channel",
+  "create.step.shares",
+  "create.step.skills",
+  "create.step.review",
 ] as const;
 const LAST_STEP = STEPS.length - 1;
 
-const CHANNELS: { value: ChannelType; label: string; hint: string }[] = [
-  { value: "none", label: "None", hint: "No chat channel" },
-  { value: "telegram", label: "Telegram", hint: "Bot token required" },
-  { value: "discord", label: "Discord", hint: "Bot token required" },
+const CHANNELS: { value: ChannelType; labelKey: string; hintKey: string }[] = [
+  { value: "none", labelKey: "channel.none", hintKey: "create.channel.noneHint" },
+  { value: "telegram", labelKey: "channel.telegram", hintKey: "create.channel.tokenHint" },
+  { value: "discord", labelKey: "channel.discord", hintKey: "create.channel.tokenHint" },
 ];
 
 interface Draft {
@@ -117,31 +118,38 @@ function templateChannel(value: string | undefined): ChannelType | null {
   return value === "telegram" || value === "discord" || value === "none" ? value : null;
 }
 
-function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = []): Record<string, string> {
+type Translate = (key: string, params?: Record<string, string | number>) => string;
+
+function validate(
+  draft: Draft,
+  step: number,
+  templateEnv: EnvSuggestion[] = [],
+  t: Translate = (key) => key,
+): Record<string, string> {
   const errors: Record<string, string> = {};
 
   if (step === 0) {
-    if (!draft.name.trim()) errors.name = "Enter a name.";
-    else if (draft.name.trim().length > 48) errors.name = "Use 48 characters or fewer.";
-    if (!draft.id.trim()) errors.id = "Enter an id.";
-    else if (!isValidSlug(draft.id.trim())) errors.id = "Use 2-32 characters: lowercase letters, digits, hyphens.";
-    else if (draft.id.trim() === "new") errors.id = "This id is reserved.";
+    if (!draft.name.trim()) errors.name = t("create.errors.nameRequired");
+    else if (draft.name.trim().length > 48) errors.name = t("create.errors.nameTooLong");
+    if (!draft.id.trim()) errors.id = t("create.errors.idRequired");
+    else if (!isValidSlug(draft.id.trim())) errors.id = t("create.errors.idFormat");
+    else if (draft.id.trim() === "new") errors.id = t("create.errors.idReserved");
   }
 
-  if (step === 1 && !draft.template) errors.template = "Select a template.";
+  if (step === 1 && !draft.template) errors.template = t("create.errors.templateRequired");
 
   if (step === 3) {
-    if (!draft.model.trim()) errors.model = "Enter a model.";
-    if (!draft.baseUrl.trim()) errors.baseUrl = "Enter a base URL.";
-    else if (!isHttpUrl(draft.baseUrl.trim())) errors.baseUrl = "Use an absolute http or https URL.";
-    if (!draft.apiKeyEnv.trim()) errors.apiKeyEnv = "Enter an environment variable name.";
+    if (!draft.model.trim()) errors.model = t("create.errors.modelRequired");
+    if (!draft.baseUrl.trim()) errors.baseUrl = t("create.errors.urlRequired");
+    else if (!isHttpUrl(draft.baseUrl.trim())) errors.baseUrl = t("create.errors.urlInvalid");
+    if (!draft.apiKeyEnv.trim()) errors.apiKeyEnv = t("create.errors.envRequired");
     else if (!/^[A-Z_][A-Z0-9_]*$/.test(draft.apiKeyEnv.trim()))
-      errors.apiKeyEnv = "Use uppercase letters, digits and underscores.";
+      errors.apiKeyEnv = t("create.errors.envFormat");
     const memory = Number(draft.memLimit);
     if (!Number.isFinite(memory) || memory < 128 || memory > 8192)
-      errors.memLimit = "Use 128 to 8192 MB.";
+      errors.memLimit = t("create.errors.memoryRange");
 
-    const envErrors = validateEnvRows(draft.env, "create", templateEnv).rows;
+    const envErrors = validateEnvRows(draft.env, "create", templateEnv, t).rows;
     for (const row of draft.env) {
       const rowErrors = envErrors[row.id];
       if (rowErrors?.key) errors[`env-${row.id}-key`] = rowErrors.key;
@@ -150,11 +158,11 @@ function validate(draft: Draft, step: number, templateEnv: EnvSuggestion[] = [])
   }
 
   if (step === 4 && draft.channel !== "none" && !draft.token.trim()) {
-    errors.token = "Enter the bot token.";
+    errors.token = t("create.errors.tokenRequired");
   }
 
   if (step === 6 && tooManySkills(draft.skills)) {
-    errors.skills = `An instance mounts at most ${MAX_SKILLS_PER_INSTANCE} skills.`;
+    errors.skills = t("create.errors.tooManySkills", { max: MAX_SKILLS_PER_INSTANCE });
   }
 
   return errors;
@@ -179,6 +187,7 @@ function ReviewRow({ label, value }: { label: string; value: ReactNode }) {
 }
 
 export function NewInstancePage() {
+  const { t } = useI18n();
   const route = useRoute();
   const templates = useResource(() => api.listTemplates(), []);
   const shares = useResource(() => api.listShares(), []);
@@ -198,17 +207,18 @@ export function NewInstancePage() {
 
   const draftTemplateEnv =
     templates.data?.find((candidate) => candidate.id === draft.template)?.env ?? [];
-  const errors = validate(draft, step, draftTemplateEnv);
+  const errors = validate(draft, step, draftTemplateEnv, t);
   const showErrors = attempted === step;
 
   const dirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(DEFAULT_DRAFT), [draft]);
   const errorCount = useMemo(
     () =>
       STEPS.reduce(
-        (total, _label, index) => total + Object.keys(validate(draft, index, draftTemplateEnv)).length,
+        (total, _label, index) =>
+          total + Object.keys(validate(draft, index, draftTemplateEnv, t)).length,
         0,
       ),
-    [draft, draftTemplateEnv],
+    [draft, draftTemplateEnv, t],
   );
 
   useEffect(() => {
@@ -238,7 +248,7 @@ export function NewInstancePage() {
 
     setRouteGuard(() => {
       if (leaveAllowed.current) return true;
-      const leave = window.confirm("Discard this instance? The form is not saved.");
+      const leave = window.confirm(t("create.discardConfirm"));
       if (leave) leaveAllowed.current = true;
       return leave;
     });
@@ -264,7 +274,7 @@ export function NewInstancePage() {
   }
 
   function next() {
-    const stepErrors = validate(draft, step, draftTemplateEnv);
+    const stepErrors = validate(draft, step, draftTemplateEnv, t);
     const keys = Object.keys(stepErrors);
     if (keys.length > 0) {
       setAttempted(step);
@@ -326,7 +336,7 @@ export function NewInstancePage() {
 
   async function create() {
     for (let index = 0; index < LAST_STEP; index += 1) {
-      const stepErrors = validate(draft, index, draftTemplateEnv);
+      const stepErrors = validate(draft, index, draftTemplateEnv, t);
       const keys = Object.keys(stepErrors);
       if (keys.length > 0) {
         setStep(index);
@@ -359,13 +369,13 @@ export function NewInstancePage() {
         notes: draft.notes.trim(),
         env: envPayload(draft.env, "create"),
       });
-      toast.success(`Instance ${detail.id} created.`);
+      toast.success(t("create.created", { id: detail.id }));
       leaveWizard(`/instances/${detail.id}`);
     } catch (cause) {
       const error = toApiError(cause);
       if (error.status === 409 && error.code === "instance_exists") {
         // The only id-specific refusal: the slug is taken.
-        setServerIdError(error.message);
+        setServerIdError(apiErrorMessage(error, t));
         setStep(0);
         setAttempted(0);
         window.requestAnimationFrame(() => document.getElementById("id")?.focus());
@@ -429,7 +439,9 @@ export function NewInstancePage() {
     (suggestion) => !draft.env.some((row) => row.key.trim() === suggestion.key),
   );
   const envErrors =
-    showErrors && step === 3 ? validateEnvRows(draft.env, "create", selectedTemplate?.env ?? []).rows : {};
+    showErrors && step === 3
+      ? validateEnvRows(draft.env, "create", selectedTemplate?.env ?? [], t).rows
+      : {};
   const envHasSecrets = draft.env.some((row) => row.secret);
   const secretsErrorShownInline =
     secretsError !== null && step === 3 && (!draft.provider || envHasSecrets);
@@ -437,12 +449,16 @@ export function NewInstancePage() {
   return (
     <>
       <PageHeader
-        title="New instance"
-        description={`Step ${step + 1} of ${STEPS.length} · ${STEPS[step]}`}
+        title={t("nav.newInstance")}
+        description={t("create.stepOf", {
+          current: step + 1,
+          total: STEPS.length,
+          name: t(STEPS[step]),
+        })}
       />
 
       <div className="grid gap-8 lg:grid-cols-[200px_minmax(0,1fr)]">
-        <nav aria-label="Progress" className="hidden lg:block">
+        <nav aria-label={t("create.progressAria")} className="hidden lg:block">
           <ol className="space-y-1">
             {STEPS.map((label, index) => {
               const current = index === step;
@@ -464,7 +480,7 @@ export function NewInstancePage() {
                     )}
                   >
                     <span className="w-5 font-mono text-xs">{String(index + 1).padStart(2, "0")}</span>
-                    <span className="flex-1">{label}</span>
+                    <span className="flex-1">{t(label)}</span>
                     {done ? <Check aria-hidden className="size-3.5" /> : null}
                   </button>
                 </li>
@@ -473,7 +489,9 @@ export function NewInstancePage() {
           </ol>
           {errorCount > 0 && attempted !== null ? (
             <p className="mt-3 px-2 text-xs text-muted-foreground">
-              {errorCount} {errorCount === 1 ? "field needs" : "fields need"} attention.
+              {t(errorCount === 1 ? "create.errorCountOne" : "create.errorCountMany", {
+                count: errorCount,
+              })}
             </p>
           ) : null}
         </nav>
@@ -487,12 +505,12 @@ export function NewInstancePage() {
             {step === 0 ? (
               <div className="space-y-5">
                 <div className="space-y-2">
-                  <Label htmlFor="name">Name</Label>
+                  <Label htmlFor="name">{t("common.name")}</Label>
                   <Input
                     id="name"
                     value={draft.name}
                     autoComplete="off"
-                    placeholder="Alice"
+                    placeholder={t("create.namePlaceholder")}
                     aria-invalid={showErrors && !!errors.name}
                     aria-describedby={showErrors && errors.name ? "name-error" : undefined}
                     onChange={(event) =>
@@ -507,14 +525,14 @@ export function NewInstancePage() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="id">Id</Label>
+                  <Label htmlFor="id">{t("personas.create.id")}</Label>
                   <Input
                     id="id"
                     value={draft.id}
                     autoComplete="off"
                     spellCheck={false}
                     className="font-mono"
-                    placeholder="alice"
+                    placeholder={t("create.idPlaceholder")}
                     aria-invalid={(showErrors && !!errors.id) || !!serverIdError}
                     aria-describedby={
                       (showErrors && errors.id) || serverIdError ? "id-error" : "id-help"
@@ -528,22 +546,21 @@ export function NewInstancePage() {
                     }
                   />
                   <p id="id-help" className="text-xs text-muted-foreground">
-                    Names the compose project{" "}
-                    <span className="font-mono">fleett-{draft.id || "…"}</span> and the directory{" "}
-                    <span className="font-mono">instances/{draft.id || "…"}</span>.
+                    <RichText text={t("create.idHint", { id: draft.id || "…" })} />
                   </p>
                   <FieldError id="id-error" message={serverIdError ?? (showErrors ? errors.id : undefined)} />
                 </div>
 
                 <div className="space-y-2">
                   <Label htmlFor="notes">
-                    Notes <span className="font-normal text-muted-foreground">(optional)</span>
+                    {t("create.notes")}{" "}
+                    <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
                   </Label>
                   <Textarea
                     id="notes"
                     rows={3}
                     value={draft.notes}
-                    placeholder="Who is this agent for, what it may touch."
+                    placeholder={t("create.notesPlaceholder")}
                     onChange={(event) => update("notes", event.target.value)}
                   />
                 </div>
@@ -563,7 +580,7 @@ export function NewInstancePage() {
                   <RadioGroup
                     id="template-group"
                     tabIndex={-1}
-                    aria-label="Template"
+                    aria-label={t("create.templateAria")}
                     aria-invalid={showErrors && !!errors.template}
                     value={draft.template}
                     onValueChange={selectTemplate}
@@ -595,7 +612,10 @@ export function NewInstancePage() {
                             </div>
                             <p className="text-sm text-muted-foreground">{template.description}</p>
                             <p className="font-mono text-xs text-muted-foreground">
-                              {template.default_model} · channel {template.channel}
+                              {template.default_model} ·{" "}
+                              {t("create.channelLabel", {
+                                channel: t(`channel.${template.channel}`),
+                              })}
                             </p>
                           </div>
                         </div>
@@ -606,8 +626,7 @@ export function NewInstancePage() {
                 <FieldError id="template-error" message={showErrors ? errors.template : undefined} />
                 {!templates.loading && !templates.error && templateList.length === 0 ? (
                   <p className="text-sm text-muted-foreground">
-                    No templates found. Add <span className="font-mono">templates/&lt;id&gt;/config.yaml</span> on
-                    the host, then reload.
+                    <RichText text={t("create.noTemplates")} />
                   </p>
                 ) : null}
               </div>
@@ -621,7 +640,8 @@ export function NewInstancePage() {
 
                 <div className="space-y-2">
                   <Label htmlFor="wizard-persona">
-                    Persona <span className="font-normal text-muted-foreground">(optional)</span>
+                    {t("clone.personaLabel")}{" "}
+                    <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
                   </Label>
                   <PersonaSelect
                     id="wizard-persona"
@@ -632,13 +652,11 @@ export function NewInstancePage() {
                     describedBy="wizard-persona-help"
                   />
                   <p id="wizard-persona-help" className="text-xs text-muted-foreground">
-                    Renders a reusable SOUL.md into{" "}
-                    <span className="font-mono">data/SOUL.md</span>. Values stay on this instance, so
-                    the same persona reads differently per agent.
+                    <RichText text={t("create.personaHint")} />
                   </p>
                   <p className="text-xs text-muted-foreground">
                     <a href={hrefFor("/personas")} className="underline underline-offset-4">
-                      Manage personas
+                      {t("create.managePersonas")}
                     </a>
                   </p>
                 </div>
@@ -662,7 +680,7 @@ export function NewInstancePage() {
                     </div>
 
                     <div className="space-y-2">
-                      <p className="text-sm font-medium">Values for this instance</p>
+                      <p className="text-sm font-medium">{t("create.valuesForInstance")}</p>
                       <PersonaVariableInputs
                         variables={selectedPersona.variables}
                         values={draft.personaVars}
@@ -674,14 +692,13 @@ export function NewInstancePage() {
                     <PersonaPreviewPanel
                       personaId={selectedPersona.id}
                       variables={draft.personaVars}
-                      description="Rendered from the saved persona; then stored on the instance."
+                      description={t("create.previewDescription")}
                       maxHeight="32vh"
                     />
                   </>
                 ) : (
                   <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-                    No persona: the instance keeps the SOUL.md its template provides. You can assign one
-                    later in Configuration.
+                    {t("create.noPersona")}
                   </p>
                 )}
               </div>
@@ -691,7 +708,8 @@ export function NewInstancePage() {
               <div className="space-y-5">
                 <div className="space-y-2">
                   <Label htmlFor="wizard-provider">
-                    Provider <span className="font-normal text-muted-foreground">(optional)</span>
+                    {t("clone.providerLabel")}{" "}
+                    <span className="font-normal text-muted-foreground">({t("common.optional")})</span>
                   </Label>
                   <ProviderSelect
                     id="wizard-provider"
@@ -702,25 +720,26 @@ export function NewInstancePage() {
                     describedBy="wizard-provider-help"
                   />
                   <p id="wizard-provider-help" className="text-xs text-muted-foreground">
-                    Share one API credential and inherit its base URL and variable name. The model stays
-                    per instance.
+                    {t("create.providerHint")}
                   </p>
                   {providers.error ? (
                     <p className="text-xs text-destructive">
-                      Providers could not be loaded: {providers.error.message}{" "}
+                      {t("clone.providersLoadFailed", {
+                        message: apiErrorMessage(providers.error, t),
+                      })}{" "}
                       <button
                         type="button"
                         className="underline underline-offset-4"
                         onClick={providers.reload}
                       >
-                        Retry
+                        {t("common.retry")}
                       </button>
                     </p>
                   ) : null}
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="model">Model</Label>
+                  <Label htmlFor="model">{t("fleet.model")}</Label>
                   <Input
                     id="model"
                     value={draft.model}
@@ -736,7 +755,7 @@ export function NewInstancePage() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="base-url">Base URL</Label>
+                  <Label htmlFor="base-url">{t("providers.form.baseUrl")}</Label>
                   <Input
                     id="base-url"
                     value={draft.baseUrl}
@@ -748,13 +767,13 @@ export function NewInstancePage() {
                     onChange={(event) => update("baseUrl", event.target.value)}
                   />
                   <p id="base-url-help" className="text-xs text-muted-foreground">
-                    OpenAI-compatible endpoint used by the agent.
+                    {t("create.baseUrlHint")}
                   </p>
                   <FieldError id="base-url-error" message={showErrors ? errors.baseUrl : undefined} />
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="api-key-env">API key env</Label>
+                  <Label htmlFor="api-key-env">{t("providers.form.apiKeyEnv")}</Label>
                   <Input
                     id="api-key-env"
                     value={draft.apiKeyEnv}
@@ -766,7 +785,7 @@ export function NewInstancePage() {
                     onChange={(event) => update("apiKeyEnv", event.target.value)}
                   />
                   <p id="api-key-env-help" className="text-xs text-muted-foreground">
-                    Environment variable that holds the provider key.
+                    {t("create.apiKeyEnvHint")}
                   </p>
                   <FieldError id="api-key-env-error" message={showErrors ? errors.apiKeyEnv : undefined} />
                 </div>
@@ -774,25 +793,19 @@ export function NewInstancePage() {
                 {selectedProvider ? (
                   <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
                     <p className="text-sm">
-                      Credential supplied by provider{" "}
-                      <a
-                        href={hrefFor(`/providers/${selectedProvider.id}`)}
-                        className="font-mono underline-offset-4 hover:underline"
-                      >
-                        {selectedProvider.name}
-                      </a>
-                      .
+                      <RichText
+                        text={t("create.suppliedBy", { name: selectedProvider.name })}
+                      />
                     </p>
-                    <p className="text-xs text-muted-foreground">
-                      No per-instance token is stored. Base URL and API key env were filled from the
-                      provider and stay editable; an explicit value wins.
-                    </p>
+                    <p className="text-xs text-muted-foreground">{t("create.suppliedByHint")}</p>
                   </div>
                 ) : (
                   <div className="space-y-2">
                     <Label htmlFor="provider-token">
-                      Provider token{" "}
-                      <span className="font-normal text-muted-foreground">(optional, recommended)</span>
+                      {t("clone.providerToken")}{" "}
+                      <span className="font-normal text-muted-foreground">
+                        ({t("create.optionalRecommended")})
+                      </span>
                     </Label>
                     <Input
                       id="provider-token"
@@ -808,9 +821,7 @@ export function NewInstancePage() {
                       }}
                     />
                     <p id="provider-token-help" className="text-xs text-muted-foreground">
-                      Encrypted at rest and never returned by the API. The host needs its secrets key
-                      (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
-                      cannot call the model.
+                      <RichText text={t("create.providerTokenHint")} />
                     </p>
                     {secretsError && !envHasSecrets ? (
                       <div data-secrets-alert>
@@ -821,7 +832,7 @@ export function NewInstancePage() {
                 )}
 
                 <div className="space-y-2">
-                  <Label htmlFor="mem-limit">Memory limit (MB)</Label>
+                  <Label htmlFor="mem-limit">{t("create.memoryLimit")}</Label>
                   <Input
                     id="mem-limit"
                     type="number"
@@ -838,7 +849,7 @@ export function NewInstancePage() {
                 </div>
 
                 <div className="space-y-3 rounded-md border p-4">
-                  <p className="text-sm font-medium">Network</p>
+                  <p className="text-sm font-medium">{t("create.network")}</p>
                   <div className="flex items-start gap-3">
                     <Checkbox
                       id="wizard-allow-lan"
@@ -852,24 +863,17 @@ export function NewInstancePage() {
                     />
                     <div className="min-w-0 space-y-1">
                       <Label htmlFor="wizard-allow-lan" className="cursor-pointer">
-                        Allow LAN access
+                        {t("create.allowLan")}
                       </Label>
                       <p id="wizard-allow-lan-help" className="text-xs text-muted-foreground">
-                        The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense
-                        and Infisical. Only enable for agents you trust.
+                        {t("create.allowLanHint")}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {draft.allowLan ? (
-                          <>
-                            Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
-                            <span className="font-mono">fleett</span> network.
-                          </>
-                        ) : (
-                          <>
-                            Stays on the restricted <span className="font-mono">fleett</span> network. No
-                            route to the LAN.
-                          </>
-                        )}
+                        <RichText
+                          text={
+                            draft.allowLan ? t("create.lanEnabled") : t("create.lanRestricted")
+                          }
+                        />
                       </p>
                     </div>
                   </div>
@@ -901,7 +905,7 @@ export function NewInstancePage() {
             {step === 4 ? (
               <div className="space-y-5">
                 <RadioGroup
-                  aria-label="Channel"
+                  aria-label={t("create.channelAria")}
                   value={draft.channel}
                   onValueChange={(value) => selectChannel(value as ChannelType)}
                   className="grid gap-3 sm:grid-cols-3"
@@ -920,10 +924,12 @@ export function NewInstancePage() {
                         <div className="flex items-center gap-2">
                           <RadioGroupItem value={channel.value} id={`channel-${channel.value}`} />
                           <Label htmlFor={`channel-${channel.value}`} className="cursor-pointer">
-                            {channel.label}
+                            {t(channel.labelKey)}
                           </Label>
                         </div>
-                        <p className="mt-1 pl-6 text-xs text-muted-foreground">{channel.hint}</p>
+                        <p className="mt-1 pl-6 text-xs text-muted-foreground">
+                          {t(channel.hintKey)}
+                        </p>
                       </div>
                     );
                   })}
@@ -931,7 +937,7 @@ export function NewInstancePage() {
 
                 {draft.channel !== "none" ? (
                   <div className="space-y-2">
-                    <Label htmlFor="channel-token">Bot token</Label>
+                    <Label htmlFor="channel-token">{t("clone.botToken")}</Label>
                     <Input
                       id="channel-token"
                       type="password"
@@ -943,7 +949,7 @@ export function NewInstancePage() {
                       onChange={(event) => update("token", event.target.value)}
                     />
                     <p id="channel-token-help" className="text-xs text-muted-foreground">
-                      Encrypted at rest. The API never returns it.
+                      {t("create.botTokenHint")}
                     </p>
                     <FieldError id="channel-token-error" message={showErrors ? errors.token : undefined} />
                   </div>
@@ -982,11 +988,17 @@ export function NewInstancePage() {
             {step === 7 ? (
               <div className="space-y-4">
                 <dl className="divide-y rounded-md border">
-                  <ReviewRow label="Name" value={draft.name || "—"} />
-                  <ReviewRow label="Id" value={<span className="font-mono">{draft.id || "—"}</span>} />
-                  <ReviewRow label="Template" value={<span className="font-mono">{draft.template || "—"}</span>} />
+                  <ReviewRow label={t("common.name")} value={draft.name || "—"} />
                   <ReviewRow
-                    label="Persona"
+                    label={t("personas.create.id")}
+                    value={<span className="font-mono">{draft.id || "—"}</span>}
+                  />
+                  <ReviewRow
+                    label={t("templates.template")}
+                    value={<span className="font-mono">{draft.template || "—"}</span>}
+                  />
+                  <ReviewRow
+                    label={t("clone.personaLabel")}
                     value={
                       selectedPersona ? (
                         <span className="space-y-1">
@@ -998,30 +1010,34 @@ export function NewInstancePage() {
                               {selectedPersona.name}
                             </a>
                             <Badge variant="outline" className="font-mono text-xs font-normal">
-                              {Object.keys(compactVariables(draft.personaVars)).length}{" "}
-                              {plural(
-                                Object.keys(compactVariables(draft.personaVars)).length,
-                                "override",
-                              )}
+                              {t("create.overrides", {
+                                count: Object.keys(compactVariables(draft.personaVars)).length,
+                              })}
                             </Badge>
                           </span>
                           <span className="block text-xs text-muted-foreground">
-                            Rendered into <span className="font-mono">data/SOUL.md</span> at creation.
+                            <RichText text={t("create.renderedAtCreation")} />
                           </span>
                         </span>
                       ) : (
-                        "None — keeps the template SOUL.md"
+                        t("create.noneKeepsTemplate")
                       )
                     }
                   />
-                  <ReviewRow label="Model" value={<span className="font-mono break-all">{draft.model}</span>} />
                   <ReviewRow
-                    label="Base URL"
+                    label={t("fleet.model")}
+                    value={<span className="font-mono break-all">{draft.model}</span>}
+                  />
+                  <ReviewRow
+                    label={t("providers.form.baseUrl")}
                     value={<span className="font-mono text-xs break-all">{draft.baseUrl}</span>}
                   />
-                  <ReviewRow label="API key env" value={<span className="font-mono">{draft.apiKeyEnv}</span>} />
                   <ReviewRow
-                    label="Provider"
+                    label={t("providers.form.apiKeyEnv")}
+                    value={<span className="font-mono">{draft.apiKeyEnv}</span>}
+                  />
+                  <ReviewRow
+                    label={t("clone.providerLabel")}
                     value={
                       selectedProvider ? (
                         <span className="flex flex-wrap items-center gap-2">
@@ -1036,22 +1052,22 @@ export function NewInstancePage() {
                           </Badge>
                         </span>
                       ) : (
-                        "None"
+                        t("common.none")
                       )
                     }
                   />
                   <ReviewRow
-                    label="Provider token"
+                    label={t("clone.providerToken")}
                     value={
                       selectedProvider
-                        ? `Supplied by provider ${selectedProvider.name}`
+                        ? t("create.suppliedByPlain", { name: selectedProvider.name })
                         : draft.providerToken.trim()
-                          ? "•••••••• set"
-                          : "Not set"
+                          ? t("create.secretSet")
+                          : t("create.notSet")
                     }
                   />
                   <ReviewRow
-                    label="Environment"
+                    label={t("env.title")}
                     value={
                       draft.env.length ? (
                         <span className="flex flex-wrap gap-1">
@@ -1062,37 +1078,43 @@ export function NewInstancePage() {
                               className="gap-1 font-mono text-xs font-normal"
                             >
                               {row.key.trim() || "…"}
-                              {row.secret ? <span className="text-muted-foreground">secret</span> : null}
+                              {row.secret ? (
+                                <span className="text-muted-foreground">{t("env.secret")}</span>
+                              ) : null}
                             </Badge>
                           ))}
                         </span>
                       ) : (
-                        "None"
+                        t("common.none")
                       )
                     }
                   />
                   <ReviewRow
-                    label="Memory limit"
+                    label={t("create.memoryLimit")}
                     value={<span className="font-mono">{draft.memLimit}&nbsp;MB</span>}
                   />
                   <ReviewRow
-                    label="LAN access"
+                    label={t("create.lanAccess")}
                     value={
                       draft.allowLan ? (
                         <span>
-                          Enabled · <span className="font-mono text-xs">fleett-lan</span>
+                          {t("common.enabled")} ·{" "}
+                          <span className="font-mono text-xs">fleett-lan</span>
                         </span>
                       ) : (
                         <span>
-                          Restricted · <span className="font-mono text-xs">fleett</span>
+                          {t("create.restricted")} ·{" "}
+                          <span className="font-mono text-xs">fleett</span>
                         </span>
                       )
                     }
                   />
-                  <ReviewRow label="Channel" value={draft.channel} />
-                  {draft.channel !== "none" ? <ReviewRow label="Token" value="•••••••• set" /> : null}
+                  <ReviewRow label={t("fleet.channel")} value={t(`channel.${draft.channel}`)} />
+                  {draft.channel !== "none" ? (
+                    <ReviewRow label={t("create.token")} value={t("create.secretSet")} />
+                  ) : null}
                   <ReviewRow
-                    label="Shares"
+                    label={t("nav.shares")}
                     value={
                       draft.shares.length ? (
                         <span className="flex flex-wrap gap-1">
@@ -1104,12 +1126,12 @@ export function NewInstancePage() {
                           ))}
                         </span>
                       ) : (
-                        "None"
+                        t("common.none")
                       )
                     }
                   />
                   <ReviewRow
-                    label="Skills"
+                    label={t("nav.skills")}
                     value={
                       draft.skills.length ? (
                         <span className="flex flex-wrap gap-1">
@@ -1121,32 +1143,31 @@ export function NewInstancePage() {
                             >
                               {skill.name}
                               <span className="text-muted-foreground">
-                                {skill.version ?? "latest"}
+                                {skill.version ?? t("skills.picker.latest")}
                               </span>
                             </Badge>
                           ))}
                         </span>
                       ) : (
-                        "None"
+                        t("common.none")
                       )
                     }
                   />
-                  <ReviewRow label="Notes" value={draft.notes || "—"} />
+                  <ReviewRow label={t("create.notes")} value={draft.notes || "—"} />
                 </dl>
                 <p className="text-xs text-muted-foreground">
-                  Creating writes the compose project and runs{" "}
-                  <span className="font-mono">docker compose up -d</span>. The container starts immediately.
+                  <RichText text={t("create.submitHint")} />
                 </p>
               </div>
             ) : null}
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
               <Button type="button" variant="ghost" onClick={requestCancel}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <div className="flex items-center gap-2">
                 <Button type="button" variant="outline" onClick={back} disabled={step === 0 || submitting}>
-                  Back
+                  {t("common.back")}
                 </Button>
                 <Button type="submit" disabled={submitting}>
                   {step === LAST_STEP ? (
@@ -1156,7 +1177,7 @@ export function NewInstancePage() {
                       <Plus aria-hidden />
                     )
                   ) : null}
-                  {step === LAST_STEP ? "Create instance" : "Continue"}
+                  {step === LAST_STEP ? t("create.submit") : t("create.continue")}
                 </Button>
               </div>
             </div>
@@ -1167,15 +1188,15 @@ export function NewInstancePage() {
       <Dialog open={cancelOpen} onOpenChange={setCancelOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Discard this instance?</DialogTitle>
-            <DialogDescription>The form is not saved. Nothing is written to the host.</DialogDescription>
+            <DialogTitle>{t("create.discardTitle")}</DialogTitle>
+            <DialogDescription>{t("create.discardDescription")}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCancelOpen(false)}>
-              Keep editing
+              {t("create.keepEditing")}
             </Button>
             <Button variant="destructive" onClick={() => leaveWizard("/instances")}>
-              Discard
+              {t("env.discard")}
             </Button>
           </DialogFooter>
         </DialogContent>

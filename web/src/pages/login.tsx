@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Boxes, Eye, EyeOff, KeyRound, Loader2, ShieldCheck } from "lucide-react";
 import { api, DEMO_TOKEN, DEMO_VIEWER_TOKEN, isMock } from "@/api";
-import { ApiError, toApiError } from "@/api/errors";
+import { ApiError, apiErrorMessage, toApiError } from "@/api/errors";
 import type { AuthConfig, Identity } from "@/api/types";
 import { tokenStore } from "@/lib/token";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ErrorAlert } from "@/components/error-alert";
+import { LanguageToggle } from "@/components/language-toggle";
+import { useI18n } from "@/lib/i18n";
 
 export function LoginPage({
   config,
@@ -19,6 +21,7 @@ export function LoginPage({
   bootError: ApiError | null;
   onSignedIn: (identity: Identity) => void;
 }) {
+  const { t } = useI18n();
   const [token, setToken] = useState("");
   const [reveal, setReveal] = useState(false);
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -55,7 +58,7 @@ export function LoginPage({
     event.preventDefault();
     const value = token.trim();
     if (!value) {
-      setFieldError("Enter the access token.");
+      setFieldError(t("login.enterToken"));
       inputRef.current?.focus();
       return;
     }
@@ -71,7 +74,7 @@ export function LoginPage({
       const failure = toApiError(cause);
       setError(
         failure.status === 401
-          ? new ApiError(401, failure.code, "Token rejected. Check the controller token.")
+          ? new ApiError(401, "token_rejected", t("login.tokenRejected"))
           : failure,
       );
       setPending(null);
@@ -87,8 +90,8 @@ export function LoginPage({
         failure.status === 401
           ? new ApiError(
               401,
-              failure.code,
-              "The token was accepted, but the controller did not return a session. Try again.",
+              "token_no_session",
+              t("login.tokenNoSession"),
             )
           : failure,
       );
@@ -99,22 +102,25 @@ export function LoginPage({
 
   const description =
     oidc && bearer
-      ? "Use your organisation account, or an access token."
+      ? t("login.descriptionBoth")
       : oidc
-        ? "Sign in with your organisation account."
-        : "Access token for the control plane.";
+        ? t("login.descriptionOidc")
+        : t("login.descriptionToken");
 
   return (
     <div className="flex min-h-dvh flex-col items-center justify-center bg-background px-4 py-10">
       <div className="w-full max-w-sm">
         <div className="mb-8 flex items-center gap-2">
-          <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Boxes aria-hidden className="size-4" />
+          <div className="flex items-center gap-2">
+            <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <Boxes aria-hidden className="size-4" />
+            </div>
+            <span className="font-semibold tracking-tight">fleett</span>
           </div>
-          <span className="font-semibold tracking-tight">fleett</span>
+          <LanguageToggle className="ml-auto" />
         </div>
 
-        <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{t("login.title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{description}</p>
 
         {bootError ? (
@@ -137,13 +143,13 @@ export function LoginPage({
             ) : (
               <ShieldCheck aria-hidden />
             )}
-            Sign in with Authentik
+            {t("login.signInWithOidc")}
           </Button>
         ) : null}
 
         {error && !tokenVisible ? (
           <p role="alert" className="mt-4 text-sm text-destructive">
-            {error.message}
+            {apiErrorMessage(error, t)}
           </p>
         ) : null}
 
@@ -153,7 +159,7 @@ export function LoginPage({
               <span className="w-full border-t" />
             </div>
             <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-background px-2 text-muted-foreground">or</span>
+              <span className="bg-background px-2 text-muted-foreground">{t("login.or")}</span>
             </div>
           </div>
         ) : null}
@@ -167,14 +173,14 @@ export function LoginPage({
             disabled={pending !== null}
           >
             <KeyRound aria-hidden />
-            Use an access token
+            {t("login.useToken")}
           </Button>
         ) : null}
 
         {tokenVisible ? (
           <form className="space-y-4" onSubmit={onSubmit} noValidate>
             <div className="space-y-2">
-              <Label htmlFor="token">Access token</Label>
+              <Label htmlFor="token">{t("login.accessToken")}</Label>
               <div className="relative">
                 <Input
                   ref={inputRef}
@@ -196,8 +202,8 @@ export function LoginPage({
                   size="icon-sm"
                   className="absolute top-1/2 right-1 -translate-y-1/2"
                   onClick={() => setReveal((value) => !value)}
-                  aria-label={reveal ? "Hide token" : "Show token"}
-                  title={reveal ? "Hide token" : "Show token"}
+                  aria-label={reveal ? t("login.hideToken") : t("login.showToken")}
+                  title={reveal ? t("login.hideToken") : t("login.showToken")}
                 >
                   {reveal ? <EyeOff aria-hidden /> : <Eye aria-hidden />}
                 </Button>
@@ -211,7 +217,7 @@ export function LoginPage({
 
             {error && tokenVisible ? (
               <p role="alert" className="text-sm text-destructive">
-                {error.message}
+                {apiErrorMessage(error, t)}
               </p>
             ) : null}
 
@@ -222,29 +228,32 @@ export function LoginPage({
               disabled={pending !== null}
             >
               {pending === "token" ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Sign in
+              {t("login.title")}
             </Button>
           </form>
         ) : null}
 
         <p className="mt-6 text-xs text-muted-foreground">
           {oidc && !bearer
-            ? "You will be redirected to your identity provider."
+            ? t("login.noteRedirect")
             : oidc
-              ? "The session is a signed cookie; the token stays in sessionStorage for this tab."
-              : "Sent as Authorization: Bearer. Kept in sessionStorage for this tab."}
+              ? t("login.noteCookie")
+              : t("login.noteBearer")}
         </p>
         {isMock ? (
           <p className="mt-2 text-xs text-muted-foreground">
-            Mock mode.
+            {t("login.mockMode")}
             {bearer ? (
               <>
                 {" "}
-                Tokens <span className="font-mono text-foreground">{DEMO_TOKEN}</span> (admin) and{" "}
-                <span className="font-mono text-foreground">{DEMO_VIEWER_TOKEN}</span> (viewer).
+                {t("login.mockTokens")}{" "}
+                <span className="font-mono text-foreground">{DEMO_TOKEN}</span> (
+                {t("login.mockAdmin")}) {t("login.mockAnd")}{" "}
+                <span className="font-mono text-foreground">{DEMO_VIEWER_TOKEN}</span> (
+                {t("login.mockViewer")}).
               </>
             ) : null}
-            {oidc ? <> Authentik starts a demo admin session.</> : null}
+            {oidc ? <> {t("login.mockOidc")}</> : null}
           </p>
         ) : null}
       </div>

@@ -1,3 +1,4 @@
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { DiffHunk, DiffLine } from "@/lib/diff";
 
@@ -18,20 +19,25 @@ const SIGN: Record<DiffLine["kind"], string> = { add: "+", remove: "-", context:
 /** Client-side preview of the unsaved buffer, grouped like a unified diff. */
 export function LineDiff({
   hunks,
-  empty = "No changes.",
+  empty,
 }: {
   hunks: DiffHunk[];
   empty?: string;
 }) {
+  const { t } = useI18n();
   if (hunks.length === 0) {
-    return <p className="px-3 py-5 text-sm text-muted-foreground">{empty}</p>;
+    return (
+      <p className="px-3 py-5 text-sm text-muted-foreground">
+        {empty ?? t("files.noChanges")}
+      </p>
+    );
   }
 
   return (
     <div
       tabIndex={0}
       role="region"
-      aria-label="Changes preview"
+      aria-label={t("files.changesPreview")}
       className="max-h-[45vh] overflow-auto bg-muted/10 font-mono text-xs leading-5"
     >
       {hunks.map((hunk) => (
@@ -104,13 +110,18 @@ function classify(line: string): PatchKind {
 /** Unified patch text from `GET /git/diff`, coloured line by line. */
 export function PatchView({
   patch,
-  empty = "This commit changed no text.",
+  empty,
 }: {
   patch: string;
   empty?: string;
 }) {
+  const { t } = useI18n();
   if (!patch.trim()) {
-    return <p className="px-3 py-6 text-sm text-muted-foreground">{empty}</p>;
+    return (
+      <p className="px-3 py-6 text-sm text-muted-foreground">
+        {empty ?? t("files.emptyPatch")}
+      </p>
+    );
   }
 
   const lines = patch.replace(/\n$/, "").split("\n");
@@ -119,7 +130,7 @@ export function PatchView({
     <div
       tabIndex={0}
       role="region"
-      aria-label="Patch"
+      aria-label={t("files.patch")}
       className="max-h-[55vh] overflow-auto bg-muted/10 font-mono text-xs leading-5"
     >
       {lines.map((line, index) => {

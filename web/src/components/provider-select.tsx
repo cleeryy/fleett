@@ -6,6 +6,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /** Radix Select forbids an empty item value; the form maps this back to "". */
@@ -34,6 +35,7 @@ export function ProviderSelect({
   describedBy?: string;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
     <Select
       value={value || NO_PROVIDER}
@@ -41,10 +43,10 @@ export function ProviderSelect({
       disabled={disabled || loading}
     >
       <SelectTrigger id={id} className={cn("w-full", className)} aria-describedby={describedBy}>
-        <SelectValue placeholder={loading ? "Loading providers…" : "Select a provider"} />
+        <SelectValue placeholder={loading ? t("providers.picker.loading") : t("providers.picker.placeholder")} />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value={NO_PROVIDER}>None — use a per-instance token</SelectItem>
+        <SelectItem value={NO_PROVIDER}>{t("providers.picker.none")}</SelectItem>
         {providers.map((provider) => (
           <SelectItem key={provider.id} value={provider.id}>
             {provider.name} · {provider.kind}

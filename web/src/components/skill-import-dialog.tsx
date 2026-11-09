@@ -14,7 +14,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ErrorAlert } from "@/components/error-alert";
-import { formatBytes, plural } from "@/lib/format";
+import { RichText } from "@/components/rich-text";
+import { formatBytes } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { MAX_SKILL_ZIP_BYTES } from "@/lib/skills";
 
 /**
@@ -33,6 +35,7 @@ export function SkillImportDialog({
   onImported: (detail: SkillDetail) => void;
   onOpenSkill: (name: string) => void;
 }) {
+  const { t } = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [pending, setPending] = useState(false);
@@ -59,7 +62,7 @@ export function SkillImportDialog({
     }
     if (next.size > MAX_SKILL_ZIP_BYTES) {
       setFile(null);
-      setFileError(`The archive is larger than ${formatBytes(MAX_SKILL_ZIP_BYTES)}.`);
+      setFileError(t("skills.import.tooLarge", { limit: formatBytes(MAX_SKILL_ZIP_BYTES) }));
       return;
     }
     setFile(next);
@@ -68,7 +71,7 @@ export function SkillImportDialog({
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!file) {
-      setFileError("Choose a zip archive.");
+      setFileError(t("skills.import.chooseFile"));
       inputRef.current?.focus();
       return;
     }
@@ -92,11 +95,9 @@ export function SkillImportDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Import a skill</DialogTitle>
+          <DialogTitle>{t("skills.import.title")}</DialogTitle>
           <DialogDescription>
-            A zip archive with <span className="font-mono">skill.yaml</span> and{" "}
-            <span className="font-mono">SKILL.md</span> at its root, or inside one wrapping folder.
-            The registry publishes the next free version.
+            <RichText text={t("skills.import.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -106,24 +107,25 @@ export function SkillImportDialog({
               <p className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-sm">{result.name}</span>
                 <Badge variant="secondary" className="font-mono text-[11px] font-normal">
-                  published {published?.version ?? result.latest ?? "?"}
+                  {t("skills.import.published", {
+                    version: published?.version ?? result.latest ?? "?",
+                  })}
                 </Badge>
               </p>
               <p className="text-sm text-muted-foreground">
-                {result.description || "No description."}
+                {result.description || t("skills.picker.noDescription")}
               </p>
               <p className="text-xs text-muted-foreground">
                 {published
-                  ? `${published.files_count} ${plural(published.files_count, "file")} · ${formatBytes(
-                      published.size_bytes,
-                    )}`
-                  : `${result.files.length} ${plural(result.files.length, "file")}`}
+                  ? t("skills.import.filesAndSize", {
+                      count: published.files_count,
+                      size: formatBytes(published.size_bytes),
+                    })
+                  : t("history.fileCount", { count: result.files.length })}
               </p>
             </div>
             <p className="text-xs text-muted-foreground">
-              The first published version of a skill also becomes{" "}
-              <span className="font-mono">latest</span>. Importing again publishes a new version
-              without moving it.
+              <RichText text={t("skills.import.latestNote")} />
             </p>
           </div>
         ) : (
@@ -135,12 +137,12 @@ export function SkillImportDialog({
               >
                 <FileArchive aria-hidden className="size-5 text-muted-foreground" />
                 <span className="text-sm font-medium">
-                  {file ? file.name : "Choose a zip archive"}
+                  {file ? file.name : t("skills.import.chooseFile")}
                 </span>
                 <span className="text-xs text-muted-foreground">
                   {file
                     ? formatBytes(file.size)
-                    : `Up to ${formatBytes(MAX_SKILL_ZIP_BYTES)}. Read once, in memory.`}
+                    : t("skills.import.limit", { limit: formatBytes(MAX_SKILL_ZIP_BYTES) })}
                 </span>
               </label>
               <input
@@ -153,8 +155,7 @@ export function SkillImportDialog({
                 onChange={(event) => pick(event.target.files?.[0] ?? null)}
               />
               <p id="skill-zip-help" className="text-xs text-muted-foreground">
-                Zip-slip paths, symlinks, non-UTF-8 content and oversized entries abort the whole
-                import before anything is written.
+                {t("skills.import.safetyNote")}
               </p>
               {fileError ? <p className="text-xs text-destructive">{fileError}</p> : null}
             </div>
@@ -168,11 +169,11 @@ export function SkillImportDialog({
                 onClick={() => onOpenChange(false)}
                 disabled={pending}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="submit" disabled={pending || !file}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <FileArchive aria-hidden />}
-                Import
+                {t("skills.import.confirm")}
               </Button>
             </DialogFooter>
           </form>
@@ -181,9 +182,9 @@ export function SkillImportDialog({
         {result ? (
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)}>
-              Close
+              {t("common.close")}
             </Button>
-            <Button onClick={() => onOpenSkill(result.name)}>Open skill</Button>
+            <Button onClick={() => onOpenSkill(result.name)}>{t("skills.import.openSkill")}</Button>
           </DialogFooter>
         ) : null}
       </DialogContent>

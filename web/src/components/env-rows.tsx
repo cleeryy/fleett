@@ -6,7 +6,9 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RichText } from "@/components/rich-text";
 import { newEnvRow, type EnvRow, type EnvRowErrors } from "@/lib/env";
+import { useI18n } from "@/lib/i18n";
 
 /**
  * Row editor used by the create wizard. Values of secret rows are write-only:
@@ -31,6 +33,7 @@ export function EnvironmentRows({
   hints?: EnvSuggestion[];
   templateName?: string;
 }) {
+  const { t } = useI18n();
   const focusId = useRef<string | null>(null);
   const hintByKey = new Map((hints ?? suggestions).map((suggestion) => [suggestion.key, suggestion]));
 
@@ -58,20 +61,21 @@ export function EnvironmentRows({
   return (
     <div className="space-y-3 rounded-md border p-4">
       <div>
-        <p className="text-sm font-medium">Environment</p>
-        <p className="text-xs text-muted-foreground">
-          Extra variables passed to the agent, such as allowlists. Secrets are encrypted at rest and
-          never returned by the API.
-        </p>
+        <p className="text-sm font-medium">{t("env.title")}</p>
+        <p className="text-xs text-muted-foreground">{t("env.description")}</p>
       </div>
 
       {rows.length > 0 ? (
         <div className="space-y-3">
           {rows.map((row, index) => {
             const rowErrors = errors[row.id];
-            const name = row.key.trim() || `variable ${index + 1}`;
+            const name = row.key.trim() || t("env.variableN", { index: index + 1 });
             const hint = hintByKey.get(row.key.trim());
-            const example = hint?.example ? `e.g. ${hint.example}` : hint?.format ? `format: ${hint.format}` : undefined;
+            const example = hint?.example
+              ? t("env.examplePrefix", { value: hint.example })
+              : hint?.format
+                ? t("env.formatPrefix", { value: hint.format })
+                : undefined;
             return (
               <div key={row.id} className="space-y-1">
                 <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_auto_auto] sm:items-center">
@@ -82,7 +86,7 @@ export function EnvironmentRows({
                     spellCheck={false}
                     className="font-mono text-xs"
                     placeholder="VARIABLE_NAME"
-                    aria-label={`${name} name`}
+                    aria-label={t("env.nameAria", { name })}
                     aria-invalid={!!rowErrors?.key}
                     aria-describedby={rowErrors?.key ? `${idPrefix}-${row.id}-key-error` : undefined}
                     onChange={(event) => patch(row.id, { key: event.target.value })}
@@ -96,14 +100,14 @@ export function EnvironmentRows({
                     className="font-mono text-xs"
                     placeholder={
                       row.secret && row.storedSecret
-                        ? "Leave empty to keep the stored secret"
+                        ? t("env.keepSecret")
                         : row.secret
-                          ? "Secret value"
+                          ? t("env.secretValue")
                           : hint?.example
-                            ? `e.g. ${hint.example}`
-                            : "Value"
+                            ? t("env.examplePrefix", { value: hint.example })
+                            : t("env.value")
                     }
-                    aria-label={`${name} value`}
+                    aria-label={t("env.valueAria", { name })}
                     aria-invalid={!!rowErrors?.value}
                     aria-describedby={rowErrors?.value ? `${idPrefix}-${row.id}-value-error` : undefined}
                     onChange={(event) => patch(row.id, { value: event.target.value })}
@@ -118,15 +122,15 @@ export function EnvironmentRows({
                       htmlFor={`${idPrefix}-${row.id}-secret`}
                       className="cursor-pointer text-xs font-normal text-muted-foreground"
                     >
-                      Secret
+                      {t("env.secret")}
                     </Label>
                   </div>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label={`Remove ${name}`}
-                    title={`Remove ${name}`}
+                    aria-label={t("env.removeAria", { name })}
+                    title={t("env.removeAria", { name })}
                     onClick={() => removeRow(row.id)}
                   >
                     <Trash2 aria-hidden />
@@ -136,7 +140,7 @@ export function EnvironmentRows({
                   <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
                     {hint?.required ? (
                       <Badge variant="outline" className="border-amber-600/40 font-normal text-amber-700 dark:text-amber-400">
-                        required
+                        {t("env.required")}
                       </Badge>
                     ) : null}
                     {example ? <span className="font-mono">{example}</span> : null}
@@ -158,19 +162,23 @@ export function EnvironmentRows({
         </div>
       ) : (
         <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
-          No variables. Add one below, or pick a suggestion.
+          {t("env.empty")}
         </p>
       )}
 
       <Button type="button" variant="outline" size="sm" onClick={() => addRow()}>
         <Plus aria-hidden />
-        Add variable
+        {t("env.add")}
       </Button>
 
       {suggestions.length > 0 ? (
         <div className="space-y-2 border-t pt-3">
           <p className="text-xs font-medium text-muted-foreground">
-            Suggested by {templateName ? <span className="font-mono">{templateName}</span> : "this template"}
+            {templateName ? (
+              <RichText text={t("env.suggestedBy", { template: templateName })} />
+            ) : (
+              t("env.suggestedByTemplate")
+            )}
           </p>
           <div className="grid gap-1.5">
             {suggestions.map((suggestion) => (
@@ -191,7 +199,7 @@ export function EnvironmentRows({
                     <span className="font-mono text-xs">{suggestion.key}</span>
                     {suggestion.required ? (
                       <Badge variant="outline" className="border-amber-600/40 text-[11px] font-normal text-amber-700 dark:text-amber-400">
-                        required
+                        {t("env.required")}
                       </Badge>
                     ) : null}
                     {suggestion.secret ? (
@@ -199,14 +207,16 @@ export function EnvironmentRows({
                         secret
                       </Badge>
                     ) : null}
-                    <span className="text-[11px] text-muted-foreground group-hover:text-foreground">Add</span>
+                    <span className="text-[11px] text-muted-foreground group-hover:text-foreground">
+                      {t("env.addShort")}
+                    </span>
                   </span>
                   {suggestion.description ? (
                     <span className="block text-xs text-muted-foreground">{suggestion.description}</span>
                   ) : null}
                   {suggestion.example ? (
                     <span className="block font-mono text-[11px] text-muted-foreground">
-                      example: {suggestion.example}
+                      {t("env.exampleLine", { value: suggestion.example })}
                     </span>
                   ) : null}
                 </span>

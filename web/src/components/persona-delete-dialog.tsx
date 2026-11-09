@@ -14,8 +14,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
-import { plural } from "@/lib/format";
 
 /** `details.instances` of a `409 persona_in_use`: bare ids. */
 function inUseInstances(error: ApiError): string[] {
@@ -44,6 +45,7 @@ export function PersonaDeleteDialog({
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
+  const { t } = useI18n();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [inUse, setInUse] = useState<string[] | null>(null);
@@ -79,10 +81,9 @@ export function PersonaDeleteDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete persona {persona.name}?</DialogTitle>
+          <DialogTitle>{t("personas.delete.title", { name: persona.name })}</DialogTitle>
           <DialogDescription>
-            Removes the SOUL.md template and its variables from fleett. Instances that already
-            received it keep their <span className="font-mono">data/SOUL.md</span>.
+            <RichText text={t("personas.delete.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -90,14 +91,17 @@ export function PersonaDeleteDialog({
           <div className="min-w-0 space-y-3">
             <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
               <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-              <AlertTitle>This persona is still assigned</AlertTitle>
+              <AlertTitle>{t("personas.delete.inUseTitle")}</AlertTitle>
               <AlertDescription>
                 <p className="text-sm text-muted-foreground">
                   {inUse.length > 0
-                    ? `${inUse.length} ${plural(inUse.length, "instance")} still ${
-                        inUse.length === 1 ? "references" : "reference"
-                      } it. Reassign them in Configuration, or delete them, then delete the persona.`
-                    : "At least one instance still references it. Reassign it in Configuration, then try again."}
+                    ? t(
+                        inUse.length === 1
+                          ? "personas.delete.inUseOne"
+                          : "personas.delete.inUseMany",
+                        { count: inUse.length },
+                      )
+                    : t("personas.delete.inUseUnknown")}
                 </p>
               </AlertDescription>
             </Alert>
@@ -122,24 +126,23 @@ export function PersonaDeleteDialog({
           <ErrorAlert error={error} />
         ) : (
           <p className="text-sm text-muted-foreground">
-            Deletion cannot be undone from the console. The version history of the persona goes with
-            it.
+            {t("personas.delete.confirmHint")}
           </p>
         )}
 
         <DialogFooter>
           {inUse !== null ? (
             <Button autoFocus onClick={() => onOpenChange(false)}>
-              Close
+              {t("common.close")}
             </Button>
           ) : (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button variant="destructive" onClick={() => void confirm()} disabled={pending}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Trash2 aria-hidden />}
-                Delete persona
+                {t("personas.delete.confirm")}
               </Button>
             </>
           )}

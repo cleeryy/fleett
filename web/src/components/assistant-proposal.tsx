@@ -18,6 +18,7 @@ import { CopyButton } from "@/components/copy-button";
 import { ErrorAlert } from "@/components/error-alert";
 import { LineDiff } from "@/components/diff-view";
 import { announceAssistantApply } from "@/lib/assistant";
+import { useI18n } from "@/lib/i18n";
 import { diffLines } from "@/lib/diff";
 
 /** File the console already loaded for this path, so no refetch is needed. */
@@ -33,13 +34,16 @@ interface BaseFile {
 }
 
 const KIND_LABEL: Record<AssistantProposal["kind"], string> = {
-  file: "File",
-  env: "Environment",
-  yaml: "YAML",
+  file: "assistant.proposal.kindFile",
+  env: "assistant.proposal.kindEnv",
+  yaml: "assistant.proposal.kindYaml",
 };
 
-function proposalTitle(proposal: AssistantProposal): string {
-  if (proposal.kind === "env") return "Environment variables";
+function proposalTitle(
+  proposal: AssistantProposal,
+  t: (key: string) => string,
+): string {
+  if (proposal.kind === "env") return t("assistant.proposal.environment");
   if (proposal.path) return proposal.path;
   return "config.yaml";
 }
@@ -61,6 +65,7 @@ export function AssistantProposalCard({
   canEdit: boolean;
   loaded?: LoadedProposalFile | null;
 }) {
+  const { t } = useI18n();
   const [base, setBase] = useState<BaseFile | null>(null);
   const [baseError, setBaseError] = useState<ApiError | null>(null);
   const [applying, setApplying] = useState(false);
@@ -145,15 +150,18 @@ export function AssistantProposalCard({
         secret: variable.secret === true,
       }));
     if (additions.length === 0) {
-      toast.info("Nothing to add: every variable in this proposal already exists.");
+      toast.info(t("assistant.proposal.nothingToAdd"));
       return;
     }
     await api.patchInstance(instance, { env: additions }, { viaAssistant: true });
     toast.success(
-      `Added ${additions.length} ${additions.length === 1 ? "variable" : "variables"} to ${instance}.`,
-      {
-        description: "Fill their values in Configuration. Existing variables were left untouched.",
-      },
+      t(
+        additions.length === 1
+          ? "assistant.proposal.addedOne"
+          : "assistant.proposal.addedMany",
+        { count: additions.length, instance },
+      ),
+      { description: t("assistant.proposal.addedDescription") },
     );
     setApplied(true);
     announceAssistantApply({ kind: "env", instance });
@@ -166,10 +174,10 @@ export function AssistantProposalCard({
       { path: target, content: proposal.content, etag: base?.etag ?? null },
       { viaAssistant: true },
     );
-    toast.success(`Applied ${target}.`, {
+    toast.success(t("assistant.proposal.appliedFile", { path: target }), {
       description: result.backup
-        ? `Recorded as a new commit. Previous version: ${result.backup}`
-        : "Recorded as a new commit.",
+        ? t("assistant.proposal.appliedFileBackup", { backup: result.backup })
+        : t("assistant.proposal.appliedFileCommit"),
     });
     setApplied(true);
     announceAssistantApply({ kind: "file", instance, path: target });
@@ -205,19 +213,23 @@ export function AssistantProposalCard({
     <div className="space-y-2 rounded-md border bg-muted/20 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <FileText aria-hidden className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs">{proposalTitle(proposal)}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">
+          {proposalTitle(proposal, t)}
+        </span>
         <Badge variant="outline" className="font-normal">
-          {KIND_LABEL[proposal.kind]}
+          {t(KIND_LABEL[proposal.kind])}
         </Badge>
         {isNewFile && target ? (
           <Badge variant="outline" className="font-normal">
-            New file
+            {t("assistant.proposal.newFile")}
           </Badge>
         ) : null}
-        {applied ? <Badge className="font-normal">Applied</Badge> : null}
+        {applied ? (
+          <Badge className="font-normal">{t("status.applied")}</Badge>
+        ) : null}
         {rejected ? (
           <Badge variant="outline" className="font-normal">
-            Rejected
+            {t("assistant.proposal.rejected")}
           </Badge>
         ) : null}
       </div>
@@ -227,9 +239,9 @@ export function AssistantProposalCard({
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Variable</TableHead>
-                <TableHead>Value</TableHead>
-                <TableHead className="w-24">Stored as</TableHead>
+                <TableHead>{t("assistant.proposal.variable")}</TableHead>
+                <TableHead>{t("assistant.proposal.value")}</TableHead>
+                <TableHead className="w-24">{t("assistant.proposal.storedAs")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -246,10 +258,12 @@ export function AssistantProposalCard({
                   <TableCell>
                     {variable.secret ? (
                       <Badge variant="outline" className="font-normal">
-                        secret
+                        {t("env.secret")}
                       </Badge>
                     ) : (
-                      <span className="text-xs text-muted-foreground">plain</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t("assistant.proposal.plain")}
+                      </span>
                     )}
                   </TableCell>
                 </TableRow>
@@ -257,8 +271,7 @@ export function AssistantProposalCard({
             </TableBody>
           </Table>
           <p className="border-t px-3 py-2 text-[11px] text-muted-foreground">
-            Values are proposed for plain variables only: fill every secret in the Configuration
-            tab after applying. A variable that already exists is left untouched.
+            {t("assistant.proposal.envFootnote")}
           </p>
         </div>
       ) : proposal.kind === "yaml" && !target ? (
@@ -267,7 +280,7 @@ export function AssistantProposalCard({
             {proposal.content ?? ""}
           </pre>
           <p className="text-[11px] text-muted-foreground">
-            config.yaml is rendered by fleett: copy the fields you need into the configuration form.
+            {t("assistant.proposal.yamlFootnote")}
           </p>
         </div>
       ) : baseError ? (
@@ -275,20 +288,20 @@ export function AssistantProposalCard({
       ) : base === null ? (
         <p className="flex items-center gap-2 px-1 py-3 text-xs text-muted-foreground" aria-live="polite">
           <Loader2 aria-hidden className="size-3 animate-spin" />
-          Loading the current file…
+          {t("assistant.proposal.loadingFile")}
         </p>
       ) : diff ? (
         <div className="overflow-hidden rounded-md border bg-background">
           <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] text-muted-foreground">
-            <span>Proposed changes</span>
+            <span>{t("assistant.proposal.proposedChanges")}</span>
             <span className="font-mono">
               +{diff.added} −{diff.removed}
             </span>
           </div>
-          <LineDiff hunks={diff.hunks} empty="The proposed file is identical to the one on disk." />
+          <LineDiff hunks={diff.hunks} empty={t("assistant.proposal.identical")} />
           {diff.coarse ? (
             <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
-              The file is too large to align line by line: the diff shows a full replacement.
+              {t("assistant.proposal.coarseDiff")}
             </p>
           ) : null}
         </div>
@@ -297,13 +310,15 @@ export function AssistantProposalCard({
       {applyError ? <ErrorAlert error={applyError} /> : null}
       {!instance ? (
         <p className="text-[11px] text-muted-foreground">
-          Open an instance to apply this proposal.
+          {t("assistant.proposal.openInstance")}
         </p>
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
         {rejected ? (
-          <span className="text-xs text-muted-foreground">Rejected. Nothing was changed.</span>
+          <span className="text-xs text-muted-foreground">
+            {t("assistant.proposal.rejectedNote")}
+          </span>
         ) : applied ? null : (
           <Button
             size="sm"
@@ -311,19 +326,19 @@ export function AssistantProposalCard({
             disabled={applyBlocked}
             title={
               !canEdit
-                ? "This account is read-only."
+                ? t("assistant.proposal.readOnly")
                 : !instance
-                  ? "Open an instance first."
+                  ? t("assistant.proposal.openFirst")
                   : undefined
             }
           >
             {applying ? <Loader2 aria-hidden className="animate-spin" /> : null}
-            {applying ? "Applying…" : "Apply"}
+            {applying ? t("common.applying") : t("common.apply")}
           </Button>
         )}
         <CopyButton
           value={copyValue}
-          label="Copy proposal"
+          label={t("assistant.proposal.copy")}
           showLabel
           size="sm"
           variant="outline"
@@ -331,15 +346,14 @@ export function AssistantProposalCard({
         />
         {!rejected && !applied ? (
           <Button size="sm" variant="ghost" onClick={reject} disabled={applying}>
-            Reject
+            {t("assistant.proposal.reject")}
           </Button>
         ) : null}
       </div>
 
       {applied ? (
         <p className="text-[11px] text-muted-foreground">
-          Applied through the regular route: the write kept its backup, git commit and audit entry,
-          marked as coming from the assistant.
+          {t("assistant.proposal.appliedNote")}
         </p>
       ) : null}
     </div>

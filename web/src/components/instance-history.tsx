@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PatchView } from "@/components/diff-view";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -28,15 +29,23 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { summarizePatch } from "@/lib/diff";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
-function statusText(status: GitStatus): string {
+function statusText(
+  status: GitStatus,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
   const parts: string[] = [];
-  if (status.modified.length > 0) parts.push(`${status.modified.length} modified`);
-  if (status.untracked.length > 0) parts.push(`${status.untracked.length} new`);
-  return parts.length > 0 ? parts.join(" · ") : "Working tree clean";
+  if (status.modified.length > 0) {
+    parts.push(t("history.modified", { count: status.modified.length }));
+  }
+  if (status.untracked.length > 0) {
+    parts.push(t("history.newFiles", { count: status.untracked.length }));
+  }
+  return parts.length > 0 ? parts.join(" · ") : t("history.clean");
 }
 
 function CommitRow({
@@ -48,6 +57,7 @@ function CommitRow({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t, lang } = useI18n();
   return (
     <button
       type="button"
@@ -66,14 +76,12 @@ function CommitRow({
         <span className="max-w-40 truncate">{commit.author}</span>
         <span aria-hidden>·</span>
         <time dateTime={commit.at} title={formatDateTime(commit.at)}>
-          {formatRelative(commit.at)}
+          {formatRelative(commit.at, lang)}
         </time>
         {commit.paths.length > 1 ? (
           <>
             <span aria-hidden>·</span>
-            <span>
-              {commit.paths.length} {plural(commit.paths.length, "file")}
-            </span>
+            <span>{t("history.fileCount", { count: commit.paths.length })}</span>
           </>
         ) : null}
       </span>
@@ -82,6 +90,7 @@ function CommitRow({
 }
 
 export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean }) {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [revertOpen, setRevertOpen] = useState(false);
@@ -141,15 +150,15 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
       if (result.commit) {
         pendingSelection.current = result.commit.id;
         toast.success(
-          `Restored ${result.paths.length} ${plural(result.paths.length, "file")} from ${selected.short}.`,
+          t("history.restored", { count: result.paths.length, commit: selected.short }),
           {
             description: result.restarted
-              ? `Recorded as ${result.commit.short}; the instance was restarted.`
-              : `Recorded as ${result.commit.short}. Restart the instance when you want the change to apply.`,
+              ? t("history.restoredRestarted", { commit: result.commit.short })
+              : t("history.restoredRecorded", { commit: result.commit.short }),
           },
         );
       } else {
-        toast.info("The files already match that commit. Nothing new was recorded.");
+        toast.info(t("history.alreadyMatches"));
       }
       setRevertOpen(false);
       setNonce((value) => value + 1);
@@ -166,24 +175,24 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm" aria-live="polite">
           <GitBranch aria-hidden className="size-4 shrink-0 text-muted-foreground" />
           {status.loading && !status.data ? (
-            <span className="text-muted-foreground">Reading the work tree…</span>
+            <span className="text-muted-foreground">{t("history.reading")}</span>
           ) : status.data && drift ? (
             <>
               <Badge variant="secondary" className="font-normal">
-                {statusText(status.data)}
+                {statusText(status.data, t)}
               </Badge>
-              <span className="text-xs text-muted-foreground">since the last commit</span>
+              <span className="text-xs text-muted-foreground">{t("history.sinceLastCommit")}</span>
             </>
           ) : (
             <span className="flex items-center gap-1.5 text-muted-foreground">
               <CheckCircle2 aria-hidden className="size-3.5" />
-              Working tree clean
+              {t("history.clean")}
             </span>
           )}
         </div>
         <Button variant="outline" size="sm" className="ml-auto" onClick={refresh}>
           <RefreshCw aria-hidden className={log.refreshing || status.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
       </div>
 
@@ -195,12 +204,12 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
         <div className="rounded-md border">
           <EmptyState
             icon={HistoryIcon}
-            title="No history yet"
-            description="Every save from the Files tab, every configuration change and every change recorded at startup lands here as a commit. Edit a file to create the first one."
+            title={t("history.emptyTitle")}
+            description={t("history.emptyDescription")}
             action={
               <Button variant="outline" size="sm" onClick={refresh}>
                 <RefreshCw aria-hidden />
-                Refresh
+                {t("common.refresh")}
               </Button>
             }
           />
@@ -209,7 +218,7 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
         <div className="grid gap-3 lg:grid-cols-[320px_minmax(0,1fr)]">
           <div className="overflow-hidden rounded-md border">
             <div className="border-b bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
-              {commits.length} {plural(commits.length, "commit")}
+              {t("history.commitCount", { count: commits.length })}
             </div>
             <ul className="max-h-[65vh] divide-y overflow-auto">
               {commits.map((commit) => (
@@ -233,7 +242,7 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
                     <span className="text-foreground">{selected.author}</span>
                     <span className="font-mono break-all">&lt;{selected.email}&gt;</span>
                     <span aria-hidden>·</span>
-                    <time dateTime={selected.at} title={formatRelative(selected.at)}>
+                    <time dateTime={selected.at} title={formatRelative(selected.at, lang)}>
                       {formatDateTime(selected.at)}
                     </time>
                     <span aria-hidden>·</span>
@@ -248,17 +257,23 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
                       ))}
                     </div>
                   ) : (
-                    <p className="text-xs text-muted-foreground">This commit changed no file.</p>
+                    <p className="text-xs text-muted-foreground">
+                      {t("history.changedNoFile")}
+                    </p>
                   )}
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
                   <span className="font-mono text-[11px] text-muted-foreground">
                     {diff.loading || diff.refreshing
-                      ? "Loading patch…"
+                      ? t("history.loadingPatch")
                       : summary.files > 0
-                        ? `${summary.files} ${plural(summary.files, "file")} · +${summary.added} −${summary.removed}`
-                        : "No text change"}
+                        ? t("history.summary", {
+                            count: summary.files,
+                            added: summary.added,
+                            removed: summary.removed,
+                          })
+                        : t("history.noTextChange")}
                   </span>
                   {canEdit ? (
                     <Button
@@ -272,7 +287,7 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
                       }}
                     >
                       <RotateCcw aria-hidden />
-                      Restore this version…
+                      {t("history.restoreVersion")}
                     </Button>
                   ) : null}
                 </div>
@@ -284,10 +299,7 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
                     <ErrorAlert error={diff.error} onRetry={diff.reload} />
                   </div>
                 ) : (
-                  <PatchView
-                    patch={diff.data?.diff ?? ""}
-                    empty="This commit changed no text."
-                  />
+                  <PatchView patch={diff.data?.diff ?? ""} empty={t("files.emptyPatch")} />
                 )}
               </>
             ) : (
@@ -302,20 +314,18 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
       <Dialog open={revertOpen} onOpenChange={setRevertOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Restore files from {selected?.short}</DialogTitle>
-            <DialogDescription>
-              Each file is copied to a .bak sibling before it is overwritten or removed. The
-              restore is recorded as a new commit attributed to you, so it can be undone the same
-              way.
-            </DialogDescription>
+            <DialogTitle>
+              {t("history.restoreTitle", { commit: selected?.short ?? "" })}
+            </DialogTitle>
+            <DialogDescription>{t("history.restoreDescription")}</DialogDescription>
           </DialogHeader>
 
           <div className="min-w-0 space-y-3">
             <div className="overflow-hidden rounded-md border">
               <p className="border-b bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
                 {selected
-                  ? `${selected.paths.length} ${plural(selected.paths.length, "file")} in this commit`
-                  : "Paths"}
+                  ? t("history.pathsInCommit", { count: selected.paths.length })
+                  : t("history.paths")}
               </p>
               <ul className="max-h-48 divide-y overflow-auto">
                 {(selected?.paths ?? []).map((path) => (
@@ -336,12 +346,10 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
               />
               <div className="min-w-0 space-y-1">
                 <Label htmlFor="revert-restart" className="cursor-pointer">
-                  Restart the instance after restoring
+                  {t("history.restartAfter")}
                 </Label>
                 <p id="revert-restart-help" className="text-xs text-muted-foreground">
-                  Hermes reads <span className="font-mono">config.yaml</span> and{" "}
-                  <span className="font-mono">SOUL.md</span> at startup. Without a restart the
-                  restored files apply on the next start.
+                  <RichText text={t("history.restartHint")} />
                 </p>
               </div>
             </div>
@@ -351,11 +359,11 @@ export function InstanceHistory({ id, canEdit }: { id: string; canEdit: boolean 
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setRevertOpen(false)} disabled={reverting}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button onClick={() => void onRevert()} disabled={reverting || !selected}>
               {reverting ? <Loader2 aria-hidden className="animate-spin" /> : <RotateCcw aria-hidden />}
-              Restore files
+              {t("history.restoreConfirm")}
             </Button>
           </DialogFooter>
         </DialogContent>

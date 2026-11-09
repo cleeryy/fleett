@@ -57,16 +57,20 @@ export function envRowsFromDetail(entries: EnvEntry[]): EnvRow[] {
   );
 }
 
-export function envKeyError(key: string): string | null {
-  if (!key) return "Enter a variable name.";
-  if (!ENV_KEY.test(key)) return "Use up to 64 uppercase letters, digits and underscores.";
-  if (key.startsWith("FLEETT_") || RESERVED_KEYS.has(key)) return `${key} is reserved by the container.`;
+type Translate = (key: string, params?: Record<string, string | number>) => string;
+
+export function envKeyError(key: string, t: Translate): string | null {
+  if (!key) return t("env.errors.keyRequired");
+  if (!ENV_KEY.test(key)) return t("env.errors.keyFormat");
+  if (key.startsWith("FLEETT_") || RESERVED_KEYS.has(key)) {
+    return t("env.errors.keyReserved", { key });
+  }
   return null;
 }
 
-export function envValueError(value: string): string | null {
-  if (value.length > 8192) return "Use 8192 characters or fewer.";
-  if (/[\n\r\0]/.test(value)) return "Use a single line.";
+export function envValueError(value: string, t: Translate): string | null {
+  if (value.length > 8192) return t("env.errors.valueTooLong");
+  if (/[\n\r\0]/.test(value)) return t("env.errors.valueSingleLine");
   return null;
 }
 
@@ -74,20 +78,17 @@ export function envValueError(value: string): string | null {
 export function envSuggestionValueError(
   format: string | undefined,
   value: string,
+  t: Translate,
 ): string | null {
   if (!value) return null;
   const trimmed = value.trim();
   switch (format) {
     case "csv-of-ids":
-      return /^\d+(\s*,\s*\d+)*$/.test(trimmed)
-        ? null
-        : "Use comma-separated numeric ids, for example 81459823,310472918374.";
+      return /^\d+(\s*,\s*\d+)*$/.test(trimmed) ? null : t("env.errors.csvIds");
     case "bool":
-      return /^(true|false|1|0|yes|no)$/i.test(trimmed)
-        ? null
-        : "Use true or false.";
+      return /^(true|false|1|0|yes|no)$/i.test(trimmed) ? null : t("env.errors.bool");
     case "url":
-      return isHttpUrl(trimmed) ? null : "Use an absolute http or https URL.";
+      return isHttpUrl(trimmed) ? null : t("env.errors.url");
     default:
       return null;
   }
@@ -112,6 +113,7 @@ export function validateEnvRows(
   rows: EnvRow[],
   mode: EnvMode,
   suggestions: EnvSuggestion[] = [],
+  t: Translate = (key) => key,
 ): { rows: Record<number, EnvRowErrors>; count: number } {
   const errors: Record<number, EnvRowErrors> = {};
   const seen = new Set<string>();
@@ -123,28 +125,28 @@ export function validateEnvRows(
     const rowErrors: EnvRowErrors = {};
     const suggestion = suggestionByKey.get(key);
 
-    const keyProblem = envKeyError(key);
+    const keyProblem = envKeyError(key, t);
     if (keyProblem) {
       rowErrors.key = keyProblem;
     } else if (seen.has(key)) {
-      rowErrors.key = "Already used above.";
+      rowErrors.key = t("env.errors.keyDuplicate");
     } else {
       seen.add(key);
     }
 
-    const valueProblem = envValueError(row.value);
+    const valueProblem = envValueError(row.value, t);
     if (valueProblem) {
       rowErrors.value = valueProblem;
     } else if (!keyProblem) {
       const keepsStored = mode === "apply" && row.value === "" && row.storedSecret;
       if (row.secret && !row.value && !keepsStored) {
-        rowErrors.value = "Enter a value for this secret.";
+        rowErrors.value = t("env.errors.secretValueRequired");
       } else if (!row.secret && !row.value && row.storedSecret) {
-        rowErrors.value = "Enter a value to store this variable in clear text.";
+        rowErrors.value = t("env.errors.clearValueRequired");
       } else if (!row.value && !keepsStored && suggestion?.required) {
-        rowErrors.value = "Required by the template: the gateway refuses every message without it.";
+        rowErrors.value = t("env.errors.templateRequired");
       } else {
-        const formatProblem = envSuggestionValueError(suggestion?.format, row.value);
+        const formatProblem = envSuggestionValueError(suggestion?.format, row.value, t);
         if (formatProblem) rowErrors.value = formatProblem;
       }
     }

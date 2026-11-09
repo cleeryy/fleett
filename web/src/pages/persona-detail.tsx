@@ -37,6 +37,7 @@ import { DataList, Section } from "@/components/data-list";
 import { PatchView } from "@/components/diff-view";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PageHeader } from "@/components/page-header";
 import { PersonaApplyDialog } from "@/components/persona-apply-dialog";
 import { PersonaDeleteDialog } from "@/components/persona-delete-dialog";
@@ -44,7 +45,8 @@ import { PersonaPreviewPanel } from "@/components/persona-preview";
 import { PersonaStateBadge } from "@/components/persona-state-badge";
 import { PersonaVariableEditor, PersonaVariableInputs } from "@/components/persona-vars";
 import { SOUL_SKELETON, SoulHelpButton } from "@/components/soul-help";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import {
   PERSONA_TAG_MAX,
   formatTags,
@@ -116,10 +118,11 @@ function DetailSkeleton() {
 }
 
 function VariablesReadOnly({ detail }: { detail: PersonaDetail }) {
+  const { t } = useI18n();
   if (detail.variables.length === 0) {
     return (
       <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-        No variables: the same SOUL.md is used by every instance.
+        {t("personas.detail.noVariables")}
       </p>
     );
   }
@@ -131,7 +134,12 @@ function VariablesReadOnly({ detail }: { detail: PersonaDetail }) {
           <span className="min-w-0 space-y-0.5">
             <span className="block text-sm text-muted-foreground">{variable.description}</span>
             <span className="block text-xs text-muted-foreground">
-              Default: {variable.default ? <span className="font-mono">{variable.default}</span> : "none"}
+              {t("personas.detail.defaultLabel")}{" "}
+              {variable.default ? (
+                <span className="font-mono">{variable.default}</span>
+              ) : (
+                t("common.none")
+              )}
             </span>
           </span>
         </li>
@@ -141,6 +149,7 @@ function VariablesReadOnly({ detail }: { detail: PersonaDetail }) {
 }
 
 function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
+  const { t, lang } = useI18n();
   const log = useResource(() => api.personaGitLog(id, { limit: 20 }), [id, nonce]);
   const commits = log.data?.commits ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -161,27 +170,27 @@ function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
 
   return (
     <Section
-      title="Version history"
-      description="Every save of the persona, committed to the personas repository."
+      title={t("personas.detail.historyTitle")}
+      description={t("personas.detail.historyDescription")}
     >
       {log.loading && !log.data ? (
         <Skeleton className="h-32 w-full rounded-md" />
       ) : log.error ? (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border px-4 py-3">
           <p className="text-sm text-muted-foreground">
-            Version history is not available on this server yet. Saves still update the persona.
+            {t("personas.detail.historyUnavailable")}
             {log.error.status > 0 ? (
               <span className="ml-1 font-mono text-xs">HTTP {log.error.status}</span>
             ) : null}
           </p>
           <Button variant="outline" size="sm" onClick={log.reload}>
             <RefreshCw aria-hidden />
-            Retry
+            {t("common.retry")}
           </Button>
         </div>
       ) : commits.length === 0 ? (
         <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-          No saved version yet. Editing and saving the persona creates the first one.
+          {t("personas.detail.noHistory")}
         </p>
       ) : (
         <div className="grid gap-3 lg:grid-cols-[320px_minmax(0,1fr)]">
@@ -207,7 +216,7 @@ function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
                     <span className="max-w-40 truncate">{commit.author}</span>
                     <span aria-hidden>·</span>
                     <time dateTime={commit.at} title={formatDateTime(commit.at)}>
-                      {formatRelative(commit.at)}
+                      {formatRelative(commit.at, lang)}
                     </time>
                   </span>
                 </button>
@@ -223,11 +232,11 @@ function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
                   <span className="font-mono text-foreground">{selected.short}</span>
                   <span aria-hidden>·</span>
                   <span className="font-mono">
-                    {selected.paths.length} {plural(selected.paths.length, "file")}
+                    {t("history.fileCount", { count: selected.paths.length })}
                   </span>
                 </>
               ) : (
-                <span>Pick a version.</span>
+                <span>{t("personas.detail.pickVersion")}</span>
               )}
             </div>
             {diff.loading || diff.refreshing ? (
@@ -239,7 +248,7 @@ function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
             ) : (
               <PatchView
                 patch={diff.data?.diff ?? ""}
-                empty="This version did not change a text file."
+                empty={t("skills.detail.noTextVersion")}
               />
             )}
           </div>
@@ -250,6 +259,7 @@ function PersonaHistory({ id, nonce }: { id: string; nonce: number }) {
 }
 
 export function PersonaDetailPage({ id }: { id: string }) {
+  const { t, lang } = useI18n();
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -295,7 +305,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
           title={id}
           actions={
             <Button asChild variant="outline">
-              <a href="#/personas">Back to personas</a>
+              <a href="#/personas">{t("personas.detail.back")}</a>
             </Button>
           }
         />
@@ -309,7 +319,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
   const diverged = linked.filter((instance) => instance.persona_state === "diverged");
   const merged = draft ? fingerprint(draft) : fingerprint(toDraft(persona));
   const dirty = draft !== null && merged !== fingerprint(toDraft(persona));
-  const variableErrors = draft ? (attempted ? validateVariableRows(draft.rows) : {}) : {};
+  const variableErrors = draft ? (attempted ? validateVariableRows(draft.rows, t) : {}) : {};
   const parsedTags = draft ? parseTags(draft.tags) : persona.tags;
   const badTag = parsedTags.find((tag) => tag.length > PERSONA_TAG_MAX);
   const undeclared = draft
@@ -320,10 +330,12 @@ export function PersonaDetailPage({ id }: { id: string }) {
 
   const errors: Record<string, string> = {};
   if (draft) {
-    if (!draft.name.trim()) errors.name = "Enter a name.";
-    else if (draft.name.trim().length > 128) errors.name = "Use 128 characters or fewer.";
-    if (badTag) errors.tags = `"${badTag}" is longer than ${PERSONA_TAG_MAX} characters.`;
-    if (!draft.soul.trim()) errors.soul = "SOUL.md must not be empty.";
+    if (!draft.name.trim()) errors.name = t("personas.create.nameRequired");
+    else if (draft.name.trim().length > 128) errors.name = t("personas.create.nameTooLong");
+    if (badTag) {
+      errors.tags = t("personas.create.tagTooLong", { tag: badTag, max: PERSONA_TAG_MAX });
+    }
+    if (!draft.soul.trim()) errors.soul = t("personas.detail.soulRequired");
   }
   const showErrors = attempted && draft !== null;
 
@@ -340,7 +352,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
       document.getElementById(FIELD_IDS[first])?.focus();
       return;
     }
-    if (Object.keys(validateVariableRows(draft.rows)).length > 0) {
+    if (Object.keys(validateVariableRows(draft.rows, t)).length > 0) {
       document.getElementById("persona-edit-variables")?.scrollIntoView({ block: "center" });
       return;
     }
@@ -356,7 +368,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
         soul_md: draft.soul,
       };
       await api.patchPersona(id, patch);
-      toast.success("Persona saved.");
+      toast.success(t("personas.detail.saved"));
       setAttempted(false);
       resetPending.current = true;
       setNonce((value) => value + 1);
@@ -369,8 +381,8 @@ export function PersonaDetailPage({ id }: { id: string }) {
 
   const previewDescription =
     previewInstance === "sample"
-      ? "Sample values only: nothing is stored."
-      : `Using the values stored on ${previewInstance}. Save the editor to include unsaved text.`;
+      ? t("personas.detail.previewSample")
+      : t("personas.detail.previewInstance", { instance: previewInstance });
 
   return (
     <>
@@ -387,19 +399,35 @@ export function PersonaDetailPage({ id }: { id: string }) {
         }
         description={
           <span className="space-y-1">
-            <span className="block">{persona.description || "No description."}</span>
+            <span className="block">
+              {persona.description || t("skills.picker.noDescription")}
+            </span>
             <span className="flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-xs">
               <span>{persona.id}</span>
               <span aria-hidden>·</span>
               <span>
-                {persona.variables.length} {plural(persona.variables.length, "variable")}
+                {t(
+                  persona.variables.length === 1
+                    ? "personas.picker.variableOne"
+                    : "personas.picker.variableMany",
+                  { count: persona.variables.length },
+                )}
               </span>
               <span aria-hidden>·</span>
               <span>
-                {persona.instances_count} {plural(persona.instances_count, "instance")}
+                {t(
+                  persona.instances_count === 1
+                    ? "skills.picker.instanceOne"
+                    : "skills.picker.instanceMany",
+                  { count: persona.instances_count },
+                )}
               </span>
               <span aria-hidden>·</span>
-              <span>updated {formatRelative(persona.updated_at)}</span>
+              <span>
+                {t("skills.picker.updated", {
+                  time: formatRelative(persona.updated_at, lang),
+                })}
+              </span>
             </span>
           </span>
         }
@@ -409,8 +437,8 @@ export function PersonaDetailPage({ id }: { id: string }) {
               variant="outline"
               size="icon-sm"
               onClick={() => setNonce((value) => value + 1)}
-              aria-label="Refresh persona"
-              title="Refresh persona"
+              aria-label={t("personas.detail.refresh")}
+              title={t("personas.detail.refresh")}
             >
               <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
             </Button>
@@ -426,15 +454,15 @@ export function PersonaDetailPage({ id }: { id: string }) {
                   }}
                 >
                   <Send aria-hidden />
-                  Apply to instances
+                  {t("personas.detail.applyToInstances")}
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
                       size="icon-sm"
-                      aria-label="More actions"
-                      title="More actions"
+                      aria-label={t("providers.detail.moreActions")}
+                      title={t("providers.detail.moreActions")}
                     >
                       <MoreHorizontal aria-hidden />
                     </Button>
@@ -442,7 +470,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                       <Trash2 aria-hidden />
-                      Delete persona…
+                      {t("personas.detail.delete")}
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -458,8 +486,14 @@ export function PersonaDetailPage({ id }: { id: string }) {
         <div className="flex flex-wrap items-center gap-3 rounded-md border border-amber-600/40 bg-amber-50/40 px-4 py-3 text-sm dark:bg-amber-950/20">
           <PersonaStateBadge state="diverged" />
           <p className="min-w-0 flex-1 text-muted-foreground">
-            {diverged.length} {plural(diverged.length, "instance")} edited{" "}
-            <span className="font-mono">SOUL.md</span> by hand after the persona was applied.
+            <RichText
+              text={t(
+                diverged.length === 1
+                  ? "personas.detail.divergedOne"
+                  : "personas.detail.divergedMany",
+                { count: diverged.length },
+              )}
+            />
           </p>
           <Button
             variant="outline"
@@ -470,7 +504,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
             }}
           >
             <RotateCcw aria-hidden />
-            Reapply to {diverged.length}
+            {t("personas.detail.reapplyTo", { count: diverged.length })}
           </Button>
         </div>
       ) : null}
@@ -478,10 +512,10 @@ export function PersonaDetailPage({ id }: { id: string }) {
       {canEdit ? (
         draft ? (
         <form onSubmit={save} noValidate className="space-y-6">
-          <Section title="Metadata">
+          <Section title={t("providers.detail.metadata")}>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="persona-edit-name">Name</Label>
+                <Label htmlFor="persona-edit-name">{t("common.name")}</Label>
                 <Input
                   id="persona-edit-name"
                   value={draft.name}
@@ -497,14 +531,14 @@ export function PersonaDetailPage({ id }: { id: string }) {
                 ) : null}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="persona-edit-tags">Tags</Label>
+                <Label htmlFor="persona-edit-tags">{t("personas.create.tags")}</Label>
                 <Input
                   id="persona-edit-tags"
                   value={draft.tags}
                   autoComplete="off"
                   spellCheck={false}
                   className="font-mono text-xs"
-                  placeholder="ops, tone, infra"
+                  placeholder={t("personas.create.tagsPlaceholder")}
                   aria-invalid={showErrors && !!errors.tags}
                   aria-describedby={showErrors && errors.tags ? "persona-edit-tags-error" : undefined}
                   onChange={(event) => update({ tags: event.target.value })}
@@ -516,7 +550,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                 ) : null}
               </div>
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="persona-edit-description">Description</Label>
+                <Label htmlFor="persona-edit-description">{t("common.description")}</Label>
                 <Textarea
                   id="persona-edit-description"
                   rows={2}
@@ -537,17 +571,16 @@ export function PersonaDetailPage({ id }: { id: string }) {
             />
             {Object.keys(variableErrors).length > 0 ? (
               <p className="mt-1 text-xs text-destructive">
-                Fix the variable rows marked above before saving.
+                {t("personas.detail.fixVariables")}
               </p>
             ) : null}
           </div>
 
-          <Section title="SOUL.md">
+          <Section title={t("personas.create.soul")}>
             <div className="space-y-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-muted-foreground">
-                  Markdown read by the agent at startup. Variables are written{" "}
-                  <span className="font-mono">{"{{key}}"}</span>.
+                  <RichText text={t("personas.detail.soulHint")} />
                 </p>
                 <div className="flex items-center gap-1">
                   {!draft.soul.trim() ? (
@@ -557,7 +590,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                       size="sm"
                       onClick={() => update({ soul: SOUL_SKELETON })}
                     >
-                      Insert a skeleton
+                      {t("personas.create.insertSkeleton")}
                     </Button>
                   ) : null}
                   <SoulHelpButton />
@@ -575,11 +608,15 @@ export function PersonaDetailPage({ id }: { id: string }) {
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs text-muted-foreground">
-                  {templateVariables(draft.soul).length}{" "}
-                  {plural(templateVariables(draft.soul).length, "placeholder")} in the text.
+                  {t(
+                    templateVariables(draft.soul).length === 1
+                      ? "personas.detail.placeholderOne"
+                      : "personas.detail.placeholderMany",
+                    { count: templateVariables(draft.soul).length },
+                  )}
                 </p>
                 <span className="font-mono text-xs text-muted-foreground">
-                  {draft.soul.length} characters
+                  {t("personas.create.characters", { count: draft.soul.length })}
                 </span>
               </div>
               {showErrors && errors.soul ? (
@@ -589,9 +626,9 @@ export function PersonaDetailPage({ id }: { id: string }) {
               ) : null}
               {undeclared.length > 0 ? (
                 <p className="text-xs text-amber-700 dark:text-amber-400">
-                  Placeholders without a variable:{" "}
-                  {undeclared.map((key) => `{{${key}}}`).join(", ")}. Add them above, or the preview
-                  will report them as missing.
+                  {t("personas.detail.undeclared", {
+                    keys: undeclared.map((key) => `{{${key}}}`).join(", "),
+                  })}
                 </p>
               ) : null}
             </div>
@@ -600,7 +637,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
           <div className="flex flex-wrap items-center gap-2 border-t pt-4">
             <Button type="submit" disabled={!dirty || saving}>
               {saving ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Save persona
+              {t("personas.detail.save")}
             </Button>
             <Button
               type="button"
@@ -612,12 +649,14 @@ export function PersonaDetailPage({ id }: { id: string }) {
                 setSaveError(null);
               }}
             >
-              Discard
+              {t("env.discard")}
             </Button>
             <p className="text-xs text-muted-foreground sm:ml-auto">
               {dirty
-                ? "Unsaved changes."
-                : `Saved ${formatDateTime(persona.updated_at)}. Applying a persona rewrites data/SOUL.md and restarts the instance.`}
+                ? t("personas.detail.unsaved")
+                : t("personas.detail.savedAt", {
+                    time: formatDateTime(persona.updated_at),
+                  })}
             </p>
           </div>
 
@@ -628,17 +667,19 @@ export function PersonaDetailPage({ id }: { id: string }) {
         )
       ) : (
         <div className="space-y-6">
-          <Section title="Metadata">
+          <Section title={t("providers.detail.metadata")}>
             <DataList
               items={[
-                { label: "Name", value: persona.name },
-                { label: "Id", value: <Mono>{persona.id}</Mono> },
+                { label: t("common.name"), value: persona.name },
+                { label: t("providers.detail.id"), value: <Mono>{persona.id}</Mono> },
                 {
-                  label: "Description",
-                  value: persona.description || <span className="text-muted-foreground">None</span>,
+                  label: t("common.description"),
+                  value: persona.description || (
+                    <span className="text-muted-foreground">{t("common.none")}</span>
+                  ),
                 },
                 {
-                  label: "Tags",
+                  label: t("personas.create.tags"),
                   value: persona.tags.length ? (
                     <span className="flex flex-wrap gap-1">
                       {persona.tags.map((tag) => (
@@ -648,17 +689,25 @@ export function PersonaDetailPage({ id }: { id: string }) {
                       ))}
                     </span>
                   ) : (
-                    <span className="text-muted-foreground">None</span>
+                    <span className="text-muted-foreground">{t("common.none")}</span>
                   ),
                 },
                 {
-                  label: "Instances",
-                  value: `${persona.instances_count} ${plural(persona.instances_count, "instance")}`,
+                  label: t("nav.instances"),
+                  value: t(
+                    persona.instances_count === 1
+                      ? "skills.picker.instanceOne"
+                      : "skills.picker.instanceMany",
+                    { count: persona.instances_count },
+                  ),
                 },
                 {
-                  label: "Updated",
+                  label: t("common.updated"),
                   value: (
-                    <span className="font-mono text-xs" title={formatRelative(persona.updated_at)}>
+                    <span
+                      className="font-mono text-xs"
+                      title={formatRelative(persona.updated_at, lang)}
+                    >
                       {formatDateTime(persona.updated_at)}
                     </span>
                   ),
@@ -666,24 +715,24 @@ export function PersonaDetailPage({ id }: { id: string }) {
               ]}
             />
           </Section>
-          <Section title="Variables">
+          <Section title={t("personas.vars.title")}>
             <VariablesReadOnly detail={persona} />
           </Section>
-          <Section title="SOUL.md">
+          <Section title={t("personas.create.soul")}>
             <CodeBlock value={persona.soul_md} title="SOUL.md" maxHeight="50vh" />
           </Section>
         </div>
       )}
 
       <Section
-        title="Preview"
-        description="The SOUL.md an instance would read, with variables rendered."
+        title={t("personas.detail.preview")}
+        description={t("personas.detail.previewDescription")}
         action={canEdit ? undefined : <SoulHelpButton />}
       >
         <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="persona-preview-instance">Values</Label>
+              <Label htmlFor="persona-preview-instance">{t("personas.detail.values")}</Label>
               <Select
                 value={previewInstance}
                 onValueChange={(value) => {
@@ -695,7 +744,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="sample">Sample values</SelectItem>
+                  <SelectItem value="sample">{t("personas.detail.sampleValues")}</SelectItem>
                   {(instances.data ?? []).map((instance) => (
                     <SelectItem key={instance.id} value={instance.id}>
                       {instance.name} · {instance.id}
@@ -704,7 +753,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Pick an instance to use the values it has stored for this persona.
+                {t("personas.detail.valuesHint")}
               </p>
             </div>
 
@@ -718,12 +767,12 @@ export function PersonaDetailPage({ id }: { id: string }) {
                 />
               ) : (
                 <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
-                  This persona takes no variables.
+                  {t("personas.vars.noVariables")}
                 </p>
               )
             ) : (
               <p className="rounded-md border bg-muted/20 px-3 py-2.5 text-xs text-muted-foreground">
-                Using the values saved on{" "}
+                {t("personas.detail.usingStored")}{" "}
                 <span className="font-mono text-foreground">{previewInstance}</span>.
               </p>
             )}
@@ -741,8 +790,8 @@ export function PersonaDetailPage({ id }: { id: string }) {
       </Section>
 
       <Section
-        title="Linked instances"
-        description="Instances whose SOUL.md comes from this persona."
+        title={t("providers.detail.linkedInstances")}
+        description={t("personas.detail.linkedDescription")}
         action={
           linked.length > 0 && canEdit ? (
             <Button
@@ -754,7 +803,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
               }}
             >
               <Send aria-hidden />
-              Apply…
+              {t("personas.detail.applyEllipsis")}
             </Button>
           ) : null
         }
@@ -765,12 +814,12 @@ export function PersonaDetailPage({ id }: { id: string }) {
           <div className="rounded-md border">
             <EmptyState
               icon={Users}
-              title="No instance uses this persona"
-              description="Apply it to an existing instance from here, or pick it when you create the next one."
+              title={t("personas.detail.noLinkedTitle")}
+              description={t("personas.detail.noLinkedDescription")}
               action={
                 canEdit ? (
                   <Button asChild variant="outline" size="sm">
-                    <a href={hrefFor("/instances/new")}>New instance</a>
+                    <a href={hrefFor("/instances/new")}>{t("nav.newInstance")}</a>
                   </Button>
                 ) : undefined
               }
@@ -803,7 +852,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
                     }}
                   >
                     <RotateCcw aria-hidden />
-                    Reapply
+                    {t("personas.detail.reapply")}
                   </Button>
                 ) : null}
               </li>
@@ -830,7 +879,7 @@ export function PersonaDetailPage({ id }: { id: string }) {
             open={deleteOpen}
             onOpenChange={setDeleteOpen}
             onDeleted={() => {
-              toast.success(`Persona ${persona.id} deleted.`);
+              toast.success(t("personas.detail.deleted", { id: persona.id }));
               navigate("/personas");
             }}
           />

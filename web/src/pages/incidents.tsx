@@ -37,25 +37,35 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { OpsBadge } from "@/components/ops-badge";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useIdentity } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 function CauseLabel({ cause }: { cause: string }) {
+  const { t } = useI18n();
+  const key = `incidentCause.${cause}`;
   return (
-    <span className="font-mono text-xs">{cause.replace(/_/g, " ")}</span>
+    <span className="font-mono text-xs">
+      {hasTranslation(key) ? t(key) : cause.replace(/_/g, " ")}
+    </span>
   );
 }
 
 function IncidentActions({ incident }: { incident: Incident }) {
+  const { t } = useI18n();
   if (incident.actions.length === 0) {
-    return <span className="text-xs text-muted-foreground">none</span>;
+    return <span className="text-xs text-muted-foreground">{t("common.none")}</span>;
   }
   return (
     <details>
       <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-        {incident.actions.length} action{incident.actions.length === 1 ? "" : "s"} · restart{" "}
-        {incident.restart_count}
+        {t(
+          incident.actions.length === 1
+            ? "incidents.actionsOne"
+            : "incidents.actionsMany",
+          { count: incident.actions.length, restarts: incident.restart_count },
+        )}
       </summary>
       <ul className="mt-1 space-y-1">
         {incident.actions.map((action) => (
@@ -84,6 +94,7 @@ function HealDialog({
   onOpenChange: (open: boolean) => void;
   onSaved: (policy: HealPolicyView) => void;
 }) {
+  const { t } = useI18n();
   const [heal, setHeal] = useState("keep");
   const [unhealthyAfter, setUnhealthyAfter] = useState("");
   const [maxRestarts, setMaxRestarts] = useState("");
@@ -118,7 +129,7 @@ function HealDialog({
     if (unhealthyAfter.trim()) {
       const value = Number(unhealthyAfter);
       if (!Number.isInteger(value) || value < 1 || value > 100) {
-        setError(toApiError(new Error("unhealthy_after must be between 1 and 100.")));
+        setError(toApiError(new Error(t("incidents.heal.rangeUnhealthy"))));
         return;
       }
       input.unhealthy_after = value;
@@ -126,7 +137,7 @@ function HealDialog({
     if (maxRestarts.trim()) {
       const value = Number(maxRestarts);
       if (!Number.isInteger(value) || value < 0 || value > 100) {
-        setError(toApiError(new Error("max_restarts must be between 0 and 100.")));
+        setError(toApiError(new Error(t("incidents.heal.rangeMaxRestarts"))));
         return;
       }
       input.max_restarts = value;
@@ -134,20 +145,20 @@ function HealDialog({
     if (backoff.trim()) {
       const value = Number(backoff);
       if (!Number.isInteger(value) || value < 1 || value > 3_600) {
-        setError(toApiError(new Error("heal_backoff_s must be between 1 and 3600.")));
+        setError(toApiError(new Error(t("incidents.heal.rangeBackoff"))));
         return;
       }
       input.heal_backoff_s = value;
     }
     if (Object.keys(input).length === 0) {
-      setError(toApiError(new Error("Change at least one field, or cancel.")));
+      setError(toApiError(new Error(t("incidents.heal.noChange"))));
       return;
     }
     setPending(true);
     setError(null);
     try {
       const policy = await api.patchHeal(instanceId, input);
-      toast.success(`Heal policy saved for ${instanceId}.`);
+      toast.success(t("incidents.heal.saved", { instance: instanceId }));
       setSaved(policy);
       onSaved(policy);
       onOpenChange(false);
@@ -171,82 +182,87 @@ function HealDialog({
     >
       <DialogContent className="max-h-[85dvh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Heal policy · {instanceId}</DialogTitle>
-          <DialogDescription>
-            The watchdog reads the policy from the instance row. The API reports it after a write, so
-            empty fields mean “keep the stored value”.
-          </DialogDescription>
+          <DialogTitle>{t("incidents.heal.title", { instance: instanceId })}</DialogTitle>
+          <DialogDescription>{t("incidents.heal.description")}</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           {error ? <ErrorAlert error={error} /> : null}
           {value ? (
             <p className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              Last saved: <span className="font-mono">{value.heal}</span>, every{" "}
-              <span className="font-mono">{value.unhealthy_after}</span> unhealthy samples, up to{" "}
-              <span className="font-mono">{value.max_restarts}</span> restarts, backoff{" "}
-              <span className="font-mono">{value.heal_backoff_s}s</span>.
+              {t("incidents.heal.lastSaved", {
+                heal: hasTranslation(`heal.${value.heal}`)
+                  ? t(`heal.${value.heal}`)
+                  : value.heal,
+                after: value.unhealthy_after,
+                max: value.max_restarts,
+                backoff: value.heal_backoff_s,
+              })}
             </p>
           ) : (
             <Alert>
               <HeartPulse aria-hidden />
-              <AlertTitle>Current policy not loaded</AlertTitle>
-              <AlertDescription>
-                Only changed fields are sent, so the stored values stay untouched until you save.
-              </AlertDescription>
+              <AlertTitle>{t("incidents.heal.notLoaded")}</AlertTitle>
+              <AlertDescription>{t("incidents.heal.notLoadedBody")}</AlertDescription>
             </Alert>
           )}
 
           <div className="space-y-2">
-            <Label htmlFor="heal-mode">Action when unhealthy</Label>
+            <Label htmlFor="heal-mode">{t("incidents.heal.action")}</Label>
             <Select value={heal} onValueChange={setHeal}>
               <SelectTrigger id="heal-mode" className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="keep">Keep current</SelectItem>
-                <SelectItem value="off">Observe only</SelectItem>
-                <SelectItem value="restart">Restart the container</SelectItem>
-                <SelectItem value="recreate">Recreate the container</SelectItem>
+                <SelectItem value="keep">{t("incidents.heal.keep")}</SelectItem>
+                <SelectItem value="off">{t("incidents.heal.observe")}</SelectItem>
+                <SelectItem value="restart">{t("incidents.heal.restart")}</SelectItem>
+                <SelectItem value="recreate">{t("incidents.heal.recreate")}</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="space-y-2">
-              <Label htmlFor="heal-after">Unhealthy after</Label>
+              <Label htmlFor="heal-after">{t("incidents.heal.unhealthyAfter")}</Label>
               <Input
                 id="heal-after"
                 type="number"
                 min={1}
                 max={100}
                 value={unhealthyAfter}
-                placeholder={value ? String(value.unhealthy_after) : "keep"}
+                placeholder={
+                  value ? String(value.unhealthy_after) : t("incidents.heal.keepShort")
+                }
                 className="font-mono"
                 onChange={(event) => setUnhealthyAfter(event.target.value)}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="heal-max">Max restarts</Label>
+              <Label htmlFor="heal-max">{t("incidents.heal.maxRestarts")}</Label>
               <Input
                 id="heal-max"
                 type="number"
                 min={0}
                 max={100}
                 value={maxRestarts}
-                placeholder={value ? String(value.max_restarts) : "keep"}
+                placeholder={
+                  value ? String(value.max_restarts) : t("incidents.heal.keepShort")
+                }
                 className="font-mono"
                 onChange={(event) => setMaxRestarts(event.target.value)}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="heal-backoff">Backoff (s)</Label>
+              <Label htmlFor="heal-backoff">{t("incidents.heal.backoff")}</Label>
               <Input
                 id="heal-backoff"
                 type="number"
                 min={1}
                 max={3_600}
                 value={backoff}
-                placeholder={value ? String(value.heal_backoff_s) : "keep"}
+                placeholder={
+                  value ? String(value.heal_backoff_s) : t("incidents.heal.keepShort")
+                }
                 className="font-mono"
                 onChange={(event) => setBackoff(event.target.value)}
               />
@@ -255,11 +271,11 @@ function HealDialog({
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              Save policy
+              {t("incidents.heal.save")}
             </Button>
           </DialogFooter>
         </form>
@@ -269,6 +285,7 @@ function HealDialog({
 }
 
 export function IncidentsPage() {
+  const { t, lang } = useI18n();
   const admin = useIdentity()?.role === "admin";
   const [tab, setTab] = useState("incidents");
   const [nonce, setNonce] = useState(0);
@@ -311,7 +328,7 @@ export function IncidentsPage() {
     setActionError(null);
     try {
       await api.closeIncident(incident.id);
-      toast.success(`Incident on ${incident.instance_id} closed.`);
+      toast.success(t("incidents.closed", { instance: incident.instance_id }));
       setNonce((value) => value + 1);
     } catch (cause) {
       setActionError(toApiError(cause));
@@ -323,16 +340,16 @@ export function IncidentsPage() {
   return (
     <>
       <PageHeader
-        title="Incidents"
+        title={t("nav.incidents")}
         description={
           incidents.data
-            ? `${openCount} open in this view · ${rows.length} ${plural(rows.length, "incident")} · watchdog sampling every 30 s`
-            : "Loading incidents."
+            ? t("incidents.summary", { open: openCount, total: rows.length })
+            : t("incidents.loading")
         }
         actions={
           <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
             <RefreshCw aria-hidden className={incidents.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
         }
       />
@@ -342,8 +359,8 @@ export function IncidentsPage() {
       <Tabs value={tab} onValueChange={setTab}>
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
-            <TabsTrigger value="incidents">Incidents</TabsTrigger>
-            <TabsTrigger value="heal">Heal policies</TabsTrigger>
+            <TabsTrigger value="incidents">{t("nav.incidents")}</TabsTrigger>
+            <TabsTrigger value="heal">{t("incidents.healPolicies")}</TabsTrigger>
           </TabsList>
         </div>
 
@@ -359,27 +376,27 @@ export function IncidentsPage() {
               <Input
                 value={q}
                 onChange={(event) => setQ(event.target.value)}
-                placeholder="Search instance, cause, detail"
-                aria-label="Search incidents"
+                placeholder={t("incidents.searchPlaceholder")}
+                aria-label={t("incidents.searchAria")}
                 className="pl-8"
               />
             </div>
             <Select value={status} onValueChange={(value) => setStatus(value as "all" | IncidentStatus)}>
-              <SelectTrigger className="w-full sm:w-40" aria-label="Filter by status">
+              <SelectTrigger className="w-full sm:w-40" aria-label={t("fleet.filterAria")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All statuses</SelectItem>
-                <SelectItem value="open">Open</SelectItem>
-                <SelectItem value="closed">Closed</SelectItem>
+                <SelectItem value="all">{t("incidents.allStatuses")}</SelectItem>
+                <SelectItem value="open">{t("status.open")}</SelectItem>
+                <SelectItem value="closed">{t("status.closed")}</SelectItem>
               </SelectContent>
             </Select>
             <Select value={instance} onValueChange={setInstance}>
-              <SelectTrigger className="w-full sm:w-48" aria-label="Filter by instance">
+              <SelectTrigger className="w-full sm:w-48" aria-label={t("schedules.filterAria")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All instances</SelectItem>
+                <SelectItem value="all">{t("logs.allInstances")}</SelectItem>
                 {instanceOptions.map((id) => (
                   <SelectItem key={id} value={id}>
                     {id}
@@ -388,7 +405,7 @@ export function IncidentsPage() {
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground sm:ml-auto" aria-live="polite">
-              {filtered.length} shown
+              {t("schedules.shown", { count: filtered.length })}
             </p>
           </div>
 
@@ -402,11 +419,13 @@ export function IncidentsPage() {
             ) : filtered.length === 0 ? (
               <EmptyState
                 icon={TriangleAlert}
-                title={rows.length === 0 ? "No incidents in this view" : "No incident matches the filters"}
+                title={
+                  rows.length === 0 ? t("incidents.emptyTitle") : t("incidents.noMatchTitle")
+                }
                 description={
                   status === "open"
-                    ? "A clean stop never opens an incident. The watchdog closes one on the first healthy sample."
-                    : "Change the status filter or clear the search."
+                    ? t("incidents.emptyOpenDescription")
+                    : t("incidents.noMatchDescription")
                 }
               />
             ) : (
@@ -415,13 +434,13 @@ export function IncidentsPage() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="w-[160px]">Opened</TableHead>
-                        <TableHead className="w-[120px]">Instance</TableHead>
-                        <TableHead className="w-[120px]">Cause</TableHead>
-                        <TableHead>Detail</TableHead>
-                        <TableHead className="w-[150px]">Status</TableHead>
+                        <TableHead className="w-[160px]">{t("incidents.opened")}</TableHead>
+                        <TableHead className="w-[120px]">{t("messages.instance")}</TableHead>
+                        <TableHead className="w-[120px]">{t("incidents.cause")}</TableHead>
+                        <TableHead>{t("incidents.detail")}</TableHead>
+                        <TableHead className="w-[150px]">{t("common.status")}</TableHead>
                         <TableHead className="w-[110px]">
-                          <span className="sr-only">Actions</span>
+                          <span className="sr-only">{t("common.actions")}</span>
                         </TableHead>
                       </TableRow>
                     </TableHeader>
@@ -431,7 +450,9 @@ export function IncidentsPage() {
                           <TableCell>
                             <span className="block font-mono text-xs">{formatDateTime(incident.opened_at)}</span>
                             <span className="block text-[11px] text-muted-foreground">
-                              last seen {formatRelative(incident.last_seen_at)}
+                              {t("incidents.lastSeen", {
+                                time: formatRelative(incident.last_seen_at, lang),
+                              })}
                             </span>
                           </TableCell>
                           <TableCell>
@@ -454,7 +475,7 @@ export function IncidentsPage() {
                               <OpsBadge status={incident.status} />
                               {incident.closed_at ? (
                                 <span className="text-[11px] text-muted-foreground">
-                                  {formatRelative(incident.closed_at)}
+                                  {formatRelative(incident.closed_at, lang)}
                                 </span>
                               ) : null}
                             </span>
@@ -470,7 +491,7 @@ export function IncidentsPage() {
                                 {closingId === incident.id ? (
                                   <Loader2 aria-hidden className="animate-spin" />
                                 ) : null}
-                                Close
+                                {t("incidents.close")}
                               </Button>
                             ) : null}
                           </TableCell>
@@ -501,7 +522,7 @@ export function IncidentsPage() {
                         <CauseLabel cause={incident.cause} />
                         <span className="text-muted-foreground">·</span>
                         <span className="text-muted-foreground">
-                          restart {incident.restart_count}
+                          {t("incidents.restartCount", { count: incident.restart_count })}
                         </span>
                       </div>
                       <p className="text-xs">{incident.detail}</p>
@@ -517,7 +538,7 @@ export function IncidentsPage() {
                             {closingId === incident.id ? (
                               <Loader2 aria-hidden className="animate-spin" />
                             ) : null}
-                            Close incident
+                            {t("incidents.closeIncident")}
                           </Button>
                         </div>
                       ) : null}
@@ -531,9 +552,8 @@ export function IncidentsPage() {
 
         <TabsContent value="heal" className="mt-4 space-y-3">
           <p className="text-sm text-muted-foreground">
-            Self-healing is opt-in per instance. The watchdog observes every 30 s; a heal policy
-            restarts or recreates a container after consecutive unhealthy samples.
-            {!admin ? " Your account can read the policies but not change them." : ""}
+            {t("incidents.healIntro")}
+            {!admin ? ` ${t("incidents.healReadOnly")}` : ""}
           </p>
           {instances.error ? <ErrorAlert error={instances.error} onRetry={instances.reload} /> : null}
           <div className="rounded-md border">
@@ -544,7 +564,11 @@ export function IncidentsPage() {
                 ))}
               </div>
             ) : (instances.data ?? []).length === 0 ? (
-              <EmptyState icon={HeartPulse} title="No instances" description="Create an instance first." />
+              <EmptyState
+                icon={HeartPulse}
+                title={t("incidents.noInstances")}
+                description={t("incidents.noInstancesDescription")}
+              />
             ) : (
               <ul className="divide-y">
                 {(instances.data ?? []).map((row) => {
@@ -558,19 +582,29 @@ export function IncidentsPage() {
                       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                         {policy ? (
                           <>
-                            <OpsBadge status={policy.heal === "off" ? "closed" : policy.heal} />
+                            <OpsBadge
+                              status={policy.heal === "off" ? "closed" : policy.heal}
+                              label={
+                                hasTranslation(`heal.${policy.heal}`)
+                                  ? t(`heal.${policy.heal}`)
+                                  : policy.heal
+                              }
+                            />
                             <span className="font-mono">
-                              after {policy.unhealthy_after} · max {policy.max_restarts} · backoff{" "}
-                              {policy.heal_backoff_s}s
+                              {t("incidents.policySummary", {
+                                after: policy.unhealthy_after,
+                                max: policy.max_restarts,
+                                backoff: policy.heal_backoff_s,
+                              })}
                             </span>
                           </>
                         ) : (
-                          <span>Policy not loaded in this session</span>
+                          <span>{t("incidents.policyNotLoaded")}</span>
                         )}
                       </div>
                       {admin ? (
                         <Button variant="outline" size="sm" onClick={() => setHealTarget(row.id)}>
-                          Edit policy
+                          {t("incidents.editPolicy")}
                         </Button>
                       ) : null}
                     </li>

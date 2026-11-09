@@ -16,6 +16,9 @@ export interface PersonaVariableRow {
 
 let rowSequence = 0;
 
+/** Example shown in the empty SOUL.md editor; technical Markdown, not UI copy. */
+export const SOUL_PLACEHOLDER = "# SOUL\n\nYou are {{agent_name}}, ...";
+
 export function newVariableRow(variable?: Partial<PersonaVariable>): PersonaVariableRow {
   rowSequence += 1;
   return {
@@ -49,6 +52,7 @@ export function variablesFromRows(rows: PersonaVariableRow[]): PersonaVariable[]
 /** Errors keyed by row id, so the table can point at the exact cell. */
 export function validateVariableRows(
   rows: PersonaVariableRow[],
+  t: (key: string, params?: Record<string, string | number>) => string,
 ): Record<string, { key?: string; description?: string }> {
   const errors: Record<string, { key?: string; description?: string }> = {};
   const seen = new Map<string, number>();
@@ -56,9 +60,9 @@ export function validateVariableRows(
     const key = row.key.trim();
     if (!key && !row.description.trim() && !row.default.trim()) continue;
     const rowErrors: { key?: string; description?: string } = {};
-    if (!key) rowErrors.key = "Enter a key.";
+    if (!key) rowErrors.key = t("personas.vars.errors.keyRequired");
     else if (!PERSONA_VAR_KEY_RE.test(key)) {
-      rowErrors.key = "Lowercase letters, digits and underscores; start with a letter.";
+      rowErrors.key = t("personas.vars.errors.keyFormat");
     }
     if (key) seen.set(key, (seen.get(key) ?? 0) + 1);
     if (Object.keys(rowErrors).length > 0) errors[row.id] = rowErrors;
@@ -66,7 +70,7 @@ export function validateVariableRows(
   for (const row of rows) {
     const key = row.key.trim();
     if (key && (seen.get(key) ?? 0) > 1) {
-      errors[row.id] = { ...errors[row.id], key: "This key is already listed." };
+      errors[row.id] = { ...errors[row.id], key: t("personas.vars.errors.keyDuplicate") };
     }
   }
   return errors;

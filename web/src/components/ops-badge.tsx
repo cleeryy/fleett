@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /**
@@ -38,14 +39,20 @@ export function OpsBadge({
   label?: string;
   className?: string;
 }) {
+  const { t } = useI18n();
   const tone = TONES[status] ?? FALLBACK;
+  // Known states get localized copy; an unknown backend state keeps its raw
+  // identifier (with underscores spelled out) rather than inventing a label.
+  const key = `status.${status}`;
+  const known = status in TONES;
+  const text = label ?? (known ? t(key) : status.replace(/_/g, " "));
   return (
     <Badge
       variant="outline"
       className={cn("gap-1.5 font-mono text-xs font-normal", tone.className, className)}
     >
       <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone.dot)} />
-      {label ?? status.replace(/_/g, " ")}
+      {text}
     </Badge>
   );
 }

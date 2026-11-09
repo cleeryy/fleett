@@ -13,12 +13,13 @@ import {
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
-import { plural } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 export function TemplatesPage() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const templates = useResource(() => api.listTemplates(), []);
   const rows = templates.data ?? [];
@@ -26,16 +27,18 @@ export function TemplatesPage() {
   return (
     <>
       <PageHeader
-        title="Templates"
+        title={t("nav.templates")}
         description={
           templates.data
-            ? `${rows.length} ${plural(rows.length, "template")} · read-only · files live in templates/ on the host`
-            : "Loading templates."
+            ? t(rows.length === 1 ? "templates.countOne" : "templates.countMany", {
+                count: rows.length,
+              })
+            : t("templates.loading")
         }
         actions={
           <Button variant="outline" size="sm" onClick={templates.reload}>
             <RefreshCw aria-hidden className={templates.refreshing ? "animate-spin" : undefined} />
-            Refresh
+            {t("common.refresh")}
           </Button>
         }
       />
@@ -52,8 +55,8 @@ export function TemplatesPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={LayoutTemplate}
-            title="No templates found"
-            description="Add templates/<id>/config.yaml on the host, then refresh. The controller renders the template at creation."
+            title={t("templates.emptyTitle")}
+            description={t("templates.emptyDescription")}
           />
         ) : (
           <>
@@ -61,13 +64,13 @@ export function TemplatesPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[200px]">Template</TableHead>
-                    <TableHead>Description</TableHead>
-                    <TableHead className="w-[240px]">Default model</TableHead>
-                    <TableHead className="w-[110px]">Channel</TableHead>
+                    <TableHead className="w-[200px]">{t("templates.template")}</TableHead>
+                    <TableHead>{t("common.description")}</TableHead>
+                    <TableHead className="w-[240px]">{t("templates.defaultModel")}</TableHead>
+                    <TableHead className="w-[110px]">{t("templates.channel")}</TableHead>
                     {canEdit ? (
                       <TableHead className="w-[90px]">
-                        <span className="sr-only">Actions</span>
+                        <span className="sr-only">{t("common.actions")}</span>
                       </TableHead>
                     ) : null}
                   </TableRow>
@@ -81,15 +84,17 @@ export function TemplatesPage() {
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">{template.description}</TableCell>
                       <TableCell className="font-mono text-xs">{template.default_model}</TableCell>
-                      <TableCell className="font-mono text-xs">{template.channel}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {t(`channel.${template.channel}`)}
+                      </TableCell>
                       {canEdit ? (
                         <TableCell className="text-right">
                           <Button asChild variant="outline" size="sm">
                             <a
                               href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
-                              aria-label={`Use ${template.name}`}
+                              aria-label={t("templates.useAria", { name: template.name })}
                             >
-                              Use
+                              {t("templates.use")}
                             </a>
                           </Button>
                         </TableCell>
@@ -110,21 +115,21 @@ export function TemplatesPage() {
                   <p className="text-sm text-muted-foreground">{template.description}</p>
                   <dl className="grid grid-cols-2 gap-2 text-xs">
                     <div className="min-w-0">
-                      <dt className="text-muted-foreground">Default model</dt>
+                      <dt className="text-muted-foreground">{t("templates.defaultModel")}</dt>
                       <dd className="truncate font-mono">{template.default_model}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Channel</dt>
-                      <dd className="font-mono">{template.channel}</dd>
+                      <dt className="text-muted-foreground">{t("templates.channel")}</dt>
+                      <dd className="font-mono">{t(`channel.${template.channel}`)}</dd>
                     </div>
                   </dl>
                   {canEdit ? (
                     <Button asChild variant="outline" size="sm">
                       <a
                         href={hrefFor(`/instances/new?template=${encodeURIComponent(template.id)}`)}
-                        aria-label={`Use ${template.name}`}
+                        aria-label={t("templates.useAria", { name: template.name })}
                       >
-                        Use template
+                        {t("templates.useTemplate")}
                       </a>
                     </Button>
                   ) : null}

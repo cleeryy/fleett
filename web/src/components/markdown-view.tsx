@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,11 +17,12 @@ export function MarkdownView({
   maxHeight?: string;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
     <div
       tabIndex={0}
       role="region"
-      aria-label="Markdown preview"
+      aria-label={t("files.markdownPreview")}
       className={cn("overflow-auto p-4 text-sm leading-relaxed", className)}
       style={{ maxHeight }}
     >

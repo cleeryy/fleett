@@ -32,7 +32,8 @@ import {
   ScheduleFormDialog,
   ScheduleRowActions,
 } from "@/components/schedules";
-import { formatDateTime, formatRate, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRate, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
@@ -46,6 +47,7 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
 }
 
 export function SchedulesPage() {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const [q, setQ] = useState("");
   const [instance, setInstance] = useState("all");
@@ -97,7 +99,12 @@ export function SchedulesPage() {
     try {
       const run = await api.runSchedule(schedule.id);
       toast.success(
-        run.status === "ok" ? `${schedule.name}: run finished ok.` : `${schedule.name}: run ${run.status}.`,
+        run.status === "ok"
+          ? t("schedules.runOk", { name: schedule.name })
+          : t("schedules.runOther", {
+              name: schedule.name,
+              status: t(`status.${run.status}`),
+            }),
       );
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -113,7 +120,7 @@ export function SchedulesPage() {
     setDeleteError(null);
     try {
       await api.deleteSchedule(deleteTarget.id);
-      toast.success(`Schedule ${deleteTarget.name} deleted.`);
+      toast.success(t("schedules.deleted", { name: deleteTarget.name }));
       setDeleteTarget(null);
       setNonce((value) => value + 1);
     } catch (cause) {
@@ -126,17 +133,20 @@ export function SchedulesPage() {
   return (
     <>
       <PageHeader
-        title="Schedules"
+        title={t("nav.schedules")}
         description={
           schedules.data
-            ? `${rows.length} ${plural(rows.length, "schedule")} across ${instanceOptions.length} ${plural(instanceOptions.length, "instance")} · cron fields are UTC; times are shown in your local timezone`
-            : "Loading schedules."
+            ? t("schedules.summary", {
+                schedules: rows.length,
+                instances: instanceOptions.length,
+              })
+            : t("schedules.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={schedules.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             <Button
               size="sm"
@@ -147,7 +157,7 @@ export function SchedulesPage() {
               }}
             >
               <Plus aria-hidden />
-              New schedule
+              {t("schedules.new")}
             </Button>
           </>
         }
@@ -157,14 +167,25 @@ export function SchedulesPage() {
       {schedules.error ? <ErrorAlert error={schedules.error} onRetry={schedules.reload} /> : null}
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="Enabled" value={`${totals.enabled}/${rows.length}`} hint={`${rows.length - totals.enabled} disabled`} />
-        <Stat label="Next run" value={totals.next ? formatDateTime(totals.next) : "—"} />
         <Stat
-          label="Failure rate"
-          value={totals.runs > 0 ? formatRate(totals.failed / totals.runs) : "—"}
-          hint={`${totals.failed} failed of ${totals.runs} runs`}
+          label={t("schedules.statEnabled")}
+          value={`${totals.enabled}/${rows.length}`}
+          hint={t("schedules.statDisabled", { count: rows.length - totals.enabled })}
         />
-        <Stat label="Schedules failing" value={String(totals.failing)} hint="error or timeout in history" />
+        <Stat
+          label={t("schedules.statNext")}
+          value={totals.next ? formatDateTime(totals.next) : "—"}
+        />
+        <Stat
+          label={t("schedules.statFailureRate")}
+          value={totals.runs > 0 ? formatRate(totals.failed / totals.runs) : "—"}
+          hint={t("schedules.statFailureHint", { failed: totals.failed, runs: totals.runs })}
+        />
+        <Stat
+          label={t("schedules.statFailing")}
+          value={String(totals.failing)}
+          hint={t("schedules.statFailingHint")}
+        />
       </div>
 
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -176,17 +197,17 @@ export function SchedulesPage() {
           <Input
             value={q}
             onChange={(event) => setQ(event.target.value)}
-            placeholder="Search name, prompt, cron"
-            aria-label="Search schedules"
+            placeholder={t("schedules.searchPlaceholder")}
+            aria-label={t("schedules.searchAria")}
             className="pl-8"
           />
         </div>
         <Select value={instance} onValueChange={setInstance} disabled={!schedules.data}>
-          <SelectTrigger className="w-full sm:w-56" aria-label="Filter by instance">
+          <SelectTrigger className="w-full sm:w-56" aria-label={t("schedules.filterAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All instances</SelectItem>
+            <SelectItem value="all">{t("logs.allInstances")}</SelectItem>
             {instanceOptions.map((id) => (
               <SelectItem key={id} value={id}>
                 {id}
@@ -195,7 +216,7 @@ export function SchedulesPage() {
           </SelectContent>
         </Select>
         <p className="text-xs text-muted-foreground sm:ml-auto" aria-live="polite">
-          {filtered.length} shown
+          {t("schedules.shown", { count: filtered.length })}
         </p>
       </div>
 
@@ -209,11 +230,13 @@ export function SchedulesPage() {
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={CalendarClock}
-            title={rows.length === 0 ? "No schedules yet" : "No schedule matches the filters"}
+            title={
+              rows.length === 0 ? t("schedules.emptyTitle") : t("schedules.noMatchTitle")
+            }
             description={
               rows.length === 0
-                ? "A schedule runs a prompt inside one instance on a cron cadence and keeps its run history."
-                : "Clear the search or pick another instance."
+                ? t("schedules.emptyDescription")
+                : t("schedules.noMatchDescription")
             }
             action={
               rows.length === 0 ? (
@@ -226,7 +249,7 @@ export function SchedulesPage() {
                   }}
                 >
                   <Plus aria-hidden />
-                  New schedule
+                  {t("schedules.new")}
                 </Button>
               ) : (
                 <Button
@@ -236,7 +259,7 @@ export function SchedulesPage() {
                     setInstance("all");
                   }}
                 >
-                  Clear filters
+                  {t("common.clearFilters")}
                 </Button>
               )
             }
@@ -247,13 +270,13 @@ export function SchedulesPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>Schedule</TableHead>
+                    <TableHead>{t("schedules.schedule")}</TableHead>
                     <TableHead className="w-[140px]">Cron</TableHead>
-                    <TableHead className="w-[170px]">Next run</TableHead>
-                    <TableHead className="w-[160px]">Last run</TableHead>
-                    <TableHead className="w-[110px]">Failure rate</TableHead>
+                    <TableHead className="w-[170px]">{t("schedules.nextRun")}</TableHead>
+                    <TableHead className="w-[160px]">{t("schedules.lastRun")}</TableHead>
+                    <TableHead className="w-[110px]">{t("schedules.failureRate")}</TableHead>
                     <TableHead className="w-[160px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -274,7 +297,9 @@ export function SchedulesPage() {
                       <TableCell>
                         <span className="font-mono text-xs">{schedule.cron}</span>
                         {!schedule.enabled ? (
-                          <span className="ml-1 text-[11px] text-muted-foreground">off</span>
+                          <span className="ml-1 text-[11px] text-muted-foreground">
+                            {t("common.disabled")}
+                          </span>
                         ) : null}
                       </TableCell>
                       <TableCell className="font-mono text-xs">
@@ -285,11 +310,13 @@ export function SchedulesPage() {
                           <span className="flex flex-col items-start gap-1">
                             <OpsBadge status={schedule.last_run.status} />
                             <span className="font-mono text-[11px] text-muted-foreground">
-                              {formatRelative(schedule.last_run.started_at)}
+                              {formatRelative(schedule.last_run.started_at, lang)}
                             </span>
                           </span>
                         ) : (
-                          <span className="text-xs text-muted-foreground">never</span>
+                          <span className="text-xs text-muted-foreground">
+                            {t("common.never")}
+                          </span>
                         )}
                       </TableCell>
                       <TableCell className="font-mono text-xs">
@@ -341,19 +368,21 @@ export function SchedulesPage() {
                       <dd className="font-mono">{schedule.cron}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Next</dt>
+                      <dt className="text-muted-foreground">{t("schedules.next")}</dt>
                       <dd className="font-mono">
                         {schedule.next_run_at ? formatDateTime(schedule.next_run_at) : "—"}
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Last</dt>
+                      <dt className="text-muted-foreground">{t("schedules.last")}</dt>
                       <dd className="font-mono">
-                        {schedule.last_run_at ? formatRelative(schedule.last_run_at) : "never"}
+                        {schedule.last_run_at
+                          ? formatRelative(schedule.last_run_at, lang)
+                          : t("common.never")}
                       </dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Failures</dt>
+                      <dt className="text-muted-foreground">{t("schedules.failures")}</dt>
                       <dd className="font-mono">{formatRate(schedule.failure_rate)}</dd>
                     </div>
                   </dl>
@@ -367,14 +396,14 @@ export function SchedulesPage() {
                       {runningId === schedule.id ? (
                         <Loader2 aria-hidden className="animate-spin" />
                       ) : null}
-                      Run
+                      {t("common.runNow")}
                     </Button>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => setHistoryInstance(schedule.instance_id)}
                     >
-                      History
+                      {t("schedules.history")}
                     </Button>
                     <Button
                       variant="outline"
@@ -384,7 +413,7 @@ export function SchedulesPage() {
                         setFormOpen(true);
                       }}
                     >
-                      Edit
+                      {t("common.edit")}
                     </Button>
                     <Button
                       variant="outline"
@@ -394,7 +423,7 @@ export function SchedulesPage() {
                         setDeleteTarget(schedule);
                       }}
                     >
-                      Delete
+                      {t("common.delete")}
                     </Button>
                   </div>
                 </div>
@@ -424,13 +453,16 @@ export function SchedulesPage() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title="Delete schedule"
+        title={t("schedules.deleteTitle")}
         description={
           deleteTarget
-            ? `Delete ${deleteTarget.name} on ${deleteTarget.instance_id} and its run history? This cannot be undone.`
+            ? t("schedules.deleteDescription", {
+                name: deleteTarget.name,
+                instance: deleteTarget.instance_id,
+              })
             : undefined
         }
-        confirmLabel="Delete schedule"
+        confirmLabel={t("schedules.deleteTitle")}
         destructive
         pending={deleting}
         error={deleteError}

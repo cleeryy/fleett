@@ -8,18 +8,20 @@ import {
 } from "@/api/mock";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
-const ONBOARDING_OPTIONS: { value: MockOnboardingMode; label: string }[] = [
-  { value: "empty", label: "0 of 4" },
-  { value: "partial", label: "2 of 4" },
-  { value: "complete", label: "Complete" },
+const ONBOARDING_OPTIONS: { value: MockOnboardingMode; labelKey: string }[] = [
+  { value: "empty", labelKey: "mock.onboardingEmpty" },
+  { value: "partial", labelKey: "mock.onboardingPartial" },
+  { value: "complete", labelKey: "mock.onboardingComplete" },
 ];
 
-const DOCTOR_OPTIONS: { value: MockDoctorMode; label: string }[] = [
-  { value: "mixed", label: "1 warning + 1 error" },
-  { value: "ok", label: "All pass" },
-  { value: "error", label: "Several errors" },
+const DOCTOR_OPTIONS: { value: MockDoctorMode; labelKey: string }[] = [
+  { value: "mixed", labelKey: "mock.doctorMixed" },
+  { value: "ok", labelKey: "mock.doctorOk" },
+  { value: "error", labelKey: "mock.doctorError" },
 ];
 
 /**
@@ -34,6 +36,7 @@ export function MockPreviewBar({
   onChange: () => void;
   className?: string;
 }) {
+  const { t } = useI18n();
   const [onboarding, setOnboarding] = useState<MockOnboardingMode>(mockConfig.onboarding);
   const [doctor, setDoctor] = useState<MockDoctorMode>(mockConfig.doctor);
 
@@ -52,21 +55,23 @@ export function MockPreviewBar({
       <div className="flex flex-wrap items-center gap-2">
         <FlaskConical aria-hidden className="size-4 text-muted-foreground" />
         <h2 id="mock-preview-title" className="text-sm font-medium">
-          Demo preview
+          {t("mock.title")}
         </h2>
         <Badge variant="outline" className="font-mono text-[11px] font-normal">
-          mock only
+          {t("mock.badge")}
         </Badge>
       </div>
       <p className="text-xs text-muted-foreground">
-        Switching a scenario reseeds the in-memory demo. Both choices stay in the URL
-        (<span className="font-mono">mock_onboarding</span>,{" "}
-        <span className="font-mono">mock_doctor</span>) so a reload shows the same state.
+        <RichText text={t("mock.description")} />
       </p>
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <p className="text-xs font-medium text-muted-foreground">First run</p>
-          <div role="group" aria-label="First-run preview" className="flex flex-wrap gap-1.5">
+          <p className="text-xs font-medium text-muted-foreground">{t("mock.firstRun")}</p>
+          <div
+            role="group"
+            aria-label={t("mock.firstRunAria")}
+            className="flex flex-wrap gap-1.5"
+          >
             {ONBOARDING_OPTIONS.map((option) => (
               <Button
                 key={option.value}
@@ -76,14 +81,18 @@ export function MockPreviewBar({
                 aria-pressed={onboarding === option.value}
                 onClick={() => apply({ onboarding: option.value })}
               >
-                {option.label}
+                {t(option.labelKey)}
               </Button>
             ))}
           </div>
         </div>
         <div className="space-y-1.5">
-          <p className="text-xs font-medium text-muted-foreground">Diagnostics</p>
-          <div role="group" aria-label="Diagnostics preview" className="flex flex-wrap gap-1.5">
+          <p className="text-xs font-medium text-muted-foreground">{t("health.title")}</p>
+          <div
+            role="group"
+            aria-label={t("mock.diagnosticsAria")}
+            className="flex flex-wrap gap-1.5"
+          >
             {DOCTOR_OPTIONS.map((option) => (
               <Button
                 key={option.value}
@@ -93,7 +102,7 @@ export function MockPreviewBar({
                 aria-pressed={doctor === option.value}
                 onClick={() => apply({ doctor: option.value })}
               >
-                {option.label}
+                {t(option.labelKey)}
               </Button>
             ))}
           </div>

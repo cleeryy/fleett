@@ -6,6 +6,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
 /** Radix Select forbids an empty item value; callers map this back to "". */
@@ -35,6 +36,7 @@ export function PersonaSelect({
   describedBy?: string;
   className?: string;
 }) {
+  const { t } = useI18n();
   return (
     <Select
       value={value || NO_PERSONA}
@@ -42,14 +44,19 @@ export function PersonaSelect({
       disabled={disabled || loading}
     >
       <SelectTrigger id={id} className={cn("w-full", className)} aria-describedby={describedBy}>
-        <SelectValue placeholder={loading ? "Loading personas…" : "Select a persona"} />
+        <SelectValue placeholder={loading ? t("personas.picker.loading") : t("personas.picker.placeholder")} />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value={NO_PERSONA}>None — keep the instance SOUL.md</SelectItem>
+        <SelectItem value={NO_PERSONA}>{t("personas.picker.none")}</SelectItem>
         {personas.map((persona) => (
           <SelectItem key={persona.id} value={persona.id}>
-            {persona.name} · {persona.variables.length}{" "}
-            {persona.variables.length === 1 ? "variable" : "variables"}
+            {persona.name} ·{" "}
+            {t(
+              persona.variables.length === 1
+                ? "personas.picker.variableOne"
+                : "personas.picker.variableMany",
+              { count: persona.variables.length },
+            )}
           </SelectItem>
         ))}
       </SelectContent>

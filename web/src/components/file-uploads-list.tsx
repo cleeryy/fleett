@@ -10,6 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { formatBytes } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import type { UploadItem } from "@/lib/use-uploads";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +33,7 @@ export function FileUploadsList({
   onDismiss: (key: string) => void;
   onClear: () => void;
 }) {
+  const { t } = useI18n();
   const done = items.filter((item) => item.status === "done").length;
   const pending = items.filter(
     (item) => item.status === "queued" || item.status === "uploading",
@@ -40,18 +42,18 @@ export function FileUploadsList({
 
   return (
     <section
-      aria-label="Uploads"
+      aria-label={t("files.uploads.title")}
       className="overflow-hidden rounded-md border"
     >
       <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-3 py-1.5">
         <Upload aria-hidden className="size-3.5 text-muted-foreground" />
-        <span className="text-xs font-medium">Uploads</span>
+        <span className="text-xs font-medium">{t("files.uploads.title")}</span>
         <span className="text-[11px] text-muted-foreground">
-          {done > 0 ? `${done} uploaded` : null}
+          {done > 0 ? t("files.uploads.doneCount", { count: done }) : null}
           {done > 0 && (pending > 0 || conflicts > 0) ? " · " : null}
-          {pending > 0 ? `${pending} in flight` : null}
+          {pending > 0 ? t("files.uploads.pendingCount", { count: pending }) : null}
           {pending > 0 && conflicts > 0 ? " · " : null}
-          {conflicts > 0 ? `${conflicts} needs a decision` : null}
+          {conflicts > 0 ? t("files.uploads.conflictsCount", { count: conflicts }) : null}
         </span>
         <Button
           variant="ghost"
@@ -60,7 +62,7 @@ export function FileUploadsList({
           onClick={onClear}
           disabled={items.every((item) => item.status !== "done" && item.status !== "skipped")}
         >
-          Clear finished
+          {t("files.uploads.clearFinished")}
         </Button>
       </div>
 
@@ -93,6 +95,7 @@ function FileUploadRow({
   onRetry: (key: string) => void;
   onDismiss: (key: string) => void;
 }) {
+  const { t } = useI18n();
   const executable = item.error?.code === "executable_file";
 
   return (
@@ -122,19 +125,16 @@ function FileUploadRow({
                     : "text-destructive",
             )}
           >
-            {describe(item)}
+            {describe(item, t)}
           </p>
 
           {executable ? (
-            <p className="text-[11px] text-muted-foreground">
-              Executables are refused on purpose: blocklisted extensions (.exe, .sh, .ps1…) and
-              native binary formats (ELF, PE, Mach-O).
-            </p>
+            <p className="text-[11px] text-muted-foreground">{t("files.uploads.executables")}</p>
           ) : null}
 
           {item.backup ? (
             <p className="truncate font-mono text-[11px] text-muted-foreground">
-              previous bytes: {item.backup}
+              {t("files.uploads.previousBytes", { size: item.backup })}
             </p>
           ) : null}
         </div>
@@ -145,26 +145,26 @@ function FileUploadRow({
         {item.status === "conflict" || item.status === "skipped" ? (
           <>
             <Button variant="outline" size="xs" onClick={() => onOverwrite(item.key)}>
-              Overwrite
+              {t("files.uploads.overwrite")}
             </Button>
             {item.status === "conflict" ? (
               <Button variant="ghost" size="xs" onClick={() => onSkip(item.key)}>
-                Skip
+                {t("files.uploads.skip")}
               </Button>
             ) : null}
           </>
         ) : null}
         {item.status === "error" ? (
           <Button variant="outline" size="xs" onClick={() => onRetry(item.key)}>
-            Retry
+            {t("common.retry")}
           </Button>
         ) : null}
         {item.status === "uploading" || item.status === "queued" ? null : (
           <Button
             variant="ghost"
             size="icon-xs"
-            aria-label={`Remove ${item.name} from the upload list`}
-            title="Remove from the list"
+            aria-label={t("files.uploads.removeAria", { name: item.name })}
+            title={t("files.uploads.removeTitle")}
             onClick={() => onDismiss(item.key)}
           >
             <X aria-hidden />
@@ -196,15 +196,16 @@ function StatusMark({ status }: { status: UploadItem["status"] }) {
 }
 
 function StatusBadge({ status }: { status: UploadItem["status"] }) {
+  const { t } = useI18n();
   const labels: Record<UploadItem["status"], string> = {
-    queued: "Waiting",
-    uploading: "Uploading",
-    done: "Uploaded",
-    conflict: "Exists",
-    refused: "Refused",
-    too_large: "Too large",
-    skipped: "Skipped",
-    error: "Failed",
+    queued: t("files.uploads.statusQueued"),
+    uploading: t("files.uploads.statusUploading"),
+    done: t("files.uploads.statusDone"),
+    conflict: t("files.uploads.statusConflict"),
+    refused: t("files.uploads.statusRefused"),
+    too_large: t("files.uploads.statusTooLarge"),
+    skipped: t("files.uploads.statusSkipped"),
+    error: t("files.uploads.statusError"),
   };
   if (status === "uploading" || status === "queued") {
     return (
@@ -220,23 +221,26 @@ function StatusBadge({ status }: { status: UploadItem["status"] }) {
   );
 }
 
-function describe(item: UploadItem): string {
+function describe(
+  item: UploadItem,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
   switch (item.status) {
     case "queued":
-      return item.overwrite ? "Replacing the file on disk…" : "Waiting for the previous file…";
+      return item.overwrite ? t("files.uploads.queuedOverwrite") : t("files.uploads.queued");
     case "uploading":
-      return "Sending the bytes to the controller…";
+      return t("files.uploads.uploading");
     case "done":
-      return item.path ? `Written to ${item.path}` : "Uploaded.";
+      return item.path ? t("files.uploads.writtenTo", { path: item.path }) : t("files.uploads.done");
     case "conflict":
-      return "A file with this name already exists here. Overwriting copies the current bytes to a .bak first, or skip it and keep both.";
+      return t("files.uploads.conflict");
     case "skipped":
-      return "Kept in the list and not written. Overwrite it whenever you want.";
+      return t("files.uploads.skipped");
     case "refused":
-      return item.error?.message ?? item.reason ?? "Refused by the controller.";
+      return item.error?.message ?? item.reason ?? t("files.uploads.refused");
     case "too_large":
-      return item.error?.message ?? item.reason ?? "Too large for one upload.";
+      return item.error?.message ?? item.reason ?? t("files.uploads.tooLarge");
     default:
-      return item.error?.message ?? "The upload failed.";
+      return item.error?.message ?? t("files.uploads.failed");
   }
 }

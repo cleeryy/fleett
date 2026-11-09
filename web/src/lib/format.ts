@@ -42,19 +42,21 @@ export function formatBytes(bytes: number): string {
   return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
 
-export function formatRelative(iso: string): string {
+/** Relative time; the same units as the console's uptime strings. */
+export function formatRelative(iso: string, lang: "en" | "fr" = "en"): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
+  const fr = lang === "fr";
   const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
-  if (seconds < 45) return "just now";
+  if (seconds < 45) return fr ? "à l'instant" : "just now";
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 60) return fr ? `il y a ${minutes} min` : `${minutes} min ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} h ago`;
+  if (hours < 24) return fr ? `il y a ${hours} h` : `${hours} h ago`;
   const days = Math.floor(hours / 24);
-  if (days < 30) return `${days} d ago`;
+  if (days < 30) return fr ? `il y a ${days} j` : `${days} d ago`;
   const months = Math.floor(days / 30);
-  return `${months} mo ago`;
+  return fr ? `il y a ${months} mois` : `${months} mo ago`;
 }
 
 export function plural(count: number, singular: string, pluralForm?: string): string {

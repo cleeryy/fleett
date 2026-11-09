@@ -32,7 +32,8 @@ import {
   messagePreview,
   SendMessageDialog,
 } from "@/components/messages";
-import { formatClock, formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatClock, formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
@@ -69,14 +70,19 @@ function FilterSelect({
 }
 
 function TimeCell({ message }: { message: Message }) {
+  const { t, lang } = useI18n();
   return (
-    <span className="font-mono text-xs" title={`${formatRelative(message.created_at)} · created`}>
+    <span
+      className="font-mono text-xs"
+      title={t("messages.createdTitle", { time: formatRelative(message.created_at, lang) })}
+    >
       {formatDateTime(message.created_at)}
     </span>
   );
 }
 
 export function MessagesPage() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const [instance, setInstance] = useState(ALL);
   const [from, setFrom] = useState(ALL);
@@ -128,24 +134,24 @@ export function MessagesPage() {
   const emptyState = filtered ? (
     <EmptyState
       icon={Inbox}
-      title="No messages match the filters"
-      description="Clear a filter or pick another instance. Expired messages are excluded from every read."
+      title={t("messages.noMatchTitle")}
+      description={t("messages.noMatchDescription")}
       action={
         <Button variant="outline" size="sm" onClick={clearFilters}>
-          Clear filters
+          {t("common.clearFilters")}
         </Button>
       }
     />
   ) : (
     <EmptyState
       icon={MessagesSquare}
-      title="No messages yet"
-      description="Agents write to their peers through the bus. Send one here, or let an agent queue its first message."
+      title={t("messages.emptyTitle")}
+      description={t("messages.emptyDescription")}
       action={
         canSend ? (
           <Button size="sm" onClick={() => setSendOpen(true)}>
             <Send aria-hidden />
-            Send message
+            {t("messages.send")}
           </Button>
         ) : undefined
       }
@@ -155,17 +161,19 @@ export function MessagesPage() {
   return (
     <>
       <PageHeader
-        title="Messages"
+        title={t("nav.messages")}
         description={
           messages.data
-            ? `${rows.length} ${plural(rows.length, "message")} · newest first · expired messages excluded`
-            : "Loading the fleet bus."
+            ? t(rows.length === 1 ? "messages.countOne" : "messages.countMany", {
+                count: rows.length,
+              })
+            : t("messages.loading")
         }
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
               <RefreshCw aria-hidden className={messages.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <Button
@@ -174,7 +182,7 @@ export function MessagesPage() {
                 disabled={!instances.data || instanceList.length === 0}
               >
                 <Send aria-hidden />
-                Send message
+                {t("messages.send")}
               </Button>
             ) : null}
           </>
@@ -184,12 +192,12 @@ export function MessagesPage() {
       {messages.error ? <ErrorAlert error={messages.error} onRetry={messages.reload} /> : null}
 
       <section
-        aria-label="Message filters"
+        aria-label={t("messages.filtersAria")}
         className="grid gap-3 rounded-md border p-3 sm:grid-cols-2 lg:grid-cols-5"
       >
         <FilterSelect
           id="messages-instance"
-          label="Instance"
+          label={t("messages.instance")}
           value={instance}
           onChange={(value) => {
             setInstance(value);
@@ -198,7 +206,7 @@ export function MessagesPage() {
           }}
           disabled={!instances.data}
         >
-          <SelectItem value={ALL}>Any instance</SelectItem>
+          <SelectItem value={ALL}>{t("messages.anyInstance")}</SelectItem>
           {instanceList.map((entry) => (
             <SelectItem key={entry.id} value={entry.id}>
               <span className="font-mono">{entry.id}</span>
@@ -209,12 +217,12 @@ export function MessagesPage() {
 
         <FilterSelect
           id="messages-from"
-          label="From"
+          label={t("messages.from")}
           value={from}
           onChange={setFrom}
           disabled={!instances.data}
         >
-          <SelectItem value={ALL}>Any sender</SelectItem>
+          <SelectItem value={ALL}>{t("messages.anySender")}</SelectItem>
           {instanceList.map((entry) => (
             <SelectItem key={entry.id} value={entry.id}>
               <span className="font-mono">{entry.id}</span>
@@ -224,12 +232,12 @@ export function MessagesPage() {
 
         <FilterSelect
           id="messages-to"
-          label="To"
+          label={t("messages.to")}
           value={to}
           onChange={setTo}
           disabled={!instances.data}
         >
-          <SelectItem value={ALL}>Any recipient</SelectItem>
+          <SelectItem value={ALL}>{t("messages.anyRecipient")}</SelectItem>
           {instanceList.map((entry) => (
             <SelectItem key={entry.id} value={entry.id}>
               <span className="font-mono">{entry.id}</span>
@@ -237,8 +245,8 @@ export function MessagesPage() {
           ))}
         </FilterSelect>
 
-        <FilterSelect id="messages-kind" label="Kind" value={kind} onChange={setKind}>
-          <SelectItem value={ALL}>Any kind</SelectItem>
+        <FilterSelect id="messages-kind" label={t("messages.kind")} value={kind} onChange={setKind}>
+          <SelectItem value={ALL}>{t("messages.anyKind")}</SelectItem>
           <SelectItem value="ask">ask</SelectItem>
           <SelectItem value="tell">tell</SelectItem>
           <SelectItem value="result">result</SelectItem>
@@ -246,24 +254,24 @@ export function MessagesPage() {
 
         <div className="flex items-end gap-2">
           <div className="min-w-0 flex-1">
-            <FilterSelect id="messages-limit" label="Limit" value={limit} onChange={setLimit}>
-              <SelectItem value="50">50 messages</SelectItem>
-              <SelectItem value="100">100 messages</SelectItem>
-              <SelectItem value="200">200 messages</SelectItem>
-              <SelectItem value="500">500 messages</SelectItem>
+            <FilterSelect id="messages-limit" label={t("messages.limit")} value={limit} onChange={setLimit}>
+              <SelectItem value="50">{t("messages.limitN", { count: 50 })}</SelectItem>
+              <SelectItem value="100">{t("messages.limitN", { count: 100 })}</SelectItem>
+              <SelectItem value="200">{t("messages.limitN", { count: 200 })}</SelectItem>
+              <SelectItem value="500">{t("messages.limitN", { count: 500 })}</SelectItem>
             </FilterSelect>
           </div>
           {filtered ? (
             <Button variant="outline" size="sm" className="mb-0 shrink-0" onClick={clearFilters}>
-              Clear
+              {t("personas.apply.clear")}
             </Button>
           ) : null}
         </div>
       </section>
 
       <p className="text-xs text-muted-foreground" aria-live="polite">
-        {refreshedAt ? `Updated ${formatClock(refreshedAt)}` : "…"}
-        {filtered ? " · filters applied" : ""}
+        {refreshedAt ? t("common.updatedAt", { time: formatClock(refreshedAt) }) : "…"}
+        {filtered ? t("messages.filtersApplied") : ""}
       </p>
 
       <div className="rounded-md border" aria-busy={messages.loading || messages.refreshing}>
@@ -292,14 +300,14 @@ export function MessagesPage() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[170px]">Time</TableHead>
-                    <TableHead className="w-[190px]">From → To</TableHead>
-                    <TableHead className="w-[80px]">Kind</TableHead>
-                    <TableHead className="w-[110px]">Status</TableHead>
-                    <TableHead className="w-[70px] text-center">Hops</TableHead>
-                    <TableHead>Body</TableHead>
+                    <TableHead className="w-[170px]">{t("audit.time")}</TableHead>
+                    <TableHead className="w-[190px]">{t("messages.route")}</TableHead>
+                    <TableHead className="w-[80px]">{t("messages.kind")}</TableHead>
+                    <TableHead className="w-[110px]">{t("common.status")}</TableHead>
+                    <TableHead className="w-[70px] text-center">{t("messages.hops")}</TableHead>
+                    <TableHead>{t("messages.body")}</TableHead>
                     <TableHead className="w-[80px]">
-                      <span className="sr-only">Actions</span>
+                      <span className="sr-only">{t("common.actions")}</span>
                     </TableHead>
                   </TableRow>
                 </TableHeader>
@@ -334,13 +342,16 @@ export function MessagesPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          aria-label={`Open message from ${message.from} to ${message.to}`}
+                          aria-label={t("messages.openAria", {
+                            from: message.from,
+                            to: message.to,
+                          })}
                           onClick={(event) => {
                             event.stopPropagation();
                             open(message);
                           }}
                         >
-                          Open
+                          {t("common.open")}
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -355,7 +366,10 @@ export function MessagesPage() {
                   key={message.id}
                   type="button"
                   className="block w-full space-y-2 p-4 text-left transition-colors hover:bg-muted/40 focus-visible:bg-muted/40"
-                  aria-label={`Open message from ${message.from} to ${message.to}`}
+                  aria-label={t("messages.openAria", {
+                    from: message.from,
+                    to: message.to,
+                  })}
                   onClick={() => open(message)}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -368,7 +382,10 @@ export function MessagesPage() {
                     <MessageKindBadge kind={message.kind} />
                     <MessageStatusBadge status={message.status} />
                     <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                      {message.hops} hop{message.hops === 1 ? "" : "s"}
+                      {t(
+                        message.hops === 1 ? "messages.hopOne" : "messages.hopMany",
+                        { count: message.hops },
+                      )}
                     </Badge>
                   </div>
                   <span className="block text-sm text-muted-foreground">

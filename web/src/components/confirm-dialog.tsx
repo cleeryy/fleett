@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useI18n } from "@/lib/i18n";
 import { ErrorAlert } from "@/components/error-alert";
 
 /** One confirmation surface for destructive or overwriting actions. */
@@ -36,6 +37,7 @@ export function ConfirmDialog({
   onConfirm: () => void;
   children?: ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
@@ -47,7 +49,7 @@ export function ConfirmDialog({
         {error ? <ErrorAlert error={error} /> : null}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button variant={destructive ? "destructive" : "default"} onClick={onConfirm} disabled={pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}

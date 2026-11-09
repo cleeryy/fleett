@@ -21,8 +21,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PersonaStateBadge } from "@/components/persona-state-badge";
 import { PersonaVariableInputs } from "@/components/persona-vars";
+import { useI18n } from "@/lib/i18n";
 import { applySucceeded, compactVariables } from "@/lib/personas";
 import { hrefFor } from "@/lib/router";
 import { cn } from "@/lib/utils";
@@ -47,6 +49,7 @@ export function PersonaApplyDialog({
   /** Ids selected when the dialog opens; defaults to the instances already using it. */
   defaultSelected?: string[];
 }) {
+  const { t } = useI18n();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [variables, setVariables] = useState<Record<string, string>>({});
   const [pending, setPending] = useState(false);
@@ -97,12 +100,17 @@ export function PersonaApplyDialog({
       const failed = result.results.filter((entry) => !applySucceeded(entry.status)).length;
       if (failed === 0) {
         toast.success(
-          `Persona applied to ${result.results.length} ${
-            result.results.length === 1 ? "instance" : "instances"
-          }.`,
+          t(
+            result.results.length === 1
+              ? "personas.apply.toastDoneOne"
+              : "personas.apply.toastDoneMany",
+            { count: result.results.length },
+          ),
         );
       } else {
-        toast.warning(`${failed} of ${result.results.length} instances could not take the persona.`);
+        toast.warning(
+          t("personas.apply.toastPartial", { failed, total: result.results.length }),
+        );
       }
       onApplied();
     } catch (cause) {
@@ -127,11 +135,11 @@ export function PersonaApplyDialog({
       <DialogContent className="max-h-[calc(100dvh_-_2rem)] grid-rows-[auto_minmax(0,1fr)] sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>
-            Apply <span className="font-mono">{persona.name}</span>
+            {t("personas.apply.title")}{" "}
+            <span className="font-mono">{persona.name}</span>
           </DialogTitle>
           <DialogDescription>
-            Rewrites <span className="font-mono">data/SOUL.md</span>, snapshots the previous file and
-            restarts each selected instance. A failed instance is reported, never silently skipped.
+            <RichText text={t("personas.apply.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -140,7 +148,7 @@ export function PersonaApplyDialog({
             <div className="-mr-2 min-h-0 space-y-4 overflow-y-auto pr-2">
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">
-                  <p className="text-sm font-medium">Instances</p>
+                  <p className="text-sm font-medium">{t("nav.instances")}</p>
                   <div className="flex items-center gap-2 text-xs">
                     <button
                       type="button"
@@ -148,7 +156,7 @@ export function PersonaApplyDialog({
                       disabled={selectedCount === instances.length}
                       onClick={() => setSelected(new Set(instances.map((row) => row.id)))}
                     >
-                      Select all
+                      {t("personas.apply.selectAll")}
                     </button>
                     <span aria-hidden className="text-muted-foreground">
                       ·
@@ -159,14 +167,14 @@ export function PersonaApplyDialog({
                       disabled={selectedCount === 0}
                       onClick={() => setSelected(new Set())}
                     >
-                      Clear
+                      {t("personas.apply.clear")}
                     </button>
                   </div>
                 </div>
 
                 {instances.length === 0 ? (
                   <p className="rounded-md border px-3 py-4 text-sm text-muted-foreground">
-                    No instance exists yet. Create one before applying a persona.
+                    {t("personas.apply.noInstances")}
                   </p>
                 ) : (
                   <div className="divide-y rounded-md border">
@@ -184,7 +192,7 @@ export function PersonaApplyDialog({
                             checked={checked}
                             className="mt-0.5"
                             onCheckedChange={() => toggle(instance.id)}
-                            aria-label={`Apply to ${instance.name}`}
+                            aria-label={t("personas.apply.applyTo", { name: instance.name })}
                           />
                           <span className="min-w-0 flex-1 space-y-1">
                             <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -198,17 +206,18 @@ export function PersonaApplyDialog({
                                 <PersonaStateBadge state={instance.persona_state} />
                               ) : instance.persona ? (
                                 <span>
-                                  uses <span className="font-mono">{instance.persona}</span>
+                                  {t("personas.apply.uses")}{" "}
+                                  <span className="font-mono">{instance.persona}</span>
                                 </span>
                               ) : (
-                                <span>no persona</span>
+                                <span>{t("personas.apply.noPersona")}</span>
                               )}
                               {instance.status !== "running" ? (
                                 <Badge
                                   variant="outline"
                                   className="font-mono text-[11px] font-normal text-muted-foreground"
                                 >
-                                  {instance.status}
+                                  {t(`status.${instance.status}`)}
                                 </Badge>
                               ) : null}
                             </span>
@@ -222,13 +231,14 @@ export function PersonaApplyDialog({
                 {persona.variables.length > 0 ? (
                   <details className="rounded-md border">
                     <summary className="cursor-pointer px-3 py-2.5 text-sm">
-                      Variable overrides{" "}
-                      <span className="text-xs text-muted-foreground">(optional)</span>
+                      {t("personas.apply.overrides")}{" "}
+                      <span className="text-xs text-muted-foreground">
+                        ({t("common.optional")})
+                      </span>
                     </summary>
                     <div className="space-y-2 px-3 pb-3">
                       <p className="text-xs text-muted-foreground">
-                        Merged over each instance's stored values for this apply. Leave empty to keep
-                        them and use the persona defaults.
+                        {t("personas.apply.overridesHint")}
                       </p>
                       <PersonaVariableInputs
                         variables={persona.variables}
@@ -243,11 +253,12 @@ export function PersonaApplyDialog({
 
                 {missing.length > 0 ? (
                   <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
-                    <AlertTitle>Values required</AlertTitle>
+                    <AlertTitle>{t("personas.apply.valuesRequired")}</AlertTitle>
                     <AlertDescription>
                       <p className="text-sm text-muted-foreground">
-                        The template uses {missing.map((key) => `{{${key}}}`).join(", ")} with no
-                        value and no default. Set an override above, or add defaults to the persona.
+                        {t("personas.apply.valuesRequiredBody", {
+                          keys: missing.map((key) => `{{${key}}}`).join(", "),
+                        })}
                       </p>
                     </AlertDescription>
                   </Alert>
@@ -264,21 +275,21 @@ export function PersonaApplyDialog({
                 onClick={() => onOpenChange(false)}
                 disabled={pending}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="button" onClick={() => void submit()} disabled={pending || selectedCount === 0}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Send aria-hidden />}
-                Apply to {selectedCount || "…"} {selectedCount === 1 ? "instance" : "instances"}
+                {t("personas.apply.confirm", { count: selectedCount || "…" })}
               </Button>
             </DialogFooter>
           </>
         ) : (
           <div className="min-h-0 space-y-4 overflow-y-auto">
             <div className="space-y-2">
-              <p className="text-sm font-medium">Report</p>
+              <p className="text-sm font-medium">{t("personas.apply.report")}</p>
               {report.length === 0 ? (
                 <p className="rounded-md border px-3 py-4 text-sm text-muted-foreground">
-                  Nothing was applied.
+                  {t("personas.apply.reportEmpty")}
                 </p>
               ) : (
                 <ul className="divide-y rounded-md border">
@@ -303,7 +314,9 @@ export function PersonaApplyDialog({
                               variant={ok ? "secondary" : "destructive"}
                               className="font-mono text-xs font-normal"
                             >
-                              {entry.status}
+                              {applySucceeded(entry.status)
+                                ? t("personas.apply.statusOk")
+                                : t("personas.apply.statusFailed")}
                             </Badge>
                           </span>
                         </div>
@@ -319,11 +332,10 @@ export function PersonaApplyDialog({
               )}
               {report.some((entry) => !applySucceeded(entry.status)) ? (
                 <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
-                  <AlertTitle>Some instances kept their old SOUL.md</AlertTitle>
+                  <AlertTitle>{t("personas.apply.partialTitle")}</AlertTitle>
                   <AlertDescription>
                     <p className="text-sm text-muted-foreground">
-                      Fix the error above, then apply again. The other instances are already on the
-                      persona.
+                      {t("personas.apply.partialBody")}
                     </p>
                   </AlertDescription>
                 </Alert>
@@ -332,7 +344,7 @@ export function PersonaApplyDialog({
 
             <DialogFooter>
               <Button autoFocus onClick={() => onOpenChange(false)}>
-                Done
+                {t("common.done")}
               </Button>
             </DialogFooter>
           </div>

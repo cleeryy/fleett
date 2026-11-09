@@ -43,7 +43,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { CopyButton } from "@/components/copy-button";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { formatDateTime, formatRelative } from "@/lib/format";
+import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
@@ -130,30 +132,33 @@ const ACTION_STYLES: Record<string, string> = {
 };
 
 function ActionBadge({ action }: { action: string }) {
+  const { t } = useI18n();
+  const key = `memoryAction.${action}`;
   return (
     <Badge
       variant="outline"
       className={cn("font-mono text-[11px] font-normal", ACTION_STYLES[action] ?? "")}
     >
-      {action}
+      {hasTranslation(key) ? t(key) : action}
     </Badge>
   );
 }
 
 function When({ iso }: { iso: string }) {
+  const { lang } = useI18n();
   return (
-    <span className="font-mono text-xs" title={formatRelative(iso)}>
+    <span className="font-mono text-xs" title={formatRelative(iso, lang)}>
       {formatDateTime(iso)}
     </span>
   );
 }
 
 const TTL_OPTIONS = [
-  { value: "3600", label: "1 hour" },
-  { value: "86400", label: "1 day" },
-  { value: "604800", label: "7 days" },
-  { value: "2592000", label: "30 days" },
-  { value: "31536000", label: "1 year" },
+  { value: "3600", labelKey: "memory.ttl1h" },
+  { value: "86400", labelKey: "memory.ttl1d" },
+  { value: "604800", labelKey: "memory.ttl7d" },
+  { value: "2592000", labelKey: "memory.ttl30d" },
+  { value: "31536000", labelKey: "memory.ttl1y" },
 ];
 
 function parseTags(text: string): string[] {
@@ -197,6 +202,7 @@ export function MemoryFormDialog({
   defaultNamespace?: string;
   onSaved: (entry: MemoryEntry) => void;
 }) {
+  const { t } = useI18n();
   const editing = entry !== null && entry !== undefined;
   const ordered = useMemo(
     () => [...instances].sort((left, right) => left.id.localeCompare(right.id)),
@@ -241,11 +247,12 @@ export function MemoryFormDialog({
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const nextErrors: { key?: string; value?: string; scope?: string } = {};
-    if (!editing && !key.trim()) nextErrors.key = "A key is required.";
+    if (!editing && !key.trim()) nextErrors.key = t("memory.errors.keyRequired");
     if (!editing && !scope.trim() && (kind === "instance" || kind === "project")) {
-      nextErrors.scope = kind === "instance" ? "Choose an instance." : "Name the project.";
+      nextErrors.scope =
+        kind === "instance" ? t("memory.errors.instanceRequired") : t("memory.errors.projectRequired");
     }
-    if (overLimit) nextErrors.value = "The value is larger than 64 KiB.";
+    if (overLimit) nextErrors.value = t("memory.errors.valueTooLarge");
     setFieldErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
 
@@ -263,7 +270,7 @@ export function MemoryFormDialog({
           tags: nextTags,
           ttl_s: ttl === "none" ? undefined : Number(ttl),
         });
-        toast.success("Memory entry updated.");
+        toast.success(t("memory.updated"));
         onSaved(result.entry);
       } else {
         const result = await api.createOrUpdateMemory({
@@ -274,9 +281,7 @@ export function MemoryFormDialog({
           ttl_s: ttl === "none" ? undefined : Number(ttl),
         });
         toast.success(
-          result.created
-            ? "Memory entry created."
-            : "An entry with this key existed: it was updated and its version incremented.",
+          result.created ? t("memory.created") : t("memory.upserted"),
         );
         onSaved(result.entry);
       }
@@ -293,17 +298,17 @@ export function MemoryFormDialog({
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg">
         <form onSubmit={onSubmit} noValidate className="space-y-4">
           <DialogHeader>
-            <DialogTitle>{editing ? "Edit memory entry" : "New memory entry"}</DialogTitle>
+            <DialogTitle>
+              {editing ? t("memory.editTitle") : t("memory.newTitle")}
+            </DialogTitle>
             <DialogDescription>
-              {editing
-                ? "A new version is appended; the previous value stays restorable from the history."
-                : "Keyed by namespace and key: writing an existing pair updates it and increments its version."}
+              {editing ? t("memory.editDescription") : t("memory.newDescription")}
             </DialogDescription>
           </DialogHeader>
 
           {editing ? (
             <div className="space-y-2">
-              <Label>Namespace and key</Label>
+              <Label>{t("memory.namespaceAndKey")}</Label>
               <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-3 py-2">
                 <NamespaceBadge namespace={entry.namespace} />
                 <span className="font-mono text-xs break-all">{entry.key}</span>
@@ -312,7 +317,7 @@ export function MemoryFormDialog({
           ) : (
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="memory-namespace">Namespace</Label>
+                <Label htmlFor="memory-namespace">{t("memory.namespace")}</Label>
                 <Select
                   value={kind}
                   onValueChange={(next) => {
@@ -321,29 +326,33 @@ export function MemoryFormDialog({
                     if (value === "instance" && !scope) setScope(ordered[0]?.id ?? "");
                   }}
                 >
-                  <SelectTrigger id="memory-namespace" className="w-full" aria-label="Namespace family">
+                  <SelectTrigger
+                    id="memory-namespace"
+                    className="w-full"
+                    aria-label={t("memory.namespaceFamilyAria")}
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="global">global — fleet-wide</SelectItem>
-                    <SelectItem value="shared">shared — any agent</SelectItem>
-                    <SelectItem value="instance">instance:&lt;id&gt;</SelectItem>
-                    <SelectItem value="project">project:&lt;name&gt;</SelectItem>
+                    <SelectItem value="global">{t("memory.kindGlobal")}</SelectItem>
+                    <SelectItem value="shared">{t("memory.kindShared")}</SelectItem>
+                    <SelectItem value="instance">{t("memory.kindInstance")}</SelectItem>
+                    <SelectItem value="project">{t("memory.kindProject")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
 
               {kind === "instance" ? (
                 <div className="space-y-2">
-                  <Label htmlFor="memory-instance">Instance</Label>
+                  <Label htmlFor="memory-instance">{t("messages.instance")}</Label>
                   <Select value={scope} onValueChange={setScope}>
                     <SelectTrigger
                       id="memory-instance"
                       className="w-full"
-                      aria-label="Instance namespace"
+                      aria-label={t("memory.instanceNamespaceAria")}
                       aria-invalid={!!fieldErrors.scope}
                     >
-                      <SelectValue placeholder="Choose an instance" />
+                      <SelectValue placeholder={t("messages.chooseInstance")} />
                     </SelectTrigger>
                     <SelectContent>
                       {ordered.map((instance) => (
@@ -359,7 +368,7 @@ export function MemoryFormDialog({
                 </div>
               ) : kind === "project" ? (
                 <div className="space-y-2">
-                  <Label htmlFor="memory-project">Project</Label>
+                  <Label htmlFor="memory-project">{t("memory.project")}</Label>
                   <Input
                     id="memory-project"
                     value={scope}
@@ -376,7 +385,7 @@ export function MemoryFormDialog({
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <Label>Resolved namespace</Label>
+                  <Label>{t("memory.resolvedNamespace")}</Label>
                   <p className="flex h-9 items-center rounded-md border bg-muted/30 px-3 font-mono text-sm">
                     {namespace}
                   </p>
@@ -384,7 +393,7 @@ export function MemoryFormDialog({
               )}
 
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="memory-key">Key</Label>
+                <Label htmlFor="memory-key">{t("personas.vars.key")}</Label>
                 <Input
                   id="memory-key"
                   value={key}
@@ -392,7 +401,7 @@ export function MemoryFormDialog({
                   autoComplete="off"
                   spellCheck={false}
                   className="font-mono"
-                  placeholder="backup-runbook"
+                  placeholder={t("memory.keyPlaceholder")}
                   aria-invalid={!!fieldErrors.key}
                   aria-describedby={fieldErrors.key ? "memory-key-error" : undefined}
                   onChange={(event) => setKey(event.target.value)}
@@ -408,21 +417,21 @@ export function MemoryFormDialog({
 
           <div className="space-y-2">
             <div className="flex items-baseline justify-between gap-3">
-              <Label htmlFor="memory-value">Value</Label>
+              <Label htmlFor="memory-value">{t("assistant.proposal.value")}</Label>
               <span
                 className={cn(
                   "font-mono text-xs",
                   overLimit ? "text-destructive" : "text-muted-foreground",
                 )}
               >
-                {bytes.toLocaleString()} / 64 KiB
+                {t("memory.valueBytes", { bytes: bytes.toLocaleString() })}
               </span>
             </div>
             <Textarea
               id="memory-value"
               rows={7}
               value={value}
-              placeholder="Restart the gateway after an upgrade: docker compose restart hermes."
+              placeholder={t("memory.valuePlaceholder")}
               aria-invalid={!!fieldErrors.value || overLimit}
               aria-describedby={fieldErrors.value ? "memory-value-error" : "memory-value-help"}
               onChange={(event) => setValue(event.target.value)}
@@ -433,39 +442,43 @@ export function MemoryFormDialog({
               </p>
             ) : (
               <p id="memory-value-help" className="text-xs text-muted-foreground">
-                Plain text, searchable by every authenticated client. Never store a credential here.
+                {t("memory.valueHint")}
               </p>
             )}
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="memory-tags">Tags</Label>
+              <Label htmlFor="memory-tags">{t("memory.tags")}</Label>
               <Input
                 id="memory-tags"
                 value={tags}
                 autoComplete="off"
                 spellCheck={false}
                 className="font-mono"
-                placeholder="backup, ops"
+                placeholder={t("memory.tagsExample")}
                 onChange={(event) => setTags(event.target.value)}
               />
-              <p className="text-xs text-muted-foreground">Comma-separated, at most 16.</p>
+              <p className="text-xs text-muted-foreground">{t("memory.tagsLimit")}</p>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="memory-ttl">Expiry</Label>
+              <Label htmlFor="memory-ttl">{t("memory.expiry")}</Label>
               <Select value={ttl} onValueChange={setTtl}>
-                <SelectTrigger id="memory-ttl" className="w-full" aria-label="Expiry">
+                <SelectTrigger
+                  id="memory-ttl"
+                  className="w-full"
+                  aria-label={t("memory.expiry")}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="none">
-                    {editing ? "Keep current expiry" : "No expiry"}
+                    {editing ? t("memory.keepExpiry") : t("memory.noExpiry")}
                   </SelectItem>
                   {TTL_OPTIONS.map((option) => (
                     <SelectItem key={option.value} value={option.value}>
-                      {option.label}
+                      {t(option.labelKey)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -482,11 +495,11 @@ export function MemoryFormDialog({
               onClick={() => onOpenChange(false)}
               disabled={pending}
             >
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={pending}>
               {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-              {editing ? "Save changes" : "Create entry"}
+              {editing ? t("common.save") : t("memory.createEntry")}
             </Button>
           </DialogFooter>
         </form>
@@ -506,6 +519,7 @@ function VersionRow({
   canEdit: boolean;
   onRestore: (version: number) => void;
 }) {
+  const { t } = useI18n();
   const current = version.version === entry.version;
   return (
     <li className="relative pl-5">
@@ -522,7 +536,7 @@ function VersionRow({
           <ActionBadge action={version.action} />
           {current ? (
             <Badge variant="secondary" className="font-mono text-[11px] font-normal">
-              current
+              {t("memory.current")}
             </Badge>
           ) : null}
           <span className="text-xs text-muted-foreground">{version.owner}</span>
@@ -539,10 +553,10 @@ function VersionRow({
             variant="outline"
             size="sm"
             onClick={() => onRestore(version.version)}
-            aria-label={`Restore version ${version.version}`}
+            aria-label={t("memory.restoreAria", { version: version.version })}
           >
             <RotateCcw aria-hidden />
-            Restore this version
+            {t("memory.restoreThis")}
           </Button>
         ) : null}
       </div>
@@ -570,6 +584,7 @@ export function MemoryDetailSheet({
   onChanged: () => void;
   onEdit: (entry: MemoryEntry) => void;
 }) {
+  const { t, lang } = useI18n();
   const [nonce, setNonce] = useState(0);
   const [pending, setPending] = useState<"restore" | "delete" | "promote" | null>(null);
   const [actionError, setActionError] = useState<ApiError | null>(null);
@@ -600,7 +615,7 @@ export function MemoryDetailSheet({
     setActionError(null);
     try {
       await api.rollbackMemory(entry.id, version);
-      toast.success(`Restored version ${version} as a new version of ${entry.key}.`);
+      toast.success(t("memory.restored", { version, key: entry.key }));
       setRestoreVersion(null);
       onChanged();
       setNonce((value) => value + 1);
@@ -617,7 +632,7 @@ export function MemoryDetailSheet({
     setActionError(null);
     try {
       await api.promoteMemory(entry.id, "global");
-      toast.success(`${entry.key} copied to global memory.`);
+      toast.success(t("memory.promoted", { key: entry.key }));
       setPromoteOpen(false);
       onChanged();
     } catch (cause) {
@@ -633,7 +648,7 @@ export function MemoryDetailSheet({
     setActionError(null);
     try {
       await api.deleteMemory(entry.id);
-      toast.success(`${entry.key} deleted. Its history stays restorable until a purge.`);
+      toast.success(t("memory.deleted", { key: entry.key }));
       setDeleteOpen(false);
       onOpenChange(false);
       onChanged();
@@ -658,7 +673,7 @@ export function MemoryDetailSheet({
                   </Badge>
                 </>
               ) : (
-                "Memory entry"
+                t("memory.entryTitle")
               )}
             </SheetTitle>
             <SheetDescription asChild>
@@ -666,7 +681,10 @@ export function MemoryDetailSheet({
                 <NamespaceBadge namespace={entry?.namespace ?? "shared"} />
                 {entry ? (
                   <span className="text-muted-foreground">
-                    {entry.owner} · updated {formatRelative(entry.updated_at)}
+                    {entry.owner} ·{" "}
+                    {t("skills.picker.updated", {
+                      time: formatRelative(entry.updated_at, lang),
+                    })}
                   </span>
                 ) : null}
               </div>
@@ -678,15 +696,17 @@ export function MemoryDetailSheet({
               <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
                 <section className="space-y-2">
                   <div className="flex items-baseline justify-between gap-3">
-                    <h3 className="text-xs font-medium text-muted-foreground">Value</h3>
+                    <h3 className="text-xs font-medium text-muted-foreground">
+                      {t("assistant.proposal.value")}
+                    </h3>
                     <span className="font-mono text-xs text-muted-foreground">
-                      {bytes.toLocaleString()} bytes
+                      {t("memory.bytes", { bytes: bytes.toLocaleString() })}
                     </span>
                   </div>
                   <pre
                     tabIndex={0}
                     role="region"
-                    aria-label="Memory value"
+                    aria-label={t("memory.valueAria")}
                     className="max-h-[45vh] overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap"
                   >
                     {entry.value || "—"}
@@ -695,35 +715,46 @@ export function MemoryDetailSheet({
 
                 <DataList
                   items={[
-                    { label: "Namespace", value: <NamespaceBadge namespace={entry.namespace} /> },
                     {
-                      label: "Key",
+                      label: t("memory.namespace"),
+                      value: <NamespaceBadge namespace={entry.namespace} />,
+                    },
+                    {
+                      label: t("personas.vars.key"),
                       value: (
                         <span className="flex items-start gap-2">
                           <span className="min-w-0 flex-1 font-mono text-xs break-all">{entry.key}</span>
                           <CopyButton
                             value={entry.key}
-                            label="Copy key"
+                            label={t("memory.copyKey")}
                             size="icon-xs"
                             className="-my-1 shrink-0"
                           />
                         </span>
                       ),
                     },
-                    { label: "Version", value: <span className="font-mono text-xs">{entry.version}</span> },
-                    { label: "Owner", value: <span className="text-sm break-all">{entry.owner}</span> },
-                    { label: "Created", value: <When iso={entry.created_at} /> },
-                    { label: "Updated", value: <When iso={entry.updated_at} /> },
                     {
-                      label: "Expires",
+                      label: t("common.version"),
+                      value: <span className="font-mono text-xs">{entry.version}</span>,
+                    },
+                    {
+                      label: t("memory.owner"),
+                      value: <span className="text-sm break-all">{entry.owner}</span>,
+                    },
+                    { label: t("common.created"), value: <When iso={entry.created_at} /> },
+                    { label: t("common.updated"), value: <When iso={entry.updated_at} /> },
+                    {
+                      label: t("messages.expires"),
                       value: entry.expires_at ? (
                         <When iso={entry.expires_at} />
                       ) : (
-                        <span className="text-xs text-muted-foreground">never</span>
+                        <span className="text-xs text-muted-foreground">
+                          {t("common.never")}
+                        </span>
                       ),
                     },
                     {
-                      label: "Tags",
+                      label: t("memory.tags"),
                       value:
                         entry.tags.length > 0 ? (
                           <span className="flex flex-wrap gap-1">
@@ -738,17 +769,19 @@ export function MemoryDetailSheet({
                             ))}
                           </span>
                         ) : (
-                          <span className="text-xs text-muted-foreground">no tags</span>
+                          <span className="text-xs text-muted-foreground">
+                            {t("personas.card.noTags")}
+                          </span>
                         ),
                     },
                     {
-                      label: "Entry ID",
+                      label: t("memory.entryId"),
                       value: (
                         <span className="flex items-start gap-2">
                           <span className="font-mono text-xs">{entry.id}</span>
                           <CopyButton
                             value={String(entry.id)}
-                            label="Copy entry id"
+                            label={t("memory.copyEntryId")}
                             size="icon-xs"
                             className="-my-1 shrink-0"
                           />
@@ -761,10 +794,17 @@ export function MemoryDetailSheet({
                 <section className="space-y-3" aria-labelledby="memory-history-title">
                   <div className="flex items-center justify-between gap-3">
                     <h3 id="memory-history-title" className="text-sm font-medium">
-                      History
+                      {t("skills.detail.history")}
                     </h3>
                     <span className="text-xs text-muted-foreground">
-                      {history.data ? `${history.data.length} version${history.data.length === 1 ? "" : "s"}` : "…"}
+                      {history.data
+                        ? t(
+                            history.data.length === 1
+                              ? "memory.versionOne"
+                              : "memory.versionMany",
+                            { count: history.data.length },
+                          )
+                        : "…"}
                     </span>
                   </div>
 
@@ -790,7 +830,7 @@ export function MemoryDetailSheet({
                       ))}
                     </ol>
                   ) : (
-                    <p className="text-xs text-muted-foreground">No versions recorded yet.</p>
+                    <p className="text-xs text-muted-foreground">{t("memory.noVersions")}</p>
                   )}
                 </section>
 
@@ -810,7 +850,7 @@ export function MemoryDetailSheet({
                       }}
                     >
                       <Pencil aria-hidden />
-                      Edit
+                      {t("common.edit")}
                     </Button>
                     {entry.namespace !== "global" ? (
                       <Button
@@ -823,7 +863,7 @@ export function MemoryDetailSheet({
                         }}
                       >
                         <ArrowUpRight aria-hidden />
-                        Promote to global
+                        {t("memory.promoteToGlobal")}
                       </Button>
                     ) : null}
                     <Button
@@ -837,12 +877,12 @@ export function MemoryDetailSheet({
                       }}
                     >
                       <Trash2 aria-hidden />
-                      Delete
+                      {t("common.delete")}
                     </Button>
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    Read-only: your account cannot change fleet memory.
+                    {t("memory.readOnly")}
                   </p>
                 )}
               </SheetFooter>
@@ -859,14 +899,9 @@ export function MemoryDetailSheet({
             setActionError(null);
           }
         }}
-        title={`Restore version ${restoreVersion ?? ""}?`}
-        description={
-          <>
-            The value and tags of version {restoreVersion} are written as a new version. Nothing is
-            rewritten, so the restore itself stays reversible.
-          </>
-        }
-        confirmLabel="Restore version"
+        title={t("memory.restoreTitle", { version: restoreVersion ?? "" })}
+        description={t("memory.restoreDescription", { version: restoreVersion ?? "" })}
+        confirmLabel={t("memory.restoreVersion")}
         pending={pending === "restore"}
         error={actionError}
         onConfirm={() => {
@@ -882,15 +917,12 @@ export function MemoryDetailSheet({
             setActionError(null);
           }
         }}
-        title="Promote to global memory?"
-        description={
-          <>
-            Copies <span className="font-mono">{entry?.key}</span> into <span className="font-mono">global</span>.
-            An existing global entry with the same key is overwritten. The entry stays readable in{" "}
-            <span className="font-mono">{entry?.namespace}</span>.
-          </>
-        }
-        confirmLabel="Promote"
+        title={t("memory.promoteTitle")}
+        description={<RichText text={t("memory.promoteDescription", {
+          key: entry?.key ?? "",
+          namespace: entry?.namespace ?? "",
+        })} />}
+        confirmLabel={t("memory.promote")}
         pending={pending === "promote"}
         error={pending === "promote" ? null : actionError}
         onConfirm={() => void promote()}
@@ -904,14 +936,9 @@ export function MemoryDetailSheet({
             setActionError(null);
           }
         }}
-        title="Delete this memory entry?"
-        description={
-          <>
-            <span className="font-mono">{entry?.key}</span> disappears from reads and search. Its
-            history stays and a rollback brings it back; a purge removes it for good.
-          </>
-        }
-        confirmLabel="Delete entry"
+        title={t("memory.deleteTitle")}
+        description={t("memory.deleteDescription", { key: entry?.key ?? "" })}
+        confirmLabel={t("memory.deleteEntry")}
         destructive
         pending={pending === "delete"}
         error={pending === "delete" ? null : actionError}

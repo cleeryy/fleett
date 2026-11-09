@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { InstanceStatus } from "@/api/types";
 
@@ -26,6 +27,7 @@ const STATUS_STYLES: Record<InstanceStatus, { dot: string; className: string }> 
 };
 
 export function StatusBadge({ status, className }: { status: string; className?: string }) {
+  const { t } = useI18n();
   const key = (status in STATUS_STYLES ? status : "unknown") as InstanceStatus;
   const style = STATUS_STYLES[key];
   return (
@@ -34,7 +36,7 @@ export function StatusBadge({ status, className }: { status: string; className?:
       className={cn("gap-1.5 font-mono text-xs font-normal", style.className, className)}
     >
       <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", style.dot)} />
-      {key}
+      {t(`status.${key}`)}
     </Badge>
   );
 }

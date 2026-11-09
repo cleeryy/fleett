@@ -15,8 +15,9 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CommandLine } from "@/components/command-line";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { StatusBadge } from "@/components/status-badge";
-import { plural } from "@/lib/format";
+import { hasTranslation, useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -41,6 +42,7 @@ export function OnboardingProgress({
   steps: OnboardingStep[];
   className?: string;
 }) {
+  const { t } = useI18n();
   const total = steps.length;
   const done = steps.filter((step) => step.done).length;
   const percent = total === 0 ? 0 : Math.round((done / total) * 100);
@@ -48,7 +50,7 @@ export function OnboardingProgress({
     <div className={cn("flex items-center gap-3", className)}>
       <div
         role="progressbar"
-        aria-label="Setup progress"
+        aria-label={t("setup.progressAria")}
         aria-valuemin={0}
         aria-valuemax={total}
         aria-valuenow={done}
@@ -60,7 +62,7 @@ export function OnboardingProgress({
         />
       </div>
       <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">
-        {done} of {total}
+        {t("setup.doneOf", { done, total })}
       </span>
     </div>
   );
@@ -93,22 +95,27 @@ function StepIcon({
 }
 
 function StepAction({ step, canEdit }: { step: OnboardingStep; canEdit: boolean }) {
+  const { t } = useI18n();
   const action = step.action;
   if (!action) return null;
   if (action.kind === "command") {
     return (
       <CommandLine
         value={action.command}
-        label={`Copy the command for ${step.title}`}
+        label={t("setup.copyCommand", { step: step.title })}
         className="mt-1.5"
       />
     );
   }
   if (!canEdit) {
-    return <p className="pt-1 text-xs text-muted-foreground">An admin has to run this step.</p>;
+    return <p className="pt-1 text-xs text-muted-foreground">{t("setup.adminRequired")}</p>;
   }
   const label =
-    step.id === "provider" ? "New provider" : step.id === "instance" ? "New instance" : "Open";
+    step.id === "provider"
+      ? t("providers.form.newTitle")
+      : step.id === "instance"
+        ? t("nav.newInstance")
+        : t("common.open");
   return (
     <div className="pt-1.5">
       <Button asChild variant="outline" size="sm">
@@ -121,6 +128,27 @@ function StepAction({ step, canEdit }: { step: OnboardingStep; canEdit: boolean 
   );
 }
 
+/**
+ * Step copy comes from the controller in English; the console maps the stable
+ * ids (`docker`, `image`, `provider`, `instance`) to translator keys and keeps
+ * the server text for anything newer than this build.
+ */
+function stepTitle(
+  step: OnboardingStep,
+  t: (key: string) => string,
+): string {
+  const key = `setup.step.${step.id}.title`;
+  return hasTranslation(key) ? t(key) : step.title;
+}
+
+function stepDescription(
+  step: OnboardingStep,
+  t: (key: string) => string,
+): string {
+  const key = `setup.step.${step.id}.description`;
+  return hasTranslation(key) ? t(key) : step.description;
+}
+
 /** The four steps, with the first unfinished one marked as the next action. */
 export function OnboardingSteps({
   report,
@@ -129,6 +157,7 @@ export function OnboardingSteps({
   report: OnboardingReport;
   className?: string;
 }) {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const currentIndex = report.steps.findIndex((step) => !step.done);
 
@@ -145,18 +174,20 @@ export function OnboardingSteps({
             <div className="min-w-0 flex-1 space-y-1">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <p className={cn("text-sm font-medium", step.done && "text-muted-foreground")}>
-                  {step.title}
+                  {stepTitle(step, t)}
                 </p>
                 {step.done ? (
-                  <span className="text-xs text-muted-foreground">Done</span>
+                  <span className="text-xs text-muted-foreground">{t("common.done")}</span>
                 ) : index === currentIndex ? (
                   <Badge variant="secondary" className="text-[11px] font-normal">
-                    Next
+                    {t("setup.next")}
                   </Badge>
                 ) : null}
-                <span className="sr-only">{step.done ? "Done." : "Not done."}</span>
+                <span className="sr-only">
+                  {step.done ? t("setup.doneSr") : t("setup.notDoneSr")}
+                </span>
               </div>
-              <p className="text-xs text-muted-foreground">{step.description}</p>
+              <p className="text-xs text-muted-foreground">{stepDescription(step, t)}</p>
               {!step.done ? <StepAction step={step} canEdit={canEdit} /> : null}
             </div>
           </li>
@@ -176,6 +207,7 @@ export function FleetOnboardingCard({
   onDismiss: () => void;
   onOpenDoctor: () => void;
 }) {
+  const { t } = useI18n();
   const remaining = report.steps.filter((step) => !step.done).length;
   return (
     <section aria-labelledby="getting-started-title" className="rounded-lg border bg-card p-4 sm:p-5">
@@ -184,13 +216,15 @@ export function FleetOnboardingCard({
           <div className="flex items-center gap-2">
             <ListChecks aria-hidden className="size-4 shrink-0 text-muted-foreground" />
             <h2 id="getting-started-title" className="text-base font-semibold tracking-tight">
-              Getting started
+              {t("setup.gettingStarted")}
             </h2>
           </div>
           <p className="text-sm text-muted-foreground">
             {remaining > 0
-              ? `${remaining} ${plural(remaining, "step")} left before your first agent can answer.`
-              : "Every prerequisite is in place."}
+              ? t(remaining === 1 ? "setup.stepsLeftOne" : "setup.stepsLeftMany", {
+                  count: remaining,
+                })
+              : t("setup.allReady")}
           </p>
         </div>
         <Button
@@ -198,8 +232,8 @@ export function FleetOnboardingCard({
           variant="ghost"
           size="icon-sm"
           className="-mt-1 -mr-1 shrink-0"
-          aria-label="Dismiss getting started"
-          title="Dismiss getting started"
+          aria-label={t("setup.dismiss")}
+          title={t("setup.dismiss")}
           onClick={onDismiss}
         >
           <X aria-hidden />
@@ -211,13 +245,13 @@ export function FleetOnboardingCard({
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <Button type="button" variant="outline" size="sm" onClick={onOpenDoctor}>
           <Stethoscope aria-hidden />
-          Run diagnostics
+          {t("setup.runDiagnostics")}
         </Button>
         <Button asChild variant="ghost" size="sm">
-          <a href={hrefFor("/setup")}>Open setup</a>
+          <a href={hrefFor("/setup")}>{t("setup.openSetup")}</a>
         </Button>
         <span className="text-xs text-muted-foreground sm:ml-auto">
-          Diagnostics only read the host.
+          {t("setup.diagnosticsReadOnly")}
         </span>
       </div>
     </section>
@@ -249,6 +283,7 @@ export function OnboardingCompleteCard({
   onDismiss?: () => void;
   onOpenDiagnostics?: () => void;
 }) {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const templates = useResource(() => api.listTemplates(), []);
   const instance = useMemo(
@@ -283,18 +318,17 @@ export function OnboardingCompleteCard({
         <div className="min-w-0 flex-1 space-y-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 id="onboarding-complete-title" className="text-base font-semibold tracking-tight">
-              You're set up
+              {t("setup.completeTitle")}
             </h2>
             {instance ? <StatusBadge status={instance.status} /> : null}
           </div>
           <p className="text-sm text-muted-foreground">
             {instance ? (
               <>
-                <span className="font-medium text-foreground">{instance.name}</span> is your first
-                instance. Open it to read the logs, message the agent or change its configuration.
+                {t("setup.completeBody", { name: instance.name })}
               </>
             ) : (
-              "The first instance exists. Open Instances to manage the fleet."
+              t("setup.completeNoInstance")
             )}
           </p>
         </div>
@@ -304,8 +338,8 @@ export function OnboardingCompleteCard({
             variant="ghost"
             size="icon-sm"
             className="-mt-1 -mr-1 shrink-0"
-            aria-label="Dismiss setup success"
-            title="Dismiss setup success"
+            aria-label={t("setup.dismissSuccess")}
+            title={t("setup.dismissSuccess")}
             onClick={onDismiss}
           >
             <X aria-hidden />
@@ -315,17 +349,21 @@ export function OnboardingCompleteCard({
 
       <div className="mt-4 flex flex-wrap items-center gap-2 sm:pl-11">
         <Button asChild size="sm">
-          <a href={instanceHref}>Open {instance ? instance.name : "Instances"}</a>
+          <a href={instanceHref}>
+            {t("setup.openInstance", { name: instance ? instance.name : t("nav.instances") })}
+          </a>
         </Button>
         {allowlistHref && allowlistKey && canEdit ? (
           <Button asChild variant="outline" size="sm">
-            <a href={allowlistHref}>Check the {channelLabel} allowlist</a>
+            <a href={allowlistHref}>
+              {t("setup.checkAllowlist", { channel: channelLabel })}
+            </a>
           </Button>
         ) : null}
         {onOpenDiagnostics ? (
           <Button type="button" variant="ghost" size="sm" onClick={onOpenDiagnostics}>
             <Stethoscope aria-hidden />
-            Run diagnostics
+            {t("setup.runDiagnostics")}
           </Button>
         ) : null}
         {onDismiss ? (
@@ -336,15 +374,14 @@ export function OnboardingCompleteCard({
             className="sm:ml-auto"
             onClick={onDismiss}
           >
-            Got it
+            {t("setup.gotIt")}
           </Button>
         ) : null}
       </div>
 
       {allowlistKey && canEdit ? (
         <p className="mt-2 text-xs text-muted-foreground sm:pl-11">
-          <span className="font-mono">{allowlistKey}</span> has to list the users allowed to talk to
-          the agent; without it, every message is denied.
+          <RichText text={t("setup.allowlistHint", { key: allowlistKey })} />
         </p>
       ) : null}
     </section>
@@ -359,6 +396,7 @@ export function OnboardingSection({
   nonce?: number;
   onRunDiagnostics: () => void;
 }) {
+  const { t } = useI18n();
   const [localNonce, setLocalNonce] = useState(0);
   const onboarding = useResource(() => api.onboarding(), [nonce, localNonce]);
   const instances = useResource(() => api.listInstances(), [nonce, localNonce]);
@@ -369,12 +407,9 @@ export function OnboardingSection({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <h2 id="getting-started-heading" className="text-base font-semibold">
-            Getting started
+            {t("setup.gettingStarted")}
           </h2>
-          <p className="text-sm text-muted-foreground">
-            Four prerequisites, in the order they have to be satisfied. The state is derived live
-            from Docker, the database and the filesystem.
-          </p>
+          <p className="text-sm text-muted-foreground">{t("setup.sectionDescription")}</p>
         </div>
         <Button
           type="button"
@@ -383,7 +418,7 @@ export function OnboardingSection({
           onClick={() => setLocalNonce((value) => value + 1)}
         >
           <RefreshCw aria-hidden className={onboarding.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
       </div>
 

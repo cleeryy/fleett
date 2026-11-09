@@ -10,12 +10,14 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { PersonaCreateDialog } from "@/components/persona-create-dialog";
-import { formatRelative, plural } from "@/lib/format";
+import { formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
 function PersonaCard({ persona }: { persona: PersonaSummary }) {
+  const { t, lang } = useI18n();
   return (
     <a
       href={hrefFor(`/personas/${persona.id}`)}
@@ -29,7 +31,12 @@ function PersonaCard({ persona }: { persona: PersonaSummary }) {
         <Badge
           variant="outline"
           className="shrink-0 gap-1 font-mono text-[11px] font-normal text-muted-foreground"
-          title={`${persona.instances_count} ${plural(persona.instances_count, "instance")} using this persona`}
+          title={t(
+            persona.instances_count === 1
+              ? "personas.card.instancesOne"
+              : "personas.card.instancesMany",
+            { count: persona.instances_count },
+          )}
         >
           <Users aria-hidden />
           {persona.instances_count}
@@ -37,7 +44,7 @@ function PersonaCard({ persona }: { persona: PersonaSummary }) {
       </div>
 
       <p className="line-clamp-2 min-h-10 text-sm text-muted-foreground">
-        {persona.description || persona.excerpt || "No description."}
+        {persona.description || persona.excerpt || t("skills.picker.noDescription")}
       </p>
 
       {persona.tags.length > 0 ? (
@@ -49,21 +56,29 @@ function PersonaCard({ persona }: { persona: PersonaSummary }) {
           ))}
         </div>
       ) : (
-        <span className="text-xs text-muted-foreground">No tags</span>
+        <span className="text-xs text-muted-foreground">{t("personas.card.noTags")}</span>
       )}
 
       <p className="mt-auto flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
         <span>
-          {persona.variables.length} {plural(persona.variables.length, "variable")}
+          {t(
+            persona.variables.length === 1
+              ? "personas.picker.variableOne"
+              : "personas.picker.variableMany",
+            { count: persona.variables.length },
+          )}
         </span>
         <span aria-hidden>·</span>
-        <span title={persona.updated_at}>updated {formatRelative(persona.updated_at)}</span>
+        <span title={persona.updated_at}>
+          {t("skills.picker.updated", { time: formatRelative(persona.updated_at, lang) })}
+        </span>
       </p>
     </a>
   );
 }
 
 export function PersonasPage() {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const [nonce, setNonce] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
@@ -73,11 +88,13 @@ export function PersonasPage() {
   return (
     <>
       <PageHeader
-        title="Personas"
+        title={t("nav.personas")}
         description={
           personas.data
-            ? `${rows.length} ${plural(rows.length, "persona")} · reusable SOUL.md with variables · applied into data/SOUL.md`
-            : "Loading personas."
+            ? t(rows.length === 1 ? "personas.countOne" : "personas.countMany", {
+                count: rows.length,
+              })
+            : t("personas.loading")
         }
         actions={
           <>
@@ -88,12 +105,12 @@ export function PersonasPage() {
               disabled={personas.refreshing}
             >
               <RefreshCw aria-hidden className={personas.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
             {canEdit ? (
               <Button size="sm" onClick={() => setCreateOpen(true)}>
                 <Plus aria-hidden />
-                New persona
+                {t("personas.create.title")}
               </Button>
             ) : null}
           </>
@@ -102,7 +119,7 @@ export function PersonasPage() {
 
       {!canEdit ? (
         <p className="text-xs text-muted-foreground">
-          Read-only: creating and applying a persona needs a write-capable account.
+          {t("personas.readOnly")}
         </p>
       ) : null}
 
@@ -123,13 +140,13 @@ export function PersonasPage() {
         <div className="rounded-md border">
           <EmptyState
             icon={Fingerprint}
-            title="No personas yet"
-            description="A persona is one SOUL.md you can give to any number of agents. Write it once, add variables such as {{agent_name}} or {{tone}}, and each instance renders its own text."
+            title={t("personas.emptyTitle")}
+            description={t("personas.emptyDescription")}
             action={
               canEdit ? (
                 <Button onClick={() => setCreateOpen(true)}>
                   <Plus aria-hidden />
-                  Create the first persona
+                  {t("personas.emptyAction")}
                 </Button>
               ) : undefined
             }
@@ -145,7 +162,7 @@ export function PersonasPage() {
 
       {rows.length > 0 ? (
         <p className="text-xs text-muted-foreground">
-          Open a persona to edit its SOUL.md, preview the rendered text and apply it to instances.
+          {t("personas.footerHint")}
         </p>
       ) : null}
 
@@ -154,7 +171,7 @@ export function PersonasPage() {
           open={createOpen}
           onOpenChange={setCreateOpen}
           onCreated={(id) => {
-            toast.success("Persona created.");
+            toast.success(t("personas.created"));
             navigate(`/personas/${id}`);
           }}
         />

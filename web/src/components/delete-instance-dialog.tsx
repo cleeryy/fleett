@@ -14,6 +14,8 @@ import {
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
+import { useI18n } from "@/lib/i18n";
 
 export interface DeletableInstance {
   id: string;
@@ -31,6 +33,7 @@ export function DeleteInstanceDialog({
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
+  const { t } = useI18n();
   const [purge, setPurge] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -61,10 +64,9 @@ export function DeleteInstanceDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete instance {instance?.id ?? ""}?</DialogTitle>
+          <DialogTitle>{t("fleet.delete.title", { id: instance?.id ?? "" })}</DialogTitle>
           <DialogDescription>
-            The container is removed with <span className="font-mono">docker compose down</span>. Choose what
-            happens to its data directory.
+            <RichText text={t("fleet.delete.description")} />
           </DialogDescription>
         </DialogHeader>
 
@@ -77,20 +79,17 @@ export function DeleteInstanceDialog({
           <div className="flex items-start gap-3 rounded-md border p-3">
             <RadioGroupItem value="keep" id="delete-keep" className="mt-0.5" />
             <div className="space-y-0.5">
-              <Label htmlFor="delete-keep">Keep data</Label>
+              <Label htmlFor="delete-keep">{t("fleet.delete.keepData")}</Label>
               <p className="text-xs text-muted-foreground">
-                <span className="font-mono">instances/{instance?.id}/data</span> stays on disk. Recreating the
-                same id reuses it.
+                {t("fleet.delete.keepDataHint", { id: instance?.id ?? "" })}
               </p>
             </div>
           </div>
           <div className="flex items-start gap-3 rounded-md border p-3">
             <RadioGroupItem value="purge" id="delete-purge" className="mt-0.5" />
             <div className="space-y-0.5">
-              <Label htmlFor="delete-purge">Delete data</Label>
-              <p className="text-xs text-muted-foreground">
-                The data directory is removed. This cannot be undone.
-              </p>
+              <Label htmlFor="delete-purge">{t("fleet.delete.deleteData")}</Label>
+              <p className="text-xs text-muted-foreground">{t("fleet.delete.deleteDataHint")}</p>
             </div>
           </div>
         </RadioGroup>
@@ -99,11 +98,11 @@ export function DeleteInstanceDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button variant="destructive" onClick={onConfirm} disabled={pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-            Delete instance
+            {t("fleet.delete.confirm")}
           </Button>
         </DialogFooter>
       </DialogContent>

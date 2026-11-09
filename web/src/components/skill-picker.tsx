@@ -11,7 +11,9 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorAlert } from "@/components/error-alert";
-import { formatRelative, plural } from "@/lib/format";
+import { RichText } from "@/components/rich-text";
+import { formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 import {
   FOLLOW_LATEST,
@@ -51,6 +53,7 @@ export function SkillPicker({
   effective?: Record<string, string | null>;
   className?: string;
 }) {
+  const { t, lang } = useI18n();
   const over = tooManySkills(value);
 
   function toggle(name: string, checked: boolean) {
@@ -72,10 +75,7 @@ export function SkillPicker({
   return (
     <div className={cn("space-y-3", className)}>
       <p className="text-sm text-muted-foreground">
-        Skills are mounted read-only at{" "}
-        <span className="font-mono">/opt/data/skills/&lt;name&gt;</span>. A pin keeps one
-        version; leaving <span className="font-mono">latest</span> means the instance follows the
-        registry pointer.
+        <RichText text={t("skills.picker.hint")} />
       </p>
 
       {error ? <ErrorAlert error={error} onRetry={onRetry} /> : null}
@@ -88,14 +88,14 @@ export function SkillPicker({
         </div>
       ) : skills.length === 0 ? (
         <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-          The registry is empty.{" "}
+          {t("skills.picker.emptyLead")}{" "}
           <a
             href={hrefFor("/skills")}
             className="underline underline-offset-4 hover:text-foreground"
           >
-            Publish a skill
+            {t("skills.picker.emptyAction")}
           </a>{" "}
-          first, then mount it here.
+          {t("skills.picker.emptyTail")}
         </p>
       ) : (
         <div className="divide-y rounded-md border">
@@ -128,16 +128,29 @@ export function SkillPicker({
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="font-mono text-sm font-medium">{skill.name}</span>
                     <Badge variant="secondary" className="font-mono text-[11px] font-normal">
-                      {skill.latest ? `latest ${skill.latest}` : "no latest"}
+                      {skill.latest
+                        ? t("skills.picker.latestBadge", { version: skill.latest })
+                        : t("skills.picker.noLatest")}
                     </Badge>
                   </span>
                   <span
                     id={`${idPrefix}-${skill.name}-help`}
                     className="mt-0.5 block truncate text-xs font-normal text-muted-foreground"
                   >
-                    {skill.description || "No description."} ·{" "}
-                    {skill.versions.length} {plural(skill.versions.length, "version")} ·{" "}
-                    {skill.instances_count} {plural(skill.instances_count, "instance")}
+                    {skill.description || t("skills.picker.noDescription")} ·{" "}
+                    {t(
+                      skill.versions.length === 1
+                        ? "skills.picker.versionOne"
+                        : "skills.picker.versionMany",
+                      { count: skill.versions.length },
+                    )}{" "}
+                    ·{" "}
+                    {t(
+                      skill.instances_count === 1
+                        ? "skills.picker.instanceOne"
+                        : "skills.picker.instanceMany",
+                      { count: skill.instances_count },
+                    )}
                   </span>
                 </label>
 
@@ -150,14 +163,16 @@ export function SkillPicker({
                   <SelectTrigger
                     className="w-40"
                     size="sm"
-                    aria-label={`Version of ${skill.name}`}
+                    aria-label={t("skills.picker.versionOf", { name: skill.name })}
                     aria-invalid={stale}
                   >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value={FOLLOW_LATEST}>
-                      latest{skill.latest ? ` (${skill.latest})` : ""}
+                      {skill.latest
+                        ? t("skills.picker.latestWith", { version: skill.latest })
+                        : t("skills.picker.latest")}
                     </SelectItem>
                     {skill.versions.map((version) => (
                       <SelectItem key={version} value={version}>
@@ -173,17 +188,19 @@ export function SkillPicker({
                     className="shrink-0 gap-1 font-mono text-[11px] font-normal"
                     title={
                       stale
-                        ? `${pin} is not published any more`
+                        ? t("skills.picker.staleTitle", { version: pin })
                         : mounted === null
-                          ? "the reference cannot be resolved"
-                          : `mounted version: ${mounted}`
+                          ? t("skills.picker.unresolvedTitle")
+                          : t("skills.picker.mountedTitle", { version: mounted })
                     }
                   >
-                    {mounted === null ? "unresolved" : `mounted ${mounted}`}
+                    {mounted === null
+                      ? t("skills.picker.unresolved")
+                      : t("skills.picker.mounted", { version: mounted })}
                   </Badge>
                 ) : (
                   <span className="text-[11px] text-muted-foreground sm:w-24 sm:shrink-0 sm:text-right">
-                    updated {formatRelative(skill.updated_at)}
+                    {t("skills.picker.updated", { time: formatRelative(skill.updated_at, lang) })}
                   </span>
                 )}
                 </div>
@@ -195,21 +212,28 @@ export function SkillPicker({
 
       <div className="space-y-1">
         <p className="text-xs text-muted-foreground">
-          {value.length} of {MAX_SKILLS_PER_INSTANCE} skills selected
+          {t(
+            value.length === 1
+              ? "skills.picker.selectedCountOne"
+              : "skills.picker.selectedCountMany",
+            { count: value.length, max: MAX_SKILLS_PER_INSTANCE },
+          )}
           {value.filter((ref) => !ref.version).length > 0
-            ? ` · ${value.filter((ref) => !ref.version).length} following latest`
+            ? t("skills.picker.followingLatest", {
+                count: value.filter((ref) => !ref.version).length,
+              })
             : ""}
           .
         </p>
         <p className="text-xs text-muted-foreground">
-          Applying the list rewrites <span className="font-mono">compose.yaml</span> and restarts the
-          instance. A promote restarts only the instances that follow{" "}
-          <span className="font-mono">latest</span>; pinned ones keep their version.
+          <RichText text={t("skills.picker.applyHint")} />
         </p>
         {over ? (
           <p className="text-xs text-destructive">
-            An instance mounts at most {MAX_SKILLS_PER_INSTANCE} skills: remove{" "}
-            {value.length - MAX_SKILLS_PER_INSTANCE} before saving.
+            {t("skills.picker.tooMany", {
+              max: MAX_SKILLS_PER_INSTANCE,
+              count: value.length - MAX_SKILLS_PER_INSTANCE,
+            })}
           </p>
         ) : null}
       </div>

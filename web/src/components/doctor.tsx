@@ -21,7 +21,8 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { CommandLine } from "@/components/command-line";
 import { ErrorAlert } from "@/components/error-alert";
-import { formatClock, plural } from "@/lib/format";
+import { hasTranslation, useI18n } from "@/lib/i18n";
+import { formatClock } from "@/lib/format";
 import { hrefFor } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
@@ -38,10 +39,10 @@ const ICON: Record<DoctorCheckStatus, LucideIcon> = {
   error: CircleX,
 };
 
-const GROUP_TITLE: Record<DoctorCheckStatus, string> = {
-  error: "Errors",
-  warn: "Warnings",
-  ok: "Passing",
+const GROUP_KEY: Record<DoctorCheckStatus, string> = {
+  error: "health.groupErrors",
+  warn: "health.groupWarnings",
+  ok: "health.groupPassing",
 };
 
 const GROUP_CLASS: Record<DoctorCheckStatus, string> = {
@@ -64,6 +65,7 @@ function isInternalPath(value: string): boolean {
 
 /** A fix is a command to copy, or a page to open when the controller sends one. */
 function Fix({ fix }: { fix: string }) {
+  const { t } = useI18n();
   if (isUrl(fix) || isInternalPath(fix)) {
     return (
       <a
@@ -72,37 +74,53 @@ function Fix({ fix }: { fix: string }) {
         className="inline-flex items-center gap-1.5 rounded-sm text-sm font-medium underline-offset-4 hover:underline"
       >
         <ExternalLink aria-hidden className="size-3.5 shrink-0" />
-        Open the fix
+        {t("health.openFix")}
       </a>
     );
   }
   // The controller wraps host paths and settings in Markdown backticks; they
   // would end up in the copied command.
-  return <CommandLine value={fix.replace(/`/g, "")} label="Copy the fix" badge="Fix" />;
+  return (
+    <CommandLine
+      value={fix.replace(/`/g, "")}
+      label={t("health.copyFix")}
+      badge={t("health.fixBadge")}
+    />
+  );
+}
+
+/** Check labels are server copy; map the stable id to translator keys. */
+function checkTitle(
+  check: DoctorCheck,
+  t: (key: string) => string,
+): string {
+  const key = `health.check.${check.id}`;
+  return hasTranslation(key) ? t(key) : check.label;
 }
 
 function CheckRow({ check }: { check: DoctorCheck }) {
+  const { t } = useI18n();
   const Icon = ICON[check.status];
   return (
     <li className="flex gap-3 px-3 py-3 sm:px-4">
       <Icon aria-hidden className={cn("mt-0.5 size-4 shrink-0", TONE[check.status])} />
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-          <p className="text-sm font-medium">{check.label}</p>
+          <p className="text-sm font-medium">{checkTitle(check, t)}</p>
           <span className="font-mono text-[11px] text-muted-foreground">{check.id}</span>
           {check.status === "error" ? (
             <Badge
               variant="outline"
               className="border-destructive/40 text-[10px] font-normal text-destructive"
             >
-              Error
+              {t("health.badgeError")}
             </Badge>
           ) : check.status === "warn" ? (
             <Badge
               variant="outline"
               className="border-amber-600/40 text-[10px] font-normal text-amber-700 dark:text-amber-400"
             >
-              Warning
+              {t("health.badgeWarning")}
             </Badge>
           ) : null}
         </div>
@@ -114,6 +132,7 @@ function CheckRow({ check }: { check: DoctorCheck }) {
 }
 
 function Summary({ report }: { report: DoctorReport }) {
+  const { t } = useI18n();
   const errors = report.checks.filter((check) => check.status === "error").length;
   const warnings = report.checks.filter((check) => check.status === "warn").length;
 
@@ -121,8 +140,12 @@ function Summary({ report }: { report: DoctorReport }) {
     return (
       <Badge variant="outline" className="gap-1.5 border-destructive/40 text-destructive">
         <CircleX aria-hidden />
-        {errors} {plural(errors, "error")}
-        {warnings > 0 ? ` · ${warnings} ${plural(warnings, "warning")}` : ""}
+        {t(errors === 1 ? "health.errorCountOne" : "health.errorCountMany", { count: errors })}
+        {warnings > 0
+          ? t(warnings === 1 ? "health.warningSuffixOne" : "health.warningSuffixMany", {
+              count: warnings,
+            })
+          : ""}
       </Badge>
     );
   }
@@ -133,7 +156,7 @@ function Summary({ report }: { report: DoctorReport }) {
         className="gap-1.5 border-amber-600/40 text-amber-700 dark:text-amber-400"
       >
         <TriangleAlert aria-hidden />
-        Ready with {warnings} {plural(warnings, "warning")}
+        {t(warnings === 1 ? "health.readyOne" : "health.readyMany", { count: warnings })}
       </Badge>
     );
   }
@@ -143,7 +166,7 @@ function Summary({ report }: { report: DoctorReport }) {
       className="gap-1.5 border-emerald-600/30 text-emerald-700 dark:text-emerald-400"
     >
       <CircleCheck aria-hidden />
-      All checks passed
+      {t("health.allPassed")}
     </Badge>
   );
 }
@@ -169,6 +192,7 @@ function ReportSkeleton() {
  * `GET /api/doctor`, which never writes or reaches the network.
  */
 export function DoctorPanel({ nonce = 0, className }: { nonce?: number; className?: string }) {
+  const { t } = useI18n();
   const doctor = useResource(() => api.doctor(), [nonce]);
   const [checkedAt, setCheckedAt] = useState<Date | null>(null);
 
@@ -191,7 +215,11 @@ export function DoctorPanel({ nonce = 0, className }: { nonce?: number; classNam
       <div className="flex flex-wrap items-center gap-2">
         {report ? <Summary report={report} /> : null}
         <span className="text-xs text-muted-foreground" aria-live="polite">
-          {checkedAt ? `Checked ${formatClock(checkedAt)}` : doctor.loading ? "Running…" : ""}
+          {checkedAt
+            ? t("health.checkedAt", { time: formatClock(checkedAt) })
+            : doctor.loading
+              ? t("health.runningNow")
+              : ""}
         </span>
         <Button
           type="button"
@@ -201,7 +229,7 @@ export function DoctorPanel({ nonce = 0, className }: { nonce?: number; classNam
           onClick={doctor.reload}
         >
           <RefreshCw aria-hidden className={doctor.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
       </div>
 
@@ -211,14 +239,14 @@ export function DoctorPanel({ nonce = 0, className }: { nonce?: number; classNam
 
       {report && report.checks.length === 0 ? (
         <p className="rounded-md border px-4 py-6 text-center text-sm text-muted-foreground">
-          The controller returned no checks.
+          {t("health.noChecks")}
         </p>
       ) : null}
 
       {groups.map((group) => (
         <div key={group.status} className="space-y-2">
           <h3 className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-            {GROUP_TITLE[group.status]}
+            {t(GROUP_KEY[group.status])}
             <span className="font-mono">{group.checks.length}</span>
           </h3>
           <ul className={cn("divide-y rounded-md border", GROUP_CLASS[group.status])}>
@@ -230,7 +258,7 @@ export function DoctorPanel({ nonce = 0, className }: { nonce?: number; classNam
       ))}
 
       <p className="text-xs text-muted-foreground">
-        Warnings never fail the report; only an error needs action. Nothing here writes to the host.
+        {t("health.footnote")}
       </p>
     </div>
   );
@@ -244,14 +272,13 @@ export function DoctorDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useI18n();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="top-[5dvh] max-h-[90dvh] translate-y-0 gap-0 overflow-hidden p-0 sm:max-w-2xl">
         <DialogHeader className="border-b px-4 py-3 pr-12">
-          <DialogTitle>Diagnostics</DialogTitle>
-          <DialogDescription>
-            Ten read-only checks of the host and the fleet. Run a fix, then refresh.
-          </DialogDescription>
+          <DialogTitle>{t("health.title")}</DialogTitle>
+          <DialogDescription>{t("health.dialogDescription")}</DialogDescription>
         </DialogHeader>
         <div className="overflow-y-auto overscroll-contain p-4">
           <DoctorPanel />

@@ -23,7 +23,8 @@ import {
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
-import { formatDateTime, formatRelative, plural } from "@/lib/format";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { useResource } from "@/lib/use-resource";
 
 function RoleBadge({ role }: { role: string }) {
@@ -47,6 +48,7 @@ function detailsTitle(entry: AuditEntry): string | undefined {
 }
 
 export function AuditPage() {
+  const { t, lang } = useI18n();
   const [limit, setLimit] = useState("50");
   const audit = useResource(() => api.listAudit(Number(limit)), [limit]);
   const rows = audit.data ?? [];
@@ -54,26 +56,26 @@ export function AuditPage() {
   return (
     <>
       <PageHeader
-        title="Audit log"
+        title={t("nav.audit")}
         description={
           audit.data
-            ? `${rows.length} ${plural(rows.length, "action")} · newest first · successful changes only`
-            : "Loading the audit trail."
+            ? t(rows.length === 1 ? "audit.countOne" : "audit.countMany", { count: rows.length })
+            : t("audit.loading")
         }
         actions={
           <>
             <Select value={limit} onValueChange={setLimit}>
-              <SelectTrigger className="w-32" aria-label="Entries to load">
+              <SelectTrigger className="w-32" aria-label={t("audit.entriesAria")}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="50">50 entries</SelectItem>
-                <SelectItem value="200">200 entries</SelectItem>
+                <SelectItem value="50">{t("audit.entries50")}</SelectItem>
+                <SelectItem value="200">{t("audit.entries200")}</SelectItem>
               </SelectContent>
             </Select>
             <Button variant="outline" size="sm" onClick={audit.reload}>
               <RefreshCw aria-hidden className={audit.refreshing ? "animate-spin" : undefined} />
-              Refresh
+              {t("common.refresh")}
             </Button>
           </>
         }
@@ -91,8 +93,8 @@ export function AuditPage() {
         ) : rows.length === 0 ? (
           <EmptyState
             icon={ScrollText}
-            title="No changes recorded yet"
-            description="Every successful create, update, lifecycle, share or token action lands here, newest first."
+            title={t("audit.emptyTitle")}
+            description={t("audit.emptyDescription")}
           />
         ) : (
           <>
@@ -100,11 +102,11 @@ export function AuditPage() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-[180px]">Time</TableHead>
-                    <TableHead>Actor</TableHead>
-                    <TableHead className="w-[100px]">Role</TableHead>
-                    <TableHead>Action</TableHead>
-                    <TableHead>Target</TableHead>
+                    <TableHead className="w-[180px]">{t("audit.time")}</TableHead>
+                    <TableHead>{t("audit.actor")}</TableHead>
+                    <TableHead className="w-[100px]">{t("audit.role")}</TableHead>
+                    <TableHead>{t("audit.action")}</TableHead>
+                    <TableHead>{t("audit.target")}</TableHead>
                     <TableHead className="w-[140px]">IP</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -112,7 +114,7 @@ export function AuditPage() {
                   {rows.map((entry) => (
                     <TableRow key={entry.id}>
                       <TableCell>
-                        <span className="font-mono text-xs" title={formatRelative(entry.at)}>
+                        <span className="font-mono text-xs" title={formatRelative(entry.at, lang)}>
                           {formatDateTime(entry.at)}
                         </span>
                       </TableCell>
@@ -158,15 +160,15 @@ export function AuditPage() {
                   </div>
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
                     <div className="col-span-2">
-                      <dt className="text-muted-foreground">Action</dt>
+                      <dt className="text-muted-foreground">{t("audit.action")}</dt>
                       <dd className="font-mono">{entry.action}</dd>
                     </div>
                     <div className="col-span-2">
-                      <dt className="text-muted-foreground">Target</dt>
+                      <dt className="text-muted-foreground">{t("audit.target")}</dt>
                       <dd className="font-mono break-all">{entry.target}</dd>
                     </div>
                     <div>
-                      <dt className="text-muted-foreground">Method</dt>
+                      <dt className="text-muted-foreground">{t("audit.method")}</dt>
                       <dd className="font-mono">{entry.method}</dd>
                     </div>
                     <div>

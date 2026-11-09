@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import { toApiError, type ApiError } from "@/api/errors";
+import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
 import type { ChannelType, EnvEntry, EnvSuggestion, InstanceDetail, PatchInstanceInput, PersonaSummary, ProviderSummary, ShareRef, SkillRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -57,6 +57,7 @@ import {
 } from "@/components/instance-ops";
 import { InstanceSchedules } from "@/components/schedules";
 import { ErrorAlert } from "@/components/error-alert";
+import { RichText } from "@/components/rich-text";
 import { PageHeader } from "@/components/page-header";
 import { PersonaStateBadge } from "@/components/persona-state-badge";
 import { PersonaSelect } from "@/components/persona-select";
@@ -72,7 +73,8 @@ import {
 } from "@/lib/assistant";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
-import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
+import { formatClock, formatDateTime, formatRelative, formatUptime } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { applySucceeded, compactVariables } from "@/lib/personas";
 import {
   MAX_SKILLS_PER_INSTANCE,
@@ -91,12 +93,13 @@ function Mono({ children, className }: { children: ReactNode; className?: string
 }
 
 function CopyValue({ value, label }: { value: string; label: string }) {
+  const { t } = useI18n();
   return (
     <span className="flex min-w-0 items-center gap-1">
       <span className="min-w-0 flex-1 font-mono text-xs break-all">{value}</span>
       <CopyButton
         value={value}
-        label={`Copy ${label}`}
+        label={t("providers.detail.copyLabel", { label })}
         size="icon-xs"
         className="-my-1 shrink-0"
       />
@@ -132,6 +135,7 @@ function OverviewTab({
   canEdit: boolean;
   onConfigure: () => void;
 }) {
+  const { t, lang } = useI18n();
   const env = tokenEnv(detail);
   const suppliedByProvider = !!detail.provider;
   const providerKeySet = suppliedByProvider || hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
@@ -142,7 +146,7 @@ function OverviewTab({
       {detail.last_error ? (
         <Alert variant="destructive" className="items-start">
           <AlertCircle aria-hidden className="mt-0.5 size-4" />
-          <AlertTitle>Last error</AlertTitle>
+          <AlertTitle>{t("detail.lastError")}</AlertTitle>
           <AlertDescription>
             <p className="font-mono text-xs break-words whitespace-pre-wrap">{detail.last_error}</p>
           </AlertDescription>
@@ -150,15 +154,18 @@ function OverviewTab({
       ) : null}
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <Section title="Runtime">
+        <Section title={t("detail.runtime")}>
           <DataList
             items={[
-              { label: "Model", value: <Mono>{detail.model}</Mono> },
-              { label: "Base URL", value: <CopyValue value={detail.base_url} label="base URL" /> },
+              { label: t("fleet.model"), value: <Mono>{detail.model}</Mono> },
+              {
+                label: t("providers.form.baseUrl"),
+                value: <CopyValue value={detail.base_url} label={t("providers.detail.baseUrl")} />,
+              },
               ...(detail.provider
                 ? [
                     {
-                      label: "Provider",
+                      label: t("clone.providerLabel"),
                       value: (
                         <span className="flex flex-wrap items-center gap-2">
                           <a
@@ -173,16 +180,19 @@ function OverviewTab({
                             </Badge>
                           ) : null}
                           <span className="text-xs text-muted-foreground">
-                            supplies the API key
+                            {t("detail.suppliesKey")}
                           </span>
                         </span>
                       ),
                     },
                   ]
                 : []),
-              { label: "API key env", value: <Mono>{detail.api_key_env}</Mono> },
               {
-                label: "Provider key",
+                label: t("providers.form.apiKeyEnv"),
+                value: <Mono>{detail.api_key_env}</Mono>,
+              },
+              {
+                label: t("detail.providerKey"),
                 value: suppliedByProvider ? (
                   <span className="flex flex-wrap items-center gap-2">
                     <Badge variant="secondary" className="font-mono text-xs font-normal">
@@ -216,29 +226,30 @@ function OverviewTab({
                           className="h-auto p-0"
                           onClick={onConfigure}
                         >
-                          Add the token
+                          {t("detail.addToken")}
                         </Button>
                       ) : null}
                     </div>
-                    <p className="text-xs text-muted-foreground">The agent cannot call the model.</p>
+                    <p className="text-xs text-muted-foreground">{t("detail.noModelCall")}</p>
                   </div>
                 ),
               },
-              { label: "Memory limit", value: `${detail.mem_limit_mb}\u00A0MB` },
               {
-                label: "LAN access",
+                label: t("create.memoryLimit"),
+                value: `${detail.mem_limit_mb}\u00A0MB`,
+              },
+              {
+                label: t("create.lanAccess"),
                 value: (
                   <div className="space-y-1">
                     <Badge
                       variant={detail.allow_lan ? "secondary" : "outline"}
                       className="font-mono text-xs font-normal"
                     >
-                      {detail.allow_lan ? "enabled" : "restricted"}
+                      {detail.allow_lan ? t("common.enabled") : t("create.restricted")}
                     </Badge>
                     <p className="text-xs text-muted-foreground">
-                      {detail.allow_lan
-                        ? "Can reach 10/8, 172.16/12 and 192.168/16."
-                        : "No LAN route. The agent only joins the fleett network."}
+                      {detail.allow_lan ? t("detail.lanOn") : t("detail.lanOff")}
                     </p>
                   </div>
                 ),
@@ -248,15 +259,15 @@ function OverviewTab({
         </Section>
 
         <Section
-          title="Persona"
+          title={t("clone.personaLabel")}
           action={
             canEdit ? (
               <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
-                Manage
+                {t("providers.list.manage")}
               </Button>
             ) : (
               <Button asChild variant="ghost" size="sm">
-                <a href="#/personas">Browse</a>
+                <a href="#/personas">{t("detail.browse")}</a>
               </Button>
             )
           }
@@ -278,44 +289,41 @@ function OverviewTab({
               </div>
               <p className="text-xs text-muted-foreground">
                 {detail.persona_state === "diverged"
-                  ? "data/SOUL.md was edited by hand after the persona was applied. Reapply the persona in Configuration to take it back over, or keep the manual text."
-                  : "data/SOUL.md is rendered from this persona; applying it rewrites the file and restarts the instance."}
+                  ? t("detail.personaDiverged")
+                  : t("detail.personaRendered")}
               </p>
               <dl className="grid grid-cols-2 gap-2 text-xs">
                 <div className="min-w-0">
-                  <dt className="text-muted-foreground">Values set</dt>
+                  <dt className="text-muted-foreground">{t("detail.valuesSet")}</dt>
                   <dd className="font-mono">
-                    {Object.keys(compactVariables(detail.persona_vars ?? {})).length}{" "}
-                    {plural(
-                      Object.keys(compactVariables(detail.persona_vars ?? {})).length,
-                      "override",
-                    )}
+                    {t("create.overrides", {
+                      count: Object.keys(compactVariables(detail.persona_vars ?? {})).length,
+                    })}
                   </dd>
                 </div>
                 <div className="min-w-0">
-                  <dt className="text-muted-foreground">Persona id</dt>
+                  <dt className="text-muted-foreground">{t("detail.personaId")}</dt>
                   <dd className="truncate font-mono">{detail.persona}</dd>
                 </div>
               </dl>
             </div>
           ) : (
             <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-              No persona. The instance keeps the SOUL.md its template provides; assign one in
-              Configuration to render a shared personality.
+              {t("detail.noPersona")}
             </p>
           )}
         </Section>
 
         <Section
-          title="Skills"
+          title={t("nav.skills")}
           action={
             canEdit ? (
               <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
-                Manage
+                {t("providers.list.manage")}
               </Button>
             ) : (
               <Button asChild variant="ghost" size="sm">
-                <a href="#/skills">Browse</a>
+                <a href="#/skills">{t("detail.browse")}</a>
               </Button>
             )
           }
@@ -344,43 +352,54 @@ function OverviewTab({
             </ul>
           ) : (
             <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-              No skill mounted. Skills are reference files the agent reads at{" "}
-              <span className="font-mono">/opt/data/skills/&lt;name&gt;</span>; declare them in
-              Configuration.
+              <RichText text={t("detail.noSkill")} />
             </p>
           )}
         </Section>
 
-        <Section title="Container">
+        <Section title={t("detail.container")}>
           {detail.container ? (
             <DataList
               items={[
-                { label: "Container id", value: <CopyValue value={detail.container.id} label="container id" /> },
-                { label: "Image", value: <Mono>{detail.container.image}</Mono> },
                 {
-                  label: "Uptime",
+                  label: t("detail.containerId"),
+                  value: (
+                    <CopyValue
+                      value={detail.container.id}
+                      label={t("detail.containerIdLabel")}
+                    />
+                  ),
+                },
+                { label: t("deployments.image"), value: <Mono>{detail.container.image}</Mono> },
+                {
+                  label: t("fleet.uptime"),
                   value:
                     detail.status === "running" ? (
                       <span className="font-mono text-xs">{formatUptime(detail.container.uptime_s, true)}</span>
                     ) : (
-                      <span className="text-muted-foreground">Not running</span>
+                      <span className="text-muted-foreground">{t("detail.notRunning")}</span>
                     ),
                 },
               ]}
             />
           ) : (
             <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
-              No container. Start the instance to create one.
+              {t("detail.noContainer")}
             </p>
           )}
         </Section>
 
-        <Section title="Channel">
+        <Section title={t("fleet.channel")}>
           <DataList
             items={[
-              { label: "Type", value: <span className="font-mono text-xs">{detail.channel}</span> },
               {
-                label: "Token",
+                label: t("detail.type"),
+                value: (
+                  <span className="font-mono text-xs">{t(`channel.${detail.channel}`)}</span>
+                ),
+              },
+              {
+                label: t("create.token"),
                 value: env ? (
                   <span className="flex flex-wrap items-center gap-2">
                     <Badge variant="outline" className="font-mono text-xs font-normal">
@@ -390,7 +409,7 @@ function OverviewTab({
                   </span>
                 ) : (
                   <span className="text-muted-foreground">
-                    {detail.channel === "none" ? "No channel" : "No token stored"}
+                    {detail.channel === "none" ? t("detail.noChannel") : t("detail.noToken")}
                   </span>
                 ),
               },
@@ -399,11 +418,11 @@ function OverviewTab({
         </Section>
 
         <Section
-          title="Environment"
+          title={t("env.title")}
           action={
             canEdit ? (
               <Button type="button" variant="ghost" size="sm" onClick={onConfigure}>
-                Manage
+                {t("providers.list.manage")}
               </Button>
             ) : null
           }
@@ -411,24 +430,29 @@ function OverviewTab({
           <DataList
             items={[
               {
-                label: "Variables",
+                label: t("detail.variables"),
                 value: detail.env.length
-                  ? `${detail.env.length} ${plural(detail.env.length, "variable")}`
-                  : "None",
+                  ? t(
+                      detail.env.length === 1
+                        ? "personas.picker.variableOne"
+                        : "personas.picker.variableMany",
+                      { count: detail.env.length },
+                    )
+                  : t("common.none"),
               },
               {
-                label: "Secrets",
-                value: secretCount ? `${secretCount} encrypted` : "None",
+                label: t("health.secrets"),
+                value: secretCount ? t("detail.encrypted", { count: secretCount }) : t("common.none"),
               },
             ]}
           />
         </Section>
 
         <Section
-          title="Shares"
+          title={t("nav.shares")}
           action={
             <Button asChild variant="ghost" size="sm">
-              <a href="#/shares">Manage</a>
+              <a href="#/shares">{t("providers.list.manage")}</a>
             </Button>
           }
         >
@@ -442,34 +466,50 @@ function OverviewTab({
               ))}
             </div>
           ) : (
-            <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">No shares attached.</p>
+            <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
+              {t("detail.noShares")}
+            </p>
           )}
         </Section>
 
-        <Section title="Storage">
+        <Section title={t("detail.storage")}>
           <DataList
             items={[
-              { label: "Data directory", value: <CopyValue value={detail.data_dir} label="data directory" /> },
-              { label: "Compose project", value: <Mono>fleett-{detail.id}</Mono> },
+              {
+                label: t("detail.dataDir"),
+                value: (
+                  <CopyValue value={detail.data_dir} label={t("detail.dataDirLabel")} />
+                ),
+              },
+              {
+                label: t("clone.composeProject"),
+                value: <Mono>fleett-{detail.id}</Mono>,
+              },
             ]}
           />
         </Section>
 
-        <Section title="Timeline">
+        <Section title={t("detail.timeline")}>
           <DataList
             items={[
               {
-                label: "Created",
+                label: t("common.created"),
                 value: (
-                  <span className="font-mono text-xs" title={formatRelative(detail.created_at)}>
+                  <span
+                    className="font-mono text-xs"
+                    title={formatRelative(detail.created_at, lang)}
+                  >
                     {formatDateTime(detail.created_at)}
                   </span>
                 ),
               },
               {
-                label: "Updated",
+                label: t("common.updated"),
                 value: (
-                  <span className="font-mono text-xs" title={formatRelative(detail.updated_at)}>
+                  <span
+                    className="font-mono text-xs"
+                    title={formatRelative(detail.updated_at, lang)}
+                  >
                     {formatDateTime(detail.updated_at)}
                   </span>
                 ),
@@ -479,11 +519,13 @@ function OverviewTab({
         </Section>
       </div>
 
-      <Section title="Notes">
+      <Section title={t("create.notes")}>
         {detail.notes ? (
           <p className="rounded-md border px-4 py-3 text-sm whitespace-pre-wrap">{detail.notes}</p>
         ) : (
-          <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">No notes.</p>
+          <p className="rounded-md border px-4 py-6 text-sm text-muted-foreground">
+            {t("detail.noNotes")}
+          </p>
         )}
       </Section>
     </div>
@@ -549,21 +591,30 @@ function toConfigDraft(detail: InstanceDetail): ConfigDraft {
   };
 }
 
-function validateConfig(draft: ConfigDraft, originalChannel: string): Record<string, string> {
+type Translate = (key: string, params?: Record<string, string | number>) => string;
+
+function validateConfig(
+  draft: ConfigDraft,
+  originalChannel: string,
+  t: Translate,
+): Record<string, string> {
   const errors: Record<string, string> = {};
-  if (!draft.name.trim()) errors.name = "Enter a name.";
-  if (!draft.model.trim()) errors.model = "Enter a model.";
-  if (!draft.base_url.trim()) errors.base_url = "Enter a base URL.";
-  else if (!isHttpUrl(draft.base_url.trim())) errors.base_url = "Use an absolute http or https URL.";
-  if (!draft.api_key_env.trim()) errors.api_key_env = "Enter an environment variable name.";
+  if (!draft.name.trim()) errors.name = t("create.errors.nameRequired");
+  if (!draft.model.trim()) errors.model = t("create.errors.modelRequired");
+  if (!draft.base_url.trim()) errors.base_url = t("create.errors.urlRequired");
+  else if (!isHttpUrl(draft.base_url.trim())) errors.base_url = t("create.errors.urlInvalid");
+  if (!draft.api_key_env.trim()) errors.api_key_env = t("create.errors.envRequired");
   else if (!/^[A-Z_][A-Z0-9_]*$/.test(draft.api_key_env.trim()))
-    errors.api_key_env = "Use uppercase letters, digits and underscores.";
+    errors.api_key_env = t("create.errors.envFormat");
   const memory = Number(draft.mem_limit_mb);
-  if (!Number.isFinite(memory) || memory < 128 || memory > 8192) errors.mem_limit_mb = "Use 128 to 8192 MB.";
-  if (draft.channel !== "none" && draft.channel !== originalChannel && !draft.token.trim())
-    errors.token = "A token is required after switching channel type.";
+  if (!Number.isFinite(memory) || memory < 128 || memory > 8192) {
+    errors.mem_limit_mb = t("create.errors.memoryRange");
+  }
+  if (draft.channel !== "none" && draft.channel !== originalChannel && !draft.token.trim()) {
+    errors.token = t("detail.tokenRequired");
+  }
   if (tooManySkills(draft.skills)) {
-    errors.skills = `An instance mounts at most ${MAX_SKILLS_PER_INSTANCE} skills.`;
+    errors.skills = t("create.errors.tooManySkills", { max: MAX_SKILLS_PER_INSTANCE });
   }
   return errors;
 }
@@ -600,6 +651,7 @@ function ConfigurationTab({
   onSaved: () => void;
   onEnvApplied: () => void;
 }) {
+  const { t } = useI18n();
   const sharesResource = useResource(() => api.listShares(), []);
   const personas = useResource(() => api.listPersonas(), []);
   const skillRegistry = useResource(() => api.listSkills(), []);
@@ -609,7 +661,7 @@ function ConfigurationTab({
   const [reapplying, setReapplying] = useState(false);
   const [reapplyError, setReapplyError] = useState<string | null>(null);
 
-  const errors = validateConfig(draft, detail.channel);
+  const errors = validateConfig(draft, detail.channel, t);
   const showErrors = attempted;
   const providerKeySet = hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
   const dirty = JSON.stringify(draft) !== JSON.stringify(toConfigDraft(detail));
@@ -665,13 +717,13 @@ function ConfigurationTab({
       });
       const entry = result.results.find((candidate) => candidate.id === detail.id) ?? result.results[0];
       if (!entry || !applySucceeded(entry.status)) {
-        setReapplyError(entry?.error ?? "The controller did not apply the persona.");
+        setReapplyError(entry?.error ?? t("detail.personaNotApplied"));
       } else {
-        toast.success("Persona reapplied: SOUL.md rewritten and the instance restarted.");
+        toast.success(t("detail.reapplied"));
       }
       onSaved();
     } catch (cause) {
-      setReapplyError(toApiError(cause).message);
+      setReapplyError(apiErrorMessage(toApiError(cause), t));
     } finally {
       setReapplying(false);
     }
@@ -714,7 +766,7 @@ function ConfigurationTab({
         skills: skillRefPayload(draft.skills),
       };
       await api.patchInstance(detail.id, patch);
-      toast.success("Configuration saved.");
+      toast.success(t("detail.saved"));
       setAttempted(false);
       setError(null);
       onDraftChange({ ...draft, gate_token: "" });
@@ -733,7 +785,7 @@ function ConfigurationTab({
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="cfg-name">Name</Label>
+            <Label htmlFor="cfg-name">{t("common.name")}</Label>
             <Input
               id="cfg-name"
               value={draft.name}
@@ -750,7 +802,7 @@ function ConfigurationTab({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="cfg-model">Model</Label>
+            <Label htmlFor="cfg-model">{t("fleet.model")}</Label>
             <Input
               id="cfg-model"
               value={draft.model}
@@ -770,7 +822,7 @@ function ConfigurationTab({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="cfg-base-url">Base URL</Label>
+          <Label htmlFor="cfg-base-url">{t("providers.form.baseUrl")}</Label>
           <Input
             id="cfg-base-url"
             value={draft.base_url}
@@ -790,7 +842,7 @@ function ConfigurationTab({
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="cfg-api-key-env">API key env</Label>
+            <Label htmlFor="cfg-api-key-env">{t("providers.form.apiKeyEnv")}</Label>
             <Input
               id="cfg-api-key-env"
               value={draft.api_key_env}
@@ -809,7 +861,7 @@ function ConfigurationTab({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="cfg-mem-limit">Memory limit (MB)</Label>
+            <Label htmlFor="cfg-mem-limit">{t("create.memoryLimit")}</Label>
             <Input
               id="cfg-mem-limit"
               type="number"
@@ -833,23 +885,13 @@ function ConfigurationTab({
         {provider ? (
           <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
             <p className="text-sm">
-              Credential supplied by provider{" "}
-              <a
-                href={hrefFor(`/providers/${provider.id}`)}
-                className="font-mono underline-offset-4 hover:underline"
-              >
-                {provider.name}
-              </a>
-              .
+              <RichText text={t("create.suppliedBy", { name: provider.name })} />
             </p>
-            <p className="text-xs text-muted-foreground">
-              No per-instance key is stored. Base URL and API key env stay editable here; rotate the
-              secret on the provider to change the credential for every attached instance.
-            </p>
+            <p className="text-xs text-muted-foreground">{t("detail.providerSuppliedHint")}</p>
           </div>
         ) : (
           <div className="space-y-2">
-            <Label htmlFor="cfg-gate-token">Provider token</Label>
+            <Label htmlFor="cfg-gate-token">{t("clone.providerToken")}</Label>
             <Input
               id="cfg-gate-token"
               type="password"
@@ -857,16 +899,18 @@ function ConfigurationTab({
               spellCheck={false}
               className="font-mono"
               value={draft.gate_token}
-              placeholder={providerKeySet ? "Keep current token" : "Not set"}
+              placeholder={
+                providerKeySet ? t("detail.keepCurrentToken") : t("create.notSet")
+              }
               aria-describedby="cfg-gate-token-help"
               onChange={(event) => update("gate_token", event.target.value)}
             />
             <p id="cfg-gate-token-help" className="text-xs text-muted-foreground">
-              {providerKeySet
-                ? "A provider key is stored. Leave empty to keep it."
-                : "No provider key stored. The agent cannot call the model without one."}{" "}
-              Encrypted at rest and never returned by the API. The host needs its secrets key
-              (<span className="font-mono">sudo fleett secrets init</span>).
+              <RichText
+                text={
+                  providerKeySet ? t("detail.keyStored") : t("detail.keyMissing")
+                }
+              />
             </p>
             {secretsError ? <ErrorAlert error={secretsError} /> : null}
           </div>
@@ -874,7 +918,7 @@ function ConfigurationTab({
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="cfg-channel">Channel</Label>
+            <Label htmlFor="cfg-channel">{t("fleet.channel")}</Label>
             <Select value={draft.channel} onValueChange={(value) => update("channel", value as ChannelType)}>
               <SelectTrigger id="cfg-channel" className="w-full">
                 <SelectValue />
@@ -882,7 +926,7 @@ function ConfigurationTab({
               <SelectContent>
                 {CHANNEL_TYPES.map((type) => (
                   <SelectItem key={type} value={type}>
-                    {type}
+                    {t(`channel.${type}`)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -891,12 +935,12 @@ function ConfigurationTab({
 
           {draft.channel !== "none" ? (
             <div className="space-y-2">
-              <Label htmlFor="cfg-token">Bot token</Label>
+              <Label htmlFor="cfg-token">{t("clone.botToken")}</Label>
               <Input
                 id="cfg-token"
                 type="password"
                 autoComplete="off"
-                placeholder="Keep current token"
+                placeholder={t("detail.keepCurrentToken")}
                 className="font-mono"
                 aria-invalid={showErrors && !!errors.token}
                 aria-describedby={
@@ -906,8 +950,8 @@ function ConfigurationTab({
               />
               <p id="cfg-token-help" className="text-xs text-muted-foreground">
                 {detail.channel !== "none" && detail.channel === draft.channel
-                  ? "Empty keeps the stored token. A new value rotates it."
-                  : "Required when switching channel type."}
+                  ? t("detail.tokenKeepHint")
+                  : t("detail.tokenSwitchHint")}
               </p>
               {showErrors && errors.token ? (
                 <p id="cfg-token-error" className="text-xs text-destructive">
@@ -919,7 +963,7 @@ function ConfigurationTab({
         </div>
 
         <fieldset className="min-w-0 space-y-3">
-          <legend className="text-sm font-medium">Network</legend>
+          <legend className="text-sm font-medium">{t("create.network")}</legend>
           <div className="flex items-start gap-3 rounded-md border p-4">
             <Checkbox
               id="cfg-allow-lan"
@@ -933,24 +977,15 @@ function ConfigurationTab({
             />
             <div className="min-w-0 space-y-1">
               <Label htmlFor="cfg-allow-lan" className="cursor-pointer">
-                Allow LAN access
+                {t("create.allowLan")}
               </Label>
               <p id="cfg-allow-lan-help" className="text-xs text-muted-foreground">
-                The agent can reach 10/8, 172.16/12 and 192.168/16, including Proxmox, OPNsense and
-                Infisical. Only enable for agents you trust.
+                {t("create.allowLanHint")}
               </p>
               <p className="text-xs text-muted-foreground">
-                {draft.allow_lan ? (
-                  <>
-                    Joins <span className="font-mono">fleett-lan</span> on top of the restricted{" "}
-                    <span className="font-mono">fleett</span> network.
-                  </>
-                ) : (
-                  <>
-                    Stays on the restricted <span className="font-mono">fleett</span> network. No route to
-                    the LAN.
-                  </>
-                )}
+                <RichText
+                  text={draft.allow_lan ? t("create.lanEnabled") : t("create.lanRestricted")}
+                />
               </p>
             </div>
           </div>
@@ -958,7 +993,7 @@ function ConfigurationTab({
         </fieldset>
 
         <fieldset className="min-w-0 space-y-3">
-          <legend className="text-sm font-medium">Persona</legend>
+          <legend className="text-sm font-medium">{t("clone.personaLabel")}</legend>
           <div className="space-y-2">
             <PersonaSelect
               id="cfg-persona"
@@ -969,24 +1004,24 @@ function ConfigurationTab({
               describedBy="cfg-persona-help"
             />
             <p id="cfg-persona-help" className="text-xs text-muted-foreground">
-              Renders a shared SOUL.md into{" "}
-              <span className="font-mono">data/SOUL.md</span>. Values stay on this instance; saving
-              rewrites the file and restarts the container.
+              <RichText text={t("detail.personaHint")} />
             </p>
             <p className="text-xs text-muted-foreground">
               <a href="#/personas" className="underline underline-offset-4">
-                Manage personas
+                {t("create.managePersonas")}
               </a>
             </p>
             {personas.error ? (
               <p className="text-xs text-destructive">
-                Personas could not be loaded: {personas.error.message}{" "}
+                {t("clone.personasLoadFailed", {
+                  message: apiErrorMessage(personas.error, t),
+                })}{" "}
                 <button
                   type="button"
                   className="underline underline-offset-4"
                   onClick={personas.reload}
                 >
-                  Retry
+                  {t("common.retry")}
                 </button>
               </p>
             ) : null}
@@ -1013,19 +1048,17 @@ function ConfigurationTab({
             </>
           ) : (
             <p className="rounded-md border px-3 py-2.5 text-xs text-muted-foreground">
-              No persona: the SOUL.md currently on disk stays untouched.
+              {t("detail.noPersonaConfig")}
             </p>
           )}
 
           {divergedActive ? (
             <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
               <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-              <AlertTitle>SOUL.md was edited by hand</AlertTitle>
+              <AlertTitle>{t("detail.divergedTitle")}</AlertTitle>
               <AlertDescription>
                 <p className="text-sm text-muted-foreground">
-                  The file on disk no longer matches this persona. Reapplying rewrites{" "}
-                  <span className="font-mono">data/SOUL.md</span> from the persona and restarts the
-                  instance; unsaved variable values above are saved first.
+                  <RichText text={t("detail.divergedBody")} />
                 </p>
                 <Button
                   type="button"
@@ -1040,7 +1073,7 @@ function ConfigurationTab({
                   ) : (
                     <RotateCw aria-hidden />
                   )}
-                  Reapply persona
+                  {t("detail.reapplyPersona")}
                 </Button>
                 {reapplyError ? (
                   <p className="mt-2 text-xs text-destructive">{reapplyError}</p>
@@ -1051,7 +1084,7 @@ function ConfigurationTab({
         </fieldset>
 
         <fieldset className="min-w-0 space-y-3">
-          <legend className="text-sm font-medium">Shares</legend>
+          <legend className="text-sm font-medium">{t("nav.shares")}</legend>
           <SharePicker
             shares={sharesResource.data ?? []}
             value={draft.shares}
@@ -1063,7 +1096,7 @@ function ConfigurationTab({
         </fieldset>
 
         <fieldset className="min-w-0 space-y-3">
-          <legend className="text-sm font-medium">Skills</legend>
+          <legend className="text-sm font-medium">{t("nav.skills")}</legend>
           <SkillPicker
             skills={skillRegistry.data ?? []}
             value={draft.skills}
@@ -1083,14 +1116,14 @@ function ConfigurationTab({
         </fieldset>
 
         <div className="space-y-2">
-          <Label htmlFor="cfg-notes">Notes</Label>
+          <Label htmlFor="cfg-notes">{t("create.notes")}</Label>
           <Textarea id="cfg-notes" rows={3} value={draft.notes} onChange={(event) => update("notes", event.target.value)} />
         </div>
 
         <div className="flex flex-wrap items-center gap-2 border-t pt-4">
           <Button type="submit" disabled={!dirty || pending}>
             {pending ? <Loader2 aria-hidden className="animate-spin" /> : null}
-            Save changes
+            {t("common.save")}
           </Button>
           <Button
             type="button"
@@ -1101,10 +1134,10 @@ function ConfigurationTab({
               setAttempted(false);
             }}
           >
-            Discard
+            {t("env.discard")}
           </Button>
           <p className="text-xs text-muted-foreground sm:ml-auto">
-            Saving rewrites <span className="font-mono">compose.yaml</span> and recreates the container.
+            <RichText text={t("detail.saveHint")} />
           </p>
         </div>
       </form>
@@ -1124,6 +1157,7 @@ function ConfigurationTab({
 }
 
 function LogsTab({ id }: { id: string }) {
+  const { t } = useI18n();
   const [tail, setTail] = useState("200");
   const [nonce, setNonce] = useState(0);
   const [fetchedAt, setFetchedAt] = useState<Date | null>(null);
@@ -1146,24 +1180,31 @@ function LogsTab({ id }: { id: string }) {
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         <Select value={tail} onValueChange={setTail}>
-          <SelectTrigger className="w-32" aria-label="Number of lines">
+          <SelectTrigger className="w-32" aria-label={t("detail.linesAria")}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {["100", "200", "500", "1000"].map((value) => (
               <SelectItem key={value} value={value}>
-                {value} lines
+                {t("logs.limitN", { count: Number(value) })}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
         <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
           <RefreshCw aria-hidden className={logs.refreshing ? "animate-spin" : undefined} />
-          Refresh
+          {t("common.refresh")}
         </Button>
-        <CopyButton value={text} label="Copy logs" showLabel size="sm" variant="outline" disabled={!text} />
+        <CopyButton
+          value={text}
+          label={t("detail.copyLogs")}
+          showLabel
+          size="sm"
+          variant="outline"
+          disabled={!text}
+        />
         <span className="text-xs text-muted-foreground sm:ml-auto">
-          {text ? `${lineCount} lines` : "No output"}
+          {text ? t("files.lineMany", { count: lineCount }) : t("detail.noOutput")}
           {fetchedAt ? ` · ${formatClock(fetchedAt)}` : ""}
         </span>
       </div>
@@ -1177,7 +1218,7 @@ function LogsTab({ id }: { id: string }) {
           ref={preRef}
           tabIndex={0}
           role="region"
-          aria-label="Container logs"
+          aria-label={t("detail.containerLogs")}
           className="max-h-[60vh] overflow-auto rounded-md border bg-muted/20 p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words"
         >
           {text}
@@ -1186,12 +1227,12 @@ function LogsTab({ id }: { id: string }) {
         <div className="rounded-md border">
           <EmptyState
             icon={Terminal}
-            title="No output"
-            description="The container may be stopped, or it has not written a log yet."
+            title={t("detail.noOutput")}
+            description={t("detail.noOutputDescription")}
             action={
               <Button variant="outline" size="sm" onClick={() => setNonce((value) => value + 1)}>
                 <RefreshCw aria-hidden />
-                Refresh
+                {t("common.refresh")}
               </Button>
             }
           />
@@ -1202,20 +1243,20 @@ function LogsTab({ id }: { id: string }) {
 }
 
 const TAB_PAGES: Record<string, string> = {
-  overview: "Overview",
-  configuration: "Configuration",
-  schedules: "Schedules",
-  incidents: "Incidents",
-  snapshots: "Snapshots",
-  files: "Files",
-  messages: "Messages",
-  memory: "Memory",
-  history: "History",
-  logs: "Logs",
-  access: "Access",
-  egress: "Egress",
-  terminal: "Terminal",
-  compose: "Compose",
+  overview: "detail.tab.overview",
+  configuration: "detail.tab.configuration",
+  schedules: "nav.schedules",
+  incidents: "nav.incidents",
+  snapshots: "detail.tab.snapshots",
+  files: "files.title",
+  messages: "nav.messages",
+  memory: "nav.memory",
+  history: "skills.detail.history",
+  logs: "nav.logs",
+  access: "detail.tab.access",
+  egress: "detail.tab.egress",
+  terminal: "detail.tab.terminal",
+  compose: "detail.tab.compose",
 };
 
 /** Tabs that only an editor may open; a viewer falls back to the overview. */
@@ -1249,6 +1290,7 @@ function DetailSkeleton() {
 }
 
 export function InstanceDetailPage({ id }: { id: string }) {
+  const { t } = useI18n();
   const canEdit = useCanEdit();
   const route = useRoute();
   const tabParam = route.query.get("tab");
@@ -1274,7 +1316,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
   // The assistant sees the tab, the instance and its last error. The Files tab
   // refines this with the open path and buffer.
   useAssistantScope({
-    page: TAB_PAGES[tab] ?? "Instance",
+    page: t(TAB_PAGES[tab] ?? "detail.tab.instance"),
     instance: id,
     schema: instanceTabSchema(tab),
     errorText: detail.data?.last_error ?? undefined,
@@ -1412,7 +1454,16 @@ export function InstanceDetailPage({ id }: { id: string }) {
     try {
       await api.action(id, action);
       toast.success(
-        `${id} ${action === "stop" ? "stopped" : action === "start" ? "started" : "restarted"}.`,
+        t("detail.actionDone", {
+          id,
+          state: t(
+            action === "stop"
+              ? "status.stopped"
+              : action === "start"
+                ? "status.started"
+                : "status.restarted",
+          ),
+        }),
       );
     } catch (cause) {
       setActionError(toApiError(cause));
@@ -1431,7 +1482,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
           title={id}
           actions={
             <Button asChild variant="outline">
-              <a href="#/instances">Back to instances</a>
+              <a href="#/instances">{t("shell.backToInstances")}</a>
             </Button>
           }
         />
@@ -1490,11 +1541,11 @@ export function InstanceDetailPage({ id }: { id: string }) {
             <span aria-hidden>·</span>
             <span>{data.template}</span>
             <span aria-hidden>·</span>
-            <span>{data.container ? data.container.id : "no container"}</span>
+            <span>{data.container ? data.container.id : t("detail.noContainerShort")}</span>
             {uptime ? (
               <>
                 <span aria-hidden>·</span>
-                <span>up {uptime}</span>
+                <span>{t("detail.uptimeUp", { uptime })}</span>
               </>
             ) : null}
           </span>
@@ -1505,8 +1556,8 @@ export function InstanceDetailPage({ id }: { id: string }) {
               variant="outline"
               size="icon-sm"
               onClick={() => setNonce((value) => value + 1)}
-              aria-label="Refresh instance"
-              title="Refresh instance"
+              aria-label={t("detail.refresh")}
+              title={t("detail.refresh")}
             >
               <RefreshCw aria-hidden className={detail.refreshing ? "animate-spin" : undefined} />
             </Button>
@@ -1519,7 +1570,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
                     ) : (
                       <Square aria-hidden />
                     )}
-                    Stop
+                    {t("action.stop")}
                   </Button>
                 ) : (
                   <Button size="sm" onClick={() => run("start")} disabled={busy}>
@@ -1528,7 +1579,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
                     ) : (
                       <Play aria-hidden />
                     )}
-                    Start
+                    {t("action.start")}
                   </Button>
                 )}
                 <Button variant="outline" size="sm" onClick={() => run("restart")} disabled={busy}>
@@ -1537,15 +1588,15 @@ export function InstanceDetailPage({ id }: { id: string }) {
                   ) : (
                     <RotateCw aria-hidden />
                   )}
-                  Restart
+                  {t("action.restart")}
                 </Button>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
                       variant="outline"
                       size="icon-sm"
-                      aria-label="More actions"
-                      title="More actions"
+                      aria-label={t("providers.detail.moreActions")}
+                      title={t("providers.detail.moreActions")}
                       disabled={busy}
                     >
                       <MoreHorizontal aria-hidden />
@@ -1554,11 +1605,11 @@ export function InstanceDetailPage({ id }: { id: string }) {
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem onSelect={() => setDuplicateOpen(true)}>
                       <CopyPlus aria-hidden />
-                      Duplicate instance…
+                      {t("detail.duplicate")}
                     </DropdownMenuItem>
                     <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
                       <Trash2 aria-hidden />
-                      Delete instance…
+                      {t("detail.deleteInstance")}
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -1573,7 +1624,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
       {warnings.length > 0 ? (
         <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
           <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-          <AlertTitle>Needs attention</AlertTitle>
+          <AlertTitle>{t("detail.warningsTitle")}</AlertTitle>
           <AlertDescription>
             <ul className="list-disc space-y-1 pl-4 text-sm text-muted-foreground">
               {warnings.map((warning) => (
@@ -1582,7 +1633,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
             </ul>
             {canEdit ? (
               <Button type="button" variant="outline" size="sm" className="mt-2" onClick={reviewWarnings}>
-                {envWarning ? "Fix environment" : "Review configuration"}
+                {envWarning ? t("detail.fixEnv") : t("detail.reviewConfig")}
               </Button>
             ) : null}
           </AlertDescription>
@@ -1592,20 +1643,24 @@ export function InstanceDetailPage({ id }: { id: string }) {
       <Tabs value={tab} onValueChange={setTab}>
         <div className="overflow-x-auto">
           <TabsList className="w-full justify-start sm:w-fit">
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            {canEdit ? <TabsTrigger value="configuration">Configuration</TabsTrigger> : null}
-            <TabsTrigger value="schedules">Schedules</TabsTrigger>
-            <TabsTrigger value="incidents">Incidents</TabsTrigger>
-            <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
-            <TabsTrigger value="files">Files</TabsTrigger>
-            <TabsTrigger value="messages">Messages</TabsTrigger>
-            <TabsTrigger value="memory">Memory</TabsTrigger>
-            <TabsTrigger value="history">History</TabsTrigger>
-            <TabsTrigger value="logs">Logs</TabsTrigger>
-            <TabsTrigger value="access">Access</TabsTrigger>
-            <TabsTrigger value="egress">Egress</TabsTrigger>
-            {canEdit ? <TabsTrigger value="terminal">Terminal</TabsTrigger> : null}
-            <TabsTrigger value="compose">Compose</TabsTrigger>
+            <TabsTrigger value="overview">{t(TAB_PAGES.overview)}</TabsTrigger>
+            {canEdit ? (
+              <TabsTrigger value="configuration">{t(TAB_PAGES.configuration)}</TabsTrigger>
+            ) : null}
+            <TabsTrigger value="schedules">{t(TAB_PAGES.schedules)}</TabsTrigger>
+            <TabsTrigger value="incidents">{t(TAB_PAGES.incidents)}</TabsTrigger>
+            <TabsTrigger value="snapshots">{t(TAB_PAGES.snapshots)}</TabsTrigger>
+            <TabsTrigger value="files">{t(TAB_PAGES.files)}</TabsTrigger>
+            <TabsTrigger value="messages">{t(TAB_PAGES.messages)}</TabsTrigger>
+            <TabsTrigger value="memory">{t(TAB_PAGES.memory)}</TabsTrigger>
+            <TabsTrigger value="history">{t(TAB_PAGES.history)}</TabsTrigger>
+            <TabsTrigger value="logs">{t(TAB_PAGES.logs)}</TabsTrigger>
+            <TabsTrigger value="access">{t(TAB_PAGES.access)}</TabsTrigger>
+            <TabsTrigger value="egress">{t(TAB_PAGES.egress)}</TabsTrigger>
+            {canEdit ? (
+              <TabsTrigger value="terminal">{t(TAB_PAGES.terminal)}</TabsTrigger>
+            ) : null}
+            <TabsTrigger value="compose">{t(TAB_PAGES.compose)}</TabsTrigger>
           </TabsList>
         </div>
 
@@ -1698,8 +1753,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
         ) : null}
         <TabsContent value="compose" className="mt-4 space-y-3">
           <p className="text-sm text-muted-foreground">
-            <span className="font-mono">compose.yaml</span> is the source of truth. The controller rewrites it on
-            every configuration change.
+            <RichText text={t("detail.composeHint")} />
           </p>
           <CodeBlock value={data.compose_yaml} title={`instances/${data.id}/compose.yaml`} />
         </TabsContent>
@@ -1712,7 +1766,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
             open={duplicateOpen}
             onOpenChange={setDuplicateOpen}
             onCloned={(clone) => {
-              toast.success(`Duplicated ${data.id} as ${clone.id}.`);
+              toast.success(t("detail.duplicated", { source: data.id, clone: clone.id }));
               navigate(`/instances/${clone.id}`);
             }}
           />
@@ -1721,7 +1775,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
             open={deleteOpen}
             onOpenChange={setDeleteOpen}
             onDeleted={() => {
-              toast.success(`Instance ${data.id} deleted.`);
+              toast.success(t("fleet.deletedId", { id: data.id }));
               navigate("/instances");
             }}
           />

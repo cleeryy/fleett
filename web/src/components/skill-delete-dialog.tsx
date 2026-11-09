@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ErrorAlert } from "@/components/error-alert";
-import { plural } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 import { hrefFor } from "@/lib/router";
 
 /** `details.instances` of a `409 skill_in_use`: bare ids. */
@@ -44,6 +44,7 @@ export function SkillDeleteDialog({
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
+  const { t } = useI18n();
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [inUse, setInUse] = useState<string[] | null>(null);
@@ -82,11 +83,14 @@ export function SkillDeleteDialog({
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete skill {skill.name}?</DialogTitle>
+          <DialogTitle>{t("skills.delete.title", { name: skill.name })}</DialogTitle>
           <DialogDescription>
-            Removes the registry entry and all {skill.versions.length}{" "}
-            {plural(skill.versions.length, "version")} from fleett, with its commit history.
-            Instances mounting it lose the directory on their next restart.
+            {t(
+              skill.versions.length === 1
+                ? "skills.delete.descriptionOne"
+                : "skills.delete.descriptionMany",
+              { count: skill.versions.length },
+            )}
           </DialogDescription>
         </DialogHeader>
 
@@ -94,14 +98,17 @@ export function SkillDeleteDialog({
           <div className="min-w-0 space-y-3">
             <Alert className="border-amber-600/40 bg-amber-50/40 dark:bg-amber-950/20">
               <TriangleAlert aria-hidden className="text-amber-600 dark:text-amber-400" />
-              <AlertTitle>This skill is still mounted</AlertTitle>
+              <AlertTitle>{t("skills.delete.inUseTitle")}</AlertTitle>
               <AlertDescription>
                 <p className="text-sm text-muted-foreground">
                   {inUse.length > 0
-                    ? `${inUse.length} ${plural(inUse.length, "instance")} still ${
-                        inUse.length === 1 ? "mounts" : "mount"
-                      } it. Remove the skill from those instances in Configuration, then delete it.`
-                    : "At least one instance still mounts it. Remove it in Configuration, then try again."}
+                    ? t(
+                        inUse.length === 1
+                          ? "skills.delete.inUseOne"
+                          : "skills.delete.inUseMany",
+                        { count: inUse.length },
+                      )
+                    : t("skills.delete.inUseUnknown")}
                 </p>
               </AlertDescription>
             </Alert>
@@ -126,24 +133,23 @@ export function SkillDeleteDialog({
           <ErrorAlert error={error} />
         ) : (
           <p className="text-sm text-muted-foreground">
-            A pinned instance restarts with the directory missing, so unmount it first. Deletion
-            cannot be undone from the console.
+            {t("skills.delete.confirmHint")}
           </p>
         )}
 
         <DialogFooter>
           {inUse !== null ? (
             <Button autoFocus onClick={() => onOpenChange(false)}>
-              Close
+              {t("common.close")}
             </Button>
           ) : (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={pending}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button variant="destructive" onClick={() => void confirm()} disabled={pending}>
                 {pending ? <Loader2 aria-hidden className="animate-spin" /> : <Trash2 aria-hidden />}
-                Delete skill
+                {t("skills.delete.confirm")}
               </Button>
             </>
           )}
