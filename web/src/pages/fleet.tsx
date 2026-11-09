@@ -50,12 +50,22 @@ import {
 } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
+import { DoctorDialog } from "@/components/doctor";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import {
+  FleetOnboardingCard,
+  OnboardingCompleteCard,
+} from "@/components/onboarding";
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
 import { formatClock, formatUptime, plural } from "@/lib/format";
+import {
+  readOnboardingMemory,
+  writeOnboardingMemory,
+  type OnboardingMemory,
+} from "@/lib/onboarding";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -174,9 +184,12 @@ export function FleetPage() {
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ApiError | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<InstanceSummary | null>(null);
+  const [doctorOpen, setDoctorOpen] = useState(false);
+  const [onboardingMemory, setOnboardingMemory] = useState<OnboardingMemory>(readOnboardingMemory);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const list = useResource(() => api.listInstances(), [nonce]);
+  const onboarding = useResource(() => api.onboarding(), [nonce]);
   const personas = useResource(() => api.listPersonas(), []);
   const personaNames = useMemo(
     () => new Map((personas.data ?? []).map((persona) => [persona.id, persona.name])),
@@ -191,6 +204,44 @@ export function FleetPage() {
     persisted.q = q;
     persisted.status = status;
   }, [q, status]);
+
+  const setupPending = onboarding.data !== null && !onboarding.data.complete;
+  const setupComplete = onboarding.data?.complete === true;
+  const setupDone = onboarding.data?.steps.filter((step) => step.done).length ?? 0;
+  const setupTotal = onboarding.data?.steps.length ?? 0;
+
+  // Remember this browser saw an unfinished host, so the one-time success
+  // banner is only shown to the operator who actually went through the tour.
+  useEffect(() => {
+    if (!setupPending || onboardingMemory.seen) return;
+    setOnboardingMemory(writeOnboardingMemory({ seen: true }));
+  }, [setupPending, onboardingMemory.seen]);
+
+  const firstInstance = useMemo(() => {
+    const sorted = [...(list.data ?? [])];
+    return sorted.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null;
+  }, [list.data]);
+
+  const showOnboardingCard = setupPending && !onboardingMemory.dismissed;
+  const showSetupSuccess =
+    setupComplete &&
+    onboardingMemory.seen &&
+    firstInstance !== null &&
+    onboardingMemory.celebrated !== firstInstance.id;
+  const setupDismissed = setupPending && onboardingMemory.dismissed;
+
+  function dismissOnboarding() {
+    setOnboardingMemory(writeOnboardingMemory({ dismissed: true }));
+  }
+
+  function showOnboardingAgain() {
+    setOnboardingMemory(writeOnboardingMemory({ dismissed: false }));
+  }
+
+  function dismissSetupSuccess() {
+    if (!firstInstance) return;
+    setOnboardingMemory(writeOnboardingMemory({ celebrated: firstInstance.id }));
+  }
 
   // The command palette can start, stop or restart an instance from any screen.
   useEffect(() => {
@@ -294,18 +345,29 @@ export function FleetPage() {
       icon={Boxes}
       title="No instances yet"
       description={
-        canEdit
-          ? "Create one to start a container. Each instance is its own compose project."
-          : "No instance exists. Your role is read-only; ask an admin to create one."
+        setupPending
+          ? `${setupDone} of ${setupTotal} setup steps are done. The getting-started steps cover Docker, the agent image, a provider and the first instance.`
+          : canEdit
+            ? "Create one to start a container. Each instance is its own compose project."
+            : "No instance exists. Your role is read-only; ask an admin to create one."
       }
       action={
-        canEdit ? (
-          <Button asChild>
-            <a href={hrefFor("/instances/new")}>
-              <Plus aria-hidden />
-              New instance
-            </a>
-          </Button>
+        canEdit || setupDismissed ? (
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {canEdit ? (
+              <Button asChild>
+                <a href={hrefFor("/instances/new")}>
+                  <Plus aria-hidden />
+                  New instance
+                </a>
+              </Button>
+            ) : null}
+            {setupDismissed ? (
+              <Button variant="outline" onClick={showOnboardingAgain}>
+                Show getting started
+              </Button>
+            ) : null}
+          </div>
         ) : undefined
       }
     />
@@ -356,6 +418,22 @@ export function FleetPage() {
           </>
         }
       />
+
+      {showOnboardingCard && onboarding.data ? (
+        <FleetOnboardingCard
+          report={onboarding.data}
+          onDismiss={dismissOnboarding}
+          onOpenDoctor={() => setDoctorOpen(true)}
+        />
+      ) : null}
+
+      {showSetupSuccess ? (
+        <OnboardingCompleteCard
+          instances={list.data ?? []}
+          onDismiss={dismissSetupSuccess}
+          onOpenDiagnostics={() => setDoctorOpen(true)}
+        />
+      ) : null}
 
       {actionError ? <ErrorAlert error={actionError} /> : null}
       {list.error ? <ErrorAlert error={list.error} onRetry={list.reload} /> : null}
@@ -689,6 +767,7 @@ export function FleetPage() {
         }}
       />
 
+      <DoctorDialog open={doctorOpen} onOpenChange={setDoctorOpen} />
     </>
   );
 }

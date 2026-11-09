@@ -581,6 +581,7 @@ function ConfigurationTab({
   detail,
   provider,
   templateEnv,
+  highlightEnvKey,
   draft,
   onDraftChange,
   envRows,
@@ -591,6 +592,7 @@ function ConfigurationTab({
   detail: InstanceDetail;
   provider: ProviderSummary | null;
   templateEnv: EnvSuggestion[];
+  highlightEnvKey?: string | null;
   draft: ConfigDraft;
   onDraftChange: (next: ConfigDraft) => void;
   envRows: EnvRow[];
@@ -1112,6 +1114,7 @@ function ConfigurationTab({
           detail={detail}
           rows={envRows}
           suggestions={templateEnv}
+          highlightKey={highlightEnvKey}
           onRowsChange={onEnvRowsChange}
           onApplied={onEnvApplied}
         />
@@ -1249,9 +1252,12 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const canEdit = useCanEdit();
   const route = useRoute();
   const tabParam = route.query.get("tab");
+  const focusEnv = route.query.get("focus") === "env";
+  const focusEnvParam = route.query.get("env");
   const [nonce, setNonce] = useState(0);
   const [tab, setTab] = useState(() => requestedTab(tabParam, canEdit));
   const appliedTabParam = useRef(tabParam);
+  const focusEnvApplied = useRef<string | null>(null);
   // The Files tab is mounted on first visit and then kept alive (hidden), so an
   // unsaved buffer survives a trip to Overview and back.
   const [filesMounted, setFilesMounted] = useState(false);
@@ -1301,6 +1307,61 @@ export function InstanceDetailPage({ id }: { id: string }) {
     appliedTabParam.current = tabParam;
     setTab(requestedTab(tabParam, canEdit));
   }, [tabParam, canEdit]);
+
+  // The setup success links straight to the channel allowlist:
+  // `?tab=configuration&focus=env&env=DISCORD_ALLOWED_USERS`. Reveal the row
+  // that holds the variable (or the suggestion that adds it) once per load.
+  useEffect(() => {
+    if (!focusEnv || tab !== "configuration") return;
+    const data = detail.data;
+    if (!data) return;
+    const template = templatesResource.data?.find((candidate) => candidate.id === data.template);
+    const key =
+      (focusEnvParam && /^[A-Z_][A-Z0-9_]*$/.test(focusEnvParam) ? focusEnvParam : null) ??
+      template?.env.find((entry) => entry.required && /ALLOW(?:ED)?_USERS/.test(entry.key))?.key ??
+      null;
+    // Without an explicit key, wait for the template suggestions that name it.
+    if (!key && templatesResource.data === null && !templatesResource.error) return;
+    const marker = `${data.id}:${key ?? "env"}`;
+    if (focusEnvApplied.current === marker) return;
+    focusEnvApplied.current = marker;
+    // The configuration tab grows while shares, personas and skills load. Keep
+    // the row in view for a short window instead of scrolling into a page that
+    // is still assembling; a click, wheel or key hands control back.
+    let stopped = false;
+    let observer: ResizeObserver | null = null;
+    const stop = () => {
+      stopped = true;
+      observer?.disconnect();
+    };
+    const reveal = () => {
+      if (stopped) return;
+      const row = key ? document.querySelector<HTMLElement>(`[data-env-key="${key}"]`) : null;
+      const suggestion = key
+        ? document.querySelector<HTMLButtonElement>(`[data-env-suggestion="${key}"]`)
+        : null;
+      const target = row ?? suggestion ?? document.getElementById("instance-env");
+      if (!target) return;
+      const rect = target.getBoundingClientRect();
+      const visible = rect.top >= 72 && rect.bottom <= window.innerHeight;
+      if (!visible) target.scrollIntoView({ block: "center" });
+      if (row) row.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
+      else suggestion?.focus({ preventScroll: true });
+    };
+    observer = new ResizeObserver(reveal);
+    observer.observe(document.getElementById("main") ?? document.body);
+    const stopTimer = window.setTimeout(stop, 4000);
+    const timers = [80, 420, 900, 1500].map((delay) => window.setTimeout(reveal, delay));
+    const cancelEvents: (keyof WindowEventMap)[] = ["pointerdown", "wheel", "touchstart", "keydown"];
+    for (const type of cancelEvents) window.addEventListener(type, stop, { once: true, passive: true });
+    return () => {
+      stopped = true;
+      window.clearTimeout(stopTimer);
+      for (const timer of timers) window.clearTimeout(timer);
+      for (const type of cancelEvents) window.removeEventListener(type, stop);
+      observer?.disconnect();
+    };
+  }, [focusEnv, focusEnvParam, tab, detail.data, templatesResource.data]);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);
@@ -1390,6 +1451,12 @@ export function InstanceDetailPage({ id }: { id: string }) {
     : null;
   const templateEnv =
     templatesResource.data?.find((candidate) => candidate.id === data.template)?.env ?? [];
+  // Deep link from the setup success: the allowlist variable to reveal.
+  const highlightEnvKey = focusEnv
+    ? ((focusEnvParam && /^[A-Z_][A-Z0-9_]*$/.test(focusEnvParam) ? focusEnvParam : null) ??
+      templateEnv.find((entry) => entry.required && /ALLOW(?:ED)?_USERS/.test(entry.key))?.key ??
+      null)
+    : null;
   const uptime =
     running && data.container ? formatUptime(data.container.uptime_s) : null;
   const warnings = data.warnings ?? [];
@@ -1559,6 +1626,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
                 detail={data}
                 provider={provider}
                 templateEnv={templateEnv}
+                highlightEnvKey={highlightEnvKey}
                 draft={configDraft}
                 onDraftChange={setConfigDraft}
                 envRows={envRows}

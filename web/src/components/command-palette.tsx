@@ -7,6 +7,7 @@ import {
   FolderTree,
   KeyRound,
   LayoutTemplate,
+  ListChecks,
   Loader2,
   Moon,
   Play,
@@ -72,6 +73,7 @@ function navigationItems(): NavigationItem[] {
     { label: "Personas", href: "/personas", icon: Fingerprint },
     { label: "Shares", href: "/shares", icon: FolderTree },
     { label: "Templates", href: "/templates", icon: LayoutTemplate },
+    { label: "Setup", href: "/setup", icon: ListChecks },
     { label: "Tokens", href: "/tokens", icon: KeyRound },
     { label: "Audit log", href: "/audit", icon: FileClock },
   ];

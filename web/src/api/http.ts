@@ -25,6 +25,7 @@ import type {
   CreatedToken,
   Deployment,
   DeploymentStatus,
+  DoctorReport,
   EgressPolicyInput,
   EgressPolicyView,
   EgressTestResult,
@@ -65,6 +66,7 @@ import type {
   Message,
   MkdirResult,
   MutationOptions,
+  OnboardingReport,
   PatchInstanceInput,
   PatchPipelineInput,
   PatchProviderInput,
@@ -859,6 +861,12 @@ export const httpApi: FleetApi = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+
+  /* Onboarding and doctor */
+
+  doctor: () => request<DoctorReport>("/api/doctor"),
+
+  onboarding: () => request<OnboardingReport>("/api/onboarding"),
 
   /* Assistant */
 

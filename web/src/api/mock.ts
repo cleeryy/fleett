@@ -34,6 +34,8 @@ import type {
   CreatedToken,
   Deployment,
   DeploymentStatus,
+  DoctorCheck,
+  DoctorReport,
   EgressPolicyInput,
   EgressPolicyView,
   EgressTestResult,
@@ -79,6 +81,9 @@ import type {
   MessageBox,
   MessageStatus,
   MkdirResult,
+  OnboardingAction,
+  OnboardingReport,
+  OnboardingStep,
   PatchInstanceInput,
   PatchPipelineInput,
   PatchPersonaInput,
@@ -194,9 +199,49 @@ export const mockConfig = {
    * provider) and `exhausted` (429, budget spent).
    */
   assistant: readAssistantMode(import.meta.env.VITE_MOCK_ASSISTANT as string | undefined),
+  /**
+   * First-run scenario, from `?mock_onboarding=complete|partial|empty` or
+   * `VITE_MOCK_ONBOARDING`. `partial` and `empty` start from a host with no
+   * provider and no instance, so the getting-started card can be exercised
+   * end to end.
+   */
+  onboarding: readMockOnboarding(import.meta.env.VITE_MOCK_ONBOARDING as string | undefined),
+  /**
+   * Doctor report shape, from `?mock_doctor=mixed|ok|error`. `mixed` is one
+   * warning and one error with its fix, the state the console has to render
+   * most often.
+   */
+  doctor: readMockDoctor(import.meta.env.VITE_MOCK_DOCTOR as string | undefined),
 };
 
 export type MockAssistantMode = "live" | "off" | "unconfigured" | "exhausted";
+
+/** First-run scenario: the normal demo, two prerequisites done, or a bare host. */
+export type MockOnboardingMode = "complete" | "partial" | "empty";
+/** Doctor shape: one warning and one error (default), all green, or several errors. */
+export type MockDoctorMode = "mixed" | "ok" | "error";
+
+function readMockOnboarding(raw: string | undefined): MockOnboardingMode {
+  const query =
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("mock_onboarding");
+  const value = (query ?? raw)?.trim().toLowerCase();
+  if (value === "empty" || value === "0") return "empty";
+  if (value === "partial" || value === "2") return "partial";
+  return "complete";
+}
+
+function readMockDoctor(raw: string | undefined): MockDoctorMode {
+  const query =
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("mock_doctor");
+  const value = (query ?? raw)?.trim().toLowerCase();
+  if (value === "ok" || value === "pass") return "ok";
+  if (value === "error" || value === "errors") return "error";
+  return "mixed";
+}
 
 function readAssistantMode(raw: string | undefined): MockAssistantMode {
   // `?mock_assistant=off|unconfigured|exhausted` switches the demo without a
@@ -3948,6 +3993,215 @@ export function resetMock(): void {
         : rendered;
     putFile(filesystems.get(row.id) as MockFs, "/SOUL.md", content, SEEDED_AT - 2 * DAY);
   }
+
+  // A first-run preview (`?mock_onboarding=partial|empty`) starts from a host
+  // with nothing to manage; the normal demo keeps its seeded fleet.
+  if (mockConfig.onboarding !== "complete") {
+    rows = [];
+    providerStore = [];
+    // Nothing references an instance either: a bare host has no schedules,
+    // incidents, deployments, logs or per-instance policies.
+    scheduleStore = [];
+    pipelineStore = [];
+    incidentStore = [];
+    healStore = {};
+    budgetStore = {};
+    usageEvents = [];
+    logEntries = [];
+    deploymentStore = [];
+    snapshotStore = [];
+    aclStore = {};
+    egressStore = {};
+  }
+}
+
+/**
+ * Switch the first-run preview, keep it in the URL (so a reload shows the same
+ * state) and reseed the in-memory demo: fleet, providers and onboarding stay
+ * coherent with each other.
+ */
+export function setMockScenario(next: {
+  onboarding?: MockOnboardingMode;
+  doctor?: MockDoctorMode;
+}): void {
+  if (next.onboarding) mockConfig.onboarding = next.onboarding;
+  if (next.doctor) mockConfig.doctor = next.doctor;
+
+  const url = new URL(window.location.href);
+  if (next.onboarding) url.searchParams.set("mock_onboarding", next.onboarding);
+  if (next.doctor) url.searchParams.set("mock_doctor", next.doctor);
+  window.history.replaceState(null, "", url.toString());
+
+  resetMock();
+}
+
+function onboardingAction(
+  done: boolean,
+  action: OnboardingAction,
+): OnboardingAction | undefined {
+  return done ? undefined : action;
+}
+
+/** `GET /api/onboarding`, derived from the same stores the console reads. */
+function mockOnboardingReport(): OnboardingReport {
+  const dockerDone = mockConfig.onboarding !== "empty";
+  // The image tag is assumed built as soon as the engine answers in the demo;
+  // a bare host has neither.
+  const imageDone = mockConfig.onboarding !== "empty";
+  const providerDone = providerStore.length > 0;
+  const instanceDone = rows.length > 0;
+
+  const steps: OnboardingStep[] = [
+    {
+      id: "docker",
+      title: "Check Docker",
+      description: "fleett drives Docker Compose; the engine must answer on this host.",
+      done: dockerDone,
+      action: onboardingAction(dockerDone, {
+        kind: "command",
+        command: "sudo systemctl start docker && docker info",
+      }),
+    },
+    {
+      id: "image",
+      title: "Build the agent image",
+      description: `The agent image "${IMAGE}" (FLEETT_IMAGE) must exist in the local image store.`,
+      done: imageDone,
+      action: onboardingAction(imageDone, {
+        kind: "command",
+        command: `docker build -t ${IMAGE} /path/to/hermes-official`,
+      }),
+    },
+    {
+      id: "provider",
+      title: "Create a provider",
+      description:
+        "A provider stores one API credential the instances reuse; its test button checks the key before the first instance starts.",
+      done: providerDone,
+      action: onboardingAction(providerDone, { kind: "link", to: "/providers?new=1" }),
+    },
+    {
+      id: "instance",
+      title: "Create your first instance",
+      description:
+        "Pick a template, attach the provider and start the agent; the instance page shows its health, logs and allowlist variables.",
+      done: instanceDone,
+      action: onboardingAction(instanceDone, { kind: "link", to: "/instances?new=1" }),
+    },
+  ];
+
+  return { complete: instanceDone, steps };
+}
+
+/** `GET /api/doctor`: the ten checks, shaped by the selected demo scenario. */
+function mockDoctorReport(): DoctorReport {
+  const mode = mockConfig.doctor;
+  const bare = mockConfig.onboarding === "empty";
+  const complete = mockConfig.onboarding === "complete";
+  const providerCount = providerStore.length;
+  const instanceCount = rows.length;
+
+  const dockerOk = !bare;
+  const imageOk = !bare && mode !== "error" && !(mode === "mixed" && complete);
+  const secretsError = mode === "error" || (mode === "mixed" && !complete && providerCount === 0);
+
+  const checks: DoctorCheck[] = [
+    {
+      id: "api",
+      label: "API",
+      status: "ok",
+      detail: "fleett 0.6.0, up 12m 40s",
+    },
+    {
+      id: "docker",
+      label: "Docker engine",
+      status: dockerOk ? "ok" : "error",
+      detail: dockerOk
+        ? "simulated: FLEETT_DRIVER=mock never contacts Docker"
+        : "the Docker engine does not answer; containers cannot be managed",
+      fix: dockerOk ? undefined : "sudo systemctl start docker && docker info",
+    },
+    {
+      id: "image",
+      label: "Agent image",
+      status: imageOk ? "ok" : "error",
+      detail: imageOk
+        ? `image "${IMAGE}" is available locally`
+        : `image "${IMAGE}" (FLEETT_IMAGE) is not in the local Docker image store`,
+      fix: imageOk ? undefined : `docker build -t ${IMAGE} /path/to/hermes-official`,
+    },
+    {
+      id: "secrets",
+      label: "Secrets",
+      status: secretsError ? "error" : "ok",
+      detail: secretsError
+        ? "no encryption key configured; instance secrets cannot be stored encrypted"
+        : `FLEETT_SECRETS_KEY; ${instanceCount} ${instanceCount === 1 ? "instance" : "instances"} encrypted`,
+      fix: secretsError ? "sudo fleett secrets init" : undefined,
+    },
+    {
+      id: "egress",
+      label: "Egress firewall",
+      status: mode === "ok" ? "ok" : "warn",
+      detail:
+        mode === "ok"
+          ? "restrict, marker present (subnet 172.31.240.0/24, installed 2026-11-09T09:12:00Z)"
+          : "restrict, but the firewall is not installed (no marker at /etc/fleett/egress.json)",
+      fix: mode === "ok" ? undefined : "sudo fleett egress install",
+    },
+    {
+      id: "providers",
+      label: "Providers",
+      status: providerCount === 0 ? "warn" : "ok",
+      detail:
+        providerCount === 0
+          ? "no provider configured; instances cannot reuse a credential"
+          : `${providerCount} configured`,
+    },
+    {
+      id: "instances",
+      label: "Instances",
+      status: "ok",
+      detail:
+        instanceCount === 0
+          ? "no instance yet; create one from a template"
+          : `${instanceCount} configured`,
+    },
+    {
+      id: "permissions",
+      label: "Permissions",
+      status: mode === "error" ? "error" : "ok",
+      detail:
+        mode === "error"
+          ? "FLEETT_ROOT /opt/fleett is writable; the Docker socket /var/run/docker.sock is not reachable: Permission denied"
+          : "FLEETT_ROOT /opt/fleett is writable; the mock driver has no Docker socket",
+      fix:
+        mode === "error"
+          ? "sudo usermod -aG docker fleett && sudo systemctl restart fleett"
+          : undefined,
+    },
+    {
+      id: "disk",
+      label: "Disk space",
+      status: mode === "error" ? "warn" : "ok",
+      detail:
+        mode === "error"
+          ? "8.2 GiB free of 98.0 GiB (8%) on /opt/fleett"
+          : "42.6 GiB free of 98.0 GiB (43%) on /opt/fleett",
+    },
+    {
+      id: "dns",
+      label: "DNS",
+      status: mode === "error" ? "error" : "ok",
+      detail:
+        mode === "error"
+          ? "no nameserver in /etc/resolv.conf; names outside /etc/hosts cannot resolve"
+          : "2 nameservers configured (9.9.9.9), no lookup was made",
+      fix: mode === "error" ? "write `nameserver 9.9.9.9` into /etc/resolv.conf" : undefined,
+    },
+  ];
+
+  return { ok: checks.every((check) => check.status !== "error"), checks };
 }
 
 resetMock();
@@ -4618,7 +4872,26 @@ function assistantAnswer(input: AssistantChatInput): {
 
 export const mockApi: FleetApi = {  async health(): Promise<Health> {
     await delay(60);
-    return { ok: true, version: "0.2.0", driver: "mock", docker: { ok: true } };
+    // A bare-host preview also reports the engine as unreachable, so the sidebar
+    // dot agrees with the first-run checklist.
+    return {
+      ok: true,
+      version: "0.6.0",
+      driver: "mock",
+      docker: { ok: mockConfig.onboarding !== "empty" },
+    };
+  },
+
+  async onboarding(): Promise<OnboardingReport> {
+    requireAuth();
+    await delay(90);
+    return mockOnboardingReport();
+  },
+
+  async doctor(): Promise<DoctorReport> {
+    requireAuth();
+    await delay(110);
+    return mockDoctorReport();
   },
 
   async authConfig(): Promise<AuthConfig> {

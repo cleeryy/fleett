@@ -32,6 +32,7 @@ import { ProviderDetailPage } from "@/pages/provider-detail";
 import { ProvidersPage } from "@/pages/providers";
 import { SchedulesPage } from "@/pages/schedules";
 import { SecurityPage } from "@/pages/security";
+import { SetupPage } from "@/pages/setup";
 import { SharesPage } from "@/pages/shares";
 import { SkillDetailPage } from "@/pages/skill-detail";
 import { SkillsPage } from "@/pages/skills";
@@ -68,6 +69,7 @@ function titleFor(path: string): string {
   if (path === "/deployments") return "Deployments";
   if (path === "/messages") return "Messages";
   if (path === "/memory") return "Memory";
+  if (path === "/setup") return "Setup";
   if (path === "/login") return "Sign in";
   return "Not found";
 }
@@ -337,6 +339,9 @@ export default function App() {
   } else if (path === "/pipelines") {
     crumbs = [{ label: "Pipelines" }];
     screen = <PipelinesPage />;
+  } else if (path === "/setup") {
+    crumbs = [{ label: "Setup" }];
+    screen = <SetupPage />;
   } else if (path === "/incidents") {
     crumbs = [{ label: "Incidents" }];
     screen = <IncidentsPage />;

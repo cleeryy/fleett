@@ -1470,6 +1470,52 @@ export interface ExecResult {
 }
 
 /* --------------------------------------------------------------------------
+ * Onboarding and doctor (issue #52, docs/ONBOARDING.md)
+ * -------------------------------------------------------------------------- */
+
+/** `ok` passes, `warn` degrades a protection, `error` needs the operator. */
+export type DoctorCheckStatus = "ok" | "warn" | "error";
+
+/** One line of `GET /api/doctor`; the ten checks always come in the same order. */
+export interface DoctorCheck {
+  /** Stable id (`api`, `docker`, `image`, …). */
+  id: string;
+  label: string;
+  status: DoctorCheckStatus;
+  /** What was observed, ready to display. */
+  detail: string;
+  /** Exact command or setting that repairs the check; absent on `ok` lines. */
+  fix?: string;
+}
+
+/** `GET /api/doctor`: `ok` is false only when a check is an `error`. */
+export interface DoctorReport {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
+/** What an unfinished first-run step offers: an internal page or a host command. */
+export type OnboardingAction =
+  | { kind: "link"; to: string }
+  | { kind: "command"; command: string };
+
+/** One prerequisite of the first-run checklist. */
+export interface OnboardingStep {
+  id: string;
+  title: string;
+  description: string;
+  done: boolean;
+  /** Absent once the step is done. */
+  action?: OnboardingAction;
+}
+
+/** `GET /api/onboarding`: complete as soon as one instance exists. */
+export interface OnboardingReport {
+  complete: boolean;
+  steps: OnboardingStep[];
+}
+
+/* --------------------------------------------------------------------------
  * Integrated assistant (issue #56)
  * -------------------------------------------------------------------------- */
 
@@ -1768,6 +1814,12 @@ export interface FleetApi {
   putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView>;
   testEgress(id: string, host: string, port: number): Promise<EgressTestResult>;
   exec(id: string, input: ExecInput): Promise<ExecResult>;
+
+  /* Onboarding and doctor */
+  /** Host checklist; any authenticated role, never a secret. */
+  doctor(): Promise<DoctorReport>;
+  /** First-run steps, derived live from Docker, the database and the filesystem. */
+  onboarding(): Promise<OnboardingReport>;
 
   /* Assistant */
   /** 404 hides the panel (`FLEETT_ASSISTANT=off`). */

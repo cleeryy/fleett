@@ -28,6 +28,7 @@ import {
   validateEnvRows,
   type EnvRow,
 } from "@/lib/env";
+import { cn } from "@/lib/utils";
 
 /**
  * The environment of one instance, edited as a list and written with a single
@@ -38,6 +39,7 @@ export function InstanceEnvironment({
   detail,
   rows,
   suggestions = [],
+  highlightKey,
   onRowsChange,
   onApplied,
 }: {
@@ -45,6 +47,8 @@ export function InstanceEnvironment({
   rows: EnvRow[];
   /** Template suggestions rendered as one-click additions. */
   suggestions?: EnvSuggestion[];
+  /** Variable the configuration deep link points at: mark the row or the suggestion. */
+  highlightKey?: string | null;
   onRowsChange: (rows: EnvRow[]) => void;
   onApplied: () => void;
 }) {
@@ -213,7 +217,11 @@ export function InstanceEnvironment({
                   const name = row.key.trim() || "variable";
                   if (editingId === row.id) {
                     return (
-                      <TableRow key={row.id} className="hover:bg-transparent">
+                      <TableRow
+                        key={row.id}
+                        data-env-key={row.key || undefined}
+                        className={cn("hover:bg-transparent", row.key === highlightKey && "bg-amber-500/5")}
+                      >
                         <TableCell colSpan={4} className="py-3 whitespace-normal">
                           <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_auto_auto_auto] sm:items-center">
                             {row.storedKey !== null ? (
@@ -278,7 +286,11 @@ export function InstanceEnvironment({
                     ? detail.env.find((entry) => entry.key === row.storedKey)?.updated_at
                     : undefined;
                   return (
-                    <TableRow key={row.id}>
+                    <TableRow
+                      key={row.id}
+                      data-env-key={row.key || undefined}
+                      className={cn(row.key === highlightKey && "bg-amber-500/5")}
+                    >
                       <TableCell className="whitespace-normal">
                         <span className="font-mono text-xs">{row.key}</span>
                         {row.storedKey === null ? (
@@ -362,10 +374,15 @@ export function InstanceEnvironment({
                 <button
                   key={suggestion.key}
                   type="button"
+                  data-env-suggestion={suggestion.key}
                   onClick={() =>
                     addRow({ key: suggestion.key, secret: suggestion.secret ?? false })
                   }
-                  className="group flex w-full items-start gap-2 rounded-md border px-3 py-2 text-left transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  className={cn(
+                    "group flex w-full items-start gap-2 rounded-md border px-3 py-2 text-left transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50",
+                    suggestion.key === highlightKey &&
+                      "border-amber-600/40 bg-amber-500/5",
+                  )}
                 >
                   <Plus aria-hidden className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1 space-y-0.5">

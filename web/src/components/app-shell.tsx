@@ -9,6 +9,7 @@ import {
   FolderTree,
   KeyRound,
   LayoutTemplate,
+  ListChecks,
   LogOut,
   Menu,
   MessagesSquare,
@@ -71,6 +72,7 @@ const NAV: NavItem[] = [
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
   { key: "personas", label: "Personas", href: "#/personas", icon: Fingerprint },
   { key: "skills", label: "Skills", href: "#/skills", icon: Sparkles },
+  { key: "setup", label: "Setup", href: "#/setup", icon: ListChecks },
   { key: "tokens", label: "Tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
   { key: "audit", label: "Audit log", href: "#/audit", icon: FileClock, adminOnly: true },
 ];
@@ -88,6 +90,7 @@ function activeKey(path: string): string {
   if (path.startsWith("/templates")) return "templates";
   if (path.startsWith("/personas")) return "personas";
   if (path.startsWith("/skills")) return "skills";
+  if (path.startsWith("/setup")) return "setup";
   if (path.startsWith("/tokens")) return "tokens";
   if (path.startsWith("/audit")) return "audit";
   if (path.startsWith("/messages")) return "messages";
