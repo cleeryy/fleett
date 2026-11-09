@@ -629,7 +629,7 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// First non-empty `Cookie:` header value with that name.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     for value in headers.get_all(header::COOKIE) {
         let Ok(raw) = value.to_str() else {
             continue;
@@ -650,8 +650,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// Best-effort client address, for the audit log.
-fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
+/// Best-effort client address, for the audit log and the rate limiter.
+pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
     let forwarded_for = HeaderName::from_static("x-forwarded-for");
     if let Some(value) = headers.get(&forwarded_for).and_then(|v| v.to_str().ok()) {
         if let Some(first) = value.split(',').map(str::trim).find(|s| !s.is_empty()) {

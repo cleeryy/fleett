@@ -189,6 +189,9 @@ enum Commands {
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
+    /// Show the effective API hardening: rate limits, lockout, headers and
+    /// tokens (client mode). See docs/HARDENING.md.
+    Security,
     /// Send a message to another instance over the fleet bus (client mode).
     Say {
         /// Recipient instance id.
@@ -477,6 +480,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+        Commands::Security => cli::run(cli::Command::Security, json).await,
         Commands::Say {
             to,
             body,
@@ -592,6 +596,15 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         oidc = cfg.auth.oidc_enabled(),
         "authentication configured"
     );
+    tracing::info!(
+        rate_limit = cfg.security.limiting_enabled(),
+        per_min = cfg.security.rate_limit_per_min,
+        auth_per_min = cfg.security.rate_limit_auth_per_min,
+        heavy_per_min = cfg.security.rate_limit_heavy_per_min,
+        lockout_failures = cfg.security.lockout_failures,
+        hsts = cfg.hsts_enabled(),
+        "API hardening configured"
+    );
 
     if cfg.env_file_path().is_file() {
         tracing::info!(
@@ -647,9 +660,15 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         "fleett listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` puts the peer address in the request
+    // extensions: the audit log and the rate limiter fall back to it when no
+    // reverse proxy sets `X-Forwarded-For`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())

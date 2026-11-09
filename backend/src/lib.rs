@@ -22,6 +22,7 @@ pub mod models;
 pub mod providers;
 pub mod render;
 pub mod secrets;
+pub mod security;
 pub mod store;
 pub mod templates_builtin;
 

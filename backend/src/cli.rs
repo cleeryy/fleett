@@ -301,20 +301,30 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
+    /// Show the effective API hardening (rate limits, lockout, headers, tokens).
+    Security,
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
     Memory(MemoryCommand),
 }
 
@@ -450,6 +460,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
+        Command::Security => security(&client, json, &config.url).await,
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
@@ -1384,6 +1395,101 @@ fn short_id(id: &str) -> String {
     // `sha256:` plus the first 12 hex characters, like `docker ps`.
     let digest = id.strip_prefix("sha256:").unwrap_or(id);
     digest.chars().take(12).collect()
+}
+
+/// Effective hardening reported by `GET /api/security/status`.
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityReport {
+    rate_limit: SecurityRateLimit,
+    lockout: SecurityLockout,
+    headers: SecurityHeaders,
+    tokens: SecurityTokens,
+    auth_mode: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityRateLimit {
+    enabled: bool,
+    limits: SecurityLimits,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityLimits {
+    per_min: u32,
+    auth_per_min: u32,
+    heavy_per_min: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityLockout {
+    failures: u32,
+    window_s: u64,
+    lockout_s: u64,
+    locked_ips: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityHeaders {
+    csp: String,
+    x_frame_options: String,
+    referrer_policy: String,
+    permissions_policy: String,
+    hsts: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityTokens {
+    expired_or_revoked: usize,
+    active: usize,
+}
+
+async fn security(client: &Client, json: bool, url: &str) -> Result<(), CliError> {
+    let report: SecurityReport = client
+        .json::<SecurityReport>(Method::GET, "/api/security/status", &[], None)
+        .await?;
+    if json {
+        return print_json(&report);
+    }
+
+    println!("fleett security {url}");
+    println!();
+
+    let limits = &report.rate_limit.limits;
+    let rate_limit = if report.rate_limit.enabled {
+        format!(
+            "enabled: {}/min, auth {}/min, heavy {}/min",
+            limits.per_min, limits.auth_per_min, limits.heavy_per_min
+        )
+    } else {
+        "disabled".to_string()
+    };
+    println!("  {:<13} {rate_limit}", "rate limit");
+
+    let lockout = &report.lockout;
+    let lockout_text = if lockout.failures == 0 {
+        "disabled".to_string()
+    } else {
+        format!(
+            "after {} failures in {} s for {} s; {} locked",
+            lockout.failures, lockout.window_s, lockout.lockout_s, lockout.locked_ips
+        )
+    };
+    println!("  {:<13} {lockout_text}", "lockout");
+
+    let headers = &report.headers;
+    println!(
+        "  {:<13} x-frame-options {}, referrer-policy {}, hsts {}",
+        "headers",
+        headers.x_frame_options,
+        headers.referrer_policy,
+        if headers.hsts { "on" } else { "off" }
+    );
+    println!(
+        "  {:<13} {} active, {} revoked",
+        "tokens", report.tokens.active, report.tokens.expired_or_revoked
+    );
+    println!("  {:<13} {}", "auth mode", report.auth_mode);
+    Ok(())
 }
 
 async fn doctor(client: &Client, json: bool, url: &str) -> Result<(), CliError> {

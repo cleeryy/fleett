@@ -58,6 +58,7 @@ port must not go unnoticed.
 | `fleett_api_requests_total` | counter | `method`, `status` | HTTP requests served by the API, per method and status code. |
 | `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `upgrade`, `rollback`) and result (`ok`, `error`). |
 | `fleett_upgrade_jobs_total` | counter | `result` | Finished rolling upgrade jobs, per final result (`success`, `rolled_back`, `failed`). |
+| `fleett_rate_limited_total` | counter | `class` | Requests refused by the API hardening, per class (`api`, `auth`, `heavy`, `lockout`). All four series are always exposed, at zero when nothing was refused. See [HARDENING.md](HARDENING.md#api-and-control-plane-hardening). |
 | `fleett_usage_ok` | gauge | — | `1` when the last utilisation sample could be read from Docker, `0` otherwise (the per-instance usage series are then stale or absent). |
 
 Notes:

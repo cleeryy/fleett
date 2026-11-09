@@ -115,6 +115,7 @@ fn app(state: MockState) -> Router {
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
         .route("/api/health", get(health))
         .route("/api/auth/me", get(me))
+        .route("/api/security/status", get(security_status))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, record))
 }
@@ -368,6 +369,25 @@ async fn me() -> Json<Value> {
         "actor": "admin",
         "role": "admin",
         "method": "bearer"
+    }))
+}
+
+async fn security_status() -> Json<Value> {
+    Json(json!({
+        "rate_limit": {
+            "enabled": true,
+            "limits": {"per_min": 120, "auth_per_min": 10, "heavy_per_min": 30}
+        },
+        "lockout": {"failures": 10, "window_s": 600, "lockout_s": 900, "locked_ips": 2},
+        "headers": {
+            "csp": "default-src 'self'",
+            "x_frame_options": "DENY",
+            "referrer_policy": "no-referrer",
+            "permissions_policy": "camera=(), microphone=(), geolocation=()",
+            "hsts": true
+        },
+        "tokens": {"expired_or_revoked": 1, "active": 3},
+        "auth_mode": "bearer"
     }))
 }
 
@@ -689,6 +709,31 @@ async fn doctor_prints_a_checklist() {
     let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
     assert_eq!(value["ok"], true);
     assert_eq!(value["checks"].as_array().expect("checks").len(), 5);
+}
+
+#[tokio::test]
+async fn security_prints_the_hardening_state() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["security"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for label in ["rate limit", "lockout", "headers", "tokens", "auth mode"] {
+        assert!(text.contains(label), "missing {label}: {text}");
+    }
+    assert!(text.contains("120/min"), "{text}");
+    assert!(text.contains("2 locked"), "{text}");
+    assert!(text.contains("hsts on"), "{text}");
+    assert_eq!(server.request("GET", "/api/security/status").method, "GET");
+
+    let output = run_against(&server, home.path(), &["--json", "security"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["rate_limit"]["limits"]["per_min"], 120);
+    assert_eq!(value["lockout"]["locked_ips"], 2);
+    assert_eq!(value["tokens"]["active"], 3);
+    assert_eq!(value["auth_mode"], "bearer");
 }
 
 #[tokio::test]

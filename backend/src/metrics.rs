@@ -51,6 +51,7 @@ struct Counters {
     api_requests: BTreeMap<(String, String), u64>,
     compose_actions: BTreeMap<(String, String), u64>,
     upgrade_jobs: BTreeMap<String, u64>,
+    rate_limited: BTreeMap<String, u64>,
 }
 
 /// Last utilisation sample, with the instant it was taken.
@@ -100,6 +101,13 @@ impl Metrics {
     pub fn record_upgrade_job(&self, result: &str) {
         let mut counters = self.counters();
         *counters.upgrade_jobs.entry(result.to_string()).or_default() += 1;
+    }
+
+    /// Count one request refused by the rate limiter or the lockout
+    /// (`fleett_rate_limited_total{class=...}`).
+    pub fn record_rate_limited(&self, class: &str) {
+        let mut counters = self.counters();
+        *counters.rate_limited.entry(class.to_string()).or_default() += 1;
     }
 
     /// Drop the cached utilisation sample.
@@ -195,6 +203,7 @@ impl Metrics {
             api_requests: counters.api_requests.clone(),
             compose_actions: counters.compose_actions.clone(),
             upgrade_jobs: counters.upgrade_jobs.clone(),
+            rate_limited: counters.rate_limited.clone(),
         }
     }
 
@@ -249,6 +258,9 @@ pub struct Snapshot {
     pub api_requests: BTreeMap<(String, String), u64>,
     pub compose_actions: BTreeMap<(String, String), u64>,
     pub upgrade_jobs: BTreeMap<String, u64>,
+    /// Refused requests, per rate-limit class (`api`, `auth`, `heavy`,
+    /// `lockout`).
+    pub rate_limited: BTreeMap<String, u64>,
 }
 
 /// Series that always exist, so a dashboard query never has to guess whether a
@@ -402,6 +414,33 @@ pub fn render(snapshot: &Snapshot) -> String {
             out,
             "fleett_upgrade_jobs_total{{result=\"{}\"}} {count}",
             escape(result)
+        );
+    }
+
+    block(
+        &mut out,
+        "fleett_rate_limited_total",
+        "Requests refused by the rate limiter or the authentication lockout, per class.",
+        "counter",
+    );
+    // Every class is always exposed, so a dashboard never has to guess whether
+    // a class was never refused or its counter is zero.
+    for class in crate::security::RATE_LIMIT_CLASSES {
+        let count = snapshot.rate_limited.get(class).copied().unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "fleett_rate_limited_total{{class=\"{}\"}} {count}",
+            escape(class)
+        );
+    }
+    for (class, count) in &snapshot.rate_limited {
+        if crate::security::RATE_LIMIT_CLASSES.contains(&class.as_str()) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "fleett_rate_limited_total{{class=\"{}\"}} {count}",
+            escape(class)
         );
     }
 
@@ -579,6 +618,7 @@ mod tests {
             ("fleett_api_requests_total", "counter"),
             ("fleett_compose_actions_total", "counter"),
             ("fleett_upgrade_jobs_total", "counter"),
+            ("fleett_rate_limited_total", "counter"),
             ("fleett_usage_ok", "gauge"),
         ] {
             assert!(
@@ -604,8 +644,8 @@ mod tests {
                 .count()
         );
         // 6 instance series + 4 per-instance series + 2 API + 1 action +
-        // 1 upgrade job + build_info + up + usage_ok.
-        assert_eq!(lines.len(), 6 + 4 + 2 + 1 + 1 + 3);
+        // 1 upgrade job + 4 rate-limit classes + build_info + up + usage_ok.
+        assert_eq!(lines.len(), 6 + 4 + 2 + 1 + 1 + 4 + 3);
     }
 
     #[test]
@@ -648,6 +688,12 @@ mod tests {
         }
         assert!(text.contains("fleett_up 1"));
         assert!(text.contains("fleett_usage_ok 0"));
+        for class in ["api", "auth", "heavy", "lockout"] {
+            assert!(
+                text.contains(&format!("fleett_rate_limited_total{{class=\"{class}\"}} 0")),
+                "{class} missing:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -657,6 +703,7 @@ mod tests {
         assert!(empty.api_requests.is_empty());
         assert!(empty.compose_actions.is_empty());
         assert!(empty.upgrade_jobs.is_empty());
+        assert!(empty.rate_limited.is_empty());
         assert!(!empty.usage_ok);
 
         metrics.record_request("GET", 200);
@@ -665,6 +712,9 @@ mod tests {
         metrics.record_compose_action("start", RESULT_OK);
         metrics.record_compose_action("start", RESULT_ERROR);
         metrics.record_upgrade_job("rolled_back");
+        metrics.record_rate_limited("api");
+        metrics.record_rate_limited("api");
+        metrics.record_rate_limited("lockout");
 
         let counters = metrics.snapshot(&[], None);
         assert_eq!(
@@ -688,6 +738,8 @@ mod tests {
             Some(&1)
         );
         assert_eq!(counters.upgrade_jobs.get("rolled_back"), Some(&1));
+        assert_eq!(counters.rate_limited.get("api"), Some(&2));
+        assert_eq!(counters.rate_limited.get("lockout"), Some(&1));
 
         let text = render(&counters);
         assert!(
@@ -700,6 +752,14 @@ mod tests {
         );
         assert!(
             text.contains("fleett_upgrade_jobs_total{result=\"rolled_back\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_rate_limited_total{class=\"api\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fleett_rate_limited_total{class=\"lockout\"} 1"),
             "{text}"
         );
     }

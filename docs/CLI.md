@@ -65,6 +65,7 @@ fleett memory restore <id> <version>
 fleett memory delete <id>
 fleett memory promote <id> [--namespace global]
 fleett doctor
+fleett security
 ```
 
 Every command accepts the global `--json` flag (before or after the subcommand). Human
@@ -223,6 +224,28 @@ Prints a checklist and exits non-zero when a check fails:
 fleett doctor
 fleett --json doctor
 ```
+
+### `security`
+
+Prints the effective API hardening read from `GET /api/security/status`
+(admin token required): rate limits, progressive lockout, security headers,
+named-token counts and the authentication mode. See
+[HARDENING.md](HARDENING.md#api-and-control-plane-hardening).
+
+```bash
+$ fleett security
+fleett security https://fleett.example.com
+
+  rate limit    enabled: 120/min, auth 10/min, heavy 30/min
+  lockout       after 10 failures in 600 s for 900 s; 0 locked
+  headers       x-frame-options DENY, referrer-policy no-referrer, hsts on
+  tokens        3 active, 1 revoked
+  auth mode     bearer
+```
+
+`--json` prints the raw `GET /api/security/status` payload (no secret ever
+appears in it). `fleett security` always exits `0` when the endpoint answers;
+it is a report, not a check — use `fleett doctor` for pass/fail.
 
 ## Output and exit codes
 
