@@ -301,21 +301,42 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
     Memory(MemoryCommand),
+    Webhooks,
+    WebhookAdd {
+        name: String,
+        url: String,
+        events: Vec<String>,
+        secret: String,
+    },
+    WebhookRemove(String),
+    WebhookTest(String),
+    Deliveries {
+        id: String,
+        limit: usize,
+    },
 }
 
 /// Sub-commands of `fleett memory`.
@@ -454,6 +475,16 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
         Command::Memory(command) => memory(&client, json, &command).await,
+        Command::Webhooks => webhooks(&client, json).await,
+        Command::WebhookAdd {
+            name,
+            url,
+            events,
+            secret,
+        } => webhook_add(&client, json, &name, &url, &events, &secret).await,
+        Command::WebhookRemove(id) => webhook_remove(&client, json, &id).await,
+        Command::WebhookTest(id) => webhook_test(&client, json, &id).await,
+        Command::Deliveries { id, limit } => deliveries(&client, json, &id, limit).await,
     }
 }
 
@@ -1384,6 +1415,167 @@ fn short_id(id: &str) -> String {
     // `sha256:` plus the first 12 hex characters, like `docker ps`.
     let digest = id.strip_prefix("sha256:").unwrap_or(id);
     digest.chars().take(12).collect()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WebhookView {
+    id: String,
+    name: String,
+    url: String,
+    #[serde(default)]
+    events: Vec<String>,
+    enabled: bool,
+    has_secret: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DeliveryView {
+    id: i64,
+    webhook_id: String,
+    event: String,
+    status: String,
+    attempts: u32,
+    #[serde(default)]
+    response_status: Option<i64>,
+    #[serde(default)]
+    error: Option<String>,
+    created_at: String,
+    #[serde(default)]
+    delivered_at: Option<String>,
+}
+
+async fn webhooks(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/webhooks", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let hooks: Vec<WebhookView> = decode(value)?;
+    if hooks.is_empty() {
+        println!("no webhooks");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = hooks
+        .iter()
+        .map(|hook| {
+            vec![
+                hook.id.clone(),
+                hook.name.clone(),
+                if hook.enabled { "yes" } else { "no" }.to_string(),
+                hook.events.join(","),
+                hook.url.clone(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["ID", "NAME", "ENABLED", "EVENTS", "URL"], &rows)
+    );
+    Ok(())
+}
+
+async fn webhook_add(
+    client: &Client,
+    json: bool,
+    name: &str,
+    url: &str,
+    events: &[String],
+    secret: &str,
+) -> Result<(), CliError> {
+    let body = json!({
+        "name": name,
+        "url": url,
+        "events": events,
+        "secret": secret,
+    });
+    let value = client
+        .value(Method::POST, "/api/webhooks", &[], Some(body))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let hook: WebhookView = decode(value)?;
+    println!(
+        "created webhook {} ({}) subscribed to {}",
+        hook.id,
+        hook.name,
+        hook.events.join(",")
+    );
+    println!("keep the signing secret: it is never returned by the API");
+    Ok(())
+}
+
+async fn webhook_remove(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/webhooks/{}", encode_path_segment(id));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "id": id, "deleted": true }));
+    }
+    println!("deleted webhook {id}");
+    Ok(())
+}
+
+async fn webhook_test(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/webhooks/{}/test", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let ok = value["ok"].as_bool().unwrap_or(false);
+    let status = value["status"]
+        .as_u64()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let latency = value["latency_ms"].as_u64().unwrap_or(0);
+    if ok {
+        println!("webhook {id}: delivered (HTTP {status}, {latency} ms)");
+        Ok(())
+    } else {
+        let error = value["error"].as_str().unwrap_or("unknown error");
+        eprintln!("webhook {id}: failed (HTTP {status}, {latency} ms): {error}");
+        Err(CliError::ChecksFailed)
+    }
+}
+
+async fn deliveries(client: &Client, json: bool, id: &str, limit: usize) -> Result<(), CliError> {
+    let path = format!("/api/webhooks/{}/deliveries", encode_path_segment(id));
+    let query = [("limit", limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let rows: Vec<DeliveryView> = decode(value)?;
+    if rows.is_empty() {
+        println!("no deliveries for webhook {id}");
+        return Ok(());
+    }
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.id.to_string(),
+                row.event.clone(),
+                row.status.clone(),
+                row.attempts.to_string(),
+                row.response_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                row.created_at.clone(),
+                row.error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "EVENT", "STATUS", "TRIES", "HTTP", "AT", "ERROR"],
+            &table
+        )
+    );
+    Ok(())
 }
 
 async fn doctor(client: &Client, json: bool, url: &str) -> Result<(), CliError> {

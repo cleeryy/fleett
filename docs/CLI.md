@@ -64,6 +64,11 @@ fleett memory history <id>
 fleett memory restore <id> <version>
 fleett memory delete <id>
 fleett memory promote <id> [--namespace global]
+fleett webhooks
+fleett webhook add --name NAME --url URL --events EVENT[,EVENT] --secret SECRET
+fleett webhook rm <id>
+fleett webhook test <id>
+fleett deliveries <id> [--limit N]
 fleett doctor
 ```
 
@@ -207,6 +212,37 @@ fleett memory promote 12 --namespace global
 
 Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
 the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+
+### `webhooks` / `webhook` / `deliveries`
+
+Manage the signed outbound webhooks described in `docs/WEBHOOKS.md`.
+
+```bash
+# List every webhook (id, name, enabled, events, url).
+fleett webhooks
+fleett --json webhooks | jq '.[].id'
+
+# Create one. --events takes a comma-separated list of exact events or prefix
+# wildcards; the secret is only accepted on input, never printed back.
+fleett webhook add --name deploy \
+  --url https://ci.example.test/fleett \
+  --events instance.created,instance.started,upgrade.* \
+  --secret "$(openssl rand -hex 32)"
+
+# Send one signed webhook.test delivery (not retried; exit 1 when it fails).
+fleett webhook test 5a2c…
+
+# Inspect the delivery log: attempts, last HTTP status and last error.
+fleett deliveries 5a2c… --limit 20
+fleett --json deliveries 5a2c… | jq '.[0] | {event, status, attempts, error}'
+
+fleett webhook rm 5a2c…
+```
+
+`fleett webhook test` returns exit code `1` when the endpoint refuses the
+delivery; with `--json` it prints the full `{ok,status,latency_ms,error}`
+object first. `fleett deliveries` accepts `--limit` between 1 and 200 (default
+50). Creating a webhook needs a secrets key on the server (`fleett secrets init`).
 
 ### `doctor`
 

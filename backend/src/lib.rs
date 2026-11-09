@@ -24,6 +24,7 @@ pub mod render;
 pub mod secrets;
 pub mod store;
 pub mod templates_builtin;
+pub mod webhooks;
 
 pub use api::{router, AppState};
 pub use config::Config;

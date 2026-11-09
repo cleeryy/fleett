@@ -9,12 +9,14 @@ pub mod git;
 pub mod health;
 pub mod instances;
 pub mod memory;
+pub mod openapi;
 pub mod providers;
 pub mod shares;
 pub mod templates;
 pub mod tokens;
 pub mod upgrade;
 pub mod usage;
+pub mod webhooks;
 
 pub use error::ApiError;
 
@@ -136,6 +138,7 @@ fn auth_pages() -> Router<AppState> {
 fn api_routes(state: AppState) -> Router<AppState> {
     let public: Router<AppState> = Router::new()
         .route("/health", get(health::health))
+        .route("/openapi.json", get(openapi::document))
         .route("/auth/config", get(auth::config));
 
     let protected: Router<AppState> = Router::new()
@@ -166,6 +169,15 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .delete(providers::delete),
         )
         .route("/providers/{id}/test", post(providers::test))
+        .route("/webhooks", get(webhooks::list).post(webhooks::create))
+        .route(
+            "/webhooks/{id}",
+            get(webhooks::get)
+                .patch(webhooks::patch)
+                .delete(webhooks::delete),
+        )
+        .route("/webhooks/{id}/test", post(webhooks::test))
+        .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(

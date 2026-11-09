@@ -234,6 +234,50 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// List the outbound webhooks of the control plane (client mode).
+    Webhooks,
+    /// Manage one outbound webhook (client mode).
+    Webhook {
+        #[command(subcommand)]
+        action: WebhookCommands,
+    },
+    /// Show the recent deliveries of one webhook (client mode).
+    Deliveries {
+        /// Webhook id.
+        id: String,
+        /// Maximum rows (1..=200).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebhookCommands {
+    /// Create a webhook subscribed to one or more events.
+    Add {
+        /// Display name.
+        #[arg(long)]
+        name: String,
+        /// Endpoint URL (http or https).
+        #[arg(long)]
+        url: String,
+        /// Comma-separated events or prefix wildcards (`instance.started,upgrade.*`).
+        #[arg(long)]
+        events: String,
+        /// HMAC-SHA256 signing secret (never returned by the API).
+        #[arg(long)]
+        secret: String,
+    },
+    /// Delete a webhook and its delivery log.
+    Rm {
+        /// Webhook id.
+        id: String,
+    },
+    /// Send one signed `webhook.test` delivery.
+    Test {
+        /// Webhook id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -558,6 +602,37 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             cli::run(cli::Command::Memory(command), json).await
+        }
+        Commands::Webhooks => cli::run(cli::Command::Webhooks, json).await,
+        Commands::Webhook { action } => match action {
+            WebhookCommands::Add {
+                name,
+                url,
+                events,
+                secret,
+            } => {
+                let events: Vec<String> = events
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                cli::run(
+                    cli::Command::WebhookAdd {
+                        name,
+                        url,
+                        events,
+                        secret,
+                    },
+                    json,
+                )
+                .await
+            }
+            WebhookCommands::Rm { id } => cli::run(cli::Command::WebhookRemove(id), json).await,
+            WebhookCommands::Test { id } => cli::run(cli::Command::WebhookTest(id), json).await,
+        },
+        Commands::Deliveries { id, limit } => {
+            cli::run(cli::Command::Deliveries { id, limit }, json).await
         }
     };
 

@@ -17,6 +17,11 @@ only `GET`/`HEAD`; a mutation returns `403 forbidden`. A cookie-authenticated
 mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 `403 csrf_required`; bearer clients are exempt.
 
+`GET /api/openapi.json` serves the OpenAPI 3.0 document for every route below.
+It is public (no secret, no credential) so SDK generators can read it without a
+token; the document is committed at the repository root as `openapi.json` and
+embedded in the binary. See `docs/WEBHOOKS.md` for the TypeScript client.
+
 ## Health and auth
 
 | Method | Route | Response |
@@ -69,6 +74,33 @@ An instance attaches a provider with `"provider":"<id>"`. `base_url` and
 request wins. `secret` on `PATCH` rotates the credential and restarts every
 attached instance sequentially (one `restarted` entry each). Instances without
 a provider keep their own `gate_token`/`api_key_env`.
+
+## Webhooks
+
+Signed outbound events, distinct from the message bus; see `docs/WEBHOOKS.md`.
+The HMAC secret is encrypted at rest and never returned (`has_secret` only).
+Creating a webhook or testing one requires a secrets key (`409
+secrets_key_missing` otherwise). Mutations are admin only and audited.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/webhooks` | — | `[{"id":"…","name":"deploy","url":"…","events":["instance.*"],"enabled":true,"has_secret":true,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/webhooks` | `{"name":"deploy","url":"https://…","events":["instance.created","upgrade.*"],"secret":"…","enabled":true}` | `201` summary, admin only |
+| GET | `/api/webhooks/{id}` | — | summary, `404` unknown |
+| PATCH | `/api/webhooks/{id}` | `{"name"?,"url"?,"events"?,"secret"?,"enabled"?}` | summary, admin only; `secret` rotates the signing key |
+| DELETE | `/api/webhooks/{id}` | — | `204` and its delivery log, admin only |
+| POST | `/api/webhooks/{id}/test` | — | `{"ok":true,"status":204,"latency_ms":12}`, admin only |
+| GET | `/api/webhooks/{id}/deliveries?limit=50` | — | `[{"id":42,"webhook_id":"…","event":"instance.started","payload":{…},"status":"sent","attempts":1,"response_status":204,"error":null,"created_at":"…","delivered_at":"…"}]` |
+
+Events: `instance.created|started|stopped|deleted`, `env.changed`,
+`upgrade.started|ok|failed|rolled_back`, `incident.open|closed`,
+`secret.rotated`, `pipeline.run.started|ok|failed`. A subscription entry is an
+exact event, `*`, or a prefix wildcard ending in `.*` (`instance.*`).
+
+Delivery headers: `X-Fleett-Event`, `X-Fleett-Delivery`,
+`X-Fleett-Signature: sha256=<hex HMAC-SHA256(secret, raw_body)>`. Retries: 3
+after the first attempt (1 s, 10 s, 60 s); the delivery log keeps the last
+status and error. Delivery never blocks the mutation.
 
 ## Instances
 

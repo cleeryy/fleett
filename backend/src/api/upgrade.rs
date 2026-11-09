@@ -180,6 +180,16 @@ pub async fn start(
 
     let job = state.upgrade.begin(job)?;
     let job_id = job.id.clone();
+    crate::webhooks::emit(
+        &state,
+        crate::webhooks::Event::UpgradeStarted,
+        json!({
+            "job": job.id.clone(),
+            "image": job.image.clone(),
+            "instances": job.results.len(),
+            "parallel": job.parallel,
+        }),
+    );
     let task_state = state.clone();
     let task_context = context.clone();
     tokio::spawn(async move {
@@ -332,6 +342,17 @@ async fn upgrade_one(
                 "error": message,
             })),
         );
+        crate::webhooks::emit(
+            &state,
+            crate::webhooks::Event::UpgradeFailed,
+            json!({
+                "job": job_id.clone(),
+                "id": id.clone(),
+                "from": from.clone(),
+                "to": image.clone(),
+                "error": message.clone(),
+            }),
+        );
         return;
     }
 
@@ -408,6 +429,16 @@ async fn upgrade_one(
                     "to": image,
                     "status": UpgradeStatus::Healthy.as_str(),
                 })),
+            );
+            crate::webhooks::emit(
+                &state,
+                crate::webhooks::Event::UpgradeOk,
+                json!({
+                    "job": job_id.clone(),
+                    "id": id.clone(),
+                    "from": old_image.clone(),
+                    "to": image.clone(),
+                }),
             );
         }
         Err(reason) => {
@@ -508,6 +539,18 @@ async fn rollback(
                 "error": reason,
             })),
         );
+        crate::webhooks::emit(
+            state,
+            crate::webhooks::Event::UpgradeFailed,
+            json!({
+                "job": job_id,
+                "id": id,
+                "from": old_image,
+                "to": attempted,
+                "status": UpgradeStatus::Failed.as_str(),
+                "error": reason,
+            }),
+        );
         return;
     }
 
@@ -575,6 +618,26 @@ async fn rollback(
             },
             "error": reason,
         })),
+    );
+    let (event, status) = if failure.is_some() {
+        (crate::webhooks::Event::UpgradeFailed, UpgradeStatus::Failed)
+    } else {
+        (
+            crate::webhooks::Event::UpgradeRolledBack,
+            UpgradeStatus::RolledBack,
+        )
+    };
+    crate::webhooks::emit(
+        state,
+        event,
+        json!({
+            "job": job_id,
+            "id": id,
+            "from": old_image,
+            "to": attempted,
+            "status": status.as_str(),
+            "error": reason,
+        }),
     );
 }
 

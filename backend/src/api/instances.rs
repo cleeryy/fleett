@@ -227,6 +227,16 @@ pub async fn create(
             "allow_lan": stored.allow_lan,
         })),
     );
+    crate::webhooks::emit(
+        &state,
+        crate::webhooks::Event::InstanceCreated,
+        serde_json::json!({
+            "id": stored.id,
+            "name": stored.name,
+            "template": stored.template,
+            "status": stored.status.as_str(),
+        }),
+    );
     let warnings = egress::warnings(&state.cfg, stored.allow_lan);
     Ok((
         StatusCode::CREATED,
@@ -785,6 +795,7 @@ pub async fn patch(
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
+    let env_changed = request.env.is_some();
     let channel_token = apply_patch(&state, &mut spec, &request)?;
     let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
     enforce_caps(&state, Some(&id), &spec)?;
@@ -825,6 +836,13 @@ pub async fn patch(
     };
     record_health(&state, &mut spec, health);
     audit::record(&state, &context, "instance.patch", &spec.id, None);
+    if env_changed {
+        crate::webhooks::emit(
+            &state,
+            crate::webhooks::Event::EnvChanged,
+            serde_json::json!({ "id": spec.id, "source": "instance.patch" }),
+        );
+    }
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
@@ -876,7 +894,17 @@ pub async fn put_env(
             "secrets": entries.iter().filter(|entry| entry.secret).count(),
         })),
     );
-    detail_after_apply(&state, &spec).await
+    let detail = detail_after_apply(&state, &spec).await?;
+    crate::webhooks::emit(
+        &state,
+        crate::webhooks::Event::EnvChanged,
+        serde_json::json!({
+            "id": spec.id,
+            "keys": entries.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+            "secrets": entries.iter().filter(|entry| entry.secret).count(),
+        }),
+    );
+    Ok(detail)
 }
 
 /// `DELETE /api/instances/{id}/env/{key}`: remove one variable and apply.
@@ -917,6 +945,11 @@ pub async fn delete_env(
         Some(serde_json::json!({ "key": key })),
     );
     up_and_record(&state, &mut spec).await?;
+    crate::webhooks::emit(
+        &state,
+        crate::webhooks::Event::EnvChanged,
+        serde_json::json!({ "id": spec.id, "removed": key, "source": "env.delete" }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1099,6 +1132,11 @@ pub async fn delete(
         &id,
         Some(serde_json::json!({ "purge": purge })),
     );
+    crate::webhooks::emit(
+        &state,
+        crate::webhooks::Event::InstanceDeleted,
+        serde_json::json!({ "id": id, "purge": purge }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1162,6 +1200,19 @@ async fn lifecycle(
         Lifecycle::Restart => "instance.restart",
     };
     audit::record(&state, &context, audit_action, &id, None);
+    let event = match operation {
+        Lifecycle::Start | Lifecycle::Restart => crate::webhooks::Event::InstanceStarted,
+        Lifecycle::Stop => crate::webhooks::Event::InstanceStopped,
+    };
+    crate::webhooks::emit(
+        &state,
+        event,
+        serde_json::json!({
+            "id": id,
+            "status": status.as_str(),
+            "action": action,
+        }),
+    );
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),
     }))
