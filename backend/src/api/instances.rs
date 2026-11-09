@@ -1277,6 +1277,17 @@ async fn lifecycle(
             crate::notify::Payload::instance(&spec).with_state(status.as_str()),
         );
     }
+    let webhook_event = match operation {
+        Lifecycle::Start | Lifecycle::Restart => Some(crate::webhooks::Event::InstanceStarted),
+        Lifecycle::Stop => Some(crate::webhooks::Event::InstanceStopped),
+    };
+    if let Some(event) = webhook_event {
+        crate::webhooks::emit(
+            &state,
+            event,
+            serde_json::json!({ "id": spec.id, "status": status.as_str(), "action": action }),
+        );
+    }
 
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),

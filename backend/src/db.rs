@@ -476,6 +476,38 @@ CREATE INDEX IF NOT EXISTS idx_instance_acl_subject ON instance_acl (subject);
 
 ALTER TABLE api_tokens ADD COLUMN scope TEXT;
 "#,
+    // recorded so `GET /api/webhooks/{id}/deliveries` can explain a failure.
+    r#"
+CREATE TABLE IF NOT EXISTS webhooks (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    events      TEXT NOT NULL,
+    nonce       BLOB NOT NULL,
+    ciphertext  BLOB NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    webhook_id      TEXT NOT NULL REFERENCES webhooks (id) ON DELETE CASCADE,
+    event           TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    response_status INTEGER,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    delivered_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook
+    ON webhook_deliveries (webhook_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
+    ON webhook_deliveries (status);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

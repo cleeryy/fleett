@@ -18,6 +18,7 @@ pub mod json;
 pub mod maintenance;
 pub mod memory;
 pub mod notifications;
+pub mod openapi;
 pub mod pipelines;
 pub mod providers;
 pub mod schedules;
@@ -27,6 +28,7 @@ pub mod templates;
 pub mod tokens;
 pub mod upgrade;
 pub mod usage;
+pub mod webhooks;
 
 pub use error::ApiError;
 
@@ -167,6 +169,7 @@ fn auth_pages() -> Router<AppState> {
 fn api_routes(state: AppState) -> Router<AppState> {
     let public: Router<AppState> = Router::new()
         .route("/health", get(health::health))
+        .route("/openapi.json", get(openapi::document))
         .route("/auth/config", get(auth::config));
 
     let protected: Router<AppState> = Router::new()
@@ -188,6 +191,15 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/desired-state/drift", get(desired_state::drift))
         .route("/desired-state/plan", post(desired_state::plan))
         .route("/desired-state/apply", post(desired_state::apply))
+        .route("/webhooks", get(webhooks::list).post(webhooks::create))
+        .route(
+            "/webhooks/{id}",
+            get(webhooks::get)
+                .patch(webhooks::patch)
+                .delete(webhooks::delete),
+        )
+        .route("/webhooks/{id}/test", post(webhooks::test))
+        .route("/webhooks/{id}/deliveries", get(webhooks::deliveries))
         .route("/audit", get(audit::list))
         .route("/messages", get(bus::list))
         .route("/messages/expired", delete(bus::purge))

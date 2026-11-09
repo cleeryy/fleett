@@ -37,6 +37,7 @@ pub mod snapshots;
 pub mod store;
 pub mod templates_builtin;
 pub mod watchdog;
+pub mod webhooks;
 
 pub use api::{router, AppState};
 pub use config::Config;

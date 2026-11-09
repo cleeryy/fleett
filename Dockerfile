@@ -39,6 +39,8 @@ RUN apt-get update \
 
 COPY backend/Cargo.toml backend/Cargo.lock ./backend/
 COPY backend/src ./backend/src
+# `include_str!("../../../openapi.json")` embeds the static contract.
+COPY openapi.json ./openapi.json
 
 # rust-embed reads `../web/dist` relative to the backend manifest.
 COPY --from=web /src/web/dist ./web/dist

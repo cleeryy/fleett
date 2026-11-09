@@ -209,6 +209,16 @@ pub async fn patch(
                 })).collect::<Vec<_>>(),
             })),
         );
+        crate::webhooks::emit(
+            &state,
+            crate::webhooks::Event::SecretRotated,
+            json!({
+                "provider": spec.id,
+                "name": spec.name,
+                "api_key_env": spec.api_key_env,
+                "restarted": report.len(),
+            }),
+        );
         report
     } else {
         Vec::new()
