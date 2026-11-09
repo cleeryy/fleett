@@ -26,7 +26,7 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 | GET | `/api/auth/check` | `204` when the credential is valid |
 | GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions) |
 | GET | `/auth/login` | `303` to the IdP; `404` when OIDC is disabled |
-| GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; `400 invalid_state`, `401 oidc_failed`, `403 forbidden` |
+| GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; failures carry `details.reason` (`cookie_missing`, `state_mismatch`, `expired`). Browsers (`Accept: text/html`) get an HTML page with a retry link, and a missing state cookie redirects to `/auth/login`; API clients keep JSON `400`/`401`/`403`. State lifetime: `FLEETT_OIDC_STATE_TTL_SECS` (default 600) |
 | POST | `/auth/logout` | `204`, clears the fleett cookies |
 
 ## Audit and tokens
@@ -46,7 +46,8 @@ SHA-256 digest only.
 `GET /api/templates`
 ```json
 [{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
-  "default_model":"deepseek-v4.1-flash","channel":"telegram"}]
+  "default_model":"deepseek-v4.1-flash","channel":"telegram",
+  "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids"}]}]
 ```
 
 ## Instances
@@ -67,7 +68,8 @@ SHA-256 digest only.
  "api_key_env":"HERMES_GATE_PROFILE_TOKEN",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"notes":""}
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"notes":"",
+ "env":[{"key":"DISCORD_ALLOWED_USERS","value":"123","secret":false}]}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
 The token is **never** returned by the API.
@@ -82,7 +84,8 @@ The token is **never** returned by the API.
  "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,
  "warnings":[],"notes":"","created_at":"...","updated_at":"...",
  "last_error":null,"data_dir":"/opt/fleett/instances/alice/data",
- "env_keys":["HERMES_GATE_PROFILE_TOKEN","TELEGRAM_BOT_TOKEN"],
+ "env":[{"key":"HERMES_GATE_PROFILE_TOKEN","secret":true,"updated_at":"..."},
+        {"key":"DISCORD_ALLOWED_USERS","secret":false,"value":"123","updated_at":"..."}],
  "container":{"id":"3f2a…","image":"hermes-agent:0.22.2-local","uptime_s":3600},
  "compose_yaml":"name: fleett-alice\n…"}
 ```
@@ -97,11 +100,31 @@ the container is not healthy. It is `null` for a healthy container and for a cle
 
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `channel` (`token` optional = rotation), `shares`,
-`mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`. Rewrites the compose file and runs `up -d`.
+`mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the compose file and runs
+`up -d`.
 
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
 `memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
 `FLEETT_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
+
+### Environment variables
+
+Every env entry is rendered as `${KEY}` in the compose file and injected by the driver, so no
+value is written to disk. `secret=true` values are encrypted at rest (AES-GCM, same key as the
+instance secrets) and are never returned; `secret=false` values are readable and are returned
+as `value`.
+
+| Method | Route | Body | Effect |
+|---|---|---|---|
+| PUT | `/api/instances/{id}/env` | `{"env":[{"key","value","secret"}]}` | full replace and apply |
+| DELETE | `/api/instances/{id}/env/{key}` | — | remove one and apply |
+| PATCH | `/api/instances/{id}` | `"env":[…]` | merge: `value:null` deletes, `""` keeps an empty value, missing `secret` keeps the flag |
+
+To keep a stored secret in a full replace, resend `{"key":"TOKEN","secret":true}` without a
+`value` (or with `null`). Keys match `^[A-Z_][A-Z0-9_]{0,63}$`; reserved names (`HERMES_UID`,
+`HERMES_GID`, `PATH`, `HOME`, `FLEETT_*`) are refused. `409 secrets_key_missing` means the host
+has no secrets key yet (`sudo fleett secrets init`). Templates expose suggested variables in
+their `env` field (Telegram/Discord allowlists).
 
 ### LAN access and egress enforcement
 
