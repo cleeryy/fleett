@@ -46,6 +46,8 @@ struct MockState {
     docker_ok: bool,
     /// Report one extra instance (`warned`) whose detail carries a warning.
     warned_instance: bool,
+    /// Last explicit egress policy written through `PUT …/egress`.
+    egress_policy: Arc<Mutex<Option<Value>>>,
 }
 
 impl MockState {
@@ -53,6 +55,20 @@ impl MockState {
         self.requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_egress_policy(&self, policy: Option<Value>) {
+        *self
+            .egress_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
+    }
+
+    fn egress_policy(&self) -> Option<Value> {
+        self.egress_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -77,6 +93,7 @@ impl MockServer {
             requests: Arc::new(Mutex::new(Vec::new())),
             docker_ok,
             warned_instance,
+            egress_policy: Arc::new(Mutex::new(None)),
         };
         let app = app(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -124,6 +141,14 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/logs", get(logs))
         .route("/api/instances/{id}/acl", get(acl_get).put(acl_put))
         .route("/api/instances/{id}/acl/{subject}", delete(acl_rm))
+        .route(
+            "/api/instances/{id}/egress",
+            get(egress_get).put(egress_put).delete(egress_delete),
+        )
+        .route(
+            "/api/instances/{id}/egress/blocks",
+            get(egress_blocks).delete(egress_clear_blocks),
+        )
         .route("/api/usage", get(usage))
         .route("/api/images", get(images))
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
@@ -421,6 +446,105 @@ async fn acl_put(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value>
 
 async fn acl_rm(Path((_id, _subject)): Path<(String, String)>) -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// Egress policy view of the mock control plane (issue #58).
+fn egress_view(id: &str, policy: Option<&Value>) -> Value {
+    match policy {
+        Some(policy) => {
+            let list = |key: &str| match policy.get(key) {
+                Some(Value::Array(values)) => Value::Array(values.clone()),
+                _ => json!([]),
+            };
+            json!({
+                "instance": id,
+                "source": "explicit",
+                "mode": policy.get("mode").and_then(Value::as_str).unwrap_or("deny"),
+                "fqdns": list("fqdns"),
+                "cidrs": list("cidrs"),
+                "ports": list("ports"),
+                "updated_at": "2026-11-09T12:00:00Z",
+                "proxy": policy
+                    .get("proxy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http://fleett-egress-proxy:3128"),
+                "proxy_acl": "# fleett egress policy for alice (deny mode)\nhttp_access deny all\n",
+                "legacy_equivalent": false,
+                "warnings": [
+                    "proxy http://fleett-egress-proxy:3128 is unreachable: Name or service \
+                     not known (os error -2)"
+                ],
+            })
+        }
+        None => json!({
+            "instance": id,
+            "source": "legacy",
+            "mode": "allow",
+            "fqdns": [],
+            "cidrs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+            "ports": [],
+            "legacy_equivalent": false,
+            "warnings": [],
+        }),
+    }
+}
+
+async fn egress_get(State(state): State<MockState>, Path(id): Path<String>) -> Response {
+    if id == "ghost" {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "instance \"ghost\" not found",
+        );
+    }
+    let policy = state.egress_policy();
+    Json(egress_view(&id, policy.as_ref())).into_response()
+}
+
+async fn egress_put(
+    State(state): State<MockState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    state.set_egress_policy(Some(body.clone()));
+    Json(egress_view(&id, Some(&body))).into_response()
+}
+
+async fn egress_delete(State(state): State<MockState>, Path(id): Path<String>) -> Response {
+    if state.egress_policy().is_none() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("instance \"{id}\" has no explicit egress policy"),
+        );
+    }
+    state.set_egress_policy(None);
+    Json(egress_view(&id, None)).into_response()
+}
+
+async fn egress_blocks(Path(_id): Path<String>) -> Json<Value> {
+    Json(json!([
+        {
+            "id": 2,
+            "instance_id": "alice",
+            "host": "10.1.20.1",
+            "port": 443,
+            "reason": "destination denied by policy",
+            "at": "2026-11-09T12:01:00Z"
+        },
+        {
+            "id": 1,
+            "instance_id": "alice",
+            "host": "example.com",
+            "port": 80,
+            "reason": null,
+            "at": "2026-11-09T12:00:00Z"
+        }
+    ]))
+}
+
+async fn egress_clear_blocks(Path(_id): Path<String>) -> Json<Value> {
+    Json(json!({"removed": 2}))
 }
 
 fn template_info(id: &str, name: &str, parent: Option<&str>, read_only: bool) -> Value {
@@ -1146,6 +1270,268 @@ async fn acl_json_prints_the_payload() {
     let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
     assert_eq!(value["instance"], "alice");
     assert_eq!(value["acl"].as_array().expect("acl").len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Egress policy (issue #58)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn egress_policy_prints_the_policy_in_force() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    // No explicit policy: the legacy projection.
+    let output = run_against(&server, home.path(), &["egress", "policy", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("legacy policy (allow)"), "{text}");
+    assert!(text.contains("10.0.0.0/8"), "{text}");
+    assert!(text.contains("none (no explicit policy)"), "{text}");
+    assert!(text.contains("warnings         none"), "{text}");
+    assert_eq!(
+        server
+            .request("GET", "/api/instances/alice/egress")
+            .authorization
+            .as_deref(),
+        Some("Bearer test-token")
+    );
+
+    // An explicit policy reports its proxy and the warning that it is down.
+    server.state.set_egress_policy(Some(json!({
+        "mode": "deny",
+        "fqdns": ["api.github.com"],
+        "cidrs": [],
+        "ports": [443]
+    })));
+    let output = run_against(&server, home.path(), &["egress", "policy", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("explicit policy (deny)"), "{text}");
+    assert!(text.contains("api.github.com"), "{text}");
+    assert!(text.contains("443"), "{text}");
+    assert!(
+        text.contains("proxy            http://fleett-egress-proxy:3128"),
+        "{text}"
+    );
+    assert!(text.contains("unreachable"), "{text}");
+
+    // `--json` passes the server payload through, unknown fields included.
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "egress", "policy", "alice"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["source"], "explicit");
+    assert_eq!(value["mode"], "deny");
+    assert_eq!(value["ports"], json!([443]));
+    assert!(value["proxy_acl"]
+        .as_str()
+        .is_some_and(|acl| acl.contains("http_access deny all")));
+    assert!(value["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("unreachable"))));
+
+    // An unknown instance is an error, not an empty report.
+    let output = run_against(&server, home.path(), &["egress", "policy", "ghost"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("ghost"), "{}", stderr(&output));
+}
+
+#[tokio::test]
+async fn egress_set_puts_the_whole_policy() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "egress",
+            "set",
+            "alice",
+            "--mode",
+            "allow",
+            "--cidr",
+            "10.0.0.0/8",
+            "--cidr",
+            "192.168.0.0/16",
+            "--fqdn",
+            "blocked.example",
+            "--port",
+            "443",
+            "--proxy",
+            "http://127.0.0.1:9",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let put = server.request("PUT", "/api/instances/alice/egress");
+    let body = put.body.expect("body");
+    assert_eq!(body["mode"], "allow");
+    assert_eq!(body["cidrs"], json!(["10.0.0.0/8", "192.168.0.0/16"]));
+    assert_eq!(body["fqdns"], json!(["blocked.example"]));
+    assert_eq!(body["ports"], json!([443]));
+    assert_eq!(body["proxy"], "http://127.0.0.1:9");
+    assert!(stdout(&output).contains("explicit policy (allow)"));
+
+    // Omitted lists are sent empty: `set` replaces the whole policy.
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "egress", "set", "alice", "--mode", "deny"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = server
+        .requests()
+        .into_iter()
+        .rfind(|record| record.method == "PUT")
+        .and_then(|record| record.body)
+        .expect("second PUT body");
+    assert_eq!(body["mode"], "deny");
+    assert_eq!(body["cidrs"], json!([]));
+    assert_eq!(body["fqdns"], json!([]));
+    assert_eq!(body["ports"], json!([]));
+    assert_eq!(body["proxy"], Value::Null);
+
+    // A mode the API would reject never leaves the machine.
+    let before = server.requests().len();
+    let output = run_against(
+        &server,
+        home.path(),
+        &["egress", "set", "alice", "--mode", "maybe"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("--mode"), "{}", stderr(&output));
+    assert_eq!(server.requests().len(), before, "no request expected");
+
+    // Same for a port of 0, which the API rejects as well.
+    let before = server.requests().len();
+    let output = run_against(
+        &server,
+        home.path(),
+        &["egress", "set", "alice", "--port", "0"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("--port"), "{}", stderr(&output));
+    assert_eq!(server.requests().len(), before, "no request expected");
+}
+
+#[tokio::test]
+async fn egress_unset_deletes_and_reports_a_missing_policy() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    server.state.set_egress_policy(Some(json!({
+        "mode": "deny",
+        "fqdns": ["api.github.com"],
+        "cidrs": [],
+        "ports": []
+    })));
+
+    let output = run_against(&server, home.path(), &["egress", "unset", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("legacy policy (allow)"));
+    assert_eq!(
+        server
+            .request("DELETE", "/api/instances/alice/egress")
+            .authorization
+            .as_deref(),
+        Some("Bearer test-token")
+    );
+    assert!(server.state.egress_policy().is_none(), "the policy is gone");
+
+    // A second `unset` answers 404: exit code 1, machine-readable code with
+    // `--json`.
+    let output = run_against(&server, home.path(), &["egress", "unset", "alice"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("has no explicit egress policy"),
+        "{}",
+        stderr(&output)
+    );
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "egress", "unset", "alice"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_str(stderr(&output).trim()).expect("JSON error");
+    assert_eq!(error["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn egress_blocks_lists_and_clears_the_log() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["egress", "blocks", "alice", "--limit", "5"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("HOST"), "{text}");
+    assert!(text.contains("10.1.20.1"), "{text}");
+    assert!(text.contains("destination denied by policy"), "{text}");
+    assert_eq!(
+        server
+            .request("GET", "/api/instances/alice/egress/blocks")
+            .query("limit"),
+        Some("5")
+    );
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["--json", "egress", "blocks", "alice"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value.as_array().expect("blocks").len(), 2);
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["egress", "blocks", "alice", "--clear"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("cleared 2 blocked destination(s)"));
+    server.request("DELETE", "/api/instances/alice/egress/blocks");
+}
+
+#[tokio::test]
+async fn egress_help_lists_the_host_firewall_and_the_policy_commands() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    // `--help` is pure clap: no Docker, no API call.
+    let output = run_against(&server, home.path(), &["egress", "--help"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for subcommand in [
+        "install", "remove", "status", "print", "policy", "set", "unset", "blocks",
+    ] {
+        assert!(
+            text.contains(subcommand),
+            "{subcommand} missing from: {text}"
+        );
+    }
+    assert!(server.requests().is_empty(), "no request expected");
 }
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,8 @@ pub struct AppState {
     pub exec_policy: Arc<crate::exec::ExecPolicy>,
     /// Ingestion budget of `POST /api/egress/blocks`.
     pub block_ingest: Arc<egress::BlockRateLimiter>,
+    /// Cached reachability of the rendered egress proxies (`GET …/egress`).
+    pub egress_probe: Arc<crate::egress_policy::ProxyProbeCache>,
     /// Rate limiter and progressive authentication lockout.
     pub security: Arc<crate::security::Security>,
     /// Shared HTTP client of the outbound notifications (and nothing else):
@@ -152,6 +154,7 @@ impl AppState {
             logstore,
             security: Arc::new(security),
             block_ingest: Arc::new(egress::BlockRateLimiter::default()),
+            egress_probe: Arc::new(crate::egress_policy::ProxyProbeCache::default()),
             http: reqwest::Client::builder()
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()

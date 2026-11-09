@@ -1,8 +1,9 @@
 //! Client mode: the `fleett` binary talking to a running control plane.
 //!
-//! Server commands (`serve`, `migrate`, `egress`, `secrets`, `backup`) run on
-//! the host; the commands below are a thin HTTP client so the fleet is
-//! scriptable from cron, CI or a runbook. See `docs/CLI.md`.
+//! Server commands (`serve`, `migrate`, `secrets`, `backup`, and the host
+//! firewall half of `egress`) run on the host; the commands below are a thin
+//! HTTP client so the fleet is scriptable from cron, CI or a runbook. See
+//! `docs/CLI.md`.
 
 use crate::logstore::LogEntry;
 use reqwest::Method;
@@ -391,6 +392,41 @@ pub enum Command {
         id: String,
         subject: String,
     },
+    Egress(EgressCommand),
+}
+
+/// Arguments of `fleett egress policy|set|unset|blocks` (client mode).
+#[derive(Debug, Clone)]
+pub enum EgressCommand {
+    /// `fleett egress policy <id>`.
+    Policy { id: String },
+    /// `fleett egress set <id> …`.
+    Set(EgressSetArgs),
+    /// `fleett egress unset <id>`.
+    Unset { id: String },
+    /// `fleett egress blocks <id> [--limit N] [--clear]`.
+    Blocks {
+        id: String,
+        limit: usize,
+        clear: bool,
+    },
+}
+
+/// Arguments of `fleett egress set <id>`.
+///
+/// `set` replaces the whole policy, like the PUT it calls: an omitted list
+/// becomes empty and an omitted `--proxy` clears the override. Only `unset`
+/// (DELETE) removes a policy — saving an empty one does not (issue #58).
+#[derive(Debug, Clone, Default)]
+pub struct EgressSetArgs {
+    pub id: String,
+    /// `allow` (blocklist) or `deny` (allowlist); the server defaults to deny.
+    pub mode: Option<String>,
+    pub fqdns: Vec<String>,
+    pub cidrs: Vec<String>,
+    pub ports: Vec<u16>,
+    /// Per-instance proxy override; `off` clears it.
+    pub proxy: Option<String>,
 }
 
 /// Arguments of `fleett template <action>`.
@@ -756,6 +792,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::AclGet(id) => acl_get(&client, json, &id).await,
         Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
         Command::AclRm { id, subject } => acl_rm(&client, json, &id, &subject).await,
+        Command::Egress(command) => egress(&client, json, &command).await,
         Command::Schedules { id } => schedules(&client, json, &id).await,
         Command::ScheduleAdd(args) => schedule_add(&client, json, &args).await,
         Command::ScheduleRm { schedule_id } => schedule_rm(&client, json, &schedule_id).await,
@@ -2016,6 +2053,41 @@ struct AclView {
     acl: Vec<AclItemView>,
 }
 
+/// The policy view of `GET|PUT|DELETE /api/instances/{id}/egress`.
+///
+/// Only the fields the table prints: `--json` passes the raw payload through,
+/// so `proxy_acl` and anything the server adds later stay visible.
+#[derive(Debug, Clone, Deserialize)]
+struct EgressPolicyView {
+    instance: String,
+    source: String,
+    mode: String,
+    #[serde(default)]
+    fqdns: Vec<String>,
+    #[serde(default)]
+    cidrs: Vec<String>,
+    #[serde(default)]
+    ports: Vec<u16>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    legacy_equivalent: bool,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+/// One refused destination of `GET /api/instances/{id}/egress/blocks`.
+#[derive(Debug, Clone, Deserialize)]
+struct EgressBlockView {
+    at: String,
+    host: String,
+    port: u16,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 fn acl_path(id: &str) -> String {
     format!("/api/instances/{}/acl", encode_path_segment(id))
 }
@@ -2091,6 +2163,164 @@ async fn acl_rm(client: &Client, json: bool, id: &str, subject: &str) -> Result<
     }
     println!("removed \"{}\" from the ACL of {}", subject.trim(), id);
     Ok(())
+}
+
+/// Path of the destination policy of one instance.
+fn egress_path(id: &str) -> String {
+    format!("/api/instances/{}/egress", encode_path_segment(id))
+}
+
+/// `fleett egress policy <id>` — print the policy in force.
+async fn egress_policy(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, &egress_path(id), &[], None)
+        .await?;
+    print_egress(value, json)
+}
+
+/// `fleett egress set <id> …` — replace the whole policy.
+async fn egress_set(client: &Client, json: bool, args: &EgressSetArgs) -> Result<(), CliError> {
+    let mode = args
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if let Some(mode) = &mode {
+        if !matches!(
+            mode.as_str(),
+            "deny" | "allow" | "allowlist" | "blocklist" | "permit"
+        ) {
+            return Err(CliError::Config(format!(
+                "--mode must be \"allow\" or \"deny\" (got \"{mode}\")"
+            )));
+        }
+    }
+    for port in &args.ports {
+        if *port == 0 {
+            return Err(CliError::Config(
+                "--port must be between 1 and 65535".to_string(),
+            ));
+        }
+    }
+    // The whole policy is replaced; `null` values mean "not set" to the server,
+    // which is exactly the semantics of `set`.
+    let body = json!({
+        "mode": mode,
+        "fqdns": args.fqdns,
+        "cidrs": args.cidrs,
+        "ports": args.ports,
+        "proxy": args.proxy,
+    });
+    let value = client
+        .value(Method::PUT, &egress_path(&args.id), &[], Some(body))
+        .await?;
+    print_egress(value, json)
+}
+
+/// `fleett egress unset <id>` — DELETE, back to the legacy shape.
+async fn egress_unset(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let value = client
+        .value(Method::DELETE, &egress_path(id), &[], None)
+        .await?;
+    print_egress(value, json)
+}
+
+/// `fleett egress blocks <id> [--limit N] [--clear]`.
+async fn egress_blocks(
+    client: &Client,
+    json: bool,
+    id: &str,
+    limit: usize,
+    clear: bool,
+) -> Result<(), CliError> {
+    let path = format!("{}/blocks", egress_path(id));
+    if clear {
+        let value = client.value(Method::DELETE, &path, &[], None).await?;
+        if json {
+            return print_json(&value);
+        }
+        let removed = value.get("removed").and_then(Value::as_u64).unwrap_or(0);
+        println!("cleared {removed} blocked destination(s) of {id}");
+        return Ok(());
+    }
+    let limit = limit.clamp(1, 1000);
+    let query = vec![("limit", limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let blocks: Vec<EgressBlockView> = decode(value)?;
+    if blocks.is_empty() {
+        println!("no blocked destination recorded for {id}");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = blocks
+        .iter()
+        .map(|block| {
+            vec![
+                block.at.clone(),
+                block.host.clone(),
+                block.port.to_string(),
+                block.reason.as_deref().unwrap_or("-").to_string(),
+            ]
+        })
+        .collect();
+    print!("{}", render_table(&["AT", "HOST", "PORT", "REASON"], &rows));
+    Ok(())
+}
+
+/// Print a policy view, either verbatim (`--json`) or as a short report.
+fn print_egress(value: Value, json: bool) -> Result<(), CliError> {
+    if json {
+        return print_json(&value);
+    }
+    let view: EgressPolicyView = decode(value)?;
+    println!("{}: {} policy ({})", view.instance, view.source, view.mode);
+    let list = |values: &[String]| {
+        if values.is_empty() {
+            "-".to_string()
+        } else {
+            values.join(", ")
+        }
+    };
+    println!("  fqdns            {}", list(&view.fqdns));
+    println!("  cidrs            {}", list(&view.cidrs));
+    let ports: Vec<String> = view.ports.iter().map(u16::to_string).collect();
+    println!("  ports            {}", list(&ports));
+    match view.proxy.as_deref() {
+        Some(proxy) => println!("  proxy            {proxy}"),
+        None if view.source != "explicit" => {
+            println!("  proxy            none (no explicit policy)")
+        }
+        None if view.legacy_equivalent => println!(
+            "  proxy            none (the policy repeats the host firewall; no proxy is rendered)"
+        ),
+        None => println!("  proxy            none (no proxy configured)"),
+    }
+    if let Some(updated) = &view.updated_at {
+        println!("  updated          {updated}");
+    }
+    if view.warnings.is_empty() {
+        println!("  warnings         none");
+    } else {
+        for warning in &view.warnings {
+            println!("  warning          {warning}");
+        }
+    }
+    Ok(())
+}
+
+/// `fleett egress …` — one client-mode destination-policy command.
+async fn egress(client: &Client, json: bool, command: &EgressCommand) -> Result<(), CliError> {
+    match command {
+        EgressCommand::Policy { id } => egress_policy(client, json, id).await,
+        EgressCommand::Set(args) => egress_set(client, json, args).await,
+        EgressCommand::Unset { id } => egress_unset(client, json, id).await,
+        EgressCommand::Blocks { id, limit, clear } => {
+            egress_blocks(client, json, id, *limit, *clear).await
+        }
+    }
 }
 
 async fn create(client: &Client, json: bool, args: &CreateArgs) -> Result<(), CliError> {

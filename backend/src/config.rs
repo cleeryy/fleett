@@ -961,6 +961,18 @@ impl Config {
         }
     }
 
+    /// Whether the operator pointed `FLEETT_EGRESS_PROXY` at a proxy of their
+    /// own instead of leaving the built-in default.
+    ///
+    /// A configured proxy is an explicit choice: the instance must keep using
+    /// it even when the policy itself would be covered by the host firewall,
+    /// because that proxy is where the operator's own rules live (issue #58).
+    /// `off`/`none`/`disabled` are not a proxy: they answer `false`.
+    pub fn egress_proxy_is_explicit(&self) -> bool {
+        self.egress_proxy_url()
+            .is_some_and(|value| value != DEFAULT_EGRESS_PROXY)
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.root.join("fleet.db")
     }

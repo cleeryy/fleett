@@ -700,7 +700,7 @@ enum SecretsCommands {
     },
 }
 
-#[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand)]
 enum EgressCommands {
     /// Install the DOCKER-USER rules for the current fleett subnet (idempotent).
     Install,
@@ -710,17 +710,57 @@ enum EgressCommands {
     Status,
     /// Print the exact iptables commands without running them.
     Print,
+    /// Show the destination policy in force for one instance (client mode).
+    Policy {
+        /// Instance id.
+        id: String,
+    },
+    /// Replace the destination policy of one instance (client mode).
+    ///
+    /// The whole policy is replaced: omitted lists become empty and an omitted
+    /// `--proxy` clears the override. Saving an empty policy does *not* remove
+    /// it; use `fleett egress unset` for that (issue #58).
+    Set {
+        /// Instance id.
+        id: String,
+        /// `allow` (blocklist) or `deny` (allowlist); the server defaults to deny.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Destination FQDN or `*.` wildcard; repeatable.
+        #[arg(long = "fqdn")]
+        fqdn: Vec<String>,
+        /// Destination CIDR; repeatable.
+        #[arg(long = "cidr")]
+        cidr: Vec<String>,
+        /// Destination port; repeatable.
+        #[arg(long = "port")]
+        port: Vec<u16>,
+        /// Proxy only this instance uses (default: `FLEETT_EGRESS_PROXY`).
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+    /// Drop the destination policy and return to the legacy shape (client mode).
+    Unset {
+        /// Instance id.
+        id: String,
+    },
+    /// List the destinations the proxy refused for one instance (client mode).
+    Blocks {
+        /// Instance id.
+        id: String,
+        /// Maximum rows (1..=1000).
+        #[arg(long, default_value_t = fleett::egress_policy::BLOCKS_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Delete the whole block log of the instance instead of listing it.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
-impl From<EgressCommands> for egress::Action {
-    fn from(command: EgressCommands) -> Self {
-        match command {
-            EgressCommands::Install => Self::Install,
-            EgressCommands::Remove => Self::Remove,
-            EgressCommands::Status => Self::Status,
-            EgressCommands::Print => Self::Print,
-        }
-    }
+/// Run one host-firewall command (root, no bearer token).
+fn firewall_command(action: egress::Action) -> anyhow::Result<i32> {
+    let cfg = Config::from_env_for_maintenance()?;
+    egress::run(action, &cfg)
 }
 
 #[tokio::main]
@@ -747,11 +787,46 @@ async fn main() -> anyhow::Result<()> {
             migrate::run(&cfg, &from, apply).await?;
             0
         }
-        Commands::Egress { action } => {
-            // Firewall commands never serve HTTP: no bearer token is needed.
-            let cfg = Config::from_env_for_maintenance()?;
-            egress::run(action.into(), &cfg)?
-        }
+        Commands::Egress { action } => match action {
+            // Host firewall: run on the Docker host as root, no bearer token.
+            EgressCommands::Install => firewall_command(egress::Action::Install)?,
+            EgressCommands::Remove => firewall_command(egress::Action::Remove)?,
+            EgressCommands::Status => firewall_command(egress::Action::Status)?,
+            EgressCommands::Print => firewall_command(egress::Action::Print)?,
+            // Destination policy: a client command against the running API.
+            EgressCommands::Policy { id } => {
+                cli::run(
+                    cli::Command::Egress(cli::EgressCommand::Policy { id }),
+                    json,
+                )
+                .await
+            }
+            EgressCommands::Set {
+                id,
+                mode,
+                fqdn,
+                cidr,
+                port,
+                proxy,
+            } => {
+                let args = cli::EgressSetArgs {
+                    id,
+                    mode,
+                    fqdns: fqdn,
+                    cidrs: cidr,
+                    ports: port,
+                    proxy,
+                };
+                cli::run(cli::Command::Egress(cli::EgressCommand::Set(args)), json).await
+            }
+            EgressCommands::Unset { id } => {
+                cli::run(cli::Command::Egress(cli::EgressCommand::Unset { id }), json).await
+            }
+            EgressCommands::Blocks { id, limit, clear } => {
+                let command = cli::EgressCommand::Blocks { id, limit, clear };
+                cli::run(cli::Command::Egress(command), json).await
+            }
+        },
         Commands::Secrets { action } => {
             // Key management never serves HTTP: no bearer token is needed.
             let cfg = Config::from_env_for_maintenance()?;

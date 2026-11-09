@@ -17,7 +17,8 @@ gaps are listed at the end of this page.
   "mode": "deny",
   "fqdns": ["api.github.com", "*.example.com"],
   "cidrs": ["10.1.0.0/16"],
-  "ports": [443]
+  "ports": [443],
+  "proxy": "http://fleett-egress-proxy:3128"
 }
 ```
 
@@ -27,6 +28,7 @@ gaps are listed at the end of this page.
 | `fqdns` | Exact hosts, lowercased. A leading `*.` matches subdomains only (`*.example.com` does **not** match `example.com`). |
 | `cidrs` | IPv4 or IPv6 ranges, `ip/prefix`. |
 | `ports` | Optional destination ports. Empty = every port. A populated list narrows the exception: in `deny` mode the listed destinations are allowed only on those ports; in `allow` mode they are blocked only on those ports. |
+| `proxy` | Optional `http(s)://host:port` override for this instance only. Empty, `off`, `none` or `disabled` clear it: the instance falls back to `FLEETT_EGRESS_PROXY`. |
 
 Validation, enforced by `PUT /api/instances/{id}/egress`:
 
@@ -34,7 +36,8 @@ Validation, enforced by `PUT /api/instances/{id}/egress`:
 - FQDN: lowercased, trailing dot removed, at most 253 characters, labels
   `[a-z0-9_-]` (no scheme, path, port or space); `*` only as a leading `*.`;
 - CIDR: a valid IP and a prefix within `32` (v4) or `128` (v6);
-- ports: `1..=65535`, deduplicated and sorted.
+- ports: `1..=65535`, deduplicated and sorted;
+- proxy: an absolute `http://` or `https://` URL with a host.
 
 Lists are sorted and deduplicated before they are stored, so the same policy
 always renders the same compose file.
@@ -59,12 +62,31 @@ instance from `fleett-lan`: an `allow_lan: true` instance can still bypass the
 proxy. The API returns a warning and the test endpoint reports
 `enforced: false` in that case.
 
+Saving never deletes. A policy whose lists are all empty is stored like any
+other (`source: explicit`); send `DELETE /api/instances/{id}/egress` — or
+`fleett egress unset <id>` — to remove it. See *Render* for what an empty
+policy actually does.
+
 An instance archive (`GET /api/instances/{id}/export`) does not carry the
 policy yet: re-apply it with `fleett egress set` after an import.
 
 ## Render
 
-When a policy exists, the generated compose file gains three variables:
+A policy renders proxy variables **only when it decides something the host
+firewall does not** (issue #58). A policy is *legacy-equivalent* when:
+
+- `mode` is `allow` (a blocklist), **and**
+- `fqdns` and `ports` are empty, **and**
+- every `cidrs` entry is inside `10.0.0.0/8`, `172.16.0.0/12` or
+  `192.168.0.0/16` — or the list is empty.
+
+The host `DOCKER-USER` rules already drop those ranges for a restricted
+instance, so a proxy would add a failure mode without adding a decision. Such a
+policy is stored, answered with `legacy_equivalent: true`, and renders **no**
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`: the instance keeps its historical bytes.
+This is what made an "identity" policy silently cut all egress in 0.6.0.
+
+Everything else renders the three variables:
 
 ```yaml
 environment:
@@ -73,10 +95,18 @@ environment:
   NO_PROXY: localhost,127.0.0.1,::1,.local,fleett
 ```
 
-The address comes from `FLEETT_EGRESS_PROXY` (default
+`deny` mode, a single FQDN, a port restriction, a destination outside RFC 1918
+(including any IPv6 range, since the host rules are v4-only) or an explicit
+proxy all need it. "Explicit proxy" means the policy's own `proxy` field, or a
+`FLEETT_EGRESS_PROXY` the operator changed from its built-in default: a proxy
+you configured yourself is where your own rules live, so it is kept even for a
+legacy-equivalent policy.
+
+The address comes from the policy `proxy`, else `FLEETT_EGRESS_PROXY` (default
 `http://fleett-egress-proxy:3128`). An empty value, `off`, `none` or `disabled`
-suppresses the variables: the policy is stored but nothing points at a proxy,
-which the API reports as a warning instead of writing a dead address.
+suppresses the variables; the policy is still stored, and the API reports a
+warning instead of writing a dead address — but only when the policy would have
+needed the proxy (a legacy-equivalent policy never reports one).
 
 Instances without a policy never gain those variables: their compose bytes are
 unchanged by this feature. A `PATCH`, an env change, an import or a rolling
@@ -86,6 +116,24 @@ upgrade re-renders the compose file and keeps the policy applied.
 agent-to-agent traffic and the gate do not depend on the proxy. A gate with
 another DNS name must be added to the proxy ACLs (and, when it is reached by
 name, to `NO_PROXY` by the operator).
+
+### Warnings
+
+`GET /api/instances/{id}/egress` and the `PUT` response include a `warnings`
+entry when a proxy is rendered but does not answer:
+
+```
+proxy 127.0.0.1:9 is unreachable: Connection refused (os error 111): the
+instance points at a proxy that does not answer, so every outbound connection
+fails; start the proxy or remove the policy with DELETE
+/api/instances/alice/egress
+```
+
+The reachability probe is a TCP connect (same one as `POST …/egress/test`),
+cached for ten seconds per proxy URL, successes and failures alike, so a dead
+proxy does not slow every read. The `PUT` **never** fails because of the probe:
+it saves the policy, restarts the instance and returns the warning. Removing
+the policy is the operator's decision, not the server's.
 
 ## Deploy the proxy
 
@@ -135,8 +183,8 @@ the host.
 
 | Method | Route | Body | Effect |
 |---|---|---|---|
-| GET | `/api/instances/{id}/egress` | — | effective policy: `source`, `mode`, `fqdns`, `cidrs`, `ports`, `proxy`, `proxy_acl` (explicit only), `warnings` |
-| PUT | `/api/instances/{id}/egress` | `{"mode","fqdns","cidrs","ports"}` | validate, store, rewrite the compose file, restart; `400 invalid_egress_policy`; audited as `egress.policy.update` |
+| GET | `/api/instances/{id}/egress` | — | effective policy: `source`, `mode`, `fqdns`, `cidrs`, `ports`, `proxy` (only when rendered), `proxy_acl` (explicit only), `legacy_equivalent`, `warnings` |
+| PUT | `/api/instances/{id}/egress` | `{"mode","fqdns","cidrs","ports","proxy"}` | validate, store, rewrite the compose file, restart; `400 invalid_egress_policy`; never `409` on an unreachable proxy (warning instead); audited as `egress.policy.update` |
 | DELETE | `/api/instances/{id}/egress` | — | drop the explicit policy, return to the legacy shape; `404` when none; `egress.policy.delete` |
 | POST | `/api/instances/{id}/egress/test` | `{"host":"api.github.com","port":443}` | policy decision plus enforcement state (below) |
 | GET | `/api/instances/{id}/egress/blocks?limit=200` | — | refused destinations, newest first; `limit` 1..=1000 |
@@ -203,7 +251,8 @@ an honest gap, not a hidden failure.
 
 1. **fleett does not run the proxy.** `docker/fleett-proxy.example.yaml` is an
    operator artifact. If it is not running, `HTTP_PROXY` points at a dead name
-   and nothing is enforced.
+   and nothing is enforced — only for policies that render the variables; a
+   legacy-equivalent one renders none and the host firewall covers it.
 2. **One shared proxy cannot distinguish instances.** The rendered variables
    are identical for every instance, so the proxy only sees the source IP; the
    ACL files are therefore a union unless the operator runs one proxy per
@@ -246,13 +295,31 @@ own.
 ## CLI
 
 ```bash
-fleett egress policy alice
+fleett egress policy alice                       # GET: source, mode, lists, proxy, warnings
 fleett egress set alice --mode deny --fqdn api.github.com --port 443
 fleett egress set alice --mode allow --cidr 10.0.0.0/8 --port 22
-fleett egress blocks alice
-fleett egress blocks alice --clear
-fleett --json egress policy alice
+fleett egress set alice --mode deny --fqdn api.github.com \
+                    --proxy http://127.0.0.1:3128   # per-instance proxy override
+fleett egress unset alice                        # DELETE: back to the legacy shape
+fleett egress blocks alice                       # newest first
+fleett egress blocks alice --clear               # DELETE the block log
+fleett --json egress policy alice                # raw payload, proxy_acl included
 ```
 
-`set` replaces the whole policy: omitted lists become empty. `--fqdn`, `--cidr`
-and `--port` are repeatable. See [CLI.md](CLI.md).
+`set` replaces the whole policy, exactly like the `PUT` it calls: omitted lists
+become empty and an omitted `--proxy` clears the override. That is why clearing
+every field is **not** how you remove a policy — it stores an empty one (deny
+everything in `deny` mode, legacy-equivalent in `allow` mode). Use `unset`.
+
+`--fqdn`, `--cidr` and `--port` are repeatable; `--mode` accepts `allow` or
+`deny` (the server defaults to `deny`); `--proxy off` clears the override.
+`unset` exits 1 with the API's `not_found` code when the instance has no
+explicit policy, so a script can tell "removed" from "there was nothing".
+`policy`, `set` and `unset` print a short report, or the raw JSON with
+`--json`. They use the same `~/.config/fleett/config.toml` (or `FLEETT_URL` /
+`FLEETT_TOKEN`) as the other client commands.
+
+The host-firewall subcommands are unchanged and stay local (no bearer token,
+root on the Docker host): `fleett egress install|remove|status|print`.
+
+See [CLI.md](CLI.md).

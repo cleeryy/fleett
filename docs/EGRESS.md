@@ -170,16 +170,20 @@ The firewall above is a binary LAN switch. For "this agent may reach
 fleett egress set alice --mode deny --fqdn api.github.com --port 443
 fleett egress policy alice
 fleett egress blocks alice
+fleett egress unset alice   # only DELETE removes a policy
 ```
 
 A policy is stored in `egress_policies`, rendered as
 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in the agent container and enforced by an
 external Squid proxy the operator deploys (`docker/fleett-proxy.example.yaml`).
-`allow_lan` and `FLEETT_EGRESS` remain shortcuts: an instance without a policy
-is unchanged. See [EGRESS-POLICY.md](EGRESS-POLICY.md) for the model, the API,
-the block log and — importantly — the enforcement gaps (the proxy is not
-deployed by fleett, `HTTP_PROXY` is advisory, and one shared proxy cannot apply
-a different allowlist per instance without extra work).
+Only a policy that decides something the host firewall does not renders those
+variables; a blocklist of RFC 1918 ranges (or an empty `allow` policy) is
+legacy-equivalent and gets none. `allow_lan` and `FLEETT_EGRESS` remain
+shortcuts: an instance without a policy is unchanged. See
+[EGRESS-POLICY.md](EGRESS-POLICY.md) for the model, the API, the block log and
+— importantly — the enforcement gaps (the proxy is not deployed by fleett,
+`HTTP_PROXY` is advisory, and one shared proxy cannot apply a different
+allowlist per instance without extra work).
 
 ## Remove
 

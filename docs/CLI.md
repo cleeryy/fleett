@@ -18,8 +18,10 @@ token = "flt_0123456789abcdef0123456789abcdef"
   `https://` only.
 - `token`: bearer token (`FLEETT_TOKEN`, or a named token created with `POST /api/tokens`).
   It is optional: a server started with `FLEETT_ALLOW_NO_AUTH=1` answers without one.
-- The file is read for client commands only. `fleett serve`, `migrate`, `egress`, `secrets`,
-  `backup` keep reading the server environment (`~/.fleett/fleett.env`).
+- The file is read for client commands only. `fleett serve`, `migrate`, `secrets`,
+  `backup` keep reading the server environment (`~/.fleett/fleett.env`); `fleett egress
+  install|remove|status|print` does too, while `fleett egress policy|set|unset|blocks` are
+  client commands and read this file.
 
 Environment variables win over the file, field by field:
 
@@ -89,6 +91,11 @@ fleett incidents [--status open|closed] [--instance ID] [--limit N]
 fleett heal <id> --policy off|restart|recreate
               [--unhealthy-after N] [--max-restarts N] [--backoff SECONDS]
 fleett incident close <incident-id>
+fleett egress policy <id>
+fleett egress set <id> [--mode allow|deny] [--fqdn HOST]… [--cidr CIDR]… [--port PORT]…
+                       [--proxy URL]
+fleett egress unset <id>
+fleett egress blocks <id> [--limit N] [--clear]
 fleett doctor
 fleett mcp [--http ADDR]
 ```
@@ -446,6 +453,37 @@ fleett memory promote 12 --namespace global
 
 Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
 the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+
+### `egress policy` / `set` / `unset` / `blocks`
+
+Read and write the per-instance destination policy
+([docs/EGRESS-POLICY.md](EGRESS-POLICY.md)):
+
+```bash
+fleett egress policy alice
+fleett egress set alice --mode deny --fqdn api.github.com --port 443
+fleett egress set alice --mode allow --cidr 10.0.0.0/8 --proxy http://127.0.0.1:3128
+fleett egress unset alice
+fleett egress blocks alice --limit 50
+fleett egress blocks alice --clear
+```
+
+`policy` prints `source`, `mode`, `fqdns`, `cidrs`, `ports`, `proxy` (only when
+one is rendered), `updated_at` and every `warning`; `--json` prints the raw
+payload including `proxy_acl` and `legacy_equivalent`. `set` replaces the whole
+policy (omitted lists become empty, an omitted `--proxy` clears the override)
+and prints the resulting policy; it exits 1 on an invalid mode or port without
+calling the API. `unset` is the only way to remove a policy: an empty one is
+stored and, in `deny` mode, denies everything; it exits 1 with the `not_found`
+code when the instance has no explicit policy. `blocks` prints `AT`, `HOST`,
+`PORT` and `REASON`; `--clear` deletes the log and prints the removed count.
+
+A policy that only repeats the host firewall (mode `allow`, no FQDN, no port,
+RFC 1918 CIDRs only) renders no proxy variable, so saving one cannot cut the
+instance's egress. The host-firewall commands `fleett egress
+install|remove|status|print` are unchanged: they run on the Docker host, as
+root, without a bearer token.
+
 ### `incidents` / `heal` / `incident close`
 
 Read the watchdog incident registry and change the self-healing policy

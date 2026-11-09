@@ -416,12 +416,14 @@ pub fn render_compose_with_project_and_policy(
             environment.insert(key.clone(), format!("${{{key}}}"));
         }
     }
-    // A destination policy is enforced by the external proxy: point the agent
-    // at it. Instances without a policy keep their historical bytes.
-    if policy.is_some() {
-        if let Some(proxy) = cfg.egress_proxy_url() {
-            environment.insert("HTTP_PROXY".to_string(), proxy.to_string());
-            environment.insert("HTTPS_PROXY".to_string(), proxy.to_string());
+    // A destination policy that genuinely needs the external proxy points the
+    // agent at it. A policy strictly equivalent to the legacy host firewall
+    // renders nothing: the firewall already covers it, and pointing at a proxy
+    // that may not exist would cut every outbound connection (issue #58).
+    if let Some(policy) = policy {
+        if let Some(proxy) = egress_policy::proxy_url(cfg, policy) {
+            environment.insert("HTTP_PROXY".to_string(), proxy.clone());
+            environment.insert("HTTPS_PROXY".to_string(), proxy);
             environment.insert(
                 "NO_PROXY".to_string(),
                 egress_policy::no_proxy(&cfg.network),
@@ -1020,7 +1022,7 @@ networks:
     }
 
     #[test]
-    fn compose_renders_the_proxy_only_when_a_policy_exists() {
+    fn compose_renders_the_proxy_only_when_a_policy_needs_it() {
         use crate::egress_policy::PolicyMode;
 
         let instance = spec(ChannelKind::None);
@@ -1030,6 +1032,7 @@ networks:
             fqdns: vec!["api.github.com".to_string()],
             cidrs: Vec::new(),
             ports: vec![443],
+            proxy: None,
             updated_at: "2026-11-09T00:00:00Z".to_string(),
         };
 
@@ -1069,6 +1072,147 @@ networks:
         assert!(doc["services"]["agent"]["environment"]
             .get("HTTP_PROXY")
             .is_none());
+    }
+
+    /// Regression for issue #58: a policy that only repeats what the host
+    /// firewall already does never gains proxy variables.
+    #[test]
+    fn compose_skips_the_proxy_for_a_legacy_equivalent_policy() {
+        use crate::egress_policy::PolicyMode;
+
+        let instance = spec(ChannelKind::None);
+        let mut policy = EgressPolicy {
+            instance_id: "alice".to_string(),
+            mode: PolicyMode::Allow,
+            fqdns: Vec::new(),
+            cidrs: vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ],
+            ports: Vec::new(),
+            proxy: None,
+            updated_at: "2026-11-09T00:00:00Z".to_string(),
+        };
+        assert!(crate::egress_policy::is_legacy_equivalent(&policy));
+
+        let rendered =
+            render_compose_with_project_and_policy(&config(), &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(doc["services"]["agent"]["environment"]
+            .get("HTTP_PROXY")
+            .is_none());
+        assert!(doc["services"]["agent"]["environment"]
+            .get("HTTPS_PROXY")
+            .is_none());
+
+        // An empty allow policy blocks nothing the firewall does not: still
+        // legacy-equivalent, still no proxy.
+        policy.cidrs.clear();
+        assert!(crate::egress_policy::is_legacy_equivalent(&policy));
+        let rendered =
+            render_compose_with_project_and_policy(&config(), &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(doc["services"]["agent"]["environment"]
+            .get("HTTP_PROXY")
+            .is_none());
+
+        // One entry outside RFC 1918 needs the proxy: the firewall does not
+        // drop it.
+        policy.cidrs = vec!["10.0.0.0/8".to_string(), "203.0.113.0/24".to_string()];
+        assert!(!crate::egress_policy::is_legacy_equivalent(&policy));
+        let rendered =
+            render_compose_with_project_and_policy(&config(), &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["environment"]
+                .get("HTTP_PROXY")
+                .and_then(Value::as_str),
+            Some("http://fleett-egress-proxy:3128")
+        );
+
+        // An FQDN or a port restriction is a real exception too.
+        for mutated in [
+            EgressPolicy {
+                cidrs: vec!["10.0.0.0/8".to_string()],
+                fqdns: vec!["api.github.com".to_string()],
+                ..policy.clone()
+            },
+            EgressPolicy {
+                cidrs: vec!["10.0.0.0/8".to_string()],
+                ports: vec![443],
+                ..policy.clone()
+            },
+        ] {
+            let rendered = render_compose_with_project_and_policy(
+                &config(),
+                &instance,
+                None,
+                &[],
+                Some(&mutated),
+            )
+            .expect("compose renders");
+            let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+            assert_eq!(
+                doc["services"]["agent"]["environment"]
+                    .get("HTTP_PROXY")
+                    .and_then(Value::as_str),
+                Some("http://fleett-egress-proxy:3128"),
+                "{mutated:?}"
+            );
+        }
+    }
+
+    /// An explicit proxy is intent: even a legacy-equivalent policy keeps it,
+    /// and a per-policy override wins over `FLEETT_EGRESS_PROXY`.
+    #[test]
+    fn compose_keeps_the_proxy_when_it_is_explicit() {
+        use crate::egress_policy::PolicyMode;
+
+        let instance = spec(ChannelKind::None);
+        let policy = EgressPolicy {
+            instance_id: "alice".to_string(),
+            mode: PolicyMode::Allow,
+            fqdns: Vec::new(),
+            cidrs: vec!["10.0.0.0/8".to_string()],
+            ports: Vec::new(),
+            proxy: None,
+            updated_at: "2026-11-09T00:00:00Z".to_string(),
+        };
+        assert!(crate::egress_policy::is_legacy_equivalent(&policy));
+
+        // The operator replaced the built-in default: their proxy, their rules.
+        let mut cfg = config();
+        cfg.egress_proxy = "http://corp-proxy.internal:8080".to_string();
+        let rendered =
+            render_compose_with_project_and_policy(&cfg, &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["environment"]
+                .get("HTTP_PROXY")
+                .and_then(Value::as_str),
+            Some("http://corp-proxy.internal:8080")
+        );
+
+        // A per-policy proxy override is explicit too, and wins.
+        let policy = EgressPolicy {
+            proxy: Some("http://instance-proxy:3128".to_string()),
+            ..policy
+        };
+        let rendered =
+            render_compose_with_project_and_policy(&config(), &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert_eq!(
+            doc["services"]["agent"]["environment"]
+                .get("HTTP_PROXY")
+                .and_then(Value::as_str),
+            Some("http://instance-proxy:3128")
+        );
     }
 
     #[test]

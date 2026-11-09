@@ -89,38 +89,62 @@ pub struct PolicyView {
     pub ports: Vec<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Proxy the instance is pointed at, when one is rendered at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
     /// Squid ACL snippet generated from an explicit policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_acl: Option<String>,
+    /// Whether the policy decides nothing more than the host firewall does, in
+    /// which case no proxy variable is rendered (issue #58).
+    pub legacy_equivalent: bool,
     pub warnings: Vec<String>,
 }
 
-fn policy_view(
-    cfg: &crate::config::Config,
+async fn policy_view(
+    state: &AppState,
     spec: &InstanceSpec,
     policy: Option<&EgressPolicy>,
 ) -> PolicyView {
+    let cfg = state.cfg.as_ref();
     let effective = egress_policy::effective(cfg, spec, policy);
     let mut warnings = Vec::new();
-    if policy.is_some() {
-        if cfg.egress_proxy_url().is_none() {
+    let proxy = policy.and_then(|policy| egress_policy::proxy_url(cfg, policy));
+    if let Some(policy) = policy {
+        if proxy.is_none() && egress_policy::needs_proxy(cfg, policy) {
             warnings.push(
-                "FLEETT_EGRESS_PROXY is empty: the policy is stored but no HTTP(S)_PROXY is \
-                 rendered, so nothing routes the agent through the proxy"
+                "FLEETT_EGRESS_PROXY does not name a proxy and the policy has no proxy override: \
+                 the policy is stored but no HTTP(S)_PROXY is rendered, so nothing routes the \
+                 agent through the proxy"
                     .to_string(),
             );
         }
         if spec.allow_lan {
-            warnings.push(
+            warnings.push(if proxy.is_some() {
                 "allow_lan is enabled: the instance joins the unrestricted LAN network and can \
                  bypass the proxy entirely; set allow_lan=false to enforce the policy"
-                    .to_string(),
-            );
+                    .to_string()
+            } else {
+                "allow_lan is enabled: the instance joins the unrestricted LAN network, which the \
+                 host egress firewall does not filter; set allow_lan=false to isolate it"
+                    .to_string()
+            });
         }
         if cfg.egress == crate::config::EgressMode::Off {
             warnings.push(firewall::WARNING_DISABLED.to_string());
+        }
+        // A rendered proxy that does not answer cuts *every* outbound
+        // connection, which is exactly the silent outage of issue #58: say it
+        // here instead of waiting for the operator to read aiohttp tracebacks.
+        if let Some(proxy_url) = proxy.as_deref() {
+            if let Err(detail) = state.egress_probe.reachable(proxy_url).await {
+                warnings.push(format!(
+                    "{detail}: the instance points at a proxy that does not answer, so every \
+                     outbound connection fails; start the proxy or remove the policy with \
+                     DELETE /api/instances/{}/egress",
+                    spec.id
+                ));
+            }
         }
     } else {
         warnings.extend(firewall::warnings(cfg, spec.allow_lan));
@@ -133,8 +157,9 @@ fn policy_view(
         cidrs: effective.cidrs.clone(),
         ports: effective.ports.clone(),
         updated_at: policy.map(|policy| policy.updated_at.clone()),
-        proxy: policy.and(cfg.egress_proxy_url()).map(str::to_string),
+        proxy,
         proxy_acl: policy.map(egress_policy::squid_acl),
+        legacy_equivalent: policy.is_some_and(egress_policy::is_legacy_equivalent),
         warnings,
     }
 }
@@ -146,7 +171,7 @@ pub async fn get_policy(
 ) -> Result<Json<PolicyView>, ApiError> {
     let spec = instances::load(&state, &id)?;
     let policy = egress_policy::load(&state.db, &id).map_err(ApiError::from)?;
-    Ok(Json(policy_view(&state.cfg, &spec, policy.as_ref())))
+    Ok(Json(policy_view(&state, &spec, policy.as_ref()).await))
 }
 
 /// Rewrite the compose file and apply it, keeping the policy as the source of
@@ -161,6 +186,8 @@ async fn apply(state: &AppState, spec: &mut InstanceSpec) -> Result<(), ApiError
 /// The compose file is rewritten and the container restarted so the proxy
 /// variables reach the process. A failure after the database write restores the
 /// previous row rather than leaving the store and the container disagreeing.
+/// An unreachable proxy is reported in `warnings`, never as an error: the
+/// operator decides whether to start the proxy or remove the policy (#58).
 pub async fn put_policy(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -181,6 +208,7 @@ pub async fn put_policy(
         fqdns: normalized.fqdns,
         cidrs: normalized.cidrs,
         ports: normalized.ports,
+        proxy: normalized.proxy,
         updated_at: now_iso(),
     };
     egress_policy::upsert(&state.db, &policy).map_err(ApiError::from)?;
@@ -189,6 +217,9 @@ pub async fn put_policy(
         restore(&state, &id, previous.as_ref());
         return Err(err);
     }
+    // The policy may have changed the proxy: probe again instead of reusing a
+    // result cached for another configuration.
+    state.egress_probe.clear();
 
     audit::record(
         &state,
@@ -200,9 +231,11 @@ pub async fn put_policy(
             "fqdns": policy.fqdns,
             "cidrs": policy.cidrs,
             "ports": policy.ports,
+            // The URL itself may carry credentials: log only that one is set.
+            "proxy": policy.proxy.is_some(),
         })),
     );
-    Ok(Json(policy_view(&state.cfg, &spec, Some(&policy))))
+    Ok(Json(policy_view(&state, &spec, Some(&policy)).await))
 }
 
 /// `DELETE /api/instances/{id}/egress` — drop the explicit policy and fall
@@ -228,9 +261,11 @@ pub async fn delete_policy(
         restore(&state, &id, previous.as_ref());
         return Err(err);
     }
+    // The proxy variables just disappeared: drop a cached failure for them.
+    state.egress_probe.clear();
 
     audit::record(&state, &context, "egress.policy.delete", &id, None);
-    Ok(Json(policy_view(&state.cfg, &spec, None)))
+    Ok(Json(policy_view(&state, &spec, None).await))
 }
 
 /// Best-effort rollback of a policy row after a failed compose apply.
@@ -281,8 +316,8 @@ pub struct TestResponse {
 ///
 /// The endpoint is honest about the gap: `allowed` comes from the policy, and
 /// `enforced` only becomes true when the proxy TCP endpoint answers (explicit
-/// policy) or the host firewall marker matches (legacy). The probe does not
-/// verify that the proxy ACLs match the stored policy.
+/// policy that needs one) or the host firewall marker matches (legacy, and any
+/// policy equivalent to it).
 pub async fn test(
     Path(id): Path<String>,
     State(state): State<AppState>,
@@ -300,8 +335,7 @@ pub async fn test(
     let policy = egress_policy::load(&state.db, &id).map_err(ApiError::from)?;
     let effective = egress_policy::effective(&state.cfg, &spec, policy.as_ref());
     let decision = effective.evaluate(&host, port);
-    let (enforced, enforcement, proxy) =
-        enforcement(&state, &spec, policy.as_ref(), effective.source).await;
+    let (enforced, enforcement, proxy) = enforcement(&state, &spec, policy.as_ref()).await;
 
     Ok(Json(TestResponse {
         instance: id,
@@ -321,47 +355,16 @@ async fn enforcement(
     state: &AppState,
     spec: &InstanceSpec,
     policy: Option<&EgressPolicy>,
-    source: egress_policy::PolicySource,
 ) -> (bool, Option<String>, Option<String>) {
-    if policy.is_some() {
-        let proxy = state.cfg.egress_proxy_url().map(str::to_string);
-        let Some(proxy_url) = proxy.as_deref() else {
-            return (
-                false,
-                Some(
-                    "FLEETT_EGRESS_PROXY is empty: no proxy is configured, the policy is \
-                     recorded but not enforced"
-                        .to_string(),
-                ),
-                None,
-            );
-        };
-        if spec.allow_lan {
-            return (
-                false,
-                Some(
-                    "allow_lan=true: the instance joins the unrestricted LAN network and can \
-                     bypass the proxy"
-                        .to_string(),
-                ),
-                Some(proxy_url.to_string()),
-            );
+    if let Some(policy) = policy {
+        if egress_policy::needs_proxy(&state.cfg, policy) {
+            return proxy_enforcement(state, spec, policy).await;
         }
-        return match egress_policy::probe_proxy(proxy_url).await {
-            Ok(target) => (
-                true,
-                Some(format!(
-                    "proxy {target} is reachable; this probe checks the socket only, not that \
-                     its ACLs match the stored policy"
-                )),
-                Some(proxy_url.to_string()),
-            ),
-            Err(detail) => (false, Some(detail), Some(proxy_url.to_string())),
-        };
+        // A policy equivalent to the legacy host firewall renders no proxy:
+        // the component that enforces it is the host firewall, checked below.
     }
-
-    match source {
-        egress_policy::PolicySource::AllowLan => (
+    if spec.allow_lan {
+        return (
             false,
             Some(
                 "allow_lan=true: the instance joins the unrestricted LAN network; no destination \
@@ -369,31 +372,71 @@ async fn enforcement(
                     .to_string(),
             ),
             None,
+        );
+    }
+    if state.cfg.egress == crate::config::EgressMode::Off {
+        return (false, Some(firewall::WARNING_DISABLED.to_string()), None);
+    }
+    let marker = firewall::read_marker(&state.cfg.egress_marker);
+    let subnet = state
+        .driver
+        .network_subnet(&spec.host, &state.cfg.network)
+        .await
+        .ok()
+        .flatten();
+    match firewall::check_marker(&marker, subnet.as_deref()) {
+        Ok(()) => (
+            true,
+            Some(
+                "the host egress firewall is installed for the current fleett subnet; Internet \
+                 destinations stay reachable and LAN destinations are dropped"
+                    .to_string(),
+            ),
+            None,
         ),
-        egress_policy::PolicySource::Disabled => {
-            (false, Some(firewall::WARNING_DISABLED.to_string()), None)
-        }
-        _ => {
-            let marker = firewall::read_marker(&state.cfg.egress_marker);
-            let subnet = state
-                .driver
-                .network_subnet(&spec.host, &state.cfg.network)
-                .await
-                .ok()
-                .flatten();
-            match firewall::check_marker(&marker, subnet.as_deref()) {
-                Ok(()) => (
-                    true,
-                    Some(
-                        "the host egress firewall is installed for the current fleett subnet; \
-                         Internet destinations stay reachable and LAN destinations are dropped"
-                            .to_string(),
-                    ),
-                    None,
-                ),
-                Err(detail) => (false, Some(detail), None),
-            }
-        }
+        Err(detail) => (false, Some(detail), None),
+    }
+}
+
+async fn proxy_enforcement(
+    state: &AppState,
+    spec: &InstanceSpec,
+    policy: &EgressPolicy,
+) -> (bool, Option<String>, Option<String>) {
+    let proxy = egress_policy::proxy_url(&state.cfg, policy);
+    let Some(proxy_url) = proxy.as_deref() else {
+        return (
+            false,
+            Some(
+                "FLEETT_EGRESS_PROXY does not name a proxy and the policy has no proxy override: \
+                 nothing routes the agent through a proxy, so the policy is recorded but not \
+                 enforced"
+                    .to_string(),
+            ),
+            None,
+        );
+    };
+    if spec.allow_lan {
+        return (
+            false,
+            Some(
+                "allow_lan=true: the instance joins the unrestricted LAN network and can bypass \
+                 the proxy"
+                    .to_string(),
+            ),
+            Some(proxy_url.to_string()),
+        );
+    }
+    match state.egress_probe.reachable(proxy_url).await {
+        Ok(target) => (
+            true,
+            Some(format!(
+                "proxy {target} is reachable; this probe checks the socket only, not that its \
+                 ACLs match the stored policy"
+            )),
+            Some(proxy_url.to_string()),
+        ),
+        Err(detail) => (false, Some(detail), Some(proxy_url.to_string())),
     }
 }
 

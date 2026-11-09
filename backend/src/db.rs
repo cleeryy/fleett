@@ -671,6 +671,12 @@ CREATE TABLE IF NOT EXISTS instance_skills (
 
 CREATE INDEX IF NOT EXISTS idx_instance_skills_name ON instance_skills (name);
 "#,
+    // v28 — optional per-policy proxy override (issue #58). NULL keeps the
+    // global `FLEETT_EGRESS_PROXY`; a value points this one instance at its own
+    // proxy. The column is additive: a v27 database keeps its policies.
+    r#"
+ALTER TABLE egress_policies ADD COLUMN proxy TEXT;
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

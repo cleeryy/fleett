@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default proxy address rendered into every instance that has a policy.
 pub const DEFAULT_PROXY_URL: &str = "http://fleett-egress-proxy:3128";
@@ -109,6 +109,9 @@ pub struct EgressPolicy {
     pub fqdns: Vec<String>,
     pub cidrs: Vec<String>,
     pub ports: Vec<u16>,
+    /// Proxy this instance uses instead of `FLEETT_EGRESS_PROXY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     pub updated_at: String,
 }
 
@@ -123,6 +126,9 @@ pub struct PolicyInput {
     pub cidrs: Option<Vec<String>>,
     #[serde(default)]
     pub ports: Option<Vec<u16>>,
+    /// Per-policy proxy override; `off`/`none`/`disabled`/empty clears it.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 /// Where an effective policy comes from.
@@ -224,6 +230,82 @@ pub fn effective(
     }
 }
 
+/// Whether `policy` decides nothing the legacy host firewall does not.
+///
+/// In `allow` mode the entries are a *blocklist*. The host firewall drops every
+/// RFC 1918 destination for a restricted instance, so a blocklist made only of
+/// RFC 1918 ranges — or no entry at all — cannot narrow egress further. Such a
+/// policy must not render `HTTP(S)_PROXY`: the proxy would add a failure mode
+/// without adding a decision (issue #58: a dead proxy cut every connection).
+///
+/// Anything else needs the proxy: `deny` mode, an FQDN, a port restriction, an
+/// IPv6 or public CIDR, or a per-policy proxy override.
+pub fn is_legacy_equivalent(policy: &EgressPolicy) -> bool {
+    policy.mode == PolicyMode::Allow
+        && policy.fqdns.is_empty()
+        && policy.ports.is_empty()
+        && policy.cidrs.iter().all(|cidr| cidr_is_rfc1918(cidr))
+}
+
+/// Whether `cidr` is entirely inside `10.0.0.0/8`, `172.16.0.0/12` or
+/// `192.168.0.0/16` (the ranges the host firewall drops).
+fn cidr_is_rfc1918(cidr: &str) -> bool {
+    const RANGES: [(u32, u8); 3] = [
+        (0x0a00_0000, 8),  // 10.0.0.0/8
+        (0xac10_0000, 12), // 172.16.0.0/12
+        (0xc0a8_0000, 16), // 192.168.0.0/16
+    ];
+    let Some((address, prefix)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let Ok(IpAddr::V4(address)) = address.parse::<IpAddr>() else {
+        // IPv6 is out of scope for the host firewall, so it is a real
+        // exception that the policy has to enforce through the proxy.
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let bits = u32::from(address);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let network = bits & mask;
+    RANGES.iter().any(|(range, range_prefix)| {
+        prefix >= *range_prefix && network & (u32::MAX << (32 - range_prefix)) == *range
+    })
+}
+
+/// Whether the policy needs the proxy at all.
+///
+/// A legacy-equivalent policy does not, unless a proxy was configured
+/// explicitly: a per-policy `proxy` override, or a `FLEETT_EGRESS_PROXY` the
+/// operator changed from its built-in default. That explicitness is intent —
+/// the operator wants this traffic through their own proxy.
+pub fn needs_proxy(cfg: &Config, policy: &EgressPolicy) -> bool {
+    policy.proxy.is_some() || cfg.egress_proxy_is_explicit() || !is_legacy_equivalent(policy)
+}
+
+/// Proxy URL rendered for `policy`, when one must be.
+///
+/// Per-policy override first, then `FLEETT_EGRESS_PROXY`. `None` means "render
+/// no proxy variable": either the policy needs none (the host firewall covers
+/// it) or no proxy is configured.
+pub fn proxy_url(cfg: &Config, policy: &EgressPolicy) -> Option<String> {
+    if !needs_proxy(cfg, policy) {
+        return None;
+    }
+    policy
+        .proxy
+        .clone()
+        .or_else(|| cfg.egress_proxy_url().map(str::to_string))
+}
+
 /// A validated policy, ready to be stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedPolicy {
@@ -231,6 +313,7 @@ pub struct NormalizedPolicy {
     pub fqdns: Vec<String>,
     pub cidrs: Vec<String>,
     pub ports: Vec<u16>,
+    pub proxy: Option<String>,
 }
 
 /// Normalise and validate the body of a policy write.
@@ -265,7 +348,44 @@ pub fn normalize_input(input: &PolicyInput) -> Result<NormalizedPolicy, String> 
         fqdns,
         cidrs,
         ports,
+        proxy: normalize_proxy(input.proxy.as_deref())?,
     })
+}
+
+/// Normalise an optional proxy override.
+///
+/// `None`, an empty string, `off`, `none` and `disabled` all mean "no
+/// override": the instance falls back to `FLEETT_EGRESS_PROXY`. Anything else
+/// must be a `http://` or `https://` URL with a host, because the value is
+/// rendered as `HTTP_PROXY` verbatim.
+fn normalize_proxy(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if ["off", "none", "disabled"]
+        .iter()
+        .any(|closes| value.eq_ignore_ascii_case(closes))
+    {
+        return Ok(None);
+    }
+    validate_proxy(value).map(Some)
+}
+
+/// Validate one proxy URL, returning it without a trailing slash.
+pub fn validate_proxy(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        format!("\"{trimmed}\" is not a valid proxy URL: {err} (expected http://host:port)")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "\"{trimmed}\": the proxy URL must use http:// or https://"
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!("\"{trimmed}\": the proxy URL has no host"));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
 }
 
 fn normalize_list(
@@ -631,7 +751,7 @@ fn port_acl(policy: &EgressPolicy) -> String {
 // Storage
 // ---------------------------------------------------------------------------
 
-const POLICY_COLUMNS: &str = "instance_id, mode, fqdns, cidrs, ports, updated_at";
+const POLICY_COLUMNS: &str = "instance_id, mode, fqdns, cidrs, ports, proxy, updated_at";
 const BLOCK_COLUMNS: &str = "id, instance_id, host, port, reason, at";
 
 fn row_to_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<EgressPolicy> {
@@ -639,13 +759,17 @@ fn row_to_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<EgressPolicy> {
     let fqdns: String = row.get(2)?;
     let cidrs: String = row.get(3)?;
     let ports: String = row.get(4)?;
+    let proxy: Option<String> = row.get(5)?;
     Ok(EgressPolicy {
         instance_id: row.get(0)?,
         mode: PolicyMode::parse(&mode).unwrap_or(PolicyMode::Deny),
         fqdns: split_list(&fqdns),
         cidrs: split_list(&cidrs),
         ports: split_ports(&ports),
-        updated_at: row.get(5)?,
+        proxy: proxy
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        updated_at: row.get(6)?,
     })
 }
 
@@ -696,13 +820,14 @@ pub fn load(db: &Db, instance_id: &str) -> Result<Option<EgressPolicy>, DbError>
 pub fn upsert(db: &Db, policy: &EgressPolicy) -> Result<(), DbError> {
     db.with_conn(|conn| {
         conn.execute(
-            "INSERT INTO egress_policies (instance_id, mode, fqdns, cidrs, ports, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO egress_policies (instance_id, mode, fqdns, cidrs, ports, proxy, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (instance_id) DO UPDATE SET \
                  mode = excluded.mode, \
                  fqdns = excluded.fqdns, \
                  cidrs = excluded.cidrs, \
                  ports = excluded.ports, \
+                 proxy = excluded.proxy, \
                  updated_at = excluded.updated_at",
             params![
                 policy.instance_id,
@@ -710,6 +835,7 @@ pub fn upsert(db: &Db, policy: &EgressPolicy) -> Result<(), DbError> {
                 join_list(&policy.fqdns),
                 join_list(&policy.cidrs),
                 join_ports(&policy.ports),
+                policy.proxy,
                 policy.updated_at,
             ],
         )
@@ -814,8 +940,10 @@ pub fn clear_blocks(db: &Db, instance_id: &str) -> Result<usize, DbError> {
 /// Whether a TCP connection to the proxy succeeds.
 ///
 /// This deliberately checks the socket only: it proves the proxy process is
-/// reachable, not that its ACLs match the policy. `POST …/egress/test` reports
-/// the distinction instead of pretending a policy is enforced.
+/// reachable, not that its ACLs match the policy. `POST …/egress/test` and the
+/// warnings of `GET|PUT …/egress` report the distinction instead of pretending
+/// a policy is enforced. The API reaches this through [`ProxyProbeCache`] so a
+/// dead proxy does not slow every read.
 pub async fn probe_proxy(proxy_url: &str) -> Result<String, String> {
     let parsed = url::Url::parse(proxy_url)
         .map_err(|err| format!("\"{proxy_url}\" is not a valid proxy URL: {err}"))?;
@@ -837,6 +965,74 @@ pub async fn probe_proxy(proxy_url: &str) -> Result<String, String> {
             "proxy {target} did not answer within {} ms",
             PROXY_PROBE_TIMEOUT.as_millis()
         )),
+    }
+}
+
+/// Time a proxy probe result is reused before the socket is retried.
+///
+/// `GET …/egress` must not pay a 750 ms timeout on every console refresh, and a
+/// dead proxy must not turn every read into a slow request; the trade-off is
+/// that a proxy started less than ten seconds ago is still reported as down.
+pub const PROXY_PROBE_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// Cached reachability of the proxies the API renders.
+///
+/// One entry per proxy URL, successes *and* failures cached for
+/// [`PROXY_PROBE_CACHE_TTL`]. The cache is per process and never persisted: a
+/// restart is exactly when an operator expects a fresh probe.
+#[derive(Debug, Default)]
+pub struct ProxyProbeCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, CachedProbe>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProbe {
+    at: Instant,
+    result: Result<String, String>,
+}
+
+impl ProxyProbeCache {
+    /// Whether `proxy_url` answers, reusing a probe younger than the TTL.
+    pub async fn reachable(&self, proxy_url: &str) -> Result<String, String> {
+        if let Some(result) = self.cached(proxy_url) {
+            return result;
+        }
+        let result = probe_proxy(proxy_url).await;
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The map is keyed by proxy URL; a fleet has one, tests a handful.
+        if entries.len() > 64 {
+            entries.retain(|_, probe| probe.at.elapsed() < PROXY_PROBE_CACHE_TTL);
+        }
+        entries.insert(
+            proxy_url.to_string(),
+            CachedProbe {
+                at: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        result
+    }
+
+    fn cached(&self, proxy_url: &str) -> Option<Result<String, String>> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .get(proxy_url)
+            .filter(|probe| probe.at.elapsed() < PROXY_PROBE_CACHE_TTL)
+            .map(|probe| probe.result.clone())
+    }
+
+    /// Drop every cached result (tests and `PUT` after a restart).
+    pub fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }
 
@@ -884,6 +1080,7 @@ mod tests {
             fqdns: fqdns.iter().map(|value| value.to_string()).collect(),
             cidrs: cidrs.iter().map(|value| value.to_string()).collect(),
             ports: ports.to_vec(),
+            proxy: None,
             updated_at: "2026-11-09T00:00:00Z".to_string(),
         }
     }
@@ -933,6 +1130,7 @@ mod tests {
             ]),
             cidrs: Some(vec!["10.0.0.0/8".to_string()]),
             ports: Some(vec![443, 80, 443]),
+            proxy: None,
         })
         .expect("valid policy");
         assert_eq!(normalized.mode, PolicyMode::Deny);
@@ -1089,23 +1287,201 @@ mod tests {
     }
 
     #[test]
+    fn legacy_equivalence_only_covers_the_host_firewall() {
+        // The blocklist of the legacy `FLEETT_EGRESS=restrict` rules.
+        assert!(is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &LAN_CIDRS,
+            &[]
+        )));
+        // A narrower blocklist decides nothing the firewall does not.
+        assert!(is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &["10.1.0.0/16", "192.168.1.0/24", "172.16.5.0/24"],
+            &[]
+        )));
+        // An empty allow policy blocks nothing at all.
+        assert!(is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &[],
+            &[]
+        )));
+        // The same ranges in deny mode would allow *only* the LAN: the host
+        // firewall cannot express that, so the proxy is required.
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Deny,
+            &[],
+            &LAN_CIDRS,
+            &[]
+        )));
+        // A public or IPv6 destination is not dropped by the v4 host rules.
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &["203.0.113.0/24"],
+            &[]
+        )));
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &["fd00::/8"],
+            &[]
+        )));
+        // A wide range that *contains* RFC 1918 is not inside it.
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &["0.0.0.0/0"],
+            &[]
+        )));
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &["10.0.0.0/7"],
+            &[]
+        )));
+        // An FQDN or a port restriction is a real exception.
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &["blocked.test"],
+            &LAN_CIDRS,
+            &[]
+        )));
+        assert!(!is_legacy_equivalent(&policy(
+            PolicyMode::Allow,
+            &[],
+            &LAN_CIDRS,
+            &[443]
+        )));
+    }
+
+    #[test]
+    fn the_proxy_is_rendered_only_when_the_policy_or_the_operator_needs_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut cfg = Config::for_tests(dir.path().to_path_buf());
+        let legacy = policy(PolicyMode::Allow, &[], &LAN_CIDRS, &[]);
+
+        // Default configuration: the host firewall covers it, no proxy.
+        assert!(!needs_proxy(&cfg, &legacy));
+        assert_eq!(proxy_url(&cfg, &legacy), None);
+
+        // A deny policy, an FQDN or a port needs the proxy.
+        let deny = policy(PolicyMode::Deny, &["api.github.com"], &[], &[443]);
+        assert!(needs_proxy(&cfg, &deny));
+        assert_eq!(
+            proxy_url(&cfg, &deny).as_deref(),
+            Some(DEFAULT_PROXY_URL),
+            "the built-in default is used when the operator configured none"
+        );
+
+        // `FLEETT_EGRESS_PROXY=off` renders nothing and says so.
+        cfg.egress_proxy = "off".to_string();
+        assert!(needs_proxy(&cfg, &deny));
+        assert_eq!(proxy_url(&cfg, &deny), None);
+        // ... but it does not make a legacy-equivalent policy need one.
+        assert!(!needs_proxy(&cfg, &legacy));
+
+        // A proxy of the operator's own is explicit: keep it, even for a
+        // legacy-equivalent policy.
+        cfg.egress_proxy = "http://corp-proxy.internal:8080".to_string();
+        assert!(needs_proxy(&cfg, &legacy));
+        assert_eq!(
+            proxy_url(&cfg, &legacy).as_deref(),
+            Some("http://corp-proxy.internal:8080")
+        );
+
+        // A per-policy override wins over the global setting.
+        let with_proxy = EgressPolicy {
+            proxy: Some("http://instance-proxy:3128".to_string()),
+            ..legacy.clone()
+        };
+        assert_eq!(
+            proxy_url(&cfg, &with_proxy).as_deref(),
+            Some("http://instance-proxy:3128")
+        );
+    }
+
+    #[test]
+    fn proxy_urls_are_validated_and_normalised() {
+        assert_eq!(
+            normalize_proxy(Some(" http://fleett-egress-proxy:3128/ ")).expect("valid"),
+            Some("http://fleett-egress-proxy:3128".to_string())
+        );
+        assert_eq!(
+            normalize_proxy(Some("https://proxy.example.com")).expect("valid"),
+            Some("https://proxy.example.com".to_string())
+        );
+        for cleared in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("off"),
+            Some("NONE"),
+            Some("disabled"),
+        ] {
+            assert_eq!(
+                normalize_proxy(cleared).expect("cleared"),
+                None,
+                "{cleared:?}"
+            );
+        }
+        assert!(normalize_proxy(Some("fleett-egress-proxy:3128")).is_err());
+        assert!(normalize_proxy(Some("ftp://proxy:21")).is_err());
+        assert!(normalize_proxy(Some("http://")).is_err());
+        assert!(validate_proxy("socks5://proxy:1080").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_probe_cache_reuses_a_result_for_ten_seconds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let proxy = format!("http://{}", listener.local_addr().expect("address"));
+        let cache = ProxyProbeCache::default();
+
+        assert!(cache.reachable(&proxy).await.is_ok());
+        // The listener is gone, but the cached success is younger than the TTL.
+        drop(listener);
+        assert!(
+            cache.reachable(&proxy).await.is_ok(),
+            "a result younger than the TTL is reused"
+        );
+        cache.clear();
+        assert!(
+            cache.reachable(&proxy).await.is_err(),
+            "a cleared cache probes again"
+        );
+
+        // Failures are cached too: a dead proxy does not slow every read.
+        assert!(cache.reachable("http://127.0.0.1:9").await.is_err());
+        assert!(cache.reachable("http://127.0.0.1:9").await.is_err());
+    }
+
+    #[test]
     fn stored_policies_round_trip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Db::open(&dir.path().join("fleet.db")).expect("open db");
         assert!(load(&db, "alice").expect("load").is_none());
 
-        let stored = policy(
-            PolicyMode::Deny,
-            &["api.github.com", "*.example.com"],
-            &["10.0.0.0/8"],
-            &[80, 443],
-        );
+        let stored = EgressPolicy {
+            proxy: Some("http://instance-proxy:3128".to_string()),
+            ..policy(
+                PolicyMode::Deny,
+                &["api.github.com", "*.example.com"],
+                &["10.0.0.0/8"],
+                &[80, 443],
+            )
+        };
         upsert(&db, &stored).expect("insert");
         let loaded = load(&db, "alice").expect("load").expect("row");
         assert_eq!(loaded.mode, PolicyMode::Deny);
         assert_eq!(loaded.fqdns, ["api.github.com", "*.example.com"]);
         assert_eq!(loaded.cidrs, ["10.0.0.0/8"]);
         assert_eq!(loaded.ports, [80, 443]);
+        assert_eq!(loaded.proxy.as_deref(), Some("http://instance-proxy:3128"));
 
         let replaced = policy(PolicyMode::Allow, &["blocked.test"], &[], &[]);
         upsert(&db, &replaced).expect("update");
@@ -1113,6 +1489,7 @@ mod tests {
         assert_eq!(loaded.mode, PolicyMode::Allow);
         assert_eq!(loaded.fqdns, ["blocked.test"]);
         assert!(loaded.cidrs.is_empty());
+        assert_eq!(loaded.proxy, None, "the override is replaced with the row");
 
         assert!(delete(&db, "alice").expect("delete"));
         assert!(load(&db, "alice").expect("load").is_none());
