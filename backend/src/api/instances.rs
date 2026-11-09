@@ -1167,7 +1167,8 @@ fn render_for_update(
     }
 }
 
-fn load(state: &AppState, id: &str) -> Result<InstanceSpec, ApiError> {
+/// Stored spec of one instance, or `404`.
+pub(crate) fn load(state: &AppState, id: &str) -> Result<InstanceSpec, ApiError> {
     state
         .db
         .get(id)

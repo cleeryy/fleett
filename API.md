@@ -126,6 +126,30 @@ To keep a stored secret in a full replace, resend `{"key":"TOKEN","secret":true}
 has no secrets key yet (`sudo fleett secrets init`). Templates expose suggested variables in
 their `env` field (Telegram/Discord allowlists).
 
+### Instance files
+
+Browse and edit the files inside `FLEETT_ROOT/instances/<id>/data` (the Hermes
+home mounted at `/opt/data`). Paths are virtual: `/` is the data directory.
+`..`, NUL and relative paths are `400 invalid_path`; a symlink escaping the
+directory is `400 path_escape`. Reads need any role, mutations need `admin`.
+See `docs/FILES.md` for the full security model.
+
+| Method | Route | Body | Effect |
+|---|---|---|---|
+| GET | `/api/instances/{id}/files?path=/` | — | `[{name,path,type:"file\|dir",size,mtime,editable,rendered}]`, one level |
+| GET | `/api/instances/{id}/files/content?path=/SOUL.md` | — | `{path,content,etag,size,mtime,editable,rendered,note?}`; `413` above 512 KiB, `415` binary |
+| PUT | `/api/instances/{id}/files/content[?restart=true]` | `{"path","content","etag"}` | compare-and-swap write; `409 etag_mismatch` on a stale/missing etag; timestamped `.bak` before overwrite; `restart=true` restarts and returns `{restarted,status}` |
+| DELETE | `/api/instances/{id}/files/content?path=/notes/old.md` | — | `204`; files and empty directories only (`409 directory_not_empty`), never a rendered file |
+| POST | `/api/instances/{id}/files/mkdir` | `{"path":"/profiles"}` | `201 {path,type:"dir"}`, parent must exist |
+
+`etag` is the lowercase SHA-256 of the bytes on disk. The `If-Match` header is
+accepted instead of the body field (`*` = the file must exist). Editing is
+limited to `.md .yaml .yml .json .txt .toml`; other text files are readable
+with `editable:false` (`409 file_not_editable` on write). `data/config.yaml`
+and `data/healthcheck.py` are rendered by fleett on every PATCH: they are
+readable with `editable:false`/`rendered:true`, and any write returns
+`409 file_regenerated`.
+
 ### LAN access and egress enforcement
 
 `allow_lan` is `false` by default: the instance only joins the restricted `fleett` network.

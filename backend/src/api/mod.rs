@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod error;
+pub mod files;
 pub mod health;
 pub mod instances;
 pub mod shares;
@@ -150,6 +151,14 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
+        .route("/instances/{id}/files", get(files::list))
+        .route(
+            "/instances/{id}/files/content",
+            get(files::read)
+                .put(files::write)
+                .delete(files::delete_file),
+        )
+        .route("/instances/{id}/files/mkdir", post(files::mkdir))
         .route("/instances/{id}/export", get(instances::export))
         .route("/instances/{id}/start", post(instances::start))
         .route("/instances/{id}/stop", post(instances::stop))

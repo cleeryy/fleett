@@ -3029,3 +3029,850 @@ async fn stopping_and_deleting_the_clone_leaves_the_source_alone() {
         .collect();
     assert_eq!(downs, ["bob"], "only the clone was brought down");
 }
+
+// ---------------------------------------------------------------------------
+// Instance files
+// ---------------------------------------------------------------------------
+
+fn data_dir(harness: &Harness, id: &str) -> PathBuf {
+    harness.instance_dir(id).join("data")
+}
+
+async fn fetch_file(harness: &Harness, id: &str, path: &str) -> (StatusCode, Value) {
+    let uri = format!("/api/instances/{id}/files/content?path={path}");
+    let (status, body) = harness.request(Method::GET, &uri, None).await;
+    (status, parse(&body))
+}
+
+async fn put_file(
+    harness: &Harness,
+    id: &str,
+    path: &str,
+    content: &str,
+    etag: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut body = json!({ "path": path, "content": content });
+    if let Some(etag) = etag {
+        body["etag"] = json!(etag);
+    }
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            &format!("/api/instances/{id}/files/content"),
+            Some(body),
+        )
+        .await;
+    (status, parse(&response))
+}
+
+async fn put_file_if_match(
+    harness: &Harness,
+    id: &str,
+    path: &str,
+    content: &str,
+    if_match: &str,
+) -> (StatusCode, String) {
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/api/instances/{id}/files/content"))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::IF_MATCH, format!("\"{if_match}\""))
+        .body(Body::from(
+            json!({ "path": path, "content": content }).to_string(),
+        ))
+        .expect("valid request");
+    let response = api::router(harness.state.clone())
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect body")
+        .to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tokio::test]
+async fn files_listing_shows_one_level_of_the_data_directory() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entries = entries.as_array().expect("array of entries");
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    for expected in ["SOUL.md", "config.yaml", "healthcheck.py"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+
+    let soul = entries
+        .iter()
+        .find(|entry| entry["name"] == "SOUL.md")
+        .expect("SOUL.md entry");
+    assert_eq!(soul["path"], "/SOUL.md");
+    assert_eq!(soul["type"], "file");
+    assert_eq!(soul["editable"], true);
+    assert_eq!(soul["rendered"], false);
+    assert!(soul["size"].as_u64().expect("size") > 0);
+    assert!(soul["mtime"].as_str().expect("mtime").ends_with('Z'));
+
+    let config = entries
+        .iter()
+        .find(|entry| entry["name"] == "config.yaml")
+        .expect("config.yaml entry");
+    assert_eq!(config["editable"], false);
+    assert_eq!(config["rendered"], true);
+
+    // `?path` defaults to the data root.
+    let (_, default_body) = harness
+        .request(Method::GET, "/api/instances/alice/files", None)
+        .await;
+    assert_eq!(parse(&default_body), parse(&body));
+
+    // One level only, and a directory gets its own listing.
+    let (status, response) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/skills"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    std::fs::write(data_dir(&harness, "alice").join("skills/NOTES.md"), "notes")
+        .expect("notes file");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/skills", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    assert_eq!(entries.as_array().expect("array").len(), 1);
+    assert_eq!(entries[0]["path"], "/skills/NOTES.md");
+    assert_eq!(entries[0]["editable"], true);
+
+    // The root listing never recurses into the subdirectory.
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/", None)
+        .await;
+    assert!(!parse(&body)
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|entry| entry["name"] == "NOTES.md"));
+
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files?path=/SOUL.md",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "not_a_directory");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/ghost", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(parse(&body)["error"]["code"], "not_found");
+
+    // A file is not a directory in the middle of a path either.
+    let (status, body) = harness
+        .request(
+            Method::GET,
+            "/api/instances/alice/files?path=/SOUL.md/skills",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "not_a_directory");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/ghost/files", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(parse(&body)["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn file_content_carries_the_etag_of_the_bytes_on_disk() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let on_disk =
+        std::fs::read_to_string(data_dir(&harness, "alice").join("SOUL.md")).expect("soul");
+
+    let (status, body) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["path"], "/SOUL.md");
+    assert_eq!(body["content"], on_disk);
+    assert_eq!(body["size"], on_disk.len());
+    assert_eq!(body["editable"], true);
+    assert_eq!(body["rendered"], false);
+    assert!(body.get("note").is_none());
+    let etag = body["etag"].as_str().expect("etag").to_string();
+    assert_eq!(etag.len(), 64);
+    assert!(etag.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // Reading twice yields the same etag; editing the file changes it.
+    let (_, again) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    assert_eq!(again["etag"], etag);
+    std::fs::write(
+        data_dir(&harness, "alice").join("SOUL.md"),
+        format!("{on_disk}\nextra"),
+    )
+    .expect("edit soul");
+    let (_, changed) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    assert_ne!(changed["etag"], etag);
+
+    let (status, body) = fetch_file(&harness, "alice", "/config.yaml").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["editable"], false);
+    assert_eq!(body["rendered"], true);
+    assert!(body["note"]
+        .as_str()
+        .expect("rendered note")
+        .contains("rendered by fleett"));
+
+    let (status, body) = fetch_file(&harness, "alice", "/").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "not_a_file");
+}
+
+#[tokio::test]
+async fn file_write_is_a_compare_and_swap() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let path = data_dir(&harness, "alice").join("SOUL.md");
+    let original = std::fs::read_to_string(&path).expect("soul");
+    let (_, body) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    let etag = body["etag"].as_str().expect("etag").to_string();
+
+    // A stale etag is refused and nothing changes on disk.
+    let (status, body) =
+        put_file(&harness, "alice", "/SOUL.md", "hijacked", Some("deadbeef")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "etag_mismatch");
+    assert_eq!(body["error"]["details"]["current"], etag);
+    assert_eq!(std::fs::read_to_string(&path).expect("soul"), original);
+
+    // An edit without any etag never overwrites an existing file.
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "hijacked", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "etag_mismatch");
+    assert_eq!(std::fs::read_to_string(&path).expect("soul"), original);
+
+    // The version the client loaded is accepted.
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "new soul", Some(&etag)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["path"], "/SOUL.md");
+    assert_eq!(body["editable"], true);
+    assert_eq!(std::fs::read_to_string(&path).expect("soul"), "new soul");
+    let fresh = body["etag"].as_str().expect("new etag").to_string();
+    assert_ne!(fresh, etag);
+    let (_, reread) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    assert_eq!(reread["etag"], fresh);
+
+    // The old etag is now stale.
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "again", Some(&etag)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["details"]["current"], fresh);
+
+    // If-Match is honoured (quoted, the way a browser sends it back).
+    let (status, body) =
+        put_file_if_match(&harness, "alice", "/SOUL.md", "via header", &fresh).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(std::fs::read_to_string(&path).expect("soul"), "via header");
+
+    // A file that does not exist yet is created with an empty etag.
+    let (status, body) = put_file(&harness, "alice", "/NEW.md", "created", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(data_dir(&harness, "alice").join("NEW.md")).expect("new file"),
+        "created"
+    );
+}
+
+#[tokio::test]
+async fn file_write_keeps_a_timestamped_backup() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let path = data_dir(&harness, "alice").join("SOUL.md");
+    let original = std::fs::read_to_string(&path).expect("soul");
+    let (_, body) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    let etag = body["etag"].as_str().expect("etag").to_string();
+
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "rewritten", Some(&etag)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let backup = body["backup"].as_str().expect("backup path");
+    assert!(
+        backup.starts_with("/SOUL.md.bak-"),
+        "unexpected backup path {backup}"
+    );
+    let stamp = backup.trim_start_matches("/SOUL.md.bak-");
+    assert_eq!(stamp.len(), 15, "YYYYMMDD-HHMMSS expected, got {stamp}");
+    assert_eq!(
+        std::fs::read_to_string(data_dir(&harness, "alice").join(&backup[1..]))
+            .expect("backup readable"),
+        original
+    );
+
+    // A creation has nothing to back up.
+    let (status, body) = put_file(&harness, "alice", "/FRESH.md", "new", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("backup").is_none());
+}
+
+#[tokio::test]
+async fn file_traversal_is_refused_and_writes_nothing() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let database = harness.root().join("fleet.db");
+    let before = std::fs::read(&database).expect("database readable");
+
+    for path in [
+        "../../fleet.db",
+        "/../fleet.db",
+        "/skills/../../fleet.db",
+        "/..",
+    ] {
+        let (status, body) = fetch_file(&harness, "alice", path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_path", "{path}");
+
+        let (status, body) = put_file(&harness, "alice", path, "owned", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_path", "{path}");
+    }
+
+    // The database is untouched and no backup landed next to it.
+    assert_eq!(std::fs::read(&database).expect("database readable"), before);
+    let stray: Vec<String> = std::fs::read_dir(harness.root())
+        .expect("root")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".bak-"))
+        .collect();
+    assert!(stray.is_empty(), "stray backups: {stray:?}");
+}
+
+#[tokio::test]
+async fn file_symlinks_cannot_escape_the_data_directory() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+    let outside = tempfile::tempdir().expect("outside dir");
+    std::fs::write(outside.path().join("secret.txt"), "top secret").expect("outside file");
+
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), data.join("leak.txt"))
+        .expect("file symlink");
+    let (status, body) = fetch_file(&harness, "alice", "/leak.txt").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "path_escape");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("outside"));
+
+    // A symlinked directory cannot receive a write either.
+    std::os::unix::fs::symlink(outside.path(), data.join("drop")).expect("dir symlink");
+    let (status, body) = put_file(&harness, "alice", "/drop/pwned.md", "owned", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "path_escape");
+    assert!(!outside.path().join("pwned.md").exists());
+
+    // Listing never advertises an escaping entry.
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/", None)
+        .await;
+    assert!(!parse(&body)
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|entry| entry["name"] == "leak.txt" || entry["name"] == "drop"));
+
+    // A link that stays inside the data directory is followed.
+    std::os::unix::fs::symlink(data.join("SOUL.md"), data.join("soul-link.md"))
+        .expect("inside symlink");
+    let (status, body) = fetch_file(&harness, "alice", "/soul-link.md").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body["content"].as_str().expect("content").is_empty());
+}
+
+#[tokio::test]
+async fn file_special_files_are_never_served() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+
+    // A socket is not a file: it cannot be read, deleted or advertised.
+    let _listener =
+        std::os::unix::net::UnixListener::bind(data.join("gateway.sock")).expect("socket");
+    let (status, body) = fetch_file(&harness, "alice", "/gateway.sock").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "unsupported_file_type");
+
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/", None)
+        .await;
+    assert!(!parse(&body)
+        .as_array()
+        .expect("array")
+        .iter()
+        .any(|entry| entry["name"] == "gateway.sock"));
+
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/gateway.sock",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "unsupported_file_type");
+    assert!(data.join("gateway.sock").exists());
+}
+
+#[tokio::test]
+async fn file_content_is_limited_to_text_under_the_size_cap() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+
+    // Exactly 512 KiB is accepted…
+    let at_cap = "a".repeat(512 * 1024);
+    let (status, body) = put_file(&harness, "alice", "/at-cap.txt", &at_cap, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["size"], 512 * 1024);
+
+    // …one byte more is refused, and nothing is written.
+    let above = "a".repeat(512 * 1024 + 1);
+    let (status, body) = put_file(&harness, "alice", "/above.txt", &above, None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["error"]["code"], "file_too_large");
+    assert_eq!(body["error"]["details"]["limit"], 512 * 1024);
+    assert!(!data.join("above.txt").exists());
+
+    // An oversized file already on disk is listed as read-only and refused.
+    std::fs::write(data.join("huge.txt"), "a".repeat(512 * 1024 + 1)).expect("huge file");
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/files?path=/", None)
+        .await;
+    let huge = parse(&body)
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["name"] == "huge.txt")
+        .expect("huge entry")
+        .clone();
+    assert_eq!(huge["editable"], false);
+    let (status, body) = fetch_file(&harness, "alice", "/huge.txt").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["code"], "file_too_large");
+
+    // Binary files are refused, never returned as mojibake.
+    std::fs::write(data.join("blob.bin"), [0u8, 159, 146, 150]).expect("binary file");
+    let (status, body) = fetch_file(&harness, "alice", "/blob.bin").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body["error"]["code"], "binary_file");
+
+    std::fs::write(data.join("latin.txt"), [0xE9, 0x74, 0xE9]).expect("invalid utf8");
+    let (status, body) = fetch_file(&harness, "alice", "/latin.txt").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body["error"]["code"], "binary_file");
+
+    std::fs::write(data.join("nul.txt"), b"hello\0world").expect("nul file");
+    let (status, body) = fetch_file(&harness, "alice", "/nul.txt").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body["error"]["code"], "binary_file");
+}
+
+#[tokio::test]
+async fn file_editing_is_limited_to_the_extension_allowlist() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+
+    std::fs::write(data.join("notes.png"), "plain text in disguise").expect("png");
+    let (status, body) = fetch_file(&harness, "alice", "/notes.png").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["editable"], false);
+    assert_eq!(body["content"], "plain text in disguise");
+
+    let (status, body) = put_file(&harness, "alice", "/notes.png", "changed", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "file_not_editable");
+    assert_eq!(
+        std::fs::read_to_string(data.join("notes.png")).expect("png"),
+        "plain text in disguise"
+    );
+
+    // A new file outside the allowlist is refused too.
+    let (status, body) = put_file(&harness, "alice", "/settings.ini", "x=1", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "file_not_editable");
+    assert!(!data.join("settings.ini").exists());
+
+    // Every allowlisted extension is accepted.
+    for (name, ext) in [
+        ("a.md", "md"),
+        ("a.yaml", "yaml"),
+        ("a.yml", "yml"),
+        ("a.json", "json"),
+        ("a.txt", "txt"),
+        ("a.toml", "toml"),
+    ] {
+        let (status, body) = put_file(&harness, "alice", &format!("/{name}"), "x", None).await;
+        assert_eq!(status, StatusCode::OK, "{ext}: {body}");
+        assert_eq!(body["editable"], true);
+    }
+}
+
+#[tokio::test]
+async fn rendered_files_are_read_only_and_explained() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = fetch_file(&harness, "alice", "/config.yaml").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["editable"], false);
+    assert_eq!(body["rendered"], true);
+    let etag = body["etag"].as_str().expect("etag").to_string();
+
+    for path in ["/config.yaml", "/healthcheck.py"] {
+        let (status, body) = put_file(&harness, "alice", path, "manual edit", Some(&etag)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "file_regenerated", "{path}");
+        assert_eq!(body["error"]["details"]["rendered"], true);
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("rendered by fleett"));
+    }
+
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/config.yaml",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(parse(&body)["error"]["code"], "file_regenerated");
+
+    // A symlinked directory cannot be used as a side door.
+    std::os::unix::fs::symlink(
+        data_dir(&harness, "alice"),
+        data_dir(&harness, "alice").join("alias"),
+    )
+    .expect("alias symlink");
+    let (status, body) = put_file(
+        &harness,
+        "alice",
+        "/alias/config.yaml",
+        "sneaky",
+        Some(&etag),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "file_regenerated");
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/alias/config.yaml",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(parse(&body)["error"]["code"], "file_regenerated");
+    assert!(data_dir(&harness, "alice").join("config.yaml").is_file());
+
+    // The next PATCH still regenerates the file untouched.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"notes": "patched"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = fetch_file(&harness, "alice", "/config.yaml").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn mkdir_and_delete_cover_files_and_empty_directories() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let data = data_dir(&harness, "alice");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/profiles"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(parse(&body)["path"], "/profiles");
+    assert_eq!(parse(&body)["type"], "dir");
+    assert!(data.join("profiles").is_dir());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/profiles"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(parse(&body)["error"]["code"], "already_exists");
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/missing/deep"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(parse(&body)["error"]["code"], "not_found");
+
+    // An empty directory may be deleted.
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/profiles",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!data.join("profiles").exists());
+
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/profiles",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(parse(&body)["error"]["code"], "not_found");
+
+    // A non-empty directory is refused.
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/work"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = put_file(&harness, "alice", "/work/brief.md", "brief", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/work",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(parse(&body)["error"]["code"], "directory_not_empty");
+
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/work/brief.md",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!data.join("work/brief.md").exists());
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/work",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The data directory itself is never deletable.
+    let (status, body) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&body)["error"]["code"], "not_a_file");
+}
+
+#[tokio::test]
+async fn file_write_can_restart_the_instance() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (_, body) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    let etag = body["etag"].as_str().expect("etag").to_string();
+    harness.mock.clear_calls();
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/files/content?restart=true",
+            Some(json!({"path": "/SOUL.md", "content": "boot me", "etag": etag})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = parse(&body);
+    assert_eq!(response["restarted"], true);
+    assert_eq!(response["status"], "running");
+    let calls = harness.mock.calls();
+    let restarts: Vec<&str> = calls
+        .iter()
+        .filter(|call| call.operation == "restart")
+        .map(|call| call.instance.as_str())
+        .collect();
+    assert_eq!(restarts, ["alice"]);
+
+    // Without the flag, saving never touches the container.
+    let etag = response["etag"].as_str().expect("etag").to_string();
+    harness.mock.clear_calls();
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "no restart", Some(&etag)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restarted"], false);
+    assert!(body.get("status").is_none());
+    assert!(harness.mock.calls().is_empty(), "no driver call expected");
+}
+
+#[tokio::test]
+async fn viewers_cannot_write_files() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/files?path=/",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/files/content?path=/SOUL.md",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/files/content",
+            Some(json!({"path": "/SOUL.md", "content": "nope"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(parse(&body)["error"]["code"], "forbidden");
+
+    let (status, _, _) = harness
+        .send(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/SOUL.md",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, _) = harness
+        .send(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/nope"})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!data_dir(&harness, "alice").join("nope").exists());
+}
+
+#[tokio::test]
+async fn file_mutations_are_audited() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let (_, body) = fetch_file(&harness, "alice", "/SOUL.md").await;
+    let etag = body["etag"].as_str().expect("etag").to_string();
+
+    let (status, body) = put_file(&harness, "alice", "/SOUL.md", "audited soul", Some(&etag)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/files/mkdir",
+            Some(json!({"path": "/notes"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            "/api/instances/alice/files/content?path=/notes",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=20", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = parse(&body);
+    let entries = entries.as_array().expect("audit array");
+    let find = |action: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["action"] == action)
+            .unwrap_or_else(|| panic!("no {action} audit entry: {entries:?}"))
+    };
+
+    let write = find("instance.file.write");
+    assert_eq!(write["target"], "alice");
+    assert_eq!(write["details"]["path"], "/SOUL.md");
+    assert_eq!(write["details"]["size"], "audited soul".len());
+    assert_eq!(write["details"]["restart"], false);
+    assert_eq!(write["actor"], "bootstrap");
+
+    let mkdir = find("instance.file.mkdir");
+    assert_eq!(mkdir["details"]["path"], "/notes");
+    let delete = find("instance.file.delete");
+    assert_eq!(delete["details"]["path"], "/notes");
+}
