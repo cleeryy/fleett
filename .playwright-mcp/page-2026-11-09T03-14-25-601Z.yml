@@ -1,0 +1,186 @@
+- generic [active] [ref=f5e1]:
+  - generic [ref=f5e2]:
+    - generic [ref=f5e17]:
+      - link [ref=f5e757] [cursor=pointer]:
+        - /url: "#main"
+        - text: Skip to content
+      - complementary [ref=f5e19]:
+        - generic [ref=f5e21]:
+          - generic [ref=f5e22]: fleett
+          - navigation [ref=f5e758]:
+            - link [ref=f5e759] [cursor=pointer]:
+              - /url: "#/instances"
+              - text: Instances
+            - link [ref=f5e760] [cursor=pointer]:
+              - /url: "#/messages"
+              - text: Messages
+            - link [ref=f5e761] [cursor=pointer]:
+              - /url: "#/memory"
+              - text: Memory
+            - link [ref=f5e762] [cursor=pointer]:
+              - /url: "#/providers"
+              - text: Providers
+            - link [ref=f5e763] [cursor=pointer]:
+              - /url: "#/shares"
+              - text: Shares
+            - link [ref=f5e764] [cursor=pointer]:
+              - /url: "#/templates"
+              - text: Templates
+            - link [ref=f5e765] [cursor=pointer]:
+              - /url: "#/tokens"
+              - text: Tokens
+            - link [ref=f5e766] [cursor=pointer]:
+              - /url: "#/audit"
+              - text: Audit log
+          - generic [ref=f5e82]:
+            - generic [ref=f5e83]:
+              - paragraph [ref=f5e84]: demo
+              - generic [ref=f5e85]: admin
+              - button [ref=f5e767]: Sign out
+            - paragraph [ref=f5e89]:
+              - generic [ref=f5e91]: mock · v0.2.0
+            - button [ref=f5e769]: Light theme
+      - generic [ref=f5e93]:
+        - banner [ref=f5e94]:
+          - navigation [ref=f5e770]:
+            - list [ref=f5e96]:
+              - listitem [ref=f5e453]:
+                - generic [ref=f5e454]: Memory
+        - main [ref=f5e102]:
+          - generic [ref=f5e455]:
+            - generic [ref=f5e456]:
+              - heading [level=1] [ref=f5e771]: Memory
+              - generic [ref=f5e458]: 6 entries · searchable by every agent · plaintext, never secrets
+            - generic [ref=f5e459]:
+              - button [ref=f5e772]: Refresh
+              - button [ref=f5e773]: Purge expired
+              - button [ref=f5e774]: New entry
+          - region [ref=f5e775]:
+            - generic [ref=f5e464]:
+              - generic [ref=f5e465]: Search
+              - textbox [ref=f5e776]:
+                - /placeholder: Search keys, values and tags
+            - generic [ref=f5e468]:
+              - generic [ref=f5e469]: Namespace
+              - combobox [ref=f5e777]:
+                - generic: All namespaces
+            - generic [ref=f5e471]:
+              - generic [ref=f5e472]: Tags
+              - textbox [ref=f5e778]:
+                - /placeholder: ops, backup
+          - paragraph [ref=f5e474]: Tags are comma-separated and all must match.
+          - table [ref=f5e478]:
+            - rowgroup [ref=f5e479]:
+              - row [ref=f5e779]:
+                - columnheader [ref=f5e780]: Key
+                - columnheader [ref=f5e781]: Namespace
+                - columnheader [ref=f5e782]: Version
+                - columnheader [ref=f5e783]: Tags
+                - columnheader [ref=f5e784]: Updated
+                - columnheader [ref=f5e785]: Value
+                - columnheader [ref=f5e786]:
+                  - generic [ref=f5e488]: Actions
+            - rowgroup [ref=f5e489]:
+              - row [ref=f5e787] [cursor=pointer]:
+                - cell [ref=f5e788]:
+                  - generic [ref=f5e727]: backup-runbook
+                  - generic [ref=f5e728]: demo
+                - cell [ref=f5e789]:
+                  - generic [ref=f5e730]: global
+                - cell [ref=f5e790]:
+                  - generic [ref=f5e732]: v1
+                - cell [ref=f5e791]:
+                  - generic [ref=f5e792]: backup · ops
+                - cell [ref=f5e793]: 2026-11-09 04:14:01
+                - cell [ref=f5e794]:
+                  - generic [ref=f5e737]: PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30.
+                - cell [ref=f5e795]:
+                  - button [ref=f5e796]: Open
+              - row [ref=f5e797] [cursor=pointer]:
+                - cell [ref=f5e798]:
+                  - generic [ref=f5e492]: backup-runbook
+                  - generic [ref=f5e493]: demo
+                - cell [ref=f5e799]:
+                  - generic [ref=f5e495]: shared
+                - cell [ref=f5e800]:
+                  - generic [ref=f5e497]: v4
+                - cell [ref=f5e801]:
+                  - generic [ref=f5e802]: backup · ops
+                - cell [ref=f5e803]: 2026-11-09 04:13:45
+                - cell [ref=f5e804]:
+                  - generic [ref=f5e502]: PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30.
+                - cell [ref=f5e805]:
+                  - button [ref=f5e806]: Open
+              - row [ref=f5e807] [cursor=pointer]:
+                - cell [ref=f5e808]:
+                  - generic [ref=f5e507]: telegram-allowlist
+                  - generic [ref=f5e508]: alice
+                - cell [ref=f5e809]:
+                  - generic [ref=f5e510]: instance:alice
+                - cell [ref=f5e810]:
+                  - generic [ref=f5e512]: v2
+                - cell [ref=f5e811]:
+                  - generic [ref=f5e812]: telegram · allowlist
+                - cell [ref=f5e813]: 2026-11-07 04:13:03
+                - cell [ref=f5e814]:
+                  - generic [ref=f5e517]: "Only the Telegram user 81459823 may talk to this agent. Add new users through the console, never by editing config.yaml: a hand edit is ove…"
+                - cell [ref=f5e815]:
+                  - button [ref=f5e816]: Open
+              - row [ref=f5e817] [cursor=pointer]:
+                - cell [ref=f5e818]:
+                  - generic [ref=f5e522]: fleet-contract
+                  - generic [ref=f5e523]: cleeryy@example.com
+                - cell [ref=f5e819]:
+                  - generic [ref=f5e525]: global
+                - cell [ref=f5e820]:
+                  - generic [ref=f5e527]: v2
+                - cell [ref=f5e821]:
+                  - generic [ref=f5e822]: bus · contract
+                - cell [ref=f5e823]: 2026-11-06 04:13:03
+                - cell [ref=f5e824]:
+                  - generic [ref=f5e532]: Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a shar…
+                - cell [ref=f5e825]:
+                  - button [ref=f5e826]: Open
+              - row [ref=f5e827] [cursor=pointer]:
+                - cell [ref=f5e828]:
+                  - generic [ref=f5e537]: gateway-upgrade
+                  - generic [ref=f5e538]: ops
+                - cell [ref=f5e829]:
+                  - generic [ref=f5e540]: instance:ops
+                - cell [ref=f5e830]:
+                  - generic [ref=f5e542]: v1
+                - cell [ref=f5e831]:
+                  - generic [ref=f5e832]: upgrade · runbook
+                - cell [ref=f5e833]: 2026-11-05 04:13:03
+                - cell [ref=f5e834]:
+                  - generic [ref=f5e547]: "Restart the gateway after an image upgrade: `docker compose restart hermes`. The healthcheck probes /opt/data/gateway.sock with the identif…"
+                - cell [ref=f5e835]:
+                  - button [ref=f5e836]: Open
+              - row [ref=f5e837] [cursor=pointer]:
+                - cell [ref=f5e838]:
+                  - generic [ref=f5e552]: course-sources
+                  - generic [ref=f5e553]: cleeryy@example.com
+                - cell [ref=f5e839]:
+                  - generic [ref=f5e555]: project:tchounis
+                - cell [ref=f5e840]:
+                  - generic [ref=f5e557]: v1
+                - cell [ref=f5e841]:
+                  - generic [ref=f5e842]: medical · tchounis +1
+                - cell [ref=f5e843]: 2026-10-10 05:13:03
+                - cell [ref=f5e844]:
+                  - generic [ref=f5e562]: "PDF sources live outside git on hermesagent:/home/hermes/tchouni-sources. Never commit them: they are large and the Docker image must stay …"
+                - cell [ref=f5e845]:
+                  - button [ref=f5e846]: Open
+    - region "Notifications alt+T":
+      - list:
+        - listitem [ref=f5e847]:
+          - button "Close toast" [ref=f5e848] [cursor=pointer]
+          - generic [ref=f5e856]: 1 expired entry removed.
+  - dialog [ref=f5e748]:
+    - generic [ref=f5e749]:
+      - heading "Purge expired memory?" [level=2] [ref=f5e750]
+      - paragraph [ref=f5e751]: Removes every entry whose expiry has passed, with its history and search index. Entries that never expire are untouched.
+    - generic [ref=f5e752]:
+      - button "Cancel" [ref=f5e753]
+      - button "Purge expired" [ref=f5e754]
+    - button "Close" [ref=f5e755]

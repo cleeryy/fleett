@@ -1,0 +1,159 @@
+- generic [ref=f11e2]:
+  - generic [ref=f11e3]:
+    - link "Skip to content" [ref=f11e4] [cursor=pointer]:
+      - /url: "#main"
+    - complementary [ref=f11e5]:
+      - generic [ref=f11e7]:
+        - generic [ref=f11e8]: fleett
+        - navigation "Console sections" [ref=f11e21]:
+          - link "Instances" [ref=f11e22] [cursor=pointer]:
+            - /url: "#/instances"
+          - link "Messages" [ref=f11e33] [cursor=pointer]:
+            - /url: "#/messages"
+          - link "Memory" [ref=f11e37] [cursor=pointer]:
+            - /url: "#/memory"
+          - link "Providers" [ref=f11e46] [cursor=pointer]:
+            - /url: "#/providers"
+          - link "Shares" [ref=f11e49] [cursor=pointer]:
+            - /url: "#/shares"
+          - link "Templates" [ref=f11e55] [cursor=pointer]:
+            - /url: "#/templates"
+          - link "Tokens" [ref=f11e60] [cursor=pointer]:
+            - /url: "#/tokens"
+          - link "Audit log" [ref=f11e64] [cursor=pointer]:
+            - /url: "#/audit"
+        - generic [ref=f11e68]:
+          - generic [ref=f11e69]:
+            - paragraph [ref=f11e70]: demo
+            - generic [ref=f11e71]: admin
+            - button "Sign out" [ref=f11e73]
+          - generic "driver mock · docker ok" [ref=f11e74]:
+            - paragraph [ref=f11e75]:
+              - generic [ref=f11e77]: mock · v0.2.0
+          - button "Switch to dark theme" [ref=f11e78]: Dark theme
+    - generic [ref=f11e79]:
+      - banner [ref=f11e80]:
+        - navigation "Breadcrumb" [ref=f11e81]:
+          - list [ref=f11e82]:
+            - listitem [ref=f11e83]:
+              - generic [ref=f11e84]: Messages
+      - main [ref=f11e85]:
+        - generic [ref=f11e86]:
+          - generic [ref=f11e87]:
+            - heading "Messages" [level=1] [ref=f11e88]
+            - generic [ref=f11e89]: 6 messages · newest first · expired messages excluded
+          - generic [ref=f11e90]:
+            - button "Refresh" [ref=f11e91]
+            - button "Send message" [ref=f11e92]
+        - region "Message filters" [ref=f11e93]:
+          - generic [ref=f11e94]:
+            - generic [ref=f11e95]: Instance
+            - combobox "Instance" [ref=f11e96]:
+              - generic: Any instance
+          - generic [ref=f11e97]:
+            - generic [ref=f11e98]: From
+            - combobox "From" [ref=f11e99]:
+              - generic: Any sender
+          - generic [ref=f11e100]:
+            - generic [ref=f11e101]: To
+            - combobox "To" [ref=f11e102]:
+              - generic: Any recipient
+          - generic [ref=f11e103]:
+            - generic [ref=f11e104]: Kind
+            - combobox "Kind" [ref=f11e105]:
+              - generic: Any kind
+          - generic [ref=f11e108]:
+            - generic [ref=f11e109]: Limit
+            - combobox "Limit" [ref=f11e110]:
+              - generic: 100 messages
+        - paragraph [ref=f11e111]: Updated 04:17:14
+        - table [ref=f11e115]:
+          - rowgroup [ref=f11e116]:
+            - row [ref=f11e117]:
+              - columnheader "Time" [ref=f11e118]
+              - columnheader "From → To" [ref=f11e119]
+              - columnheader "Kind" [ref=f11e120]
+              - columnheader "Status" [ref=f11e121]
+              - columnheader "Hops" [ref=f11e122]
+              - columnheader "Body" [ref=f11e123]
+              - columnheader "Actions" [ref=f11e124]
+          - rowgroup [ref=f11e126]:
+            - row [ref=f11e127] [cursor=pointer]:
+              - cell "2026-11-09 03:30:14" [ref=f11e128]
+              - cell "workshop school" [ref=f11e129]:
+                - generic [ref=f11e130]:
+                  - generic [ref=f11e131]: workshop
+                  - generic [ref=f11e132]: →
+                  - generic [ref=f11e133]: school
+              - cell "tell" [ref=f11e134]
+              - cell [ref=f11e136]
+              - cell "0" [ref=f11e139]
+              - cell "The sandbox template now ships with the note skill enabled. Start the instance once and the gateway picks up the new config." [ref=f11e140]
+              - cell [ref=f11e142]:
+                - button "Open message from workshop to school" [ref=f11e143]: Open
+            - row [ref=f11e144] [cursor=pointer]:
+              - cell "2026-11-09 02:45:14" [ref=f11e145]
+              - cell "ops margaret" [ref=f11e146]:
+                - generic [ref=f11e147]:
+                  - generic [ref=f11e148]: ops
+                  - generic [ref=f11e149]: →
+                  - generic [ref=f11e150]: margaret
+              - cell "tell" [ref=f11e151]
+              - cell [ref=f11e153]
+              - cell "0" [ref=f11e156]
+              - 'cell "Heads-up: the weekly PBS verify job moved to 03:30 on Sunday. Nothing to do on your side; the media share is read-only and stays untouched." [ref=f11e157]'
+              - cell [ref=f11e159]:
+                - button "Open message from ops to margaret" [ref=f11e160]: Open
+            - row [ref=f11e161] [cursor=pointer]:
+              - cell "2026-11-09 01:25:14" [ref=f11e162]
+              - cell "alice ops" [ref=f11e163]:
+                - generic [ref=f11e164]:
+                  - generic [ref=f11e165]: alice
+                  - generic [ref=f11e166]: →
+                  - generic [ref=f11e167]: ops
+              - cell "result" [ref=f11e168]
+              - cell [ref=f11e170]
+              - cell "1" [ref=f11e173]
+              - cell "Confirmed. The 06:00 run completed in 11 minutes. The mismatch came from two deleted photos that were still in the mirror index; it is consistent again. No nee…" [ref=f11e174]
+              - cell [ref=f11e176]:
+                - button "Open message from alice to ops" [ref=f11e177]: Open
+            - row [ref=f11e178] [cursor=pointer]:
+              - cell "2026-11-09 01:11:14" [ref=f11e179]
+              - cell "ops alice" [ref=f11e180]:
+                - generic [ref=f11e181]:
+                  - generic [ref=f11e182]: ops
+                  - generic [ref=f11e183]: →
+                  - generic [ref=f11e184]: alice
+              - cell "ask" [ref=f11e185]
+              - cell [ref=f11e187]
+              - cell "0" [ref=f11e190]
+              - cell "The nightly rclone mirror of the media share reported a size mismatch this morning. Can you confirm the 06:00 backup finished on your side before I re-run the …" [ref=f11e191]
+              - cell [ref=f11e193]:
+                - button "Open message from ops to alice" [ref=f11e194]: Open
+            - row [ref=f11e195] [cursor=pointer]:
+              - cell "2026-11-08 04:19:14" [ref=f11e196]
+              - cell "margaret alice" [ref=f11e197]:
+                - generic [ref=f11e198]:
+                  - generic [ref=f11e199]: margaret
+                  - generic [ref=f11e200]: →
+                  - generic [ref=f11e201]: alice
+              - cell "result" [ref=f11e202]
+              - cell [ref=f11e204]
+              - cell "1" [ref=f11e207]
+              - cell "Keep the originals. Disk is cheap and I never want to lose the negatives; the resized copies are only for the phone album." [ref=f11e208]
+              - cell [ref=f11e210]:
+                - button "Open message from margaret to alice" [ref=f11e211]: Open
+            - row [ref=f11e212] [cursor=pointer]:
+              - cell "2026-11-08 03:57:14" [ref=f11e213]
+              - cell "alice margaret" [ref=f11e214]:
+                - generic [ref=f11e215]:
+                  - generic [ref=f11e216]: alice
+                  - generic [ref=f11e217]: →
+                  - generic [ref=f11e218]: margaret
+              - cell "ask" [ref=f11e219]
+              - cell [ref=f11e221]
+              - cell "0" [ref=f11e224]
+              - 'cell "For the family archive: do you want me to keep the camera originals under media/original, or only the resized copies? Originals are about 40 GB." [ref=f11e225]'
+              - cell [ref=f11e227]:
+                - button "Open message from alice to margaret" [ref=f11e228]: Open
+  - region "Notifications alt+T"

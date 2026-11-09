@@ -1,0 +1,146 @@
+- generic [ref=f5e2]:
+  - generic [ref=f5e17]:
+    - link "Skip to content" [ref=f5e18] [cursor=pointer]:
+      - /url: "#main"
+    - complementary [ref=f5e19]:
+      - generic [ref=f5e21]:
+        - generic [ref=f5e22]: fleett
+        - navigation "Console sections" [ref=f5e35]:
+          - link "Instances" [ref=f5e36] [cursor=pointer]:
+            - /url: "#/instances"
+          - link "Messages" [ref=f5e47] [cursor=pointer]:
+            - /url: "#/messages"
+          - link "Memory" [ref=f5e51] [cursor=pointer]:
+            - /url: "#/memory"
+          - link "Providers" [ref=f5e60] [cursor=pointer]:
+            - /url: "#/providers"
+          - link "Shares" [ref=f5e63] [cursor=pointer]:
+            - /url: "#/shares"
+          - link "Templates" [ref=f5e69] [cursor=pointer]:
+            - /url: "#/templates"
+          - link "Tokens" [ref=f5e74] [cursor=pointer]:
+            - /url: "#/tokens"
+          - link "Audit log" [ref=f5e78] [cursor=pointer]:
+            - /url: "#/audit"
+        - generic [ref=f5e82]:
+          - generic [ref=f5e83]:
+            - paragraph [ref=f5e84]: demo
+            - generic [ref=f5e85]: admin
+            - button "Sign out" [ref=f5e87]
+          - generic "driver mock · docker ok" [ref=f5e88]:
+            - paragraph [ref=f5e89]:
+              - generic [ref=f5e91]: mock · v0.2.0
+          - button "Switch to light theme" [ref=f5e92]: Light theme
+    - generic [ref=f5e93]:
+      - banner [ref=f5e94]:
+        - navigation "Breadcrumb" [ref=f5e95]:
+          - list [ref=f5e96]:
+            - listitem [ref=f5e261]:
+              - generic [ref=f5e262]: Messages
+      - main [ref=f5e102]:
+        - generic [ref=f5e263]:
+          - generic [ref=f5e264]:
+            - heading "Messages" [level=1] [ref=f5e265]
+            - generic [ref=f5e266]: 5 messages · newest first · expired messages excluded
+          - generic [ref=f5e267]:
+            - button "Refresh" [ref=f5e268]
+            - button "Send message" [ref=f5e269]
+        - region "Message filters" [ref=f5e270]:
+          - generic [ref=f5e271]:
+            - generic [ref=f5e272]: Instance
+            - combobox "Instance" [disabled] [ref=f5e273]:
+              - generic: Any instance
+          - generic [ref=f5e274]:
+            - generic [ref=f5e275]: From
+            - combobox "From" [disabled] [ref=f5e276]:
+              - generic: Any sender
+          - generic [ref=f5e277]:
+            - generic [ref=f5e278]: To
+            - combobox "To" [disabled] [ref=f5e279]:
+              - generic: Any recipient
+          - generic [ref=f5e280]:
+            - generic [ref=f5e281]: Kind
+            - combobox "Kind" [ref=f5e282]:
+              - generic: Any kind
+          - generic [ref=f5e284]:
+            - generic [ref=f5e285]: Limit
+            - combobox "Limit" [ref=f5e286]:
+              - generic: 100 messages
+        - paragraph [ref=f5e287]: …
+        - table [ref=f5e291]:
+          - rowgroup [ref=f5e292]:
+            - row [ref=f5e293]:
+              - columnheader "Time" [ref=f5e294]
+              - columnheader "From → To" [ref=f5e295]
+              - columnheader "Kind" [ref=f5e296]
+              - columnheader "Status" [ref=f5e297]
+              - columnheader "Hops" [ref=f5e298]
+              - columnheader "Body" [ref=f5e299]
+              - columnheader "Actions" [ref=f5e300]
+          - rowgroup [ref=f5e302]:
+            - row [ref=f5e303] [cursor=pointer]:
+              - cell "2026-11-09 03:26:03" [ref=f5e304]
+              - cell "workshop school" [ref=f5e305]:
+                - generic [ref=f5e306]:
+                  - generic [ref=f5e307]: workshop
+                  - generic [ref=f5e308]: →
+                  - generic [ref=f5e309]: school
+              - cell "tell" [ref=f5e310]
+              - cell [ref=f5e312]
+              - cell "0" [ref=f5e315]
+              - cell "The sandbox template now ships with the note skill enabled. Start the instance once and the gateway picks up the new config." [ref=f5e316]
+              - cell [ref=f5e318]:
+                - button "Open message from workshop to school" [ref=f5e319]: Open
+            - row [ref=f5e320] [cursor=pointer]:
+              - cell "2026-11-09 02:41:03" [ref=f5e321]
+              - cell "ops margaret" [ref=f5e322]:
+                - generic [ref=f5e323]:
+                  - generic [ref=f5e324]: ops
+                  - generic [ref=f5e325]: →
+                  - generic [ref=f5e326]: margaret
+              - cell "tell" [ref=f5e327]
+              - cell [ref=f5e329]
+              - cell "0" [ref=f5e332]
+              - 'cell "Heads-up: the weekly PBS verify job moved to 03:30 on Sunday. Nothing to do on your side; the media share is read-only and stays untouched." [ref=f5e333]'
+              - cell [ref=f5e335]:
+                - button "Open message from ops to margaret" [ref=f5e336]: Open
+            - row [ref=f5e337] [cursor=pointer]:
+              - cell "2026-11-09 01:21:03" [ref=f5e338]
+              - cell "alice ops" [ref=f5e339]:
+                - generic [ref=f5e340]:
+                  - generic [ref=f5e341]: alice
+                  - generic [ref=f5e342]: →
+                  - generic [ref=f5e343]: ops
+              - cell "result" [ref=f5e344]
+              - cell [ref=f5e346]
+              - cell "1" [ref=f5e349]
+              - cell "Confirmed. The 06:00 run completed in 11 minutes. The mismatch came from two deleted photos that were still in the mirror index; it is consistent again. No nee…" [ref=f5e350]
+              - cell [ref=f5e352]:
+                - button "Open message from alice to ops" [ref=f5e353]: Open
+            - row [ref=f5e354] [cursor=pointer]:
+              - cell "2026-11-09 01:07:03" [ref=f5e355]
+              - cell "ops alice" [ref=f5e356]:
+                - generic [ref=f5e357]:
+                  - generic [ref=f5e358]: ops
+                  - generic [ref=f5e359]: →
+                  - generic [ref=f5e360]: alice
+              - cell "ask" [ref=f5e361]
+              - cell [ref=f5e363]
+              - cell "0" [ref=f5e366]
+              - cell "The nightly rclone mirror of the media share reported a size mismatch this morning. Can you confirm the 06:00 backup finished on your side before I re-run the …" [ref=f5e367]
+              - cell [ref=f5e369]:
+                - button "Open message from ops to alice" [ref=f5e370]: Open
+            - row [ref=f5e371] [cursor=pointer]:
+              - cell "2026-11-08 04:15:03" [ref=f5e372]
+              - cell "margaret alice" [ref=f5e373]:
+                - generic [ref=f5e374]:
+                  - generic [ref=f5e375]: margaret
+                  - generic [ref=f5e376]: →
+                  - generic [ref=f5e377]: alice
+              - cell "result" [ref=f5e378]
+              - cell [ref=f5e380]
+              - cell "1" [ref=f5e383]
+              - cell "Keep the originals. Disk is cheap and I never want to lose the negatives; the resized copies are only for the phone album." [ref=f5e384]
+              - cell [ref=f5e386]:
+                - button "Open message from margaret to alice" [ref=f5e387]: Open
+  - region "Notifications alt+T"

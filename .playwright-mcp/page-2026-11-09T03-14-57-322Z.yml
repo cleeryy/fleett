@@ -1,0 +1,134 @@
+- generic [ref=f6e2]:
+  - generic [ref=f6e3]:
+    - link "Skip to content" [ref=f6e4] [cursor=pointer]:
+      - /url: "#main"
+    - complementary [ref=f6e5]:
+      - generic [ref=f6e7]:
+        - generic [ref=f6e8]: fleett
+        - navigation "Console sections" [ref=f6e21]:
+          - link "Instances" [ref=f6e22] [cursor=pointer]:
+            - /url: "#/instances"
+          - link "Messages" [ref=f6e33] [cursor=pointer]:
+            - /url: "#/messages"
+          - link "Memory" [ref=f6e37] [cursor=pointer]:
+            - /url: "#/memory"
+          - link "Providers" [ref=f6e46] [cursor=pointer]:
+            - /url: "#/providers"
+          - link "Shares" [ref=f6e49] [cursor=pointer]:
+            - /url: "#/shares"
+          - link "Templates" [ref=f6e55] [cursor=pointer]:
+            - /url: "#/templates"
+          - link "Tokens" [ref=f6e60] [cursor=pointer]:
+            - /url: "#/tokens"
+          - link "Audit log" [ref=f6e64] [cursor=pointer]:
+            - /url: "#/audit"
+        - generic [ref=f6e68]:
+          - generic [ref=f6e69]:
+            - paragraph [ref=f6e70]: demo
+            - generic [ref=f6e71]: admin
+            - button "Sign out" [ref=f6e73]
+          - generic "driver mock · docker ok" [ref=f6e74]:
+            - paragraph [ref=f6e75]:
+              - generic [ref=f6e77]: mock · v0.2.0
+          - button "Switch to dark theme" [active] [ref=f6e196]: Dark theme
+    - generic [ref=f6e79]:
+      - banner [ref=f6e80]:
+        - navigation "Breadcrumb" [ref=f6e81]:
+          - list [ref=f6e82]:
+            - listitem [ref=f6e83]:
+              - generic [ref=f6e84]: Memory
+      - main [ref=f6e85]:
+        - generic [ref=f6e86]:
+          - generic [ref=f6e87]:
+            - heading "Memory" [level=1] [ref=f6e88]
+            - generic [ref=f6e89]: 5 entries · searchable by every agent · plaintext, never secrets
+          - generic [ref=f6e90]:
+            - button "Refresh" [ref=f6e91]
+            - button "Purge expired" [ref=f6e92]
+            - button "New entry" [ref=f6e93]
+        - region "Memory filters" [ref=f6e94]:
+          - generic [ref=f6e95]:
+            - generic [ref=f6e96]: Search
+            - textbox "Search" [ref=f6e98]:
+              - /placeholder: Search keys, values and tags
+          - generic [ref=f6e99]:
+            - generic [ref=f6e100]: Namespace
+            - combobox "Filter by namespace" [ref=f6e101]:
+              - generic: All namespaces
+          - generic [ref=f6e102]:
+            - generic [ref=f6e103]: Tags
+            - textbox "Tags" [ref=f6e104]:
+              - /placeholder: ops, backup
+        - paragraph [ref=f6e105]: Tags are comma-separated and all must match.
+        - table [ref=f6e109]:
+          - rowgroup [ref=f6e110]:
+            - row [ref=f6e111]:
+              - columnheader "Key" [ref=f6e112]
+              - columnheader "Namespace" [ref=f6e113]
+              - columnheader "Version" [ref=f6e114]
+              - columnheader "Tags" [ref=f6e115]
+              - columnheader "Updated" [ref=f6e116]
+              - columnheader "Value" [ref=f6e117]
+              - columnheader "Actions" [ref=f6e118]
+          - rowgroup [ref=f6e120]:
+            - row [ref=f6e121] [cursor=pointer]:
+              - cell "backup-runbook ops" [ref=f6e122]:
+                - generic [ref=f6e123]: backup-runbook
+                - generic [ref=f6e124]: ops
+              - cell "shared" [ref=f6e125]
+              - cell "v3" [ref=f6e127]
+              - cell "backup · ops +1" [ref=f6e129]:
+                - generic "backup, ops, runbook" [ref=f6e130]: backup · ops +1
+              - cell "2026-11-08 04:14:47" [ref=f6e131]
+              - cell "PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30. When a …" [ref=f6e132]
+              - cell [ref=f6e134]:
+                - button "Open memory entry backup-runbook" [ref=f6e135]: Open
+            - row [ref=f6e136] [cursor=pointer]:
+              - cell "telegram-allowlist alice" [ref=f6e137]:
+                - generic [ref=f6e138]: telegram-allowlist
+                - generic [ref=f6e139]: alice
+              - cell "instance:alice" [ref=f6e140]
+              - cell "v2" [ref=f6e142]
+              - cell "telegram · allowlist" [ref=f6e144]:
+                - generic "telegram, allowlist" [ref=f6e145]: telegram · allowlist
+              - cell "2026-11-07 04:14:47" [ref=f6e146]
+              - 'cell "Only the Telegram user 81459823 may talk to this agent. Add new users through the console, never by editing config.yaml: a hand edit is ove…" [ref=f6e147]'
+              - cell [ref=f6e149]:
+                - button "Open memory entry telegram-allowlist" [ref=f6e150]: Open
+            - row [ref=f6e151] [cursor=pointer]:
+              - cell "fleet-contract cleeryy@example.com" [ref=f6e152]:
+                - generic [ref=f6e153]: fleet-contract
+                - generic [ref=f6e154]: cleeryy@example.com
+              - cell "global" [ref=f6e155]
+              - cell "v2" [ref=f6e157]
+              - cell "bus · contract" [ref=f6e159]:
+                - generic "bus, contract" [ref=f6e160]: bus · contract
+              - cell "2026-11-06 04:14:47" [ref=f6e161]
+              - cell "Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a shar…" [ref=f6e162]
+              - cell [ref=f6e164]:
+                - button "Open memory entry fleet-contract" [ref=f6e165]: Open
+            - row [ref=f6e166] [cursor=pointer]:
+              - cell "gateway-upgrade ops" [ref=f6e167]:
+                - generic [ref=f6e168]: gateway-upgrade
+                - generic [ref=f6e169]: ops
+              - cell "instance:ops" [ref=f6e170]
+              - cell "v1" [ref=f6e172]
+              - cell "upgrade · runbook" [ref=f6e174]:
+                - generic "upgrade, runbook" [ref=f6e175]: upgrade · runbook
+              - cell "2026-11-05 04:14:47" [ref=f6e176]
+              - 'cell "Restart the gateway after an image upgrade: `docker compose restart hermes`. The healthcheck probes /opt/data/gateway.sock with the identif…" [ref=f6e177]'
+              - cell [ref=f6e179]:
+                - button "Open memory entry gateway-upgrade" [ref=f6e180]: Open
+            - row [ref=f6e181] [cursor=pointer]:
+              - cell "course-sources cleeryy@example.com" [ref=f6e182]:
+                - generic [ref=f6e183]: course-sources
+                - generic [ref=f6e184]: cleeryy@example.com
+              - cell "project:tchounis" [ref=f6e185]
+              - cell "v1" [ref=f6e187]
+              - cell "medical · tchounis +1" [ref=f6e189]:
+                - generic "medical, tchounis, sources" [ref=f6e190]: medical · tchounis +1
+              - cell "2026-10-10 05:14:47" [ref=f6e191]
+              - 'cell "PDF sources live outside git on hermesagent:/home/hermes/tchouni-sources. Never commit them: they are large and the Docker image must stay …" [ref=f6e192]'
+              - cell [ref=f6e194]:
+                - button "Open memory entry course-sources" [ref=f6e195]: Open
+  - region "Notifications alt+T"

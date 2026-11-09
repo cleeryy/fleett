@@ -1,0 +1,17 @@
+- generic [ref=f4e2]:
+  - generic [ref=f4e3]:
+    - link "Skip to content" [ref=f4e4] [cursor=pointer]:
+      - /url: "#main"
+    - generic [ref=f4e5]:
+      - banner [ref=f4e6]:
+        - button "Open navigation" [ref=f4e7]
+        - navigation "Breadcrumb" [ref=f4e8]:
+          - list [ref=f4e9]:
+            - listitem [ref=f4e196]:
+              - link "Instances" [ref=f4e197] [cursor=pointer]:
+                - /url: "#/instances"
+            - listitem [ref=f4e198]:
+              - generic [ref=f4e199]: /
+              - generic [ref=f4e200]: alice
+      - main [ref=f4e12]
+  - region "Notifications alt+T"

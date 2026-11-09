@@ -1,0 +1,159 @@
+- generic:
+  - generic:
+    - generic:
+      - link:
+        - /url: "#main"
+        - text: Skip to content
+      - generic:
+        - banner:
+          - button
+          - navigation:
+            - list:
+              - listitem:
+                - generic: Memory
+        - main:
+          - generic:
+            - generic:
+              - heading [level=1]: Memory
+              - generic: 5 entries · searchable by every agent · plaintext, never secrets
+            - generic:
+              - button: Refresh
+          - region:
+            - generic:
+              - generic: Search
+              - generic:
+                - textbox:
+                  - /placeholder: Search keys, values and tags
+            - generic:
+              - generic: Namespace
+              - combobox:
+                - generic: All namespaces
+            - generic:
+              - generic: Tags
+              - textbox:
+                - /placeholder: ops, backup
+          - paragraph: Tags are comma-separated and all must match.
+          - generic:
+            - generic:
+              - button:
+                - generic:
+                  - generic: backup-runbook
+                  - generic: v3
+                - generic:
+                  - generic: shared
+                  - generic: backup · ops · runbook
+                - paragraph: PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30. When a run is missing, star…
+                - paragraph: 2026-11-08 04:11:45
+              - button:
+                - generic:
+                  - generic: telegram-allowlist
+                  - generic: v2
+                - generic:
+                  - generic: instance:alice
+                  - generic: telegram · allowlist
+                - paragraph: "Only the Telegram user 81459823 may talk to this agent. Add new users through the console, never by editing config.yaml: a hand edit is overwritten on the next…"
+                - paragraph: 2026-11-07 04:11:45
+              - button:
+                - generic:
+                  - generic: fleet-contract
+                  - generic: v2
+                - generic:
+                  - generic: global
+                  - generic: bus · contract
+                - paragraph: Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a share. Findings belong i…
+                - paragraph: 2026-11-06 04:11:45
+              - button:
+                - generic:
+                  - generic: gateway-upgrade
+                  - generic: v1
+                - generic:
+                  - generic: instance:ops
+                  - generic: upgrade · runbook
+                - paragraph: "Restart the gateway after an image upgrade: `docker compose restart hermes`. The healthcheck probes /opt/data/gateway.sock with the identify verb and reports u…"
+                - paragraph: 2026-11-05 04:11:45
+              - button:
+                - generic:
+                  - generic: course-sources
+                  - generic: v1
+                - generic:
+                  - generic: project:tchounis
+                  - generic: medical · tchounis · sources
+                - paragraph: "PDF sources live outside git on hermesagent:/home/hermes/tchouni-sources. Never commit them: they are large and the Docker image must stay small. Medical conte…"
+                - paragraph: 2026-10-10 05:11:45
+    - region "Notifications alt+T"
+  - dialog [ref=f4e95]:
+    - generic [ref=f4e96]:
+      - heading "fleet-contract v2" [level=2] [ref=f4e97]:
+        - generic [ref=f4e98]: fleet-contract
+        - generic [ref=f4e99]: v2
+      - generic [ref=f4e100]:
+        - generic [ref=f4e101]: global
+        - generic [ref=f4e102]: cleeryy@example.com · updated 3 d ago
+    - generic [ref=f4e103]:
+      - generic [ref=f4e104]:
+        - generic [ref=f4e105]:
+          - heading "Value" [level=3] [ref=f4e106]
+          - generic [ref=f4e107]: 216 bytes
+        - generic [ref=f4e108]: "Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a share. Findings belong in the `findings` share, durable lessons in shared memory."
+      - generic [ref=f4e109]:
+        - generic [ref=f4e110]:
+          - term [ref=f4e111]: Namespace
+          - definition [ref=f4e112]:
+            - generic [ref=f4e113]: global
+        - generic [ref=f4e114]:
+          - term [ref=f4e115]: Key
+          - definition [ref=f4e116]:
+            - generic [ref=f4e117]:
+              - generic [ref=f4e118]: fleet-contract
+              - button "Copy key" [active] [ref=f4e119]
+        - generic [ref=f4e121]:
+          - term [ref=f4e122]: Version
+          - definition [ref=f4e123]: "2"
+        - generic [ref=f4e124]:
+          - term [ref=f4e125]: Owner
+          - definition [ref=f4e126]: cleeryy@example.com
+        - generic [ref=f4e127]:
+          - term [ref=f4e128]: Created
+          - definition [ref=f4e129]: 2026-10-22 05:11:45
+        - generic [ref=f4e130]:
+          - term [ref=f4e131]: Updated
+          - definition [ref=f4e132]: 2026-11-06 04:11:45
+        - generic [ref=f4e133]:
+          - term [ref=f4e134]: Expires
+          - definition [ref=f4e135]: never
+        - generic [ref=f4e136]:
+          - term [ref=f4e137]: Tags
+          - definition [ref=f4e138]:
+            - generic [ref=f4e139]:
+              - generic [ref=f4e140]: bus
+              - generic [ref=f4e141]: contract
+        - generic [ref=f4e142]:
+          - term [ref=f4e143]: Entry ID
+          - definition [ref=f4e144]:
+            - generic [ref=f4e145]:
+              - generic [ref=f4e146]: "1"
+              - button "Copy entry id" [ref=f4e147]
+      - region [ref=f4e149]:
+        - generic [ref=f4e150]:
+          - heading "History" [level=3] [ref=f4e151]
+          - generic [ref=f4e152]: 2 versions
+        - list [ref=f4e153]:
+          - listitem [ref=f4e154]:
+            - generic [ref=f4e156]:
+              - generic [ref=f4e157]:
+                - generic [ref=f4e158]: v2
+                - generic [ref=f4e159]: update
+                - generic [ref=f4e160]: current
+                - generic [ref=f4e161]: cleeryy@example.com
+                - generic [ref=f4e162]: 2026-11-06 04:11:45
+              - paragraph [ref=f4e163]: "Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a share. Findings belong in the `findings` share, durable lessons in shared memory."
+          - listitem [ref=f4e164]:
+            - generic [ref=f4e166]:
+              - generic [ref=f4e167]:
+                - generic [ref=f4e168]: v1
+                - generic [ref=f4e169]: create
+                - generic [ref=f4e170]: cleeryy@example.com
+                - generic [ref=f4e171]: 2026-10-22 05:11:45
+              - paragraph [ref=f4e172]: "Agents share findings through the `findings` share. Announce a deploy in #ops before restarting more than one instance."
+    - paragraph [ref=f4e174]: "Read-only: your account cannot change fleet memory."
+    - button "Close" [ref=f4e175]

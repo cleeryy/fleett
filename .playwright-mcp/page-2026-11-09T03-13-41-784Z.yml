@@ -1,0 +1,265 @@
+- generic:
+  - generic:
+    - generic:
+      - link:
+        - /url: "#main"
+        - text: Skip to content
+      - complementary:
+        - generic:
+          - generic:
+            - generic: fleett
+            - navigation:
+              - link:
+                - /url: "#/instances"
+                - text: Instances
+              - link:
+                - /url: "#/messages"
+                - text: Messages
+              - link:
+                - /url: "#/memory"
+                - text: Memory
+              - link:
+                - /url: "#/providers"
+                - text: Providers
+              - link:
+                - /url: "#/shares"
+                - text: Shares
+              - link:
+                - /url: "#/templates"
+                - text: Templates
+              - link:
+                - /url: "#/tokens"
+                - text: Tokens
+              - link:
+                - /url: "#/audit"
+                - text: Audit log
+            - generic:
+              - generic:
+                - paragraph: demo
+                - generic: admin
+                - button: Sign out
+              - generic:
+                - paragraph:
+                  - generic: mock · v0.2.0
+              - button: Light theme
+      - generic:
+        - banner:
+          - navigation:
+            - list:
+              - listitem:
+                - generic: Memory
+        - main:
+          - generic:
+            - generic:
+              - heading [level=1]: Memory
+              - generic: 5 entries · searchable by every agent · plaintext, never secrets
+            - generic:
+              - button: Refresh
+              - button: Purge expired
+              - button: New entry
+          - region:
+            - generic:
+              - generic: Search
+              - generic:
+                - textbox:
+                  - /placeholder: Search keys, values and tags
+            - generic:
+              - generic: Namespace
+              - combobox:
+                - generic: All namespaces
+            - generic:
+              - generic: Tags
+              - textbox:
+                - /placeholder: ops, backup
+          - paragraph: Tags are comma-separated and all must match.
+          - generic:
+            - generic:
+              - generic:
+                - table:
+                  - rowgroup:
+                    - row:
+                      - columnheader: Key
+                      - columnheader: Namespace
+                      - columnheader: Version
+                      - columnheader: Tags
+                      - columnheader: Updated
+                      - columnheader: Value
+                      - columnheader:
+                        - generic: Actions
+                  - rowgroup:
+                    - row:
+                      - cell:
+                        - generic: backup-runbook
+                        - generic: ops
+                      - cell:
+                        - generic: shared
+                      - cell:
+                        - generic: v3
+                      - cell:
+                        - generic: backup · ops +1
+                      - cell: 2026-11-08 04:13:03
+                      - cell:
+                        - generic: PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30. When a …
+                      - cell:
+                        - button: Open
+                    - row:
+                      - cell:
+                        - generic: telegram-allowlist
+                        - generic: alice
+                      - cell:
+                        - generic: instance:alice
+                      - cell:
+                        - generic: v2
+                      - cell:
+                        - generic: telegram · allowlist
+                      - cell: 2026-11-07 04:13:03
+                      - cell:
+                        - generic: "Only the Telegram user 81459823 may talk to this agent. Add new users through the console, never by editing config.yaml: a hand edit is ove…"
+                      - cell:
+                        - button: Open
+                    - row:
+                      - cell:
+                        - generic: fleet-contract
+                        - generic: cleeryy@example.com
+                      - cell:
+                        - generic: global
+                      - cell:
+                        - generic: v2
+                      - cell:
+                        - generic: bus · contract
+                      - cell: 2026-11-06 04:13:03
+                      - cell:
+                        - generic: Agents poll their inbox through GET /api/instances/<id>/messages and ack handled messages. Never send more than 16 KiB; put files in a shar…
+                      - cell:
+                        - button: Open
+                    - row:
+                      - cell:
+                        - generic: gateway-upgrade
+                        - generic: ops
+                      - cell:
+                        - generic: instance:ops
+                      - cell:
+                        - generic: v1
+                      - cell:
+                        - generic: upgrade · runbook
+                      - cell: 2026-11-05 04:13:03
+                      - cell:
+                        - generic: "Restart the gateway after an image upgrade: `docker compose restart hermes`. The healthcheck probes /opt/data/gateway.sock with the identif…"
+                      - cell:
+                        - button: Open
+                    - row:
+                      - cell:
+                        - generic: course-sources
+                        - generic: cleeryy@example.com
+                      - cell:
+                        - generic: project:tchounis
+                      - cell:
+                        - generic: v1
+                      - cell:
+                        - generic: medical · tchounis +1
+                      - cell: 2026-10-10 05:13:03
+                      - cell:
+                        - generic: "PDF sources live outside git on hermesagent:/home/hermes/tchouni-sources. Never commit them: they are large and the Docker image must stay …"
+                      - cell:
+                        - button: Open
+    - region "Notifications alt+T"
+  - dialog "backup-runbook v3":
+    - generic:
+      - heading [level=2]:
+        - generic: backup-runbook
+        - generic: v3
+      - generic:
+        - generic: shared
+        - generic: ops · updated 1 d ago
+    - generic:
+      - generic:
+        - generic:
+          - heading [level=3]: Value
+          - generic: 238 bytes
+        - generic: "PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30. When a run is missing, start with `journalctl -u pbs` and check `flock` holders before re-running by hand."
+      - generic:
+        - generic:
+          - term: Namespace
+          - definition:
+            - generic: shared
+        - generic:
+          - term: Key
+          - definition:
+            - generic:
+              - generic: backup-runbook
+              - button
+        - generic:
+          - term: Version
+          - definition: "3"
+        - generic:
+          - term: Owner
+          - definition: ops
+        - generic:
+          - term: Created
+          - definition: 2026-10-20 05:13:03
+        - generic:
+          - term: Updated
+          - definition: 2026-11-08 04:13:03
+        - generic:
+          - term: Expires
+          - definition: never
+        - generic:
+          - term: Tags
+          - definition:
+            - generic:
+              - generic: backup
+              - generic: ops
+              - generic: runbook
+        - generic:
+          - term: Entry ID
+          - definition:
+            - generic:
+              - generic: "2"
+              - button
+      - region:
+        - generic:
+          - heading [level=3]: History
+          - generic: 3 versions
+        - list:
+          - listitem:
+            - generic:
+              - generic:
+                - generic: v3
+                - generic: update
+                - generic: current
+                - generic: ops
+                - generic: 2026-11-08 04:13:03
+              - paragraph: "PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30. When a run is missing, start with `journalctl -u pbs` and check `flock` holders before re-running by hand."
+          - listitem:
+            - generic:
+              - generic:
+                - generic: v2
+                - generic: update
+                - generic: ops
+                - generic: 2026-11-03 04:13:03
+              - paragraph: PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily copies; the verify job runs on Sunday at 03:30.
+              - button: Restore this version
+          - listitem:
+            - generic:
+              - generic:
+                - generic: v1
+                - generic: create
+                - generic: ops
+                - generic: 2026-10-20 05:13:03
+              - paragraph: PBS runs at 02:00. Check the dashboard when a job is missing.
+              - button: Restore this version
+    - generic:
+      - generic:
+        - button: Edit
+        - button: Promote to global
+        - button: Delete
+    - button:
+      - generic: Close
+  - dialog [ref=f5e667]:
+    - generic [ref=f5e668]:
+      - heading "Restore version 2?" [level=2] [ref=f5e669]
+      - paragraph [ref=f5e670]: The value and tags of version 2 are written as a new version. Nothing is rewritten, so the restore itself stays reversible.
+    - generic [ref=f5e671]:
+      - button "Cancel" [active] [ref=f5e672]
+      - button "Restore version" [ref=f5e673]
+    - button "Close" [ref=f5e674]

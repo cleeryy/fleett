@@ -1,0 +1,167 @@
+- generic:
+  - generic:
+    - generic:
+      - link:
+        - /url: "#main"
+        - text: Skip to content
+      - complementary:
+        - generic:
+          - generic:
+            - generic: fleett
+            - navigation:
+              - link:
+                - /url: "#/instances"
+                - text: Instances
+              - link:
+                - /url: "#/messages"
+                - text: Messages
+              - link:
+                - /url: "#/memory"
+                - text: Memory
+              - link:
+                - /url: "#/providers"
+                - text: Providers
+              - link:
+                - /url: "#/shares"
+                - text: Shares
+              - link:
+                - /url: "#/templates"
+                - text: Templates
+              - link:
+                - /url: "#/tokens"
+                - text: Tokens
+              - link:
+                - /url: "#/audit"
+                - text: Audit log
+            - generic:
+              - generic:
+                - paragraph: demo
+                - generic: admin
+                - button: Sign out
+              - generic:
+                - paragraph:
+                  - generic: mock · v0.2.0
+              - button: Dark theme
+      - generic:
+        - banner:
+          - navigation:
+            - list:
+              - listitem:
+                - link:
+                  - /url: "#/instances"
+                  - text: Instances
+              - listitem:
+                - generic: /
+                - generic: alice
+        - main:
+          - generic:
+            - generic:
+              - heading [level=1]:
+                - generic:
+                  - text: Alice
+                  - generic: running
+              - generic:
+                - generic:
+                  - generic: alice
+                  - generic: ·
+                  - generic: guest
+                  - generic: ·
+                  - generic: 3d6122461310
+                  - generic: ·
+                  - generic: up 4h 12m
+            - generic:
+              - button
+              - button: Stop
+              - button: Restart
+              - button
+          - generic:
+            - generic:
+              - tablist:
+                - tab: Overview
+                - tab: Configuration
+                - tab: Files
+                - tab: Messages
+                - tab [selected]: Memory
+                - tab: History
+                - tab: Logs
+                - tab: Compose
+            - tabpanel:
+              - generic:
+                - generic:
+                  - paragraph: Namespace instance:alice · private notes, readable by every authenticated client
+                  - generic:
+                    - button: Refresh
+                    - button: New entry
+                - generic:
+                  - generic:
+                    - generic:
+                      - table:
+                        - rowgroup:
+                          - row:
+                            - columnheader: Key
+                            - columnheader: Namespace
+                            - columnheader: Version
+                            - columnheader: Tags
+                            - columnheader: Updated
+                            - columnheader: Value
+                            - columnheader:
+                              - generic: Actions
+                        - rowgroup:
+                          - row:
+                            - cell:
+                              - generic: telegram-allowlist
+                              - generic: alice
+                            - cell:
+                              - generic: instance:alice
+                            - cell:
+                              - generic: v2
+                            - cell:
+                              - generic: telegram · allowlist
+                            - cell: 2026-11-07 04:22:23
+                            - cell:
+                              - generic: Only the Telegram user 81459823 may talk to this agent. Add new users through the console, never by editing config.yaml…
+                            - cell:
+                              - button: Open
+    - region "Notifications alt+T"
+  - dialog [ref=f12e295]:
+    - generic [ref=f12e296]:
+      - generic [ref=f12e297]:
+        - heading "New memory entry" [level=2] [ref=f12e298]
+        - paragraph [ref=f12e299]: "Keyed by namespace and key: writing an existing pair updates it and increments its version."
+      - generic [ref=f12e300]:
+        - generic [ref=f12e301]:
+          - generic [ref=f12e302]: Namespace
+          - combobox "Namespace family" [ref=f12e303]:
+            - generic: instance:<id>
+          - combobox [ref=f12e304]
+        - generic [ref=f12e305]:
+          - generic [ref=f12e306]: Instance
+          - combobox "Instance namespace" [ref=f12e307]:
+            - generic: alice
+          - combobox [ref=f12e308]
+        - generic [ref=f12e309]:
+          - generic [ref=f12e310]: Key
+          - textbox "Key" [active] [ref=f12e311]:
+            - /placeholder: backup-runbook
+      - generic [ref=f12e312]:
+        - generic [ref=f12e313]:
+          - generic [ref=f12e314]: Value
+          - generic [ref=f12e315]: 0 / 64 KiB
+        - textbox "Value" [ref=f12e316]:
+          - /placeholder: "Restart the gateway after an upgrade: docker compose restart hermes."
+        - paragraph [ref=f12e317]: Plain text, searchable by every authenticated client. Never store a credential here.
+      - generic [ref=f12e318]:
+        - generic [ref=f12e319]:
+          - generic [ref=f12e320]: Tags
+          - textbox "Tags" [ref=f12e321]:
+            - /placeholder: backup, ops
+          - paragraph [ref=f12e322]: Comma-separated, at most 16.
+        - generic [ref=f12e323]:
+          - generic [ref=f12e324]: Expiry
+          - combobox "Expiry" [ref=f12e325]:
+            - generic: No expiry
+          - combobox [ref=f12e326]
+      - generic [ref=f12e327]:
+        - button "Cancel" [ref=f12e328]
+        - button "Create entry" [ref=f12e329]
+    - button "Close" [ref=f12e330]

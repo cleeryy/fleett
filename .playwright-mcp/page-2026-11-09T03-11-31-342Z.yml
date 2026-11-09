@@ -1,0 +1,42 @@
+- generic [ref=f3e2]:
+  - generic [ref=f3e3]:
+    - link "Skip to content" [ref=f3e456] [cursor=pointer]:
+      - /url: "#main"
+    - generic [ref=f3e79]:
+      - banner [ref=f3e80]:
+        - button "Open navigation" [ref=f3e810]
+        - navigation "Breadcrumb" [ref=f3e469]:
+          - list [ref=f3e82]:
+            - listitem [ref=f3e822]:
+              - generic [ref=f3e823]: Messages
+      - main [ref=f3e85]:
+        - generic [ref=f3e824]:
+          - generic [ref=f3e825]:
+            - heading "Messages" [level=1] [ref=f3e826]
+            - generic [ref=f3e827]: Loading the fleet bus.
+          - generic [ref=f3e828]:
+            - button "Refresh" [ref=f3e829]
+            - button "Send message" [ref=f3e830]
+        - region "Message filters" [ref=f3e831]:
+          - generic [ref=f3e832]:
+            - generic [ref=f3e833]: Instance
+            - combobox "Instance" [ref=f3e834]:
+              - generic: Any instance
+          - generic [ref=f3e835]:
+            - generic [ref=f3e836]: From
+            - combobox "From" [ref=f3e837]:
+              - generic: Any sender
+          - generic [ref=f3e838]:
+            - generic [ref=f3e839]: To
+            - combobox "To" [ref=f3e840]:
+              - generic: Any recipient
+          - generic [ref=f3e841]:
+            - generic [ref=f3e842]: Kind
+            - combobox "Kind" [ref=f3e843]:
+              - generic: Any kind
+          - generic [ref=f3e845]:
+            - generic [ref=f3e846]: Limit
+            - combobox "Limit" [ref=f3e847]:
+              - generic: 100 messages
+        - paragraph [ref=f3e848]: …
+  - region "Notifications alt+T"
