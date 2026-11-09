@@ -56,6 +56,14 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett memory set <namespace> <key> <value> [--tag T]… [--ttl S]
+fleett memory get <namespace> <key>
+fleett memory list [--namespace NS] [--limit N]
+fleett memory search <query> [--namespace NS] [--limit N]
+fleett memory history <id>
+fleett memory restore <id> <version>
+fleett memory delete <id>
+fleett memory promote <id> [--namespace global]
 fleett doctor
 ```
 
@@ -184,6 +192,21 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `memory`
+
+Read and write the shared knowledge base ([docs/MEMORY.md](MEMORY.md)):
+
+```bash
+fleett memory set instance:probe runbook "restart the gateway after an upgrade" --tag ops
+fleett memory search "gateway upgrade"
+fleett memory history 12
+fleett memory restore 12 1
+fleett memory promote 12 --namespace global
+```
+
+Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
+the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
 
 ### `doctor`
 

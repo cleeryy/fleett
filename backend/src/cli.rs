@@ -315,6 +315,46 @@ pub enum Command {
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
+    Memory(MemoryCommand),
+}
+
+/// Sub-commands of `fleett memory`.
+#[derive(Debug, Clone)]
+pub enum MemoryCommand {
+    Set {
+        namespace: String,
+        key: String,
+        value: String,
+        tags: Vec<String>,
+        ttl_s: Option<u64>,
+    },
+    Get {
+        namespace: String,
+        key: String,
+    },
+    List {
+        namespace: Option<String>,
+        limit: usize,
+    },
+    Search {
+        query: String,
+        namespace: Option<String>,
+        limit: usize,
+    },
+    History {
+        id: i64,
+    },
+    Restore {
+        id: i64,
+        version: u32,
+    },
+    Delete {
+        id: i64,
+    },
+    Promote {
+        id: i64,
+        namespace: String,
+    },
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +453,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Memory(command) => memory(&client, json, &command).await,
     }
 }
 
@@ -850,6 +891,232 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
         return print_json(&value);
     }
     println!("message {message_id} marked as read");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoryEntryView {
+    id: i64,
+    namespace: String,
+    key: String,
+    value: String,
+    tags: Vec<String>,
+    owner: String,
+    version: u32,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoryVersionView {
+    version: u32,
+    value: String,
+    tags: Vec<String>,
+    owner: String,
+    action: String,
+    at: String,
+}
+
+async fn memory(client: &Client, json: bool, command: &MemoryCommand) -> Result<(), CliError> {
+    match command {
+        MemoryCommand::Set {
+            namespace,
+            key,
+            value,
+            tags,
+            ttl_s,
+        } => {
+            let mut body = json!({
+                "namespace": namespace,
+                "key": key,
+                "value": value,
+                "tags": tags,
+            });
+            if let Some(ttl) = ttl_s {
+                body["ttl_s"] = json!(ttl);
+            }
+            let value = client
+                .value(Method::POST, "/api/memory", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value["entry"].clone())?;
+            println!(
+                "{} {}/{} (version {}, id {})",
+                if value["created"].as_bool().unwrap_or(false) {
+                    "created"
+                } else {
+                    "updated"
+                },
+                entry.namespace,
+                entry.key,
+                entry.version,
+                entry.id
+            );
+        }
+        MemoryCommand::Get { namespace, key } => {
+            let query = [("namespace", namespace.clone()), ("key", key.clone())];
+            let value = client
+                .value(Method::GET, "/api/memory/by-key", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!(
+                "{} / {} (version {})",
+                entry.namespace, entry.key, entry.version
+            );
+            println!("{}", entry.value);
+            if !entry.tags.is_empty() {
+                println!("tags: {}", entry.tags.join(", "));
+            }
+        }
+        MemoryCommand::List { namespace, limit } => {
+            let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+            if let Some(namespace) = namespace {
+                query.push(("namespace", namespace.clone()));
+            }
+            let value = client
+                .value(Method::GET, "/api/memory", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<MemoryEntryView> = decode(value)?;
+            if entries.is_empty() {
+                println!("memory is empty");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.to_string(),
+                        entry.namespace.clone(),
+                        entry.key.clone(),
+                        entry.value.replace('\n', " "),
+                        entry.tags.join(","),
+                        entry.version.to_string(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "NAMESPACE", "KEY", "VALUE", "TAGS", "VER"], &rows)
+            );
+        }
+        MemoryCommand::Search {
+            query,
+            namespace,
+            limit,
+        } => {
+            let mut params: Vec<(&str, String)> =
+                vec![("q", query.clone()), ("limit", limit.to_string())];
+            if let Some(namespace) = namespace {
+                params.push(("namespace", namespace.clone()));
+            }
+            let value = client
+                .value(Method::GET, "/api/memory/search", &params, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<MemoryEntryView> = decode(value)?;
+            if entries.is_empty() {
+                println!("no match");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.to_string(),
+                        entry.namespace.clone(),
+                        entry.key.clone(),
+                        entry.value.replace('\n', " "),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "NAMESPACE", "KEY", "VALUE"], &rows)
+            );
+        }
+        MemoryCommand::History { id } => {
+            let value = client
+                .value(Method::GET, &format!("/api/memory/{id}/history"), &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let versions: Vec<MemoryVersionView> = decode(value)?;
+            let rows: Vec<Vec<String>> = versions
+                .iter()
+                .map(|version| {
+                    vec![
+                        version.version.to_string(),
+                        version.action.clone(),
+                        version.owner.clone(),
+                        version.at.clone(),
+                        version.value.replace('\n', " "),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["VER", "ACTION", "ACTOR", "AT", "VALUE"], &rows)
+            );
+        }
+        MemoryCommand::Restore { id, version } => {
+            let body = json!({ "version": version });
+            let value = client
+                .value(
+                    Method::POST,
+                    &format!("/api/memory/{id}/rollback"),
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!(
+                "restored {}/{} as version {}",
+                entry.namespace, entry.key, entry.version
+            );
+        }
+        MemoryCommand::Delete { id } => {
+            client
+                .text(Method::DELETE, &format!("/api/memory/{id}"), &[], None)
+                .await?;
+            if json {
+                println!("{}", json!({"deleted": id}));
+            } else {
+                println!("deleted memory entry {id}");
+            }
+        }
+        MemoryCommand::Promote { id, namespace } => {
+            let body = json!({ "namespace": namespace });
+            let value = client
+                .value(
+                    Method::POST,
+                    &format!("/api/memory/{id}/promote"),
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!("promoted {} to {}", entry.key, entry.namespace);
+        }
+    }
     Ok(())
 }
 

@@ -164,6 +164,45 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — shared fleet memory (issue #29): key/value entries with FTS5
+    // search, TTL and a full version history. Values are operator knowledge,
+    // never credentials; secrets stay in `instance_env` / `providers`.
+    r#"
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '',
+    owner       TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    expires_at  TEXT,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (namespace, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory_entries (namespace);
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id   INTEGER NOT NULL,
+    namespace  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    tags       TEXT NOT NULL,
+    owner      TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    action     TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_versions_entry ON memory_versions (entry_id, version);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+    USING fts5(namespace, key, value, tags, tokenize = 'unicode61');
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

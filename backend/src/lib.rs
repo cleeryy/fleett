@@ -15,6 +15,7 @@ pub mod files;
 pub mod history;
 pub mod instance_archive;
 pub mod logs;
+pub mod memory;
 pub mod metrics;
 pub mod migrate;
 pub mod models;

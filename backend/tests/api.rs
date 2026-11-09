@@ -3958,3 +3958,96 @@ async fn a_message_loop_is_stopped_by_hops() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(parse(&body)["error"]["code"], "message_loop");
 }
+
+// ---------------------------------------------------------------------------
+// Shared memory (#29)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Shared memory (#29)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_is_written_searched_and_rolled_back() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/memory",
+            Some(json!({
+                "namespace": "instance:probe",
+                "key": "runbook",
+                "value": "restart the gateway after an upgrade",
+                "tags": ["ops"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = parse(&body)["entry"].clone();
+    let id = first["id"].as_i64().expect("id");
+    assert_eq!(first["version"], 1);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/memory/search?q=gateway", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/memory",
+            Some(json!({
+                "namespace": "instance:probe",
+                "key": "runbook",
+                "value": "drain first",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["entry"]["version"], 2);
+
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/memory/{id}/history"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 2);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/memory/{id}/rollback"),
+            Some(json!({ "version": 1 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse(&body)["value"],
+        "restart the gateway after an upgrade"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/memory/{id}/promote"),
+            Some(json!({ "namespace": "global" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["namespace"], "global");
+
+    let (status, _) = harness
+        .request(Method::DELETE, &format!("/api/memory/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = harness
+        .request(Method::GET, "/api/memory/search?q=gateway", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let remaining = parse(&body);
+    assert_eq!(remaining.as_array().expect("array").len(), 1);
+    assert_eq!(remaining[0]["namespace"], "global");
+}

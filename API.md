@@ -259,6 +259,39 @@ Secrets are not restored: `warnings` lists the variables to PATCH
 attached only when they already exist on this host. Nothing is started unless `start=true`.
 See `docs/BACKUP.md`.
 
+## Shared memory
+
+Key/value knowledge base with FTS5 search, TTL and history. See
+[docs/MEMORY.md](docs/MEMORY.md). Values are knowledge, never secrets.
+
+`POST /api/memory` → `201` (create) or `200` (update) `{"entry": MemoryEntry, "created": bool}`
+
+```json
+{"namespace":"instance:probe","key":"runbook","value":"restart the gateway after an upgrade",
+ "tags":["ops"],"ttl_s":86400}
+```
+
+`namespace`: `global`, `shared`, `instance:<id>` or `project:<name>`. `ttl_s` is optional
+(60 … 31536000). `PUT /api/memory/{id}` updates by id.
+
+`GET /api/memory?namespace=&tag=&limit=50` → `MemoryEntry[]` (newest first, expired and
+deleted entries excluded).
+
+`GET /api/memory/search?q=&namespace=&tags=a,b&limit=50` → `MemoryEntry[]`. Every search
+term is quoted before it reaches FTS5, so `OR`, `NEAR` and column filters are inert. Tags are
+ANDed.
+
+`GET /api/memory/by-key?namespace=&key=` → `MemoryEntry`, `404` when absent.
+
+`GET /api/memory/{id}/history` → `MemoryVersion[]` (newest first). Every write appends a
+version; `DELETE` is a soft delete and stays restorable.
+
+`POST /api/memory/{id}/rollback` `{"version":1}` → `MemoryEntry` (a new version).
+
+`POST /api/memory/{id}/promote` `{"namespace":"global"}` → `MemoryEntry` (copy).
+
+`DELETE /api/memory/{id}` → `204`. `DELETE /api/memory/expired` → `{"removed": N}`.
+
 ## Agent-to-agent messages
 
 The bus is persistent (SQLite) and documented in [docs/BUS.md](docs/BUS.md).

@@ -8,6 +8,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod instances;
+pub mod memory;
 pub mod providers;
 pub mod shares;
 pub mod templates;
@@ -143,6 +144,14 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/audit", get(audit::list))
         .route("/messages", get(bus::list))
         .route("/messages/expired", delete(bus::purge))
+        .route("/memory", get(memory::list).post(memory::write))
+        .route("/memory/search", get(memory::search))
+        .route("/memory/by-key", get(memory::get_by_key))
+        .route("/memory/expired", delete(memory::purge))
+        .route("/memory/{id}", delete(memory::delete))
+        .route("/memory/{id}/history", get(memory::history))
+        .route("/memory/{id}/rollback", post(memory::rollback))
+        .route("/memory/{id}/promote", post(memory::promote))
         .route("/tokens", get(tokens::list).post(tokens::create))
         .route("/tokens/{id}", delete(tokens::revoke))
         .route("/templates", get(templates::list))

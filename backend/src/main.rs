@@ -229,6 +229,57 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// Read and write the shared fleet memory (client mode).
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Create or update one entry.
+    Set {
+        /// `global`, `shared`, `instance:<id>` or `project:<name>`.
+        namespace: String,
+        key: String,
+        value: String,
+        /// Tag, repeatable.
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Expire after N seconds.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Read one entry by namespace and key.
+    Get { namespace: String, key: String },
+    /// Browse entries.
+    List {
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Full text search.
+    Search {
+        query: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show every version of one entry.
+    History { id: i64 },
+    /// Restore an old version as a new one.
+    Restore { id: i64, version: u32 },
+    /// Soft-delete one entry.
+    Delete { id: i64 },
+    /// Copy an entry into another namespace (default global).
+    Promote {
+        id: i64,
+        #[arg(long, default_value = "global")]
+        namespace: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +517,47 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Memory { action } => {
+            let command = match action {
+                MemoryCommands::Set {
+                    namespace,
+                    key,
+                    value,
+                    tag,
+                    ttl,
+                } => cli::MemoryCommand::Set {
+                    namespace,
+                    key,
+                    value,
+                    tags: tag,
+                    ttl_s: ttl,
+                },
+                MemoryCommands::Get { namespace, key } => {
+                    cli::MemoryCommand::Get { namespace, key }
+                }
+                MemoryCommands::List { namespace, limit } => {
+                    cli::MemoryCommand::List { namespace, limit }
+                }
+                MemoryCommands::Search {
+                    query,
+                    namespace,
+                    limit,
+                } => cli::MemoryCommand::Search {
+                    query,
+                    namespace,
+                    limit,
+                },
+                MemoryCommands::History { id } => cli::MemoryCommand::History { id },
+                MemoryCommands::Restore { id, version } => {
+                    cli::MemoryCommand::Restore { id, version }
+                }
+                MemoryCommands::Delete { id } => cli::MemoryCommand::Delete { id },
+                MemoryCommands::Promote { id, namespace } => {
+                    cli::MemoryCommand::Promote { id, namespace }
+                }
+            };
+            cli::run(cli::Command::Memory(command), json).await
         }
     };
 
