@@ -110,6 +110,8 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/stop", post(stop_instance))
         .route("/api/instances/{id}/restart", post(restart_instance))
         .route("/api/instances/{id}/logs", get(logs))
+        .route("/api/logs", get(log_search))
+        .route("/api/logs/export", get(log_export))
         .route("/api/usage", get(usage))
         .route("/api/images", get(images))
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
@@ -276,6 +278,42 @@ async fn logs(
         "line one\nline two\n".to_string(),
     )
         .into_response()
+}
+
+async fn log_search() -> Json<Value> {
+    Json(json!({
+        "entries": [
+            {
+                "id": 2,
+                "instance": "bob",
+                "at": "2026-11-09T10:01:00.000Z",
+                "level": "error",
+                "message": "allowlist accepted"
+            }
+        ],
+        "count": 1,
+        "limit": 10
+    }))
+}
+
+async fn log_export(
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    match query.get("format").map(String::as_str) {
+        Some("csv") => (
+            [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            "at,instance,level,message\n2026-11-09T10:01:00.000Z,bob,error,allowlist accepted\n",
+        )
+            .into_response(),
+        _ => Json(json!([{
+            "id": 2,
+            "instance": "bob",
+            "at": "2026-11-09T10:01:00.000Z",
+            "level": "error",
+            "message": "allowlist accepted"
+        }]))
+        .into_response(),
+    }
 }
 
 async fn usage() -> Json<Value> {
@@ -531,6 +569,89 @@ async fn logs_json_requests_and_prints_json() {
 
     let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
     assert_eq!(value.as_array().expect("array").len(), 2);
+}
+
+#[tokio::test]
+async fn logs_search_sends_the_filters_and_prints_a_table() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "logs",
+            "search",
+            "--q",
+            "allowlist",
+            "--instance",
+            "bob",
+            "--level",
+            "warn",
+            "--since",
+            "24h",
+            "--until",
+            "2026-11-09T12:00:00Z",
+            "--limit",
+            "10",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("INSTANCE"), "{text}");
+    assert!(text.contains("bob"), "{text}");
+    assert!(text.contains("allowlist accepted"), "{text}");
+
+    let request = server.request("GET", "/api/logs");
+    assert_eq!(request.query("q"), Some("allowlist"));
+    assert_eq!(request.query("instances"), Some("bob"));
+    assert_eq!(request.query("level"), Some("warn"));
+    assert_eq!(request.query("since"), Some("24h"));
+    assert_eq!(request.query("until"), Some("2026-11-09T12:00:00Z"));
+    assert_eq!(request.query("limit"), Some("10"));
+}
+
+#[tokio::test]
+async fn logs_export_writes_the_requested_file() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let out = home.path().join("logs.csv");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "logs",
+            "export",
+            "--format",
+            "csv",
+            "-f",
+            out.to_str().expect("path"),
+            "--q",
+            "allowlist",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = std::fs::read_to_string(&out).expect("export file");
+    assert!(text.starts_with("at,instance,level,message\n"), "{text}");
+    assert!(text.contains("allowlist accepted"), "{text}");
+
+    let request = server.request("GET", "/api/logs/export");
+    assert_eq!(request.query("format"), Some("csv"));
+    assert_eq!(request.query("q"), Some("allowlist"));
+}
+
+#[tokio::test]
+async fn logs_without_an_instance_or_subcommand_is_a_usage_error() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["logs"]).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("instance id"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[tokio::test]

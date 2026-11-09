@@ -42,6 +42,11 @@ install -m 600 /dev/null ~/.config/fleett/config.toml
 fleett ls
 fleett ps [--all]
 fleett logs <id> [--tail N] [--since DURATION|TIMESTAMP] [--grep REGEX] [--level error|warn]
+fleett logs search [--q TEXT] [--instance ID[,ID]] [--level info|warn|error]
+                   [--since WHEN] [--until WHEN] [--limit N]
+fleett logs tail [--instance ID[,ID]] [--q TEXT] [--level LEVEL] [--since WHEN]
+fleett logs export --format json|csv -f FILE [--q TEXT] [--instance ID[,ID]]
+                   [--level LEVEL] [--since WHEN] [--until WHEN] [--limit N]
 fleett create --id ID [--name NAME] [--template TEMPLATE] [--model MODEL]
                [--base-url URL] [--api-key-env VAR] [--gate-token TOKEN]
                [--channel telegram|discord|none] [--channel-token TOKEN]
@@ -81,18 +86,43 @@ fleett ps
 fleett ps --all --json
 ```
 
-### `logs`
+### `logs` / log center
 
-Prints the logs of one instance. `--tail` defaults to 200 (maximum 2000). `--since` accepts a
-Docker duration (`30s`, `10m`, `2h`, `1h30m`) or an RFC 3339 timestamp. `--grep` is a regex,
-`--level warn` keeps warnings **and** errors. With `--json` the API returns
-`[{"time":"…","message":"…"}]` or `[{"line":"…"}]` entries.
+`fleett logs <id>` prints the logs of one instance. `--tail` defaults to 200 (maximum 2000).
+`--since` accepts a Docker duration (`30s`, `10m`, `2h`, `1h30m`) or an RFC 3339 timestamp.
+`--grep` is a regex, `--level warn` keeps warnings **and** errors. With `--json` the API
+returns `[{"time":"…","message":"…"}]` or `[{"line":"…"}]` entries.
 
 ```bash
 fleett logs alice --tail 50
 fleett logs alice --since 10m --grep 'gateway|health'
 fleett logs alice --level error --json
 ```
+
+The `search`, `tail` and `export` subcommands use the persistent log center
+([docs/LOGS.md](LOGS.md)): every instance is tailed continuously and the lines are stored,
+redacted and indexed with FTS5.
+
+```bash
+# Search every instance, or only alice and bob (--instance accepts a comma-separated list).
+fleett logs search --q allowlist --since 24h --limit 50
+fleett logs search --q allowlist --instance alice,bob --level warn
+
+# Follow new lines until Ctrl-C (polls every second).
+fleett logs tail --instance alice
+fleett --json logs tail --instance alice | jq -r .message
+
+# Download the current result set.
+fleett logs export --format csv -f /tmp/logs.csv --q allowlist
+fleett logs export --format json -f /tmp/logs.json --instance alice --level error
+```
+
+`--q` is an FTS5 query; a partial word falls back to a substring search. `--since` and
+`--until` accept an RFC 3339 timestamp or a relative window (`30m`, `24h`, `7d`).
+`--level warn` keeps warnings and errors; `info` (default) keeps everything. `search`
+defaults to 100 rows, `export` to 500; the API caps both at 500. `tail` prints
+`at instance level message`, or one JSON object per line with `--json`. `export` writes the
+server response verbatim and prints the path, format and byte count.
 
 ### `create`
 

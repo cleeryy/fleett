@@ -164,6 +164,31 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — persistent log center (issue #42). `log_entries` keeps the lines
+    // tailed from every instance container; `log_fts` is a standalone FTS5
+    // index over the message, whose rowid is `log_entries.id` (it is written
+    // and deleted by the log store in the same transaction as the row).
+    // `line_hash` makes repeated tails idempotent: the same raw line of the
+    // same instance is never stored twice.
+    r#"
+CREATE TABLE IF NOT EXISTS log_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    level       TEXT NOT NULL DEFAULT 'info',
+    message     TEXT NOT NULL,
+    raw         TEXT NOT NULL,
+    line_hash   TEXT NOT NULL,
+    UNIQUE (instance_id, line_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_entries_at ON log_entries (at);
+CREATE INDEX IF NOT EXISTS idx_log_entries_instance_at
+    ON log_entries (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_log_entries_level ON log_entries (level);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(message, instance_id);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.

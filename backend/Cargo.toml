@@ -19,6 +19,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
+futures-util = "0.3"
 http-body-util = "0.1"
 clap = { version = "4", features = ["derive"] }
 hmac = "0.12"

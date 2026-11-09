@@ -321,6 +321,10 @@ pub const MIN_OIDC_STATE_TTL_SECS: u64 = 60;
 pub const MAX_OIDC_STATE_TTL_SECS: u64 = 3600;
 /// Minimum length of the decoded `FLEETT_SESSION_SECRET`.
 pub const MIN_SESSION_SECRET_BYTES: usize = 32;
+/// Default retention of the persistent log center (`FLEETT_LOG_RETENTION`).
+pub const DEFAULT_LOG_RETENTION: &str = "7d";
+/// Default row cap of the persistent log center (`FLEETT_LOG_MAX_ROWS`).
+pub const DEFAULT_LOG_MAX_ROWS: u64 = 500_000;
 
 /// Fully resolved configuration.
 #[derive(Debug, Clone)]
@@ -356,6 +360,10 @@ pub struct Config {
     pub hardening: Hardening,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Retention window of the persistent log center (`FLEETT_LOG_RETENTION`).
+    pub log_retention: std::time::Duration,
+    /// Row cap of the log center; `0` disables the cap (`FLEETT_LOG_MAX_ROWS`).
+    pub log_max_rows: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +586,23 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
 
+        let log_retention = match get("LOG_RETENTION") {
+            None => parse_log_retention(DEFAULT_LOG_RETENTION).expect("default retention is valid"),
+            Some(value) => parse_log_retention(&value).ok_or_else(|| ConfigError::Invalid {
+                var: "FLEETT_LOG_RETENTION",
+                value: value.clone(),
+                detail: "expected a positive duration such as 7d, 24h or 1h30m".to_string(),
+            })?,
+        };
+        let log_max_rows = match get("LOG_MAX_ROWS") {
+            None => DEFAULT_LOG_MAX_ROWS,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_LOG_MAX_ROWS",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
         Ok(Self {
             root,
             bind,
@@ -598,6 +623,8 @@ impl Config {
             web_dist,
             hardening,
             metrics,
+            log_retention,
+            log_max_rows,
         })
     }
 
@@ -634,6 +661,8 @@ impl Config {
             hardening: Hardening::Standard,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            log_retention: parse_log_retention(DEFAULT_LOG_RETENTION).expect("valid default"),
+            log_max_rows: DEFAULT_LOG_MAX_ROWS,
         }
     }
 
@@ -861,6 +890,43 @@ fn resolve_metrics(
     Ok(MetricsConfig { bind, token })
 }
 
+/// Parse a log retention window.
+///
+/// Accepts one or more `<number><unit>` groups (`7d`, `24h`, `1h30m`) or a bare
+/// number of seconds. Units are `s`, `m`, `h`, `d` and `w`; the result must be
+/// strictly positive.
+pub fn parse_log_retention(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+    }
+    let mut rest = value;
+    let mut total = 0u64;
+    while !rest.is_empty() {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let (number, tail) = rest.split_at(digits);
+        let number: u64 = number.parse().ok()?;
+        let unit = tail.chars().next()?;
+        let unit_seconds = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            'w' => 7 * 24 * 60 * 60,
+            _ => return None,
+        };
+        total = total.checked_add(number.checked_mul(unit_seconds)?)?;
+        rest = &tail[unit.len_utf8()..];
+    }
+    (total > 0).then(|| std::time::Duration::from_secs(total))
+}
+
 /// Resolve one configuration variable: `FLEETT_<suffix>` then `FLEET_<suffix>`.
 fn resolve_var(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<String> {
     resolve_var_raw(lookup, suffix).filter(|value| !value.is_empty())
@@ -1020,6 +1086,29 @@ fn unquote(value: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn log_retention_windows_are_parsed() {
+        assert_eq!(
+            parse_log_retention("7d"),
+            Some(std::time::Duration::from_secs(7 * 24 * 3600))
+        );
+        assert_eq!(
+            parse_log_retention("24h"),
+            Some(std::time::Duration::from_secs(24 * 3600))
+        );
+        assert_eq!(
+            parse_log_retention("1h30m"),
+            Some(std::time::Duration::from_secs(90 * 60))
+        );
+        assert_eq!(
+            parse_log_retention("3600"),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        for invalid in ["", "0", "0d", "d", "1x", "-1h", "1.5h"] {
+            assert_eq!(parse_log_retention(invalid), None, "{invalid:?}");
+        }
+    }
 
     #[test]
     fn parses_env_file_and_ignores_comments() {

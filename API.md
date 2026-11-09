@@ -259,6 +259,37 @@ Secrets are not restored: `warnings` lists the variables to PATCH
 attached only when they already exist on this host. Nothing is started unless `start=true`.
 See `docs/BACKUP.md`.
 
+## Log center
+
+Persistent multi-instance logs, indexed with FTS5. The background tail, retention,
+redaction patterns and search semantics are documented in [docs/LOGS.md](docs/LOGS.md).
+
+| Method | Route | Response |
+|---|---|---|
+| GET | `/api/logs?instances=&q=&level=&since=&until=&limit=` | `{"entries":[…],"count":N,"limit":N}` |
+| GET | `/api/logs/instances/{id}?q=&level=&since=&until=&limit=` | same envelope, restricted to one instance |
+| GET | `/api/logs/stream?instances=` | `text/event-stream`; one `event: log` per new line, `:` heartbeat every 15 s |
+| GET | `/api/logs/export?format=json\|csv&<filters>` | attachment; JSON array or CSV (`at,instance,level,message`) |
+
+`instances` is a comma-separated list (empty means every instance, maximum 100).
+`q` is an FTS5 query with a `LIKE` substring fallback when FTS finds nothing or
+rejects the syntax. `level=info|warn|error` is a minimum: `warn` keeps warnings
+and errors. `since`/`until` accept an RFC 3339 timestamp or a relative window
+(`30m`, `24h`, `7d`). `limit` defaults to 100 and is capped at 500. Rows are sorted
+by `at` descending, then id. Invalid input answers `400` with `invalid_instance`,
+`invalid_level`, `invalid_since`, `invalid_until`, `invalid_window`,
+`invalid_limit`, `invalid_query`, `invalid_format` or `too_many_instances`.
+
+Entry shape:
+
+```json
+{"id":42,"instance":"alice","at":"2026-11-09T10:00:00.000Z","level":"error",
+ "message":"gateway died"}
+```
+
+Known secrets are redacted before storage and therefore never appear in any of
+these responses: `flt_…`, `sk-…`, `Bot …`, `Bearer …` and `token=…`.
+
 ## Agent-to-agent messages
 
 The bus is persistent (SQLite) and documented in [docs/BUS.md](docs/BUS.md).

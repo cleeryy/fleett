@@ -85,9 +85,15 @@ enum Commands {
         all: bool,
     },
     /// Print the logs of one instance (client mode).
+    ///
+    /// `fleett logs <id>` keeps the classic per-instance view; the
+    /// `search`, `tail` and `export` subcommands use the persistent log
+    /// center. See docs/LOGS.md.
     Logs {
-        /// Instance id.
-        id: String,
+        /// Instance id (classic mode).
+        id: Option<String>,
+        #[command(subcommand)]
+        action: Option<LogsCommands>,
         /// Number of trailing lines (1..=2000).
         #[arg(long, default_value_t = cli::DEFAULT_LOG_TAIL)]
         tail: u32,
@@ -232,6 +238,73 @@ enum Commands {
 }
 
 #[derive(Subcommand, Clone)]
+enum LogsCommands {
+    /// Search the persistent log center across one or more instances.
+    Search {
+        /// Full-text query (substring fallback when FTS finds nothing).
+        #[arg(long)]
+        q: Option<String>,
+        /// Instance id, or a comma-separated list (default: every instance).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Minimum level: `info`, `warn` or `error`.
+        #[arg(long)]
+        level: Option<String>,
+        /// RFC 3339 timestamp or a relative window (30m, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Upper bound (RFC 3339 timestamp or relative window).
+        #[arg(long)]
+        until: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Follow new lines (polls every second until interrupted).
+    Tail {
+        /// Instance id, or a comma-separated list (default: every instance).
+        #[arg(long)]
+        instance: Option<String>,
+        /// Only lines matching this full-text query.
+        #[arg(long)]
+        q: Option<String>,
+        /// Minimum level: `info`, `warn` or `error`.
+        #[arg(long)]
+        level: Option<String>,
+        /// Start at this timestamp or relative window instead of now.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Export the matching lines to a file.
+    Export {
+        /// `json` or `csv`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Output file.
+        #[arg(short = 'f', long = "file")]
+        out: PathBuf,
+        /// Full-text query.
+        #[arg(long)]
+        q: Option<String>,
+        /// Instance id, or a comma-separated list.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Minimum level: `info`, `warn` or `error`.
+        #[arg(long)]
+        level: Option<String>,
+        /// Lower bound (RFC 3339 timestamp or relative window).
+        #[arg(long)]
+        since: Option<String>,
+        /// Upper bound (RFC 3339 timestamp or relative window).
+        #[arg(long)]
+        until: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum BackupCommands {
     /// List the archives of the backup directory, newest first.
     List {
@@ -350,23 +423,100 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ps { all } => cli::run(cli::Command::Ps { all }, json).await,
         Commands::Logs {
             id,
+            action,
             tail,
             since,
             grep,
             level,
-        } => {
-            cli::run(
-                cli::Command::Logs(cli::LogsArgs {
-                    id,
-                    tail,
-                    since,
-                    grep,
-                    level,
-                }),
-                json,
-            )
-            .await
-        }
+        } => match action {
+            Some(LogsCommands::Search {
+                q,
+                instance,
+                level,
+                since,
+                until,
+                limit,
+            }) => {
+                cli::run(
+                    cli::Command::LogsSearch(cli::LogSearchArgs {
+                        q,
+                        instance,
+                        level,
+                        since,
+                        until,
+                        limit,
+                    }),
+                    json,
+                )
+                .await
+            }
+            Some(LogsCommands::Tail {
+                instance,
+                q,
+                level,
+                since,
+            }) => {
+                cli::run(
+                    cli::Command::LogsTail(cli::LogTailArgs {
+                        instance,
+                        q,
+                        level,
+                        since,
+                    }),
+                    json,
+                )
+                .await
+            }
+            Some(LogsCommands::Export {
+                format,
+                out,
+                q,
+                instance,
+                level,
+                since,
+                until,
+                limit,
+            }) => {
+                cli::run(
+                    cli::Command::LogsExport(cli::LogExportArgs {
+                        format,
+                        out,
+                        filters: cli::LogSearchArgs {
+                            q,
+                            instance,
+                            level,
+                            since,
+                            until,
+                            limit,
+                        },
+                    }),
+                    json,
+                )
+                .await
+            }
+            None => match id {
+                Some(id) => {
+                    cli::run(
+                        cli::Command::Logs(cli::LogsArgs {
+                            id,
+                            tail,
+                            since,
+                            grep,
+                            level,
+                        }),
+                        json,
+                    )
+                    .await
+                }
+                None => {
+                    eprintln!(
+                        "fleett: `fleett logs` needs an instance id or one of the \
+                         search, tail and export subcommands"
+                    );
+                    2
+                }
+            },
+        },
         Commands::Create {
             id,
             name,
@@ -539,6 +689,11 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state.clone());
+
+    // Persistent log center (issue #42): tail every instance every 10 s and
+    // enforce retention hourly. Tests never reach `serve`, so they call
+    // `logstore::tick` directly instead.
+    tokio::spawn(fleett::logstore::run(state.clone()));
 
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
