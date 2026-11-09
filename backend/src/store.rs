@@ -30,6 +30,7 @@ pub fn ensure_layout(cfg: &Config) -> io::Result<()> {
         cfg.templates_dir(),
         cfg.personas_dir(),
         cfg.root.join("bus"),
+        cfg.marketplace_dir(),
     ] {
         create_dir_private(&dir)?;
     }

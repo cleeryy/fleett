@@ -356,6 +356,11 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// Search, preview and install skills from the marketplace (client mode).
+    Marketplace {
+        #[command(subcommand)]
+        action: MarketplaceCommands,
+    },
     /// Read or change the per-instance access list (client mode).
     Acl {
         #[command(subcommand)]
@@ -526,6 +531,59 @@ enum TemplateCommands {
         /// Version number.
         version: i64,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum MarketplaceCommands {
+    /// Search every catalogue provider (local index, git, GitHub, skills.sh).
+    Search {
+        /// Free-text query; empty lists what the providers have.
+        query: String,
+        /// Only one provider: `local`, `git`, `github` or `skills.sh`.
+        #[arg(long)]
+        source: Option<String>,
+        /// Maximum entries (1..=200).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Resolve a source and show what would be installed, without writing.
+    Preview {
+        /// `local:<name>`, `git:owner/repo[:path]`, `github:owner/repo[:path][@ref]`,
+        /// `url:<https://…>` or `skills.sh:<owner>/<name>`.
+        source: String,
+        /// Upstream reference (branch, tag or version); `latest` keeps the default.
+        #[arg(default_value = "latest")]
+        r#ref: String,
+    },
+    /// Install a skill as the next free version, with its provenance.
+    Install {
+        /// Same grammar as `preview`.
+        source: String,
+        /// Upstream reference (branch, tag or version); `latest` keeps the default.
+        #[arg(default_value = "latest")]
+        r#ref: String,
+        /// Install even when the skill contains scripts.
+        #[arg(long)]
+        confirm_scripts: bool,
+        /// Registry name override (defaults to the upstream name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Publish the upstream diff as the next version, optionally promoting it.
+    Update {
+        /// Installed skill name.
+        name: String,
+        /// Move `latest` and restart the instances that follow it.
+        #[arg(long)]
+        promote: bool,
+        /// Publish even when the new version contains scripts.
+        #[arg(long)]
+        confirm_scripts: bool,
+    },
+    /// List installed skills whose upstream commit changed.
+    Updates,
+    /// Refresh the local index from `FLEETT_MARKETPLACE_GIT_INDEX`.
+    Sync,
 }
 
 #[derive(Subcommand, Clone)]
@@ -1211,6 +1269,52 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             cli::run(cli::Command::Memory(command), json).await
+        }
+        Commands::Marketplace { action } => {
+            let reference = |reference: String| {
+                (!reference.trim().is_empty() && reference.trim() != "latest")
+                    .then_some(reference.trim().to_string())
+            };
+            let command = match action {
+                MarketplaceCommands::Search {
+                    query,
+                    source,
+                    limit,
+                } => cli::MarketplaceCommand::Search {
+                    query,
+                    source,
+                    limit,
+                },
+                MarketplaceCommands::Preview { source, r#ref } => {
+                    cli::MarketplaceCommand::Preview {
+                        source,
+                        reference: reference(r#ref),
+                    }
+                }
+                MarketplaceCommands::Install {
+                    source,
+                    r#ref,
+                    confirm_scripts,
+                    name,
+                } => cli::MarketplaceCommand::Install {
+                    source,
+                    reference: reference(r#ref),
+                    confirm_scripts,
+                    name,
+                },
+                MarketplaceCommands::Update {
+                    name,
+                    promote,
+                    confirm_scripts,
+                } => cli::MarketplaceCommand::Update {
+                    name,
+                    promote,
+                    confirm_scripts,
+                },
+                MarketplaceCommands::Updates => cli::MarketplaceCommand::Updates,
+                MarketplaceCommands::Sync => cli::MarketplaceCommand::Sync,
+            };
+            cli::run(cli::Command::Marketplace(command), json).await
         }
         Commands::Schedules { id } => cli::run(cli::Command::Schedules { id }, json).await,
         Commands::Schedule { action } => {

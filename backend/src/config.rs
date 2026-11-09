@@ -149,6 +149,38 @@ impl fmt::Display for Hardening {
     }
 }
 
+/// `FLEETT_MARKETPLACE_SKILLS_SH` (issue #61): whether the skills.sh scraper
+/// is part of the catalogue search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MarketplaceSkillsSh {
+    /// Scrape behind a cache and a rate limit (the default).
+    #[default]
+    Auto,
+    /// Never contact skills.sh; local, git and GitHub keep working.
+    Off,
+}
+
+impl MarketplaceSkillsSh {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "on" | "true" | "1" | "yes" => Some(Self::Auto),
+            "off" | "false" | "0" | "no" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 /// Settings of the dedicated Prometheus listener (`FLEETT_METRICS_*`).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct MetricsConfig {
@@ -401,6 +433,10 @@ pub const MIN_SESSION_SECRET_BYTES: usize = 32;
 pub const DEFAULT_LOG_RETENTION: &str = "7d";
 /// Default row cap of the persistent log center (`FLEETT_LOG_MAX_ROWS`).
 pub const DEFAULT_LOG_MAX_ROWS: u64 = 500_000;
+/// GitHub REST base used by the marketplace GitHub provider (issue #61).
+pub const DEFAULT_MARKETPLACE_API_BASE: &str = "https://api.github.com";
+/// Public skills.sh origin scraped by the lightweight provider.
+pub const DEFAULT_MARKETPLACE_SKILLS_SH_BASE: &str = "https://skills.sh";
 
 /// Fully resolved configuration.
 #[derive(Debug, Clone)]
@@ -485,6 +521,24 @@ pub struct Config {
     /// Per-session token budget (`FLEETT_ASSISTANT_BUDGET_TOKENS`, default
     /// 50 000; `0` disables the limit).
     pub assistant_budget_tokens: u64,
+    /// `FLEETT_MARKETPLACE_SKILLS_SH` (issue #61): `auto` scrapes skills.sh,
+    /// `off` disables that provider without touching local/git/GitHub.
+    pub marketplace_skills_sh: MarketplaceSkillsSh,
+    /// `FLEETT_MARKETPLACE_GIT_INDEX=owner/repo`: the versioned index the
+    /// `fleett marketplace sync` job writes under `marketplace/index.json`.
+    pub marketplace_git_index: Option<String>,
+    /// Optional GitHub token (`GITHUB_TOKEN`, `FLEETT_GITHUB_TOKEN`): raises
+    /// the search rate limit. Never logged, never returned by an endpoint.
+    pub github_token: Option<String>,
+    /// Base URL of the GitHub API (`FLEETT_MARKETPLACE_API_BASE`), overridable
+    /// so a test fixture can stand in for github.com.
+    pub marketplace_api_base: String,
+    /// Base URL of skills.sh (`FLEETT_MARKETPLACE_SKILLS_SH_BASE`).
+    pub marketplace_skills_sh_base: String,
+    /// `FLEETT_MARKETPLACE_INSECURE=1` allows plain HTTP downloads from
+    /// non-loopback hosts. Off by default: a skill archive is executable
+    /// supply-chain content, it never travels in clear text unless asked.
+    pub marketplace_insecure: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -824,6 +878,40 @@ impl Config {
             })?,
         };
 
+        // Marketplace (issue #61). The scraper defaults to `auto`; `off` turns
+        // it off without touching the other providers.
+        let marketplace_skills_sh = match get("MARKETPLACE_SKILLS_SH") {
+            None => MarketplaceSkillsSh::Auto,
+            Some(value) => {
+                MarketplaceSkillsSh::parse(&value).ok_or_else(|| ConfigError::Invalid {
+                    var: "FLEETT_MARKETPLACE_SKILLS_SH",
+                    value,
+                    detail: "expected \"auto\" or \"off\"".to_string(),
+                })?
+            }
+        };
+        let marketplace_git_index = get("MARKETPLACE_GIT_INDEX");
+        // A plain `GITHUB_TOKEN` is accepted too: it is the conventional name
+        // operators already export. The value is never logged nor returned.
+        let github_token = get("GITHUB_TOKEN").or_else(|| {
+            std::env::var("GITHUB_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+        let marketplace_api_base = get("MARKETPLACE_API_BASE")
+            .unwrap_or_else(|| DEFAULT_MARKETPLACE_API_BASE.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let marketplace_skills_sh_base = get("MARKETPLACE_SKILLS_SH_BASE")
+            .unwrap_or_else(|| DEFAULT_MARKETPLACE_SKILLS_SH_BASE.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let marketplace_insecure = matches!(
+            get("MARKETPLACE_INSECURE").as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "on")
+        );
+
         Ok(Self {
             root,
             bind,
@@ -861,6 +949,12 @@ impl Config {
             assistant_provider,
             assistant_model,
             assistant_budget_tokens,
+            marketplace_skills_sh,
+            marketplace_git_index,
+            github_token,
+            marketplace_api_base,
+            marketplace_skills_sh_base,
+            marketplace_insecure,
         })
     }
 
@@ -928,6 +1022,14 @@ impl Config {
             assistant_provider: None,
             assistant_model: crate::assistant::DEFAULT_MODEL.to_string(),
             assistant_budget_tokens: crate::assistant::DEFAULT_BUDGET_TOKENS,
+            // The scraper is on by default; tests override both base URLs to
+            // reach their local fixture instead of the real internet.
+            marketplace_skills_sh: MarketplaceSkillsSh::Auto,
+            marketplace_git_index: None,
+            github_token: None,
+            marketplace_api_base: DEFAULT_MARKETPLACE_API_BASE.to_string(),
+            marketplace_skills_sh_base: DEFAULT_MARKETPLACE_SKILLS_SH_BASE.to_string(),
+            marketplace_insecure: false,
         }
     }
 
@@ -1040,6 +1142,17 @@ impl Config {
 
     pub fn skill_version_dir(&self, name: &str, version: &str) -> PathBuf {
         self.skill_dir(name).join(version)
+    }
+
+    /// Marketplace catalogue (issue #61): a synced `index.json` and nothing
+    /// else. The registry itself stays under `skills/`.
+    pub fn marketplace_dir(&self) -> PathBuf {
+        self.root.join("marketplace")
+    }
+
+    /// Path of the local marketplace index written by `fleett marketplace sync`.
+    pub fn marketplace_index_path(&self) -> PathBuf {
+        self.marketplace_dir().join("index.json")
     }
 
     pub fn template_config_path(&self, id: &str) -> PathBuf {
@@ -1639,6 +1752,51 @@ FLEETT_NETWORK='fleett-net'
         assert_eq!(cfg.assistant_model, "model-x");
         assert_eq!(cfg.assistant_budget_tokens, 0);
         assert!(load(vec![("FLEETT_ASSISTANT_BUDGET_TOKENS", "many")]).is_err());
+    }
+
+    #[test]
+    fn marketplace_settings_are_resolved_with_defaults_and_off_switches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_string_lossy().to_string();
+        let load = |vars: Vec<(&'static str, &'static str)>| {
+            let root = root.clone();
+            Config::from_process_env(move |key| {
+                if key == "FLEETT_ROOT" {
+                    return Some(root.clone());
+                }
+                if key == "FLEETT_TOKEN" {
+                    return Some("token".to_string());
+                }
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+
+        // Defaults: the scraper is on, the GitHub origin is the public one and
+        // plain HTTP stays refused.
+        let cfg = load(vec![]).expect("defaults");
+        assert_eq!(cfg.marketplace_skills_sh, MarketplaceSkillsSh::Auto);
+        assert_eq!(cfg.marketplace_git_index, None);
+        assert_eq!(cfg.marketplace_api_base, DEFAULT_MARKETPLACE_API_BASE);
+        assert_eq!(
+            cfg.marketplace_skills_sh_base,
+            DEFAULT_MARKETPLACE_SKILLS_SH_BASE
+        );
+        assert!(!cfg.marketplace_insecure);
+
+        let cfg = load(vec![
+            ("FLEETT_MARKETPLACE_SKILLS_SH", "off"),
+            ("FLEETT_MARKETPLACE_GIT_INDEX", "owner/repo"),
+            ("FLEETT_MARKETPLACE_INSECURE", "1"),
+            ("FLEETT_MARKETPLACE_API_BASE", "http://127.0.0.1:9/api/"),
+        ])
+        .expect("explicit values");
+        assert_eq!(cfg.marketplace_skills_sh, MarketplaceSkillsSh::Off);
+        assert_eq!(cfg.marketplace_git_index.as_deref(), Some("owner/repo"));
+        assert!(cfg.marketplace_insecure);
+        assert_eq!(cfg.marketplace_api_base, "http://127.0.0.1:9/api");
+        assert!(load(vec![("FLEETT_MARKETPLACE_SKILLS_SH", "maybe")]).is_err());
     }
 
     #[test]

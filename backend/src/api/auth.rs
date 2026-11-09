@@ -627,7 +627,14 @@ pub async fn require_auth(
     context.ip = ip;
     context.user_agent = user_agent;
 
-    if context.role == Role::Viewer && !is_read_method(&method) {
+    // The marketplace preview is a read-only POST: it resolves a source and
+    // reports what would be installed, without writing anything (issue #61).
+    // The path may or may not carry the `/api` prefix depending on the nesting
+    // layer that runs this middleware.
+    let unprefixed = path.strip_prefix("/api").unwrap_or(&path);
+    let read_only_post = method == Method::POST && unprefixed == "/marketplace/skills/preview";
+
+    if context.role == Role::Viewer && !is_read_method(&method) && !read_only_post {
         // A per-instance ACL may grant write (operator) or exec (owner) on an
         // instance route; `authz::require_instance_access` decides there.
         // Every other mutation stays admin-only.

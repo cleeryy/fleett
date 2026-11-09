@@ -21,6 +21,7 @@ pub mod instances;
 pub mod json;
 pub mod logcenter;
 pub mod maintenance;
+pub mod marketplace;
 pub mod memory;
 pub mod notifications;
 pub mod openapi;
@@ -96,6 +97,8 @@ pub struct AppState {
     pub quota: Arc<crate::quota::QuotaMonitor>,
     /// In-memory token counters of the integrated assistant, one per session.
     pub assistant: Arc<crate::assistant::Sessions>,
+    /// Marketplace catalogue (issue #61): providers, caches and rate limits.
+    pub marketplace: Arc<crate::marketplace::Marketplace>,
     pub started_at: Instant,
 }
 
@@ -141,6 +144,9 @@ impl AppState {
         let logstore = Arc::new(crate::logstore::LogStore::from_config(&cfg));
         // Build the limiter before `cfg` is moved into the state.
         let security = crate::security::Security::new(cfg.security.clone());
+        // Build the catalogue before `cfg` is moved into the state: its HTTP
+        // client embeds the download policy (HTTPS, loopback, insecure flag).
+        let marketplace = Arc::new(crate::marketplace::Marketplace::from_config(&cfg));
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
@@ -161,6 +167,7 @@ impl AppState {
                 .unwrap_or_default(),
             quota: Arc::new(crate::quota::QuotaMonitor::new()),
             assistant: Arc::new(crate::assistant::Sessions::default()),
+            marketplace,
             started_at: Instant::now(),
         })
     }
@@ -300,6 +307,15 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/skills/{name}/promote", post(skills::promote))
         .route("/skills/{name}/git/log", get(skills::log))
         .route("/skills/{name}/git/diff", get(skills::diff))
+        .route("/marketplace/skills", get(marketplace::search))
+        .route("/marketplace/skills/preview", post(marketplace::preview))
+        .route("/marketplace/skills/install", post(marketplace::install))
+        .route(
+            "/marketplace/skills/{name}/update",
+            post(marketplace::update),
+        )
+        .route("/marketplace/updates", get(marketplace::updates))
+        .route("/marketplace/sync", post(marketplace::sync))
         .route("/security/status", get(security::status))
         .route("/doctor", get(doctor::doctor))
         .route("/onboarding", get(doctor::onboarding))

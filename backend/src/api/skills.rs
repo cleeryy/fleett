@@ -217,21 +217,33 @@ pub async fn promote(
         .ok_or_else(|| {
             ApiError::bad_request("invalid_version", "version is required (for example v2)")
         })?;
+    let report = promote_and_restart(&state, &context, &name, version, "skill.promote").await?;
+    Ok(Json(report))
+}
 
+/// Move `latest` and roll the followers, shared by the registry promote and
+/// the marketplace update so both run exactly the same health-gated loop.
+pub(crate) async fn promote_and_restart(
+    state: &AppState,
+    context: &AuthContext,
+    name: &str,
+    version: &str,
+    audit_action: &str,
+) -> Result<PromoteResponse, ApiError> {
     let lock = state.locks.for_id(&format!("skill:{name}"));
     let _guard = lock.lock().await;
-    let author = history::author_for(&context);
-    let latest = skills::promote(&state.cfg, &name, version, &author).map_err(ApiError::from)?;
+    let author = history::author_for(context);
+    let latest = skills::promote(&state.cfg, name, version, &author).map_err(ApiError::from)?;
     let followers = state
         .db
-        .instances_following_skill(&name)
+        .instances_following_skill(name)
         .map_err(ApiError::from)?;
 
     let mut results = Vec::with_capacity(followers.len());
     for instance_id in followers {
         let lock = state.locks.for_id(&instance_id);
         let _guard = lock.lock().await;
-        match promote_one(&state, &instance_id).await {
+        match promote_one(state, &instance_id).await {
             Ok(()) => results.push(PromoteResult {
                 id: instance_id,
                 status: "restarted",
@@ -239,8 +251,8 @@ pub async fn promote(
             }),
             Err(message) => {
                 record_result(
-                    &state,
-                    &context,
+                    state,
+                    context,
                     "instance.skills",
                     &instance_id,
                     Some(json!({ "skill": name, "version": latest, "code": "promote_failed" })),
@@ -259,10 +271,10 @@ pub async fn promote(
         .filter(|result| result.status == "restarted")
         .count();
     record(
-        &state,
-        &context,
-        "skill.promote",
-        &name,
+        state,
+        context,
+        audit_action,
+        name,
         Some(json!({
             "version": latest,
             "instances": results.iter().map(|result| result.id.clone()).collect::<Vec<_>>(),
@@ -270,7 +282,7 @@ pub async fn promote(
             "failed": results.len() - restarted,
         })),
     );
-    Ok(Json(PromoteResponse { latest, results }))
+    Ok(PromoteResponse { latest, results })
 }
 
 /// `DELETE /api/skills/{name}` — refused while an instance mounts it.

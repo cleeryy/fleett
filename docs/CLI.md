@@ -80,6 +80,12 @@ fleett template from-instance <instance> --id <new> [--name NAME]
 fleett template rm <id>
 fleett template versions <id>
 fleett template restore <id> <version>
+fleett marketplace search <q> [--source local|git|github|skills.sh] [--limit N]
+fleett marketplace preview <source> [ref]
+fleett marketplace install <source> [ref] [--confirm-scripts] [--name NAME]
+fleett marketplace update <name> [--promote] [--confirm-scripts]
+fleett marketplace updates
+fleett marketplace sync
 fleett schedules <id>
 fleett schedule add <id> --name NAME --cron EXPR --prompt TEXT
                 [--enabled|--disabled] [--overlap skip|queue] [--timeout S]
@@ -453,6 +459,35 @@ fleett memory promote 12 --namespace global
 
 Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
 the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+
+### `marketplace`
+
+Search, preview, install and update skills from the catalogue
+([docs/MARKETPLACE.md](MARKETPLACE.md)):
+
+```bash
+fleett marketplace search pdf
+fleett marketplace search pdf --source github --limit 20
+fleett marketplace preview github:acme/pdf-tools main
+fleett marketplace install github:acme/pdf-tools main
+fleett marketplace install github:acme/pdf-tools main --confirm-scripts
+fleett marketplace updates
+fleett marketplace update pdf-tools --promote
+fleett marketplace sync
+```
+
+`search` prints `NAME`, `PROVIDER`, `DESCRIPTION`, `SOURCE`, `VERSION`, `COMMIT`
+then one status line per provider. `preview` prints the metadata, the file
+table (`PATH`, `SIZE`, `KIND`), the scripts that require `--confirm-scripts` and
+the `SKILL.md` body; it never writes anything. `install` publishes the next
+free version and prints the provenance. `update` publishes the upstream diff as
+the next version and, with `--promote`, runs the same rolling promote as the
+registry (followers restarted sequentially, health-checked). `updates` lists
+the installed skills whose upstream commit changed; `sync` refreshes the local
+index from `FLEETT_MARKETPLACE_GIT_INDEX`. Source grammar:
+`local:<name>`, `<name>`, `git:owner/repo[:path]`,
+`github:owner/repo[:path][@ref]`, `url:<https://…zip|…md>`,
+`skills.sh:<owner>/<name>`. `--json` prints the raw API payload.
 
 ### `egress policy` / `set` / `unset` / `blocks`
 

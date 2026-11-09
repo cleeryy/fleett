@@ -300,8 +300,8 @@ a `latest` pointer drives the instances that do not pin a version. See
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/skills` | — | `[{name,description,latest,versions,instances_count}]` |
-| GET | `/api/skills/{name}` | — | metadata, versions and files |
+| GET | `/api/skills` | — | `[{name,description,latest,versions,instances_count,source?,ref?,commit?}]` |
+| GET | `/api/skills/{name}` | — | metadata, versions and files (each version may carry `source?`,`ref?`,`commit?`,`upstream_version?`,`author?`,`tags?`,`installed_at?`) |
 | POST | `/api/skills` | `{"name","version","description"?,"files":[{path,content}]}` | `201`; `409 skill_version_exists`, admin only |
 | POST | `/api/skills/import` | multipart zip (`skill.yaml` + files) | `201` with the next free version, admin only |
 | POST | `/api/skills/{name}/promote` | `{"version":"v2"}` | `{"latest","results":[{id,status:"restarted\|failed",error?}]}`; restarts followers only, admin only |
@@ -313,6 +313,28 @@ On an instance, `skills: [{name, version?}]` mounts each skill read-only at
 `/opt/data/skills/<name>`. Omitting `version` follows `latest`; pinning freezes
 the mount. The instance detail returns `{name, version, effective_version}`.
 Changing the list rewrites the compose file and runs `up -d`.
+
+## Marketplace
+
+A catalogue of upstream skills with preview, install, update and promote; see
+[docs/MARKETPLACE.md](docs/MARKETPLACE.md). Providers (`local`, `git`,
+`github`, `skills.sh`) are independent: one failing provider reports a status
+and never fails the search. Installed versions carry their provenance in
+`skill.yaml` (`source`, `ref`, `commit`, `upstream_version`, `author`, `tags`,
+`installed_at`), exposed additively by the skill endpoints.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/marketplace/skills?q=&source=&limit=` | — | `{"entries":[{name,description,provider,source?,ref?,url?,author?,tags?,version?,commit?}],"sources":[{source,status:"ok\|disabled\|error",count,message?}]}` |
+| POST | `/api/marketplace/skills/preview` | `{"source","ref"?}` | `{name,description,version?,author?,files:[{path,size,script}],total_bytes,skill_md,scripts,commit?,source?,requires_confirmation}`; any role, rate-limited |
+| POST | `/api/marketplace/skills/install` | `{"source","ref"?,"name"?,"confirm_scripts"?}` | `201` `SkillDetail`; `409 scripts_require_confirmation` with `details.scripts`, `409 skill_version_exists`, admin only |
+| POST | `/api/marketplace/skills/{name}/update` | `{"promote"?,"confirm_scripts"?}` | `{name,from,to,commit?,files:[{path,status}],promoted?:{latest,results}}`; `409 no_upstream`, `409 upstream_unchanged`, admin only |
+| GET | `/api/marketplace/updates` | — | `{"updates":[{name,installed_version,upstream_version?,commit?,source,ref?}],"warnings":[…]}`, cached 60 s; an outage yields an empty list plus warnings, never `500` |
+| POST | `/api/marketplace/sync` | — | `{"skills":N,"source":"owner/repo","commit"?}`; `409 no_index_configured`, admin only |
+
+Uninstall stays `DELETE /api/skills/{name}` (`409 skill_in_use` while an
+instance mounts the skill). Imported content is never executed, symlinks are
+refused, downloads are capped and HTTPS-only (loopback excepted).
 
 ## Providers
 

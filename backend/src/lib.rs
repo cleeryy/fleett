@@ -28,6 +28,7 @@ pub mod instance_archive;
 pub mod logs;
 pub mod logstore;
 pub mod maintenance;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;

@@ -382,6 +382,7 @@ pub enum Command {
         limit: usize,
     },
     Memory(MemoryCommand),
+    Marketplace(MarketplaceCommand),
     AclGet(String),
     AclSet {
         id: String,
@@ -520,6 +521,33 @@ pub enum MemoryCommand {
         id: i64,
         namespace: String,
     },
+}
+
+/// Sub-commands of `fleett marketplace`.
+#[derive(Debug, Clone)]
+pub enum MarketplaceCommand {
+    Search {
+        query: String,
+        source: Option<String>,
+        limit: usize,
+    },
+    Preview {
+        source: String,
+        reference: Option<String>,
+    },
+    Install {
+        source: String,
+        reference: Option<String>,
+        confirm_scripts: bool,
+        name: Option<String>,
+    },
+    Update {
+        name: String,
+        promote: bool,
+        confirm_scripts: bool,
+    },
+    Updates,
+    Sync,
 }
 
 /// Arguments of `fleett incidents`.
@@ -789,6 +817,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Templates => templates_command(&client, json).await,
         Command::Template(action) => template_command(&client, json, &action).await,
         Command::Memory(command) => memory(&client, json, &command).await,
+        Command::Marketplace(command) => marketplace(&client, json, &command).await,
         Command::AclGet(id) => acl_get(&client, json, &id).await,
         Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
         Command::AclRm { id, subject } => acl_rm(&client, json, &id, &subject).await,
@@ -4073,6 +4102,498 @@ fn print_template_detail(value: &Value, json: bool) -> Result<(), CliError> {
             .map_err(|err| CliError::Decode(err.to_string()))?;
         print!("{text}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceEntryView {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceSourceView {
+    source: String,
+    status: String,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceSearchView {
+    #[serde(default)]
+    entries: Vec<MarketplaceEntryView>,
+    #[serde(default)]
+    sources: Vec<MarketplaceSourceView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplacePreviewFileView {
+    path: String,
+    #[serde(default)]
+    size: usize,
+    #[serde(default)]
+    script: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplacePreviewView {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    files: Vec<MarketplacePreviewFileView>,
+    #[serde(default)]
+    total_bytes: usize,
+    #[serde(default)]
+    skill_md: String,
+    #[serde(default)]
+    scripts: Vec<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    requires_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceFileChangeView {
+    path: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplacePromoteResultView {
+    id: String,
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplacePromoteView {
+    latest: String,
+    #[serde(default)]
+    results: Vec<MarketplacePromoteResultView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceUpdateView {
+    name: String,
+    from: String,
+    to: String,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    files: Vec<MarketplaceFileChangeView>,
+    #[serde(default)]
+    promoted: Option<MarketplacePromoteView>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceUpdateInfoView {
+    name: String,
+    installed_version: String,
+    #[serde(default)]
+    upstream_version: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceUpdatesView {
+    #[serde(default)]
+    updates: Vec<MarketplaceUpdateInfoView>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceSyncView {
+    skills: usize,
+    source: String,
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+/// Shorten a cell to keep the search table readable.
+fn ellipsis(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+async fn marketplace(
+    client: &Client,
+    json: bool,
+    command: &MarketplaceCommand,
+) -> Result<(), CliError> {
+    match command {
+        MarketplaceCommand::Search {
+            query,
+            source,
+            limit,
+        } => marketplace_search(client, json, query, source.as_deref(), *limit).await,
+        MarketplaceCommand::Preview { source, reference } => {
+            marketplace_preview(client, json, source, reference.as_deref()).await
+        }
+        MarketplaceCommand::Install {
+            source,
+            reference,
+            confirm_scripts,
+            name,
+        } => {
+            marketplace_install(
+                client,
+                json,
+                source,
+                reference.as_deref(),
+                *confirm_scripts,
+                name.as_deref(),
+            )
+            .await
+        }
+        MarketplaceCommand::Update {
+            name,
+            promote,
+            confirm_scripts,
+        } => marketplace_update(client, json, name, *promote, *confirm_scripts).await,
+        MarketplaceCommand::Updates => marketplace_updates(client, json).await,
+        MarketplaceCommand::Sync => marketplace_sync(client, json).await,
+    }
+}
+
+async fn marketplace_search(
+    client: &Client,
+    json: bool,
+    query: &str,
+    source: Option<&str>,
+    limit: usize,
+) -> Result<(), CliError> {
+    let mut params = vec![("q", query.to_string()), ("limit", limit.to_string())];
+    if let Some(source) = source {
+        params.push(("source", source.to_string()));
+    }
+    let value = client
+        .value(Method::GET, "/api/marketplace/skills", &params, None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let search: MarketplaceSearchView = decode(value)?;
+    if search.entries.is_empty() {
+        println!("no skill found");
+    } else {
+        let rows: Vec<Vec<String>> = search
+            .entries
+            .iter()
+            .map(|entry| {
+                vec![
+                    entry.name.clone(),
+                    entry.provider.clone(),
+                    ellipsis(&entry.description, 48),
+                    entry.source.clone().unwrap_or_else(|| "-".to_string()),
+                    entry.version.clone().unwrap_or_else(|| "-".to_string()),
+                    entry
+                        .commit
+                        .as_deref()
+                        .map(|commit| commit.chars().take(7).collect())
+                        .unwrap_or_else(|| "-".to_string()),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render_table(
+                &[
+                    "NAME",
+                    "PROVIDER",
+                    "DESCRIPTION",
+                    "SOURCE",
+                    "VERSION",
+                    "COMMIT"
+                ],
+                &rows
+            )
+        );
+    }
+    if !search.sources.is_empty() {
+        println!();
+        for source in &search.sources {
+            match &source.message {
+                Some(message) => println!(
+                    "{}: {} ({} entries) — {}",
+                    source.source, source.status, source.count, message
+                ),
+                None => println!(
+                    "{}: {} ({} entries)",
+                    source.source, source.status, source.count
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn marketplace_preview(
+    client: &Client,
+    json: bool,
+    source: &str,
+    reference: Option<&str>,
+) -> Result<(), CliError> {
+    let value = client
+        .value(
+            Method::POST,
+            "/api/marketplace/skills/preview",
+            &[],
+            Some(json!({ "source": source, "ref": reference })),
+        )
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let preview: MarketplacePreviewView = decode(value)?;
+    println!("name: {}", preview.name);
+    if !preview.description.is_empty() {
+        println!("description: {}", preview.description);
+    }
+    if let Some(version) = &preview.version {
+        println!("upstream version: {version}");
+    }
+    if let Some(author) = &preview.author {
+        println!("author: {author}");
+    }
+    if let Some(commit) = &preview.commit {
+        println!("commit: {commit}");
+    }
+    if let Some(source) = &preview.source {
+        println!("source: {source}");
+    }
+    println!(
+        "files: {} ({} total)",
+        preview.files.len(),
+        human_bytes(preview.total_bytes as u64)
+    );
+    let rows: Vec<Vec<String>> = preview
+        .files
+        .iter()
+        .map(|file| {
+            vec![
+                file.path.clone(),
+                human_bytes(file.size as u64),
+                if file.script {
+                    "script".to_string()
+                } else {
+                    "-".to_string()
+                },
+            ]
+        })
+        .collect();
+    print!("{}", render_table(&["PATH", "SIZE", "KIND"], &rows));
+    if preview.requires_confirmation {
+        println!();
+        println!(
+            "this skill contains {} script(s); re-run with --confirm-scripts to install it:",
+            preview.scripts.len()
+        );
+        for script in &preview.scripts {
+            println!("  {script}");
+        }
+    }
+    if !preview.skill_md.is_empty() {
+        println!();
+        println!("--- SKILL.md ---");
+        print!("{}", preview.skill_md);
+        if !preview.skill_md.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+async fn marketplace_install(
+    client: &Client,
+    json: bool,
+    source: &str,
+    reference: Option<&str>,
+    confirm_scripts: bool,
+    name: Option<&str>,
+) -> Result<(), CliError> {
+    let mut body = json!({
+        "source": source,
+        "ref": reference,
+        "confirm_scripts": confirm_scripts,
+    });
+    if let Some(name) = name {
+        body["name"] = json!(name);
+    }
+    let value = client
+        .value(
+            Method::POST,
+            "/api/marketplace/skills/install",
+            &[],
+            Some(body),
+        )
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    print_skill_summary(&value);
+    Ok(())
+}
+
+fn print_skill_summary(value: &Value) {
+    let name = value["name"].as_str().unwrap_or_default();
+    let latest = value["latest"].as_str().unwrap_or("-");
+    let files = value["files"].as_array().map(Vec::len).unwrap_or(0);
+    println!("skill {name} installed as {latest} ({files} files)");
+    if let Some(source) = value["source"].as_str() {
+        println!("  source: {source}");
+    }
+    if let Some(commit) = value["commit"].as_str() {
+        println!("  commit: {commit}");
+    }
+}
+
+async fn marketplace_update(
+    client: &Client,
+    json: bool,
+    name: &str,
+    promote: bool,
+    confirm_scripts: bool,
+) -> Result<(), CliError> {
+    let value = client
+        .value(
+            Method::POST,
+            &format!(
+                "/api/marketplace/skills/{}/update",
+                encode_path_segment(name)
+            ),
+            &[],
+            Some(json!({
+                "promote": promote,
+                "confirm_scripts": confirm_scripts,
+            })),
+        )
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let update: MarketplaceUpdateView = decode(value)?;
+    println!(
+        "{}: {} → {}{}",
+        update.name,
+        update.from,
+        update.to,
+        update
+            .commit
+            .as_ref()
+            .map(|commit| format!(" (commit {commit})"))
+            .unwrap_or_default()
+    );
+    if update.files.is_empty() {
+        println!("no file change");
+    } else {
+        for file in &update.files {
+            println!("  {:<9} {}", file.status, file.path);
+        }
+    }
+    if let Some(promoted) = &update.promoted {
+        println!("latest moved to {}", promoted.latest);
+        for result in &promoted.results {
+            match &result.error {
+                Some(error) => println!("  {}: {} ({error})", result.id, result.status),
+                None => println!("  {}: {}", result.id, result.status),
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn marketplace_updates(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/marketplace/updates", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let updates: MarketplaceUpdatesView = decode(value)?;
+    if updates.updates.is_empty() {
+        println!("every installed skill is up to date");
+    } else {
+        let rows: Vec<Vec<String>> = updates
+            .updates
+            .iter()
+            .map(|update| {
+                vec![
+                    update.name.clone(),
+                    update.installed_version.clone(),
+                    update
+                        .upstream_version
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                    update.commit.clone().unwrap_or_else(|| "-".to_string()),
+                    update.source.clone(),
+                ]
+            })
+            .collect();
+        print!(
+            "{}",
+            render_table(
+                &["NAME", "INSTALLED", "UPSTREAM", "COMMIT", "SOURCE"],
+                &rows
+            )
+        );
+    }
+    for warning in &updates.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+async fn marketplace_sync(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::POST, "/api/marketplace/sync", &[], Some(json!({})))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let sync: MarketplaceSyncView = decode(value)?;
+    println!(
+        "indexed {} skills from {}{}",
+        sync.skills,
+        sync.source,
+        sync.commit
+            .as_ref()
+            .map(|commit| format!(" (commit {commit})"))
+            .unwrap_or_default()
+    );
     Ok(())
 }
 

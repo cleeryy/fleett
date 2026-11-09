@@ -130,6 +130,49 @@ pub struct SkillFile {
     pub content: String,
 }
 
+/// Where an installed version came from (issue #61).
+///
+/// Every field is optional: a skill published through `POST /api/skills` or
+/// imported as a zip carries no provenance at all, and the registry must keep
+/// reading hand-written `skill.yaml` files that only declare a name and a
+/// description.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Canonical marketplace source (`github:owner/repo:path@main`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Requested upstream reference (branch, tag or version selector).
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// Upstream commit the files were resolved from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Version declared by the upstream metadata, when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_version: Option<String>,
+    /// Upstream author (repository owner or frontmatter author).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// When the marketplace installed this version (RFC 3339, UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<String>,
+}
+
+impl Provenance {
+    /// `true` when the version carries no marketplace origin at all.
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none()
+            && self.reference.is_none()
+            && self.commit.is_none()
+            && self.upstream_version.is_none()
+            && self.author.is_none()
+            && self.tags.is_empty()
+            && self.installed_at.is_none()
+    }
+}
+
 /// `skill.yaml` as stored. Every field is optional on disk so a hand-written
 /// file only has to declare what it needs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +181,14 @@ struct SkillMetaFile {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(flatten)]
+    provenance: Provenance,
+}
+
+/// `skill.yaml` after normalisation.
+struct SkillMeta {
+    description: String,
+    provenance: Provenance,
 }
 
 /// `GET /api/skills` entry.
@@ -152,6 +203,13 @@ pub struct SkillSummary {
     pub versions: Vec<String>,
     /// Instances mounting the skill, pinned or not.
     pub instances_count: usize,
+    /// Provenance of the followed version (absent for a local publish).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -164,6 +222,10 @@ pub struct SkillVersionInfo {
     pub files_count: usize,
     pub size_bytes: usize,
     pub published_at: String,
+    /// Where this version came from, when it was installed from the
+    /// marketplace (field-by-field additive: an older client ignores them).
+    #[serde(flatten)]
+    pub provenance: Provenance,
 }
 
 /// `GET /api/skills/{name}`.
@@ -178,6 +240,12 @@ pub struct SkillDetail {
     /// Instances mounting the skill, sorted.
     pub instances: Vec<String>,
     pub instances_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -248,7 +316,7 @@ pub fn ensure_registry(cfg: &Config) -> io::Result<()> {
 ///
 /// Returns the path unchanged when valid; refuses absolute paths, `.`/`..`
 /// components, empty components, backslashes, NUL bytes and over-long paths.
-fn validate_relative_path(path: &str) -> Result<(), String> {
+pub(crate) fn validate_relative_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("a file path must not be empty".to_string());
     }
@@ -304,7 +372,7 @@ fn read_text(path: &Path) -> Result<String, SkillError> {
 }
 
 /// Validate the content of one version before anything is written.
-fn validate_files(files: &[SkillFile]) -> Result<(), SkillError> {
+pub(crate) fn validate_files(files: &[SkillFile]) -> Result<(), SkillError> {
     if files.is_empty() {
         return Err(SkillError::Invalid("files must not be empty".to_string()));
     }
@@ -391,29 +459,28 @@ fn read_optional(path: &Path) -> Result<Option<String>, SkillError> {
     }
 }
 
-/// `(name, description)` of one version, tolerating a hand-written file.
-fn read_meta(cfg: &Config, name: &str, version: &str) -> Result<(String, String), SkillError> {
+/// `skill.yaml` of one version, tolerating a hand-written file.
+fn read_meta(cfg: &Config, name: &str, version: &str) -> Result<SkillMeta, SkillError> {
     let path = version_dir(cfg, name, version)?.join(META_FILE);
     let Some(text) = read_optional(&path)? else {
-        return Ok((name.to_string(), String::new()));
+        return Ok(SkillMeta {
+            description: String::new(),
+            provenance: Provenance::default(),
+        });
     };
     let file: SkillMetaFile = serde_yaml::from_str(&text).map_err(|err| {
         SkillError::Invalid(format!("{} is not valid YAML: {err}", path.display()))
     })?;
-    let stored_name = file
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(name)
-        .to_string();
     let description = file
         .description
         .as_deref()
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
-    Ok((stored_name, description))
+    Ok(SkillMeta {
+        description,
+        provenance: file.provenance,
+    })
 }
 
 /// Versions present on disk for one skill, sorted by number.
@@ -589,12 +656,16 @@ fn summary(
     let latest = latest(cfg, name);
     // The description is the one of the version instances follow, then of the
     // newest version: a skill keeps a description even without a `latest`.
-    let description = latest
+    let followed = latest
         .as_deref()
         .or_else(|| versions.last().map(String::as_str))
-        .map(|version| read_meta(cfg, name, version).map(|(_, description)| description))
-        .transpose()?
+        .map(|version| read_meta(cfg, name, version))
+        .transpose()?;
+    let description = followed
+        .as_ref()
+        .map(|meta| meta.description.clone())
         .unwrap_or_default();
+    let provenance = followed.map(|meta| meta.provenance).unwrap_or_default();
     let (created_at, updated_at) = timestamps(cfg, name);
     Ok(SkillSummary {
         name: name.to_string(),
@@ -602,6 +673,9 @@ fn summary(
         latest,
         versions,
         instances_count: counts.get(name).copied().unwrap_or(0),
+        source: provenance.source,
+        reference: provenance.reference,
+        commit: provenance.commit,
         created_at,
         updated_at,
     })
@@ -616,22 +690,27 @@ pub fn detail(cfg: &Config, db: &Db, name: &str) -> Result<SkillDetail, SkillErr
     let latest = latest(cfg, name);
     let mut infos = Vec::with_capacity(versions.len());
     for version in &versions {
-        let (_, description) = read_meta(cfg, name, version)?;
+        let meta = read_meta(cfg, name, version)?;
         let files = read_files(cfg, name, version)?;
         infos.push(SkillVersionInfo {
             version: version.clone(),
-            description,
+            description: meta.description,
             files_count: files.len(),
             size_bytes: files.iter().map(|file| file.content.len()).sum(),
             published_at: version_time(cfg, name, version),
+            provenance: meta.provenance,
         });
     }
-    let description = latest
+    let followed = latest
         .as_deref()
         .or_else(|| versions.last().map(String::as_str))
-        .map(|version| read_meta(cfg, name, version).map(|(_, description)| description))
-        .transpose()?
+        .map(|version| read_meta(cfg, name, version))
+        .transpose()?;
+    let description = followed
+        .as_ref()
+        .map(|meta| meta.description.clone())
         .unwrap_or_default();
+    let provenance = followed.map(|meta| meta.provenance).unwrap_or_default();
     let files = match latest.as_deref() {
         Some(version) => read_files(cfg, name, version)?,
         None => Vec::new(),
@@ -646,6 +725,9 @@ pub fn detail(cfg: &Config, db: &Db, name: &str) -> Result<SkillDetail, SkillErr
         files,
         instances_count: instances.len(),
         instances,
+        source: provenance.source,
+        reference: provenance.reference,
+        commit: provenance.commit,
         created_at,
         updated_at,
     })
@@ -681,11 +763,41 @@ pub fn publish(
         version,
         request.description.as_deref().unwrap_or_default(),
         request.files.as_deref().unwrap_or_default(),
+        &Provenance::default(),
+        author,
+    )
+}
+
+/// Publish one version with an explicit provenance (marketplace install).
+///
+/// The public [`publish`] keeps its signature and publishes without
+/// provenance; this entry point is what the catalogue uses so a later update
+/// can answer "where did this skill come from?".
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_with_provenance(
+    cfg: &Config,
+    db: &Db,
+    name: &str,
+    version: &str,
+    description: &str,
+    files: &[SkillFile],
+    provenance: &Provenance,
+    author: &Author,
+) -> Result<SkillDetail, SkillError> {
+    publish_parts(
+        cfg,
+        db,
+        name,
+        version,
+        description,
+        files,
+        provenance,
         author,
     )
 }
 
 /// Publish after the name, version, description and files are known.
+#[allow(clippy::too_many_arguments)]
 fn publish_parts(
     cfg: &Config,
     db: &Db,
@@ -693,6 +805,7 @@ fn publish_parts(
     version: &str,
     description: &str,
     files: &[SkillFile],
+    provenance: &Provenance,
     author: &Author,
 ) -> Result<SkillDetail, SkillError> {
     validate_skill_name(name).map_err(SkillError::Invalid)?;
@@ -708,7 +821,7 @@ fn publish_parts(
         });
     }
     ensure_registry(cfg).map_err(|err| SkillError::io(&cfg.skills_dir(), err))?;
-    write_version(cfg, name, version, description, files)?;
+    write_version(cfg, name, version, description, files, provenance)?;
     // The first version of a skill becomes its `latest`: an instance that
     // follows latest has something to mount immediately.
     if latest(cfg, name).is_none() {
@@ -726,6 +839,7 @@ fn write_version(
     version: &str,
     description: &str,
     files: &[SkillFile],
+    provenance: &Provenance,
 ) -> Result<(), SkillError> {
     let root = skill_dir(cfg, name)?;
     fs::create_dir_all(&root).map_err(|err| SkillError::io(&root, err))?;
@@ -749,6 +863,7 @@ fn write_version(
         let meta = SkillMetaFile {
             name: Some(name.to_string()),
             description: Some(description.to_string()),
+            provenance: provenance.clone(),
         };
         let text = serde_yaml::to_string(&meta)
             .map_err(|err| SkillError::Invalid(format!("cannot serialise {META_FILE}: {err}")))?;
@@ -853,6 +968,56 @@ pub fn publish_zip(
     bytes: &[u8],
     author: &Author,
 ) -> Result<SkillDetail, SkillError> {
+    let files = read_zip(bytes)?;
+    let meta_index = files
+        .iter()
+        .position(|entry| entry.path == META_FILE)
+        .ok_or_else(|| {
+            SkillError::Invalid(format!(
+                "the archive must contain {META_FILE} at its root (name and description)"
+            ))
+        })?;
+    let meta: SkillMetaFile = serde_yaml::from_str(&files[meta_index].content)
+        .map_err(|err| SkillError::Invalid(format!("{META_FILE} is not valid YAML: {err}")))?;
+    let name = meta
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SkillError::Invalid(format!("{META_FILE} must declare a name")))?
+        .to_string();
+    let description = meta
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let version = default_version(cfg, &name);
+    let files: Vec<SkillFile> = files
+        .into_iter()
+        .filter(|entry| entry.path != META_FILE)
+        .collect();
+    publish_parts(
+        cfg,
+        db,
+        &name,
+        &version,
+        &description,
+        &files,
+        &Provenance::default(),
+        author,
+    )
+}
+
+/// Read and validate the entries of a zip archive held in memory.
+///
+/// Shared by the zip import and the marketplace: the archive is bounded, every
+/// entry is a regular text file with a validated relative path (zip-slip and
+/// symlink entries are refused), and a single wrapping folder is stripped.
+/// `skill.yaml` is *not* required here; the caller decides how to name the
+/// skill (the registry import insists on it, a marketplace archive may declare
+/// its metadata in the frontmatter of `SKILL.md` instead).
+pub fn read_zip(bytes: &[u8]) -> Result<Vec<SkillFile>, SkillError> {
     if bytes.len() > MAX_ZIP_BYTES {
         return Err(SkillError::Invalid(format!(
             "the archive must be at most {MAX_ZIP_BYTES} bytes"
@@ -921,39 +1086,13 @@ pub fn publish_zip(
         ));
     }
     strip_common_root(&mut entries);
-    let meta_index = entries
-        .iter()
-        .position(|entry| entry.path == META_FILE)
-        .ok_or_else(|| {
-            SkillError::Invalid(format!(
-                "the archive must contain {META_FILE} at its root (name and description)"
-            ))
-        })?;
-    let meta: SkillMetaFile = serde_yaml::from_str(&entries[meta_index].content)
-        .map_err(|err| SkillError::Invalid(format!("{META_FILE} is not valid YAML: {err}")))?;
-    let name = meta
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| SkillError::Invalid(format!("{META_FILE} must declare a name")))?
-        .to_string();
-    let description = meta
-        .description
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
-    let version = default_version(cfg, &name);
-    let files: Vec<SkillFile> = entries
+    Ok(entries
         .into_iter()
-        .filter(|entry| entry.path != META_FILE)
         .map(|entry| SkillFile {
             path: entry.path,
             content: entry.content,
         })
-        .collect();
-    publish_parts(cfg, db, &name, &version, &description, &files, author)
+        .collect())
 }
 
 /// Remove a single wrapping folder (`my-skill/SKILL.md` → `SKILL.md`).
@@ -992,6 +1131,43 @@ fn default_version(cfg: &Config, name: &str) -> String {
         .unwrap_or(0)
         + 1;
     format!("v{next}")
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace helpers (issue #61)
+// ---------------------------------------------------------------------------
+
+/// Next free version of a skill (`v1` first), used by a marketplace install or
+/// update so the same source can be installed twice without a conflict.
+pub fn next_version(cfg: &Config, name: &str) -> String {
+    default_version(cfg, name)
+}
+
+/// Provenance recorded in the `skill.yaml` of one version.
+///
+/// Hand-written metadata yields a default (all-`None`) provenance, never an
+/// error: an old registry keeps working unchanged.
+pub fn version_provenance(
+    cfg: &Config,
+    name: &str,
+    version: &str,
+) -> Result<Provenance, SkillError> {
+    Ok(read_meta(cfg, name, version)?.provenance)
+}
+
+/// Files of one version (`skill.yaml` excluded), used to diff an update
+/// against what is installed.
+pub fn version_files(
+    cfg: &Config,
+    name: &str,
+    version: &str,
+) -> Result<Vec<SkillFile>, SkillError> {
+    read_files(cfg, name, version)
+}
+
+/// Every version of one skill, oldest first.
+pub fn versions(cfg: &Config, name: &str) -> Vec<String> {
+    versions_on_disk(cfg, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1596,39 @@ mod tests {
         let mut versions = vec!["v10".to_string(), "v2".to_string(), "v1".to_string()];
         versions.sort_by_key(|version| version_number(version).unwrap_or(u64::MAX));
         assert_eq!(versions, ["v1", "v2", "v10"]);
+    }
+
+    #[test]
+    fn hand_written_metadata_without_provenance_still_reads() {
+        let file: SkillMetaFile =
+            serde_yaml::from_str("name: homelab\ndescription: my notes\n").expect("yaml");
+        assert_eq!(file.name.as_deref(), Some("homelab"));
+        assert_eq!(file.description.as_deref(), Some("my notes"));
+        assert!(file.provenance.is_empty());
+    }
+
+    #[test]
+    fn provenance_round_trips_through_the_yaml_keys() {
+        let provenance = Provenance {
+            source: Some("github:acme/pdf-tools".to_string()),
+            reference: Some("main".to_string()),
+            commit: Some("9f2c1ab".to_string()),
+            upstream_version: Some("1.2.0".to_string()),
+            author: Some("acme".to_string()),
+            tags: vec!["pdf".to_string()],
+            installed_at: Some("2026-11-09T10:00:00Z".to_string()),
+        };
+        let text = serde_yaml::to_string(&SkillMetaFile {
+            name: Some("pdf-tools".to_string()),
+            description: Some("PDF".to_string()),
+            provenance: provenance.clone(),
+        })
+        .expect("yaml");
+        assert!(text.contains("ref: main"), "{text}");
+        assert!(text.contains("upstream_version: 1.2.0"), "{text}");
+        assert!(text.contains("installed_at:"), "{text}");
+        let parsed: SkillMetaFile = serde_yaml::from_str(&text).expect("re-read");
+        assert_eq!(parsed.provenance, provenance);
     }
 
     #[test]
