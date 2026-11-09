@@ -57,7 +57,7 @@ impl Harness {
 
     /// Decrypted secrets of an instance, read from the control plane store.
     fn instance_secrets(&self, id: &str) -> BTreeMap<String, String> {
-        fleett::secrets::load(&self.state.cfg, &self.state.db, id).expect("secrets readable")
+        fleett::envs::values(&self.state.cfg, &self.state.db, id).expect("secrets readable")
     }
 
     /// Every file under the instance directory, concatenated.
@@ -287,6 +287,48 @@ async fn lists_builtin_templates() {
         .collect();
     assert!(ids.contains(&"guest-discord"));
     assert!(ids.contains(&"solo"));
+
+    // Templates suggest the allowlist variables so the console can propose
+    // them instead of making the operator guess.
+    let discord = templates
+        .iter()
+        .find(|template| template["id"] == "guest-discord")
+        .expect("guest-discord template");
+    let discord_env = discord["env"].as_array().expect("env suggestions");
+    let keys: Vec<&str> = discord_env
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "DISCORD_ALLOWED_USERS",
+            "DISCORD_ALLOWED_ROLES",
+            "DISCORD_ALLOWED_CHANNELS",
+            "DISCORD_ALLOW_ALL_USERS"
+        ]
+    );
+    assert!(discord_env.iter().all(|entry| entry["secret"] == false));
+    assert!(discord_env.iter().all(|entry| entry["description"]
+        .as_str()
+        .is_some_and(|text| !text.is_empty())));
+    let guest_env: Vec<&str> = guest["env"]
+        .as_array()
+        .expect("guest env suggestions")
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
+    assert_eq!(
+        guest_env,
+        ["TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"]
+    );
+    assert_eq!(
+        templates
+            .iter()
+            .find(|template| template["id"] == "solo")
+            .expect("solo template")["env"],
+        json!([])
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +340,10 @@ async fn creates_instance_and_writes_files() {
     let harness = Harness::new();
     let mut body = instance_body("alice");
     body["gate_token"] = json!("gate-secret");
-    body["env"] = json!({"EXTRA_FLAG": "1"});
+    body["env"] = json!([
+        {"key": "EXTRA_FLAG", "value": "1", "secret": false},
+        {"key": "PROVIDER_TOKEN", "value": "provider-secret", "secret": true}
+    ]);
 
     let (status, response) = harness
         .request(Method::POST, "/api/instances", Some(body))
@@ -315,6 +360,7 @@ async fn creates_instance_and_writes_files() {
     // Secrets never come back through the API.
     assert!(!response.contains("123:ABC"));
     assert!(!response.contains("gate-secret"));
+    assert!(!response.contains("provider-secret"));
 
     // compose.yaml parses and names the project.
     let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
@@ -323,6 +369,14 @@ async fn creates_instance_and_writes_files() {
     assert_eq!(
         compose["services"]["agent"]["environment"]["TELEGRAM_BOT_TOKEN"],
         "${TELEGRAM_BOT_TOKEN}"
+    );
+    assert_eq!(
+        compose["services"]["agent"]["environment"]["PROVIDER_TOKEN"],
+        "${PROVIDER_TOKEN}"
+    );
+    assert_eq!(
+        compose["services"]["agent"]["environment"]["EXTRA_FLAG"], "${EXTRA_FLAG}",
+        "a non-secret value is interpolated too, never written in the file"
     );
 
     // No plaintext secrets file: the values are encrypted in the index.
@@ -338,9 +392,14 @@ async fn creates_instance_and_writes_files() {
         Some("gate-secret")
     );
     assert_eq!(secrets.get("EXTRA_FLAG").map(String::as_str), Some("1"));
+    assert_eq!(
+        secrets.get("PROVIDER_TOKEN").map(String::as_str),
+        Some("provider-secret")
+    );
     let on_disk = harness.instance_files("alice");
     assert!(!on_disk.contains("123:ABC"), "{on_disk}");
     assert!(!on_disk.contains("gate-secret"), "{on_disk}");
+    assert!(!on_disk.contains("provider-secret"), "{on_disk}");
 
     // config.yaml parses and has the mandated model block.
     let config = read_yaml(&harness.instance_dir("alice").join("data/config.yaml"));
@@ -353,14 +412,33 @@ async fn creates_instance_and_writes_files() {
     assert_eq!(config["platforms"]["discord"]["enabled"], false);
     assert!(harness.instance_dir("alice").join("data/SOUL.md").is_file());
 
+    let env = detail["env"].as_array().expect("env list");
+    let keys: Vec<&str> = env
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
     assert_eq!(
-        detail["env_keys"],
-        json!([
+        keys,
+        [
             "EXTRA_FLAG",
             "HERMES_GATE_PROFILE_TOKEN",
+            "PROVIDER_TOKEN",
             "TELEGRAM_BOT_TOKEN"
-        ])
+        ]
     );
+    let flag = env
+        .iter()
+        .find(|entry| entry["key"] == "EXTRA_FLAG")
+        .expect("plain entry");
+    assert_eq!(flag["secret"], false);
+    assert_eq!(flag["value"], "1");
+    let provider = env
+        .iter()
+        .find(|entry| entry["key"] == "PROVIDER_TOKEN")
+        .expect("secret entry");
+    assert_eq!(provider["secret"], true);
+    assert!(provider.get("value").is_none(), "{provider}");
+    assert!(provider["updated_at"].is_string());
     assert_eq!(
         detail["data_dir"],
         harness
@@ -650,6 +728,527 @@ async fn patch_can_rotate_the_channel_token() {
 }
 
 // ---------------------------------------------------------------------------
+// Editable environment (issue #22)
+// ---------------------------------------------------------------------------
+
+/// Create an instance with no messaging platform, so its environment is easy
+/// to reason about.
+async fn create_solo(harness: &Harness, id: &str) -> Value {
+    let body = json!({
+        "id": id,
+        "name": format!("Agent {id}"),
+        "template": "solo",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "none"},
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {response}");
+    parse(&response)
+}
+
+fn env_keys(detail: &Value) -> Vec<&str> {
+    detail["env"]
+        .as_array()
+        .expect("env list")
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn put_env_adds_plain_and_secret_variables_and_applies() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let ups_before = harness
+        .mock
+        .calls()
+        .iter()
+        .filter(|call| call.operation == "up" && call.instance == "alice")
+        .count();
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "123,456", "secret": false},
+                {"key": "OPENAI_KEY", "value": "sk-secret", "secret": true},
+                {"key": "TELEGRAM_BOT_TOKEN", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("sk-secret"), "{body}");
+    assert!(!body.contains("123:ABC"), "{body}");
+
+    let detail = parse(&body);
+    assert_eq!(
+        env_keys(&detail),
+        ["DISCORD_ALLOWED_USERS", "OPENAI_KEY", "TELEGRAM_BOT_TOKEN"]
+    );
+    let env = detail["env"].as_array().expect("env");
+    let allowed = env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_USERS")
+        .expect("plain entry");
+    assert_eq!(allowed["value"], "123,456");
+    assert_eq!(allowed["secret"], false);
+    let key = env
+        .iter()
+        .find(|entry| entry["key"] == "OPENAI_KEY")
+        .expect("secret entry");
+    assert_eq!(key["secret"], true);
+    assert!(
+        key.get("value").is_none(),
+        "a secret never returns its value"
+    );
+
+    // The stored values: the plain one in clear, the secret one encrypted, and
+    // the platform token the request did not resend kept as it was.
+    let rows = harness
+        .state
+        .db
+        .list_instance_env("alice")
+        .expect("env rows");
+    let plain = rows
+        .iter()
+        .find(|row| row.key == "DISCORD_ALLOWED_USERS")
+        .expect("plain row");
+    assert_eq!(plain.value.as_deref(), Some("123,456"));
+    assert!(plain.ciphertext.is_none());
+    let secret = rows
+        .iter()
+        .find(|row| row.key == "OPENAI_KEY")
+        .expect("secret row");
+    assert!(secret.value.is_none());
+    assert!(secret.ciphertext.is_some());
+    assert_eq!(
+        harness
+            .instance_secrets("alice")
+            .get("TELEGRAM_BOT_TOKEN")
+            .map(String::as_str),
+        Some("123:ABC"),
+        "a secret resent without a value keeps the stored one"
+    );
+
+    // The container is recreated through a rewritten compose file that only
+    // interpolates names.
+    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+        .expect("compose");
+    for name in ["DISCORD_ALLOWED_USERS", "OPENAI_KEY", "TELEGRAM_BOT_TOKEN"] {
+        assert!(
+            compose.contains(&format!("{name}: ${{{name}}}")),
+            "{name} missing from {compose}"
+        );
+    }
+    assert!(!compose.contains("123,456"));
+    assert!(!compose.contains("sk-secret"));
+    let ups_after = harness
+        .mock
+        .calls()
+        .iter()
+        .filter(|call| call.operation == "up" && call.instance == "alice")
+        .count();
+    assert_eq!(ups_after, ups_before + 1, "the change must be applied");
+
+    let actions: Vec<String> = harness
+        .state
+        .db
+        .list_audit(20)
+        .expect("audit")
+        .into_iter()
+        .map(|entry| entry.action)
+        .collect();
+    assert!(
+        actions.contains(&"instance.env.update".to_string()),
+        "{actions:?}"
+    );
+    let audit = harness.state.db.list_audit(5).expect("audit");
+    let entry = audit
+        .iter()
+        .find(|entry| entry.action == "instance.env.update")
+        .expect("env update entry");
+    assert_eq!(entry.target, "alice");
+    let details = entry.details.clone().expect("details");
+    assert!(details.contains("OPENAI_KEY"), "{details}");
+    assert!(
+        !details.contains("sk-secret") && !details.contains("123:ABC"),
+        "an audit detail must never carry a value: {details}"
+    );
+}
+
+#[tokio::test]
+async fn put_env_replaces_the_whole_set() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "KEEP_ME", "value": "a", "secret": false},
+                {"key": "DROP_ME", "value": "b", "secret": false}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [{"key": "KEEP_ME", "value": "c", "secret": false}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    assert_eq!(env_keys(&detail), ["KEEP_ME"]);
+    assert_eq!(detail["env"][0]["value"], "c");
+
+    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+        .expect("compose");
+    assert!(!compose.contains("DROP_ME"), "{compose}");
+    assert!(compose.contains("KEEP_ME: ${KEEP_ME}"), "{compose}");
+
+    // An empty list clears the environment (and the compose declarations).
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": []})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(env_keys(&parse(&body)), Vec::<&str>::new());
+}
+
+#[tokio::test]
+async fn delete_env_removes_one_variable() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DELETE_ME", "value": "1", "secret": false},
+                {"key": "KEEP_ME", "value": "2", "secret": false}
+            ]})),
+        )
+        .await;
+    let ups_before = harness
+        .mock
+        .calls()
+        .iter()
+        .filter(|call| call.operation == "up" && call.instance == "alice")
+        .count();
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/env/DELETE_ME", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let ups_after = harness
+        .mock
+        .calls()
+        .iter()
+        .filter(|call| call.operation == "up" && call.instance == "alice")
+        .count();
+    assert_eq!(ups_after, ups_before + 1, "the removal must be applied");
+
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(env_keys(&parse(&body)), ["KEEP_ME"]);
+    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+        .expect("compose");
+    assert!(!compose.contains("DELETE_ME"), "{compose}");
+    assert!(compose.contains("KEEP_ME: ${KEEP_ME}"), "{compose}");
+
+    let actions: Vec<String> = harness
+        .state
+        .db
+        .list_audit(20)
+        .expect("audit")
+        .into_iter()
+        .map(|entry| entry.action)
+        .collect();
+    assert!(
+        actions.contains(&"instance.env.delete".to_string()),
+        "{actions:?}"
+    );
+
+    // Deleting an unknown key is a 404, not a silent success.
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/env/ABSENT", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn patch_env_merges_deletes_and_keeps_empty_values() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "EMPTIED", "value": "old", "secret": false},
+                {"key": "DELETED", "value": "old", "secret": false},
+                {"key": "KEPT", "value": "same", "secret": false}
+            ]})),
+        )
+        .await;
+
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"env": [
+                {"key": "EMPTIED", "value": ""},
+                {"key": "DELETED", "value": null},
+                {"key": "ADDED", "value": "new"}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    assert_eq!(env_keys(&detail), ["ADDED", "EMPTIED", "KEPT"]);
+    let env = detail["env"].as_array().expect("env");
+    assert_eq!(env[1]["key"], "EMPTIED");
+    assert_eq!(env[1]["value"], "", "an empty string is a kept value");
+    let added = env
+        .iter()
+        .find(|entry| entry["key"] == "ADDED")
+        .expect("added");
+    assert_eq!(added["secret"], false, "a new key defaults to non-secret");
+
+    let compose = std::fs::read_to_string(harness.instance_dir("alice").join("compose.yaml"))
+        .expect("compose");
+    assert!(!compose.contains("DELETED"), "{compose}");
+    assert!(compose.contains("EMPTIED: ${EMPTIED}"), "{compose}");
+    assert!(compose.contains("KEPT: ${KEPT}"), "{compose}");
+}
+
+#[tokio::test]
+async fn env_validation_refuses_reserved_duplicate_and_oversized_entries() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+
+    let cases = [
+        (
+            json!([{"key": "HERMES_UID", "value": "0", "secret": false}]),
+            "reserved_env",
+        ),
+        (
+            json!([{"key": "PATH", "value": "/bin", "secret": false}]),
+            "reserved_env",
+        ),
+        (
+            json!([{"key": "FLEETT_ROOT", "value": "/tmp", "secret": false}]),
+            "reserved_env",
+        ),
+        (
+            json!([
+                {"key": "DUP", "value": "1", "secret": false},
+                {"key": "DUP", "value": "2", "secret": false}
+            ]),
+            "duplicate_env",
+        ),
+        (
+            json!([{"key": "lower_case", "value": "1", "secret": false}]),
+            "invalid_env",
+        ),
+        (
+            json!([{"key": "TOO_LONG", "value": "x".repeat(8 * 1024 + 1), "secret": false}]),
+            "invalid_env",
+        ),
+        (
+            json!([{"key": "NO_SECRET_FLAG", "value": "1"}]),
+            "invalid_env",
+        ),
+    ];
+    for (env, code) in cases {
+        let (status, body) = harness
+            .request(
+                Method::PUT,
+                "/api/instances/alice/env",
+                Some(json!({ "env": env })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{code}: {body}");
+        assert_eq!(parse(&body)["error"]["code"], code, "{body}");
+    }
+
+    // A reserved key is refused at creation too.
+    let mut body = instance_body("bob");
+    body["env"] = json!([{"key": "HOME", "value": "/root", "secret": false}]);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(parse(&response)["error"]["code"], "reserved_env");
+
+    // The `env` field itself is required on a full replace.
+    let (status, body) = harness
+        .request(Method::PUT, "/api/instances/alice/env", Some(json!({})))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn put_env_refuses_a_new_secret_without_a_value() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [{"key": "NEW_SECRET", "secret": true}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "invalid_env");
+}
+
+#[tokio::test]
+async fn put_env_records_a_failed_apply_in_last_error() {
+    let harness = Harness::new();
+    create_solo(&harness, "alice").await;
+    harness.mock.fail_next("up", "compose exploded");
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [{"key": "PLAIN", "value": "1", "secret": false}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        harness
+            .state
+            .db
+            .get("alice")
+            .expect("get")
+            .expect("stored")
+            .status,
+        Status::Error,
+        "a failed apply must be recorded"
+    );
+
+    // The values were stored, the failure is visible, and the operator can
+    // retry with another write or a restart.
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    assert!(
+        detail["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("compose exploded")),
+        "{detail}"
+    );
+    assert_eq!(env_keys(&detail), ["PLAIN"]);
+}
+
+#[tokio::test]
+async fn env_writes_need_the_secrets_key() {
+    let harness = Harness::with_config(|cfg| {
+        cfg.secrets_key = None;
+        cfg.secrets_key_file = cfg.root.with_extension("missing.key");
+    });
+    create_solo(&harness, "alice").await;
+
+    // A plain variable needs no key, at creation or through the API.
+    let mut body = json!({
+        "id": "bob",
+        "name": "Agent bob",
+        "template": "solo",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "none"},
+        "env": [{"key": "PLAIN", "value": "1", "secret": false}],
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body.clone()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(parse(&response)["env"][0]["value"], "1");
+    body["id"] = json!("carol");
+    body["env"] = json!([{"key": "TOKEN", "value": "secret", "secret": true}]);
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        parse(&response)["error"]["code"],
+        "secrets_key_missing",
+        "{response}"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [{"key": "PLAIN", "value": "1", "secret": false}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [{"key": "TOKEN", "value": "s", "secret": true}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "secrets_key_missing");
+}
+
+#[tokio::test]
+async fn the_startup_migration_imports_instance_secrets() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    let values = harness.instance_secrets("alice");
+    assert!(!values.is_empty());
+
+    // Roll back to the pre-0.5 store: one encrypted map instead of rows.
+    harness
+        .state
+        .db
+        .delete_instance_env("alice")
+        .expect("drop rows");
+    let key = fleett::secrets::SecretsKey::from_config(&harness.state.cfg)
+        .expect("key readable")
+        .expect("key configured");
+    let sealed = fleett::secrets::encrypt_map(&key, &values).expect("encrypt");
+    harness
+        .state
+        .db
+        .put_sealed("alice", &sealed.nonce, &sealed.ciphertext)
+        .expect("sealed row");
+
+    // A fresh state (what a service restart does) imports it.
+    let cfg = (*harness.state.cfg).clone();
+    let state = AppState::bootstrap_with_db(cfg, harness.mock.clone(), harness.state.db.clone())
+        .expect("bootstrap");
+    assert!(state.db.sealed("alice").expect("sealed").is_none());
+    let rows = state.db.list_instance_env("alice").expect("rows");
+    assert_eq!(rows.len(), values.len());
+    assert!(rows.iter().all(|row| row.secret));
+    assert_eq!(
+        fleett::envs::values(&state.cfg, &state.db, "alice").expect("values"),
+        values
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Secrets at rest
 // ---------------------------------------------------------------------------
 
@@ -675,7 +1274,7 @@ async fn create_without_a_key_is_refused_with_a_hint() {
 }
 
 #[tokio::test]
-async fn a_legacy_secrets_env_keeps_working_without_a_key() {
+async fn a_legacy_secrets_env_is_read_but_writes_need_a_key() {
     let harness = Harness::with_config(|cfg| {
         cfg.secrets_key = None;
         cfg.secrets_key_file = cfg.root.with_extension("missing.key");
@@ -704,6 +1303,29 @@ async fn a_legacy_secrets_env_keeps_working_without_a_key() {
     )
     .expect("legacy secrets");
 
+    // The legacy token is still read (and masked in the detail) without a key.
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let detail = parse(&body);
+    let env = detail["env"].as_array().expect("env");
+    let token = env
+        .iter()
+        .find(|entry| entry["key"] == "TELEGRAM_BOT_TOKEN")
+        .expect("legacy token listed");
+    assert_eq!(token["secret"], true);
+    assert!(token.get("value").is_none());
+    assert_eq!(
+        harness
+            .instance_secrets("alice")
+            .get("TELEGRAM_BOT_TOKEN")
+            .map(String::as_str),
+        Some("111:OLD")
+    );
+
+    // Rotating a token through the API now needs the key: the control plane
+    // never writes a plaintext token again.
     let (status, response) = harness
         .request(
             Method::PATCH,
@@ -711,22 +1333,25 @@ async fn a_legacy_secrets_env_keeps_working_without_a_key() {
             Some(json!({"channel": {"type": "telegram", "token": "222:NEW"}})),
         )
         .await;
-    assert_eq!(status, StatusCode::OK, "{response}");
-
-    // Rotation still works, in legacy mode, on the plaintext file.
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        parse(&response)["error"]["code"],
+        "secrets_key_missing",
+        "{response}"
+    );
     let text = std::fs::read_to_string(harness.instance_dir("alice").join("secrets.env"))
-        .expect("legacy secrets");
-    assert!(text.contains("TELEGRAM_BOT_TOKEN=222:NEW"), "{text}");
-    assert!(harness.state.db.sealed("alice").expect("sealed").is_none());
-    assert!(harness
-        .instance_secrets("alice")
-        .contains_key("TELEGRAM_BOT_TOKEN"));
+        .expect("legacy secrets kept");
+    assert!(text.contains("TELEGRAM_BOT_TOKEN=111:OLD"), "{text}");
 
-    // The operator is warned loudly.
-    let detail = parse(&response);
-    let warnings = detail["warnings"].as_array().expect("warnings");
+    // The detail still warns about the plaintext file.
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice", None)
+        .await;
+    let warnings = parse(&body)["warnings"].clone();
     assert!(
         warnings
+            .as_array()
+            .expect("warnings")
             .iter()
             .filter_map(Value::as_str)
             .any(|warning| warning.contains("plain text")),
@@ -739,8 +1364,13 @@ async fn secrets_migration_dry_run_then_apply() {
     let harness = Harness::new();
     create_instance(&harness, "alice").await;
 
-    // Roll the instance back to what an older release left on disk: an
-    // encrypted row removed, a plaintext file, a compose file with env_file.
+    // Roll the instance back to what an older release left on disk: the stored
+    // environment removed, a plaintext file, a compose file with env_file.
+    harness
+        .state
+        .db
+        .delete_instance_env("alice")
+        .expect("drop env rows");
     harness.state.db.delete_sealed("alice").expect("drop row");
     std::fs::write(
         harness.instance_dir("alice").join("secrets.env"),
@@ -1078,7 +1708,16 @@ async fn delete_keeps_data_by_default() {
     assert!(!harness.instance_dir("alice").join("secrets.env").exists());
     assert!(
         harness.state.db.sealed("alice").expect("sealed").is_none(),
-        "the encrypted secrets row must be deleted with the instance"
+        "the legacy secrets row must be deleted with the instance"
+    );
+    assert!(
+        harness
+            .state
+            .db
+            .list_instance_env("alice")
+            .expect("env rows")
+            .is_empty(),
+        "the environment rows must be deleted with the instance"
     );
     assert!(marker.is_file(), "data directory must be preserved");
     assert_eq!(

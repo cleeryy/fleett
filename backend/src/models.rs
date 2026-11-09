@@ -1,7 +1,6 @@
 //! Domain types, API payloads and input validation.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 pub const INSTANCE_ID_MIN: usize = 2;
 pub const INSTANCE_ID_MAX: usize = 32;
@@ -19,6 +18,14 @@ pub const HEALTH_UNHEALTHY_MESSAGE: &str =
 pub const DEFAULT_TEMPLATE: &str = "guest";
 pub const DEFAULT_API_KEY_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
 pub const GATE_TOKEN_ENV: &str = "HERMES_GATE_PROFILE_TOKEN";
+/// Longest environment variable name accepted by the API (`^[A-Z_][A-Z0-9_]{0,63}$`).
+pub const ENV_KEY_MAX: usize = 64;
+/// Largest value accepted for one environment variable (8 KiB).
+pub const ENV_VALUE_MAX_BYTES: usize = 8 * 1024;
+/// Variable names the container contract owns; an instance env never sets them.
+pub const RESERVED_ENV_KEYS: [&str; 4] = ["HERMES_UID", "HERMES_GID", "PATH", "HOME"];
+/// Prefix reserved for the control plane itself.
+pub const RESERVED_ENV_PREFIX: &str = "FLEETT_";
 
 /// Messaging platform of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,7 +296,9 @@ pub struct InstanceDetail {
     pub updated_at: String,
     pub last_error: Option<String>,
     pub data_dir: String,
-    pub env_keys: Vec<String>,
+    /// Environment variables of the instance. A secret entry never carries a
+    /// `value`; a non-secret one always does.
+    pub env: Vec<EnvEntry>,
     pub container: Option<ContainerInfo>,
     pub compose_yaml: String,
 }
@@ -441,6 +450,20 @@ pub struct TemplateInfo {
     pub description: String,
     pub default_model: String,
     pub channel: String,
+    /// Environment variables the template expects, so the console can propose
+    /// them instead of making the operator guess (allowlists, mostly).
+    pub env: Vec<EnvSuggestion>,
+}
+
+/// One environment variable a template suggests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvSuggestion {
+    pub key: String,
+    #[serde(default)]
+    pub description: String,
+    /// `true` when the value must be stored encrypted (default `false`).
+    #[serde(default)]
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -463,6 +486,37 @@ pub struct TemplateMeta {
     pub description: Option<String>,
     pub default_model: Option<String>,
     pub channel: Option<String>,
+    /// Environment variables the template suggests.
+    #[serde(default)]
+    pub env: Option<Vec<EnvSuggestion>>,
+}
+
+/// One environment variable of an instance, as returned by the API.
+///
+/// `value` is only set for a non-secret entry: a secret value never leaves the
+/// control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnvEntry {
+    pub key: String,
+    pub secret: bool,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// One environment variable supplied by a request.
+///
+/// `value: null` deletes the key on `PATCH` and keeps the stored secret value
+/// on `PUT`; an empty string is a real, kept value.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvVarInput {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Required by `POST /api/instances` and `PUT .../env`; optional on
+    /// `PATCH`, where an existing key keeps its previous flag.
+    #[serde(default)]
+    pub secret: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,9 +559,11 @@ pub struct CreateInstanceRequest {
     /// `api_key_env` when the two differ).
     #[serde(default)]
     pub gate_token: Option<String>,
-    /// Extra environment variables written to `secrets.env`.
+    /// Additional environment variables. Every entry must state whether it is a
+    /// secret; the gate token and the platform token are always secret and win
+    /// over an entry with the same key.
     #[serde(default)]
-    pub env: Option<BTreeMap<String, String>>,
+    pub env: Option<Vec<EnvVarInput>>,
 }
 
 /// `POST /api/instances/{id}/clone`.
@@ -560,6 +616,10 @@ pub struct PatchInstanceRequest {
     pub notes: Option<String>,
     #[serde(default)]
     pub gate_token: Option<String>,
+    /// Merge into the current environment: `null` deletes a key, `""` keeps an
+    /// empty value, a missing `secret` keeps the flag of an existing key.
+    #[serde(default)]
+    pub env: Option<Vec<EnvVarInput>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -716,6 +776,58 @@ pub fn validate_secret_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True when the control plane owns the name and an instance may not set it.
+pub fn env_key_is_reserved(key: &str) -> bool {
+    RESERVED_ENV_KEYS.contains(&key) || key.starts_with(RESERVED_ENV_PREFIX)
+}
+
+/// Validate an instance environment variable name.
+///
+/// `^[A-Z_][A-Z0-9_]{0,63}$`, minus the names the container contract owns
+/// (`HERMES_UID`, `HERMES_GID`, `PATH`, `HOME` and the `FLEETT_` prefix).
+pub fn validate_env_key(key: &str) -> Result<(), String> {
+    if key.len() > ENV_KEY_MAX {
+        return Err(format!(
+            "environment variable names must be at most {ENV_KEY_MAX} characters"
+        ));
+    }
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_uppercase() || first == '_' => {}
+        _ => {
+            return Err(
+                "environment variable names must start with an uppercase letter or '_'".to_string(),
+            )
+        }
+    }
+    if !chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        return Err(
+            "environment variable names may only contain uppercase letters, digits and '_'"
+                .to_string(),
+        );
+    }
+    if env_key_is_reserved(key) {
+        return Err(format!("environment variable \"{key}\" is reserved"));
+    }
+    Ok(())
+}
+
+/// Validate an instance environment variable value.
+pub fn validate_env_value(value: &str) -> Result<(), String> {
+    if value.len() > ENV_VALUE_MAX_BYTES {
+        return Err(format!(
+            "environment variable values must be at most {} KiB",
+            ENV_VALUE_MAX_BYTES / 1024
+        ));
+    }
+    if value.contains(['\n', '\r', '\0']) {
+        return Err(
+            "environment variable values must not contain newlines or NUL bytes".to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn validate_notes(value: &str) -> Result<(), String> {
     if value.len() > 4096 {
         return Err("notes must be at most 4096 characters".to_string());
@@ -786,6 +898,36 @@ mod tests {
         assert!(validate_secret_name("lower_case").is_ok());
         assert!(validate_secret_name("1BAD").is_err());
         assert!(validate_secret_name("WITH-DASH").is_err());
+    }
+
+    #[test]
+    fn env_names_are_uppercase_and_not_reserved() {
+        for valid in ["DISCORD_ALLOWED_USERS", "_PRIVATE", "A", "A1_B2"] {
+            assert!(validate_env_key(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "lower", "1ST", "WITH-DASH", "WITH SPACE", "A\nB"] {
+            assert!(validate_env_key(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_env_key(&"A".repeat(64)).is_ok());
+        assert!(validate_env_key(&"A".repeat(65)).is_err());
+
+        for reserved in ["HERMES_UID", "HERMES_GID", "PATH", "HOME", "FLEETT_ROOT"] {
+            assert!(env_key_is_reserved(reserved), "{reserved}");
+            assert!(validate_env_key(reserved).is_err(), "{reserved}");
+        }
+        assert!(!env_key_is_reserved("FLEET_ROOT"));
+        assert!(!env_key_is_reserved("TELEGRAM_ALLOWED_USERS"));
+    }
+
+    #[test]
+    fn env_values_are_bounded_and_single_line() {
+        assert!(validate_env_value("").is_ok());
+        assert!(validate_env_value("123,456").is_ok());
+        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES)).is_ok());
+        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES + 1)).is_err());
+        assert!(validate_env_value("a\nb").is_err());
+        assert!(validate_env_value("a\rb").is_err());
+        assert!(validate_env_value("a\0b").is_err());
     }
 
     #[test]

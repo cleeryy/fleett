@@ -1,0 +1,242 @@
+# Instance environment — editable after creation
+
+Before v0.5.0 an instance received its whole environment at creation, and every
+value went into the encrypted secret store. An allowlist such as
+`DISCORD_ALLOWED_USERS` could not be added to a running agent without
+recreating it.
+
+Every variable is now an editable, per-key row with an explicit **secret flag**:
+
+| | `secret: false` | `secret: true` |
+|---|---|---|
+| Database | plaintext `value` | AES-256-GCM `nonce` + `ciphertext`, no `value` |
+| `GET /api/instances/{id}` | `value` returned | `value` never returned |
+| Compose file | `${KEY}` | `${KEY}` |
+| `docker compose` child env | the plaintext value | the decrypted value |
+
+The AES key is the one managed by `fleett secrets init` (see
+[SECRETS.md](SECRETS.md); `FLEETT_SECRETS_KEY` or `FLEETT_SECRETS_KEY_FILE`).
+A secret value is encrypted
+together with its variable name, so a ciphertext moved to another row fails to
+decrypt instead of silently changing another variable. A fresh nonce is used
+for every write.
+
+The compose file never contains a value: only
+`KEY: ${KEY}` declarations. The compose driver injects both kinds of values
+into the `docker compose` child process, so `docker inspect <container>` shows
+the environment of the running container.
+
+## Storage
+
+Schema v7 adds:
+
+```sql
+CREATE TABLE instance_env (
+    instance_id  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    secret       INTEGER NOT NULL DEFAULT 0,
+    value        TEXT,               -- secret = 0
+    nonce        BLOB,               -- secret = 1
+    ciphertext   BLOB,               -- secret = 1
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (instance_id, key)
+);
+```
+
+The table is part of `fleet.db`, which lives inside `FLEETT_ROOT`. Keep the
+secrets key outside the root: a backup of the root then contains ciphertext
+only.
+
+### Migrating the old stores
+
+Two stores are read as a fallback and superseded by the first API write:
+
+- `instance_secrets` (one encrypted JSON map per instance, releases up to
+  v0.4.0). At startup every map is decrypted and split into `instance_env` rows
+  with `secret = 1`, and the superseded row is deleted. The table itself is kept
+  for one release so a downgrade can still read it; it is no longer written by
+  this build. Without a configured key the maps stay in place (readable through
+  the fallback) and a warning is logged.
+- `instances/<id>/secrets.env` (plaintext, pre-encryption releases). The driver
+  still injects its values, `GET` lists the keys as secrets, and
+  `fleett secrets migrate --apply` imports them. See [SECRETS.md](SECRETS.md).
+
+The first API write (`POST`, `PATCH`, `PUT .../env`, `DELETE .../env/{key}`)
+writes the complete set into `instance_env`, deletes the `instance_secrets`
+row and removes the plaintext `secrets.env`. A stale token can then never
+reappear.
+
+**Behaviour change:** the API no longer writes plaintext token files. Rotating a
+token on a host that still uses a `secrets.env` therefore requires the secrets
+key (`sudo fleett secrets init`, then retry). Before v0.5.0 the API rewrote the
+plaintext file.
+
+A legacy key that does not match the new grammar (a lowercase name accepted by
+older releases, for example) is imported as it is. The first write that would
+rewrite it is refused with `400 invalid_env` naming the key; delete it once with
+`DELETE /api/instances/{id}/env/{key}`.
+
+## API
+
+### Detail
+
+```json
+{
+  "id": "tchouniz",
+  "env": [
+    {"key": "DISCORD_ALLOWED_USERS", "secret": false, "updated_at": "2026-11-09T10:00:00Z", "value": "123456789"},
+    {"key": "DISCORD_BOT_TOKEN", "secret": true, "updated_at": "2026-11-09T10:00:00Z"}
+  ]
+}
+```
+
+`env` replaces the `env_keys` array of older releases (**breaking**, v0.5.0).
+A secret entry never carries `value`; the key names are returned so a console
+can show the masked list and round-trip it. Entries are sorted by key.
+
+### Full replace
+
+```bash
+curl -X PUT https://fleett.example/api/instances/tchouniz/env \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env": [
+        {"key": "DISCORD_ALLOWED_USERS", "value": "123456789,987654321", "secret": false},
+        {"key": "DISCORD_ALLOWED_ROLES", "value": "424242", "secret": false},
+        {"key": "DISCORD_BOT_TOKEN", "secret": true}
+      ]}'
+```
+
+- Every key the request leaves out is **deleted**.
+- `secret` is required on every entry.
+- A secret entry without a value keeps the stored value. This is what makes a
+  round-trip possible: the API never returned that value, so a console can
+  send the key back as `{"key": "...", "secret": true}`.
+- A new secret, or a non-secret entry, without a value is a `400 invalid_env`.
+
+The response is the updated instance detail.
+
+### Delete one key
+
+```bash
+curl -X DELETE https://fleett.example/api/instances/tchouniz/env/DISCORD_ALLOWED_ROLES \
+  -H "Authorization: Bearer $FLEETT_TOKEN"
+```
+
+`204 No Content`, or `404 not_found` when the key is not set.
+
+### Merge on PATCH
+
+```bash
+curl -X PATCH https://fleett.example/api/instances/tchouniz \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env": [
+        {"key": "DISCORD_ALLOWED_USERS", "value": "123456789"},
+        {"key": "DISCORD_ALLOWED_CHANNELS", "value": "555"},
+        {"key": "OBSOLETE", "value": null}
+      ]}'
+```
+
+- merge by key: only the listed keys move;
+- `"value": null` deletes the key;
+- `"value": ""` keeps an empty value;
+- a missing `secret` keeps the flag of an existing key (`false` for a new one).
+
+### Create
+
+`POST /api/instances` accepts the same list:
+
+```json
+{
+  "id": "helper",
+  "template": "guest-discord",
+  "model": "deepseek-v4.1-flash",
+  "base_url": "https://opencode.ai/inference/go/openai/v1",
+  "channel": {"type": "discord", "token": "..."},
+  "env": [
+    {"key": "DISCORD_ALLOWED_USERS", "value": "123456789", "secret": false}
+  ]
+}
+```
+
+The gate token (`gate_token`) and the platform token (`channel.token`) are
+always secret, whether or not they appear in `env`, and win over an entry with
+the same key. `env` used to be a map of strings on create: that shape is gone in
+v0.5.0 (breaking).
+
+## Validation
+
+| Rule | Error code |
+|---|---|
+| key matches `^[A-Z_][A-Z0-9_]{0,63}$` | `invalid_env` |
+| key is not `HERMES_UID`, `HERMES_GID`, `PATH`, `HOME` or `FLEETT_*` | `reserved_env` |
+| value is at most 8 KiB | `invalid_env` |
+| value contains no newline, carriage return or NUL | `invalid_env` |
+| no duplicate key in one request | `duplicate_env` |
+| secret flag present where required | `invalid_env` |
+
+The reserved names belong to the container contract: `HERMES_UID` and
+`HERMES_GID` are literals in the compose file, and the driver environment would
+otherwise shadow `PATH`/`HOME` of the `docker compose` process.
+
+## Apply and audit
+
+Every write rewrites `instances/<id>/compose.yaml` and runs `docker compose up
+-d`, so **the container is recreated** (brief downtime). `docker compose ps` is
+then read back:
+
+- success: the status and health of the detail reflect the new container;
+- failure: `last_error` carries the compose stderr and the status is `error`,
+  while the stored environment keeps the new values (retry the apply with
+  another write, or `POST .../restart`).
+
+Audit entries:
+
+| Action | When |
+|---|---|
+| `instance.env.update` | `PUT .../env` (and `PATCH .../env` goes through `instance.patch`) |
+| `instance.env.delete` | `DELETE .../env/{key}` |
+
+`instance.env.update` details carry the key list and the number of secrets,
+never a value.
+
+## Templates
+
+`GET /api/templates` now returns the variables a template expects, so the
+console can propose them:
+
+| Template | Suggestions |
+|---|---|
+| `guest` (Telegram) | `TELEGRAM_ALLOWED_USERS`, `GATEWAY_ALLOW_ALL_USERS` |
+| `guest-discord` | `DISCORD_ALLOWED_USERS`, `DISCORD_ALLOWED_ROLES`, `DISCORD_ALLOWED_CHANNELS`, `DISCORD_ALLOW_ALL_USERS` |
+| `solo` | none |
+
+```json
+{
+  "id": "guest-discord",
+  "env": [
+    {"key": "DISCORD_ALLOWED_USERS", "description": "Comma-separated Discord user ids…", "secret": false}
+  ]
+}
+```
+
+A custom template can declare its own list in `templates/<id>/template.yaml`:
+
+```yaml
+env:
+  - key: DISCORD_ALLOWED_USERS
+    description: Comma-separated Discord user ids allowed to talk to the agent.
+    secret: false
+```
+
+All suggestions are non-secret: they are allowlists, not credentials.
+
+## Clone and export
+
+- `POST /api/instances/{id}/clone` copies the **non-secret** variables of the
+  source and never a secret one; the gate and platform tokens must still be
+  supplied by the request, as before.
+- `GET /api/instances/{id}/export` excludes every environment value, secret or
+  not. An import therefore starts with an empty environment and the usual
+  warning telling the operator which tokens to set.

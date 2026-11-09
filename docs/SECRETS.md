@@ -7,7 +7,10 @@ Instance secrets are provider API keys and messaging bot tokens:
 | `HERMES_GATE_PROFILE_TOKEN` | `gate_token` on create / patch |
 | `<api_key_env>` when it differs from the gate token | `api_key_env` / `gate_token` |
 | `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN` | `channel.token` |
-| anything in `env` on create | the API caller |
+| `env` entries with `secret: true` | the API caller (`POST`, `PATCH`, `PUT .../env`) |
+
+Environment variables with `secret: false` are stored in clear and returned by
+the API; see [ENV.md](ENV.md).
 
 They used to be written to `instances/<id>/secrets.env`, mode `0600` but plain
 text: a `tar czf backup.tgz $FLEETT_ROOT` carried every token, and a leaked
@@ -16,9 +19,14 @@ database, and the compose file only references their names.
 
 ## How it works
 
-- `fleet.db` (inside `FLEETT_ROOT`) holds one row per instance in
-  `instance_secrets`: `instance_id`, a random 96-bit `nonce`, the
-  AES-256-GCM `ciphertext` of a JSON `{"KEY": "value"}` map, `updated_at`.
+- `fleet.db` (inside `FLEETT_ROOT`) holds one row per variable in
+  `instance_env`: `instance_id`, `key`, an explicit `secret` flag, and either
+  the plaintext `value` (non-secret) or a random 96-bit `nonce` plus the
+  AES-256-GCM `ciphertext` of the value (secret), with `updated_at`. See
+  [ENV.md](ENV.md) for the editable environment and its API.
+- Releases up to v0.4.0 stored one encrypted JSON map per instance in
+  `instance_secrets`. It is imported into `instance_env` at startup (and the
+  row dropped); the table is kept for one release so a downgrade still works.
 - The key is a 32-byte random value, base64-encoded, kept **outside**
   `FLEETT_ROOT`:
   - `FLEETT_SECRETS_KEY` (inline, base64) if set, otherwise
@@ -97,7 +105,7 @@ fleett secrets migrate --apply     # encrypt, rewrite compose, delete files
 For each instance with a legacy file, `--apply`:
 
 1. reads `instances/<id>/secrets.env`;
-2. encrypts it into `instance_secrets` (fresh nonce);
+2. encrypts every value into `instance_env` (`secret = 1`, fresh nonce each);
 3. rewrites `instances/<id>/compose.yaml`: removes `env_file: secrets.env`,
    keeps `HERMES_UID` / `HERMES_GID` as literals, adds `${KEY}` for every key;
 4. deletes the plaintext file — only after 1-3 succeeded.
@@ -105,8 +113,8 @@ For each instance with a legacy file, `--apply`:
 It needs a configured key (`fleett secrets init` first). The file is left in
 place if any step fails, so a failed migration never loses a token.
 
-Once an instance has an encrypted row, that row wins: the driver reads it at
-runtime, and a stale `secrets.env` never reverts a token rotated through the
+Once an instance has `instance_env` rows, those rows win: the driver reads them
+at runtime, and a stale `secrets.env` never reverts a token rotated through the
 API (the startup import only rewrites the compose file, and `--apply` deletes
 the file). Prefer rotating through the API over editing `secrets.env` by hand.
 
@@ -124,7 +132,7 @@ docker compose -f $FLEETT_ROOT/instances/alice/compose.yaml up -d
 
 On every start, when a key is configured and a legacy file exists, the control
 plane encrypts it into the database automatically when the instance has no
-encrypted row yet (an existing row wins, so a rotation is never reverted); the
+stored environment yet (existing rows win, so a rotation is never reverted); the
 plaintext file is **not** deleted, so no data is lost if the import or the
 compose rewrite fails. The plaintext file is deleted only when you opt in:
 
@@ -150,8 +158,8 @@ curl -X PATCH https://fleett.example/api/instances/alice \
 ```
 
 - encrypted instance: the row is replaced with a new nonce and ciphertext;
-- legacy instance: `secrets.env` is rewritten (same mode `0600`) until you
-  migrate it;
+- legacy plaintext instance: the rotation needs the secrets key (`fleett
+  secrets init` then migrate); the API never writes a plaintext token again;
 - the compose file is unchanged (same `${KEY}`), so `docker compose up -d`
   starts the container with the new value.
 
@@ -163,10 +171,11 @@ curl -X PATCH https://fleett.example/api/instances/alice \
 |---|---|
 | New instance with tokens, no key, no legacy file | `409 secrets_key_missing` — run `sudo fleett secrets init` |
 | New instance with no token at all | created |
-| Instance with a legacy `secrets.env`, no key | keeps working in legacy mode, warning in `warnings` and in the logs |
-| Instance with an encrypted row, key missing | every compose call fails with `docker compose … failed: secrets … fleett secrets init`; the API returns `409 secrets_key_missing` on patch |
+| Instance with a legacy `secrets.env`, no key | keeps running (the driver reads the file) and a warning is reported, but API env writes need the key |
+| Instance with encrypted values, key missing | every compose call fails with `docker compose … failed: secrets … fleett secrets init`; the API returns `409 secrets_key_missing` on patch |
 
-The API never returns a secret value: `env_keys` only lists the names.
+The API never returns a secret value: `GET /api/instances/{id}` lists the names
+and masks secret values (see [ENV.md](ENV.md)).
 
 ## Backup implications
 

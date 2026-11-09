@@ -4,10 +4,11 @@
 //! `instances/*/compose.yaml` and `shares/*` at every start, so deleting
 //! `fleet.db` only loses notes and timestamps, never an agent.
 //!
-//! One exception: `instance_secrets` holds the AES-256-GCM blobs of the
-//! instance secrets (see [`crate::secrets`]). That table is *not* rebuildable
-//! from disk; losing the database loses the stored tokens, and they cannot be
-//! decrypted without the key that lives outside `FLEETT_ROOT`.
+//! One exception: `instance_env` (and the legacy `instance_secrets` table it
+//! replaces) holds encrypted values (see [`crate::envs`] and [`crate::secrets`]).
+//! Those rows are *not* rebuildable from disk; losing the database loses the
+//! stored tokens, and they cannot be decrypted without the key that lives
+//! outside `FLEETT_ROOT`.
 
 use crate::config::Config;
 use crate::models::{now_iso, ChannelKind, InstanceSpec, ShareMode, ShareRef, Status};
@@ -98,6 +99,23 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     // v6 — per-instance container image (copy of `services.agent.image`).
     // Rolling upgrades move one instance at a time between tags.
     "ALTER TABLE instances ADD COLUMN image TEXT NOT NULL DEFAULT '';",
+    // v7 — editable per-instance environment variables (issue #22). A secret
+    // row holds only its AES-256-GCM blob; a non-secret row holds the
+    // plaintext value and no ciphertext. Supersedes `instance_secrets`, whose
+    // maps are imported into this table at startup (they cannot be migrated in
+    // SQL: they are encrypted) and whose table stays readable for one release.
+    r#"
+CREATE TABLE IF NOT EXISTS instance_env (
+    instance_id  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    secret       INTEGER NOT NULL DEFAULT 0,
+    value        TEXT,
+    nonce        BLOB,
+    ciphertext   BLOB,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (instance_id, key)
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -128,6 +146,21 @@ pub struct SealedRecord {
     /// AES-GCM nonce (96 bits).
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
+    pub updated_at: String,
+}
+
+/// One row of `instance_env`.
+///
+/// Exactly one of the two storage shapes is filled: a secret row has `nonce`
+/// and `ciphertext` set and no `value`; a non-secret row has `value` set and
+/// neither blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceEnvRecord {
+    pub key: String,
+    pub secret: bool,
+    pub value: Option<String>,
+    pub nonce: Option<Vec<u8>>,
+    pub ciphertext: Option<Vec<u8>>,
     pub updated_at: String,
 }
 
@@ -407,6 +440,10 @@ impl Db {
             "DELETE FROM instance_secrets WHERE instance_id = ?1",
             params![id],
         )?;
+        transaction.execute(
+            "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
         transaction.commit()?;
         Ok(())
@@ -474,6 +511,87 @@ impl Db {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM instance_secrets", [], |row| {
             row.get(0)
         })?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Environment rows of one instance, sorted by key.
+    pub fn list_instance_env(&self, id: &str) -> Result<Vec<InstanceEnvRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT key, secret, value, nonce, ciphertext, updated_at FROM instance_env \
+             WHERE instance_id = ?1 ORDER BY key",
+        )?;
+        let rows = statement
+            .query_map(params![id], |row| {
+                Ok(InstanceEnvRecord {
+                    key: row.get(0)?,
+                    secret: row.get::<_, i64>(1)? != 0,
+                    value: row.get(2)?,
+                    nonce: row.get(3)?,
+                    ciphertext: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace the whole environment of one instance in a single transaction.
+    ///
+    /// A row that is written through this call supersedes the encrypted
+    /// `instance_secrets` blob of the instance, which is dropped at the same
+    /// time: two stores for the same values would let a stale token win.
+    pub fn replace_instance_env(
+        &self,
+        id: &str,
+        records: &[InstanceEnvRecord],
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO instance_env (instance_id, key, secret, value, nonce, ciphertext, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    record.key,
+                    i64::from(record.secret),
+                    record.value,
+                    record.nonce,
+                    record.ciphertext,
+                    record.updated_at,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM instance_secrets WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Drop every environment row of one instance.
+    pub fn delete_instance_env(&self, id: &str) -> Result<(), DbError> {
+        self.lock().execute(
+            "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Number of instances that hold at least one encrypted environment value.
+    pub fn secret_instance_count(&self) -> Result<usize, DbError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT instance_id) FROM instance_env WHERE secret = 1",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count.max(0) as usize)
     }
 
@@ -1016,6 +1134,7 @@ mod tests {
             "shares",
             "share_links",
             "instance_secrets",
+            "instance_env",
             "audit_log",
             "api_tokens",
         ] {
@@ -1143,6 +1262,45 @@ mod tests {
         assert_eq!(entries[0].actor, "cleeryy@example.test");
         assert_eq!(entries[0].ip.as_deref(), Some("10.1.20.50"));
         assert_eq!(db.list_audit(1).expect("limit").len(), 1);
+    }
+
+    #[test]
+    fn instance_env_rows_replace_atomically_and_follow_the_instance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        db.insert_instance(&spec("alice")).expect("insert");
+
+        let record = |key: &str, secret: bool| InstanceEnvRecord {
+            key: key.to_string(),
+            secret,
+            value: (!secret).then(|| "plain".to_string()),
+            nonce: secret.then(|| vec![0u8; 12]),
+            ciphertext: secret.then(|| vec![1u8, 2, 3]),
+            updated_at: "2026-11-09T00:00:00Z".to_string(),
+        };
+        db.replace_instance_env("alice", &[record("B_KEY", true), record("A_KEY", false)])
+            .expect("replace");
+        let rows = db.list_instance_env("alice").expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "A_KEY");
+        assert!(!rows[0].secret);
+        assert_eq!(rows[0].value.as_deref(), Some("plain"));
+        assert!(rows[0].nonce.is_none());
+        assert!(rows[1].secret);
+        assert!(rows[1].value.is_none());
+
+        // A second replace drops the keys the caller left out.
+        db.replace_instance_env("alice", &[record("A_KEY", false)])
+            .expect("replace");
+        assert_eq!(db.list_instance_env("alice").expect("list").len(), 1);
+        assert_eq!(db.secret_instance_count().expect("count"), 0);
+
+        db.replace_instance_env("alice", &[record("B_KEY", true)])
+            .expect("replace");
+        assert_eq!(db.secret_instance_count().expect("count"), 1);
+
+        db.delete_instance("alice").expect("delete");
+        assert!(db.list_instance_env("alice").expect("list").is_empty());
     }
 
     #[test]

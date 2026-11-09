@@ -13,7 +13,6 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
 use crate::render;
-use crate::secrets;
 use crate::store::compose_project_name;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -83,19 +82,21 @@ impl ComposeDriver {
             .unwrap_or_else(|| render::project_name(id))
     }
 
-    /// Environment of the compose process: the instance secrets, decrypted.
+    /// Environment of the compose process: every instance variable, decrypted
+    /// for the secret rows and plaintext for the others.
     ///
-    /// The compose file declares `${KEY}` for every secret, so the values only
-    /// exist in this child process (`docker inspect` sees them per container).
+    /// The compose file declares `${KEY}` for every variable, so the values
+    /// only exist in this child process (`docker inspect` sees them per
+    /// container).
     fn environment(
         &self,
         id: &str,
     ) -> Result<std::collections::BTreeMap<String, String>, DriverError> {
-        let secrets = match &self.db {
-            Some(db) => secrets::load(&self.cfg, db, id),
+        let values = match &self.db {
+            Some(db) => crate::envs::values(&self.cfg, db, id),
             None => Ok(crate::store::read_legacy_secrets(&self.cfg, id)),
         };
-        secrets.map_err(|err| DriverError::new("secrets", err.to_string()))
+        values.map_err(|err| DriverError::new("secrets", err.to_string()))
     }
 
     fn command_for(&self, id: &str, project: &str) -> Result<Command, DriverError> {
@@ -843,6 +844,7 @@ fn field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets;
 
     fn driver_in(dir: &std::path::Path) -> ComposeDriver {
         ComposeDriver::new(&Config::for_tests(dir.to_path_buf()))
@@ -918,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_commands_receive_the_decrypted_secrets() {
+    fn compose_commands_receive_the_decrypted_secrets_and_the_plain_values() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut cfg = Config::for_tests(dir.path().join("root"));
         crate::store::ensure_layout(&cfg).expect("layout");
@@ -931,10 +933,24 @@ mod tests {
         cfg.secrets_key = Some(secrets::encode_key(&[7u8; 32]));
 
         let db = Db::open(&cfg.db_path()).expect("db");
-        let mut stored = std::collections::BTreeMap::new();
-        stored.insert("TELEGRAM_BOT_TOKEN".to_string(), "123:ABC".to_string());
-        stored.insert("HERMES_GATE_PROFILE_TOKEN".to_string(), "gate".to_string());
-        secrets::store(&cfg, &db, "alice", &stored).expect("store secrets");
+        let entries = vec![
+            crate::envs::EnvWrite {
+                key: "TELEGRAM_BOT_TOKEN".to_string(),
+                value: "123:ABC".to_string(),
+                secret: true,
+            },
+            crate::envs::EnvWrite {
+                key: "HERMES_GATE_PROFILE_TOKEN".to_string(),
+                value: "gate".to_string(),
+                secret: true,
+            },
+            crate::envs::EnvWrite {
+                key: "DISCORD_ALLOWED_USERS".to_string(),
+                value: "42,43".to_string(),
+                secret: false,
+            },
+        ];
+        crate::envs::replace(&cfg, &db, "alice", &entries).expect("store env");
 
         let driver = ComposeDriver::new(&cfg).with_secrets(db);
         let environment = env_of(&driver.command("alice").expect("command"));
@@ -947,6 +963,11 @@ mod tests {
                 .get("HERMES_GATE_PROFILE_TOKEN")
                 .map(String::as_str),
             Some("gate")
+        );
+        assert_eq!(
+            environment.get("DISCORD_ALLOWED_USERS").map(String::as_str),
+            Some("42,43"),
+            "a non-secret value must reach the compose process too"
         );
     }
 
@@ -987,9 +1008,12 @@ mod tests {
         .expect("compose file");
         cfg.secrets_key = Some(secrets::encode_key(&[7u8; 32]));
         let db = Db::open(&cfg.db_path()).expect("db");
-        let mut stored = std::collections::BTreeMap::new();
-        stored.insert("TELEGRAM_BOT_TOKEN".to_string(), "123:ABC".to_string());
-        secrets::store(&cfg, &db, "alice", &stored).expect("store");
+        let entries = vec![crate::envs::EnvWrite {
+            key: "TELEGRAM_BOT_TOKEN".to_string(),
+            value: "123:ABC".to_string(),
+            secret: true,
+        }];
+        crate::envs::replace(&cfg, &db, "alice", &entries).expect("store");
 
         // Same database, key gone: the compose command must not run with an
         // empty token.

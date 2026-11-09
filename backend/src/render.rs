@@ -6,8 +6,8 @@
 
 use crate::config::{Config, Hardening};
 use crate::models::{
-    ChannelKind, InstanceSpec, ShareMode, TemplateInfo, TemplateMeta, DEFAULT_API_KEY_ENV,
-    DEFAULT_TEMPLATE, GATE_TOKEN_ENV,
+    ChannelKind, EnvSuggestion, InstanceSpec, ShareMode, TemplateInfo, TemplateMeta,
+    DEFAULT_API_KEY_ENV, DEFAULT_TEMPLATE, GATE_TOKEN_ENV,
 };
 use crate::templates_builtin;
 use serde::Serialize;
@@ -134,6 +134,17 @@ pub fn load_template(cfg: &Config, id: &str) -> Result<TemplateSource, RenderErr
                 description: Some(builtin.description.to_string()),
                 default_model: Some(builtin.default_model.to_string()),
                 channel: Some(builtin.channel.to_string()),
+                env: Some(
+                    builtin
+                        .env
+                        .iter()
+                        .map(|(key, description)| EnvSuggestion {
+                            key: (*key).to_string(),
+                            description: (*description).to_string(),
+                            secret: false,
+                        })
+                        .collect(),
+                ),
             },
         });
     }
@@ -156,6 +167,15 @@ pub fn list_templates(cfg: &Config) -> Vec<TemplateInfo> {
                 description: builtin.description.to_string(),
                 default_model: builtin.default_model.to_string(),
                 channel: builtin.channel.to_string(),
+                env: builtin
+                    .env
+                    .iter()
+                    .map(|(key, description)| EnvSuggestion {
+                        key: (*key).to_string(),
+                        description: (*description).to_string(),
+                        secret: false,
+                    })
+                    .collect(),
             },
         );
     }
@@ -207,6 +227,7 @@ pub fn list_templates(cfg: &Config) -> Vec<TemplateInfo> {
                             .unwrap_or_default()
                     }),
                     channel,
+                    env: meta.env.unwrap_or_default(),
                 },
             );
         }
@@ -235,16 +256,16 @@ fn detected_channel(doc: Option<&Value>) -> Option<String> {
 
 /// Render every generated file for an instance.
 ///
-/// `secret_keys` are the environment variable names the instance holds: they
+/// `env_keys` are the environment variable names the instance holds: they
 /// are declared in the compose file as `${KEY}` and resolved by the driver at
 /// runtime, so no secret value is ever written here.
 pub fn render_instance(
     cfg: &Config,
     spec: &InstanceSpec,
     template: &TemplateSource,
-    secret_keys: &[String],
+    env_keys: &[String],
 ) -> Result<RenderedInstance, RenderError> {
-    render_instance_with_project(cfg, spec, template, None, secret_keys)
+    render_instance_with_project(cfg, spec, template, None, env_keys)
 }
 
 /// Same as [`render_instance`], keeping an explicit compose project name.
@@ -257,10 +278,10 @@ pub fn render_instance_with_project(
     spec: &InstanceSpec,
     template: &TemplateSource,
     project: Option<&str>,
-    secret_keys: &[String],
+    env_keys: &[String],
 ) -> Result<RenderedInstance, RenderError> {
     Ok(RenderedInstance {
-        compose_yaml: render_compose_with_project(cfg, spec, project, secret_keys)?,
+        compose_yaml: render_compose_with_project(cfg, spec, project, env_keys)?,
         config_yaml: render_config(spec, &template.config_yaml)?,
         soul_md: template.soul_md.as_ref().map(|soul| substitute(soul, spec)),
     })
@@ -396,15 +417,16 @@ pub fn project_name(id: &str) -> String {
 
 /// Render `instances/<id>/compose.yaml`.
 ///
-/// Secret values never appear in the document: every key is declared as
-/// `${KEY}` and resolved from the `docker compose` process environment by the
-/// driver (`environment` is a Compose interpolation, not a literal).
+/// No value ever appears in the document: every environment variable (secret
+/// or not) is declared as `${KEY}` and resolved from the `docker compose`
+/// process environment by the driver (`environment` is a Compose
+/// interpolation, not a literal).
 pub fn render_compose(
     cfg: &Config,
     spec: &InstanceSpec,
-    secret_keys: &[String],
+    env_keys: &[String],
 ) -> Result<String, RenderError> {
-    render_compose_with_project(cfg, spec, None, secret_keys)
+    render_compose_with_project(cfg, spec, None, env_keys)
 }
 
 /// Same as [`render_compose`] with an explicit project (and container) name.
@@ -412,7 +434,7 @@ pub fn render_compose_with_project(
     cfg: &Config,
     spec: &InstanceSpec,
     project: Option<&str>,
-    secret_keys: &[String],
+    env_keys: &[String],
 ) -> Result<String, RenderError> {
     let project = project
         .map(str::to_string)
@@ -433,7 +455,7 @@ pub fn render_compose_with_project(
     let mut environment = BTreeMap::new();
     environment.insert("HERMES_UID".to_string(), "10000".to_string());
     environment.insert("HERMES_GID".to_string(), "10000".to_string());
-    for key in secret_keys {
+    for key in env_keys {
         if crate::models::validate_secret_name(key).is_ok() {
             environment.insert(key.clone(), format!("${{{key}}}"));
         }
@@ -961,7 +983,7 @@ networks:
     }
 
     #[test]
-    fn compose_interpolates_secret_keys_without_writing_values() {
+    fn compose_interpolates_env_keys_without_writing_values() {
         let instance = spec(ChannelKind::Telegram);
         let keys = vec![
             "TELEGRAM_BOT_TOKEN".to_string(),

@@ -12,6 +12,8 @@ pub struct BuiltinTemplate {
     pub description: &'static str,
     pub default_model: &'static str,
     pub channel: &'static str,
+    /// Environment variables the template expects: `(key, description)`.
+    pub env: &'static [(&'static str, &'static str)],
     pub config_yaml: &'static str,
     pub soul_md: &'static str,
 }
@@ -175,12 +177,44 @@ API server.
 - Ask before doing anything destructive or expensive.
 "#;
 
+const GUEST_ENV: &[(&str, &str)] = &[
+    (
+        "TELEGRAM_ALLOWED_USERS",
+        "Comma-separated Telegram user ids allowed to talk to the agent; without it every \
+         message is denied.",
+    ),
+    (
+        "GATEWAY_ALLOW_ALL_USERS",
+        "Set to true to accept every user on the platform, with no allowlist. Use with care.",
+    ),
+];
+
+const GUEST_DISCORD_ENV: &[(&str, &str)] = &[
+    (
+        "DISCORD_ALLOWED_USERS",
+        "Comma-separated Discord user ids allowed to talk to the agent.",
+    ),
+    (
+        "DISCORD_ALLOWED_ROLES",
+        "Comma-separated Discord role ids allowed to talk to the agent.",
+    ),
+    (
+        "DISCORD_ALLOWED_CHANNELS",
+        "Comma-separated Discord channel ids where the agent answers.",
+    ),
+    (
+        "DISCORD_ALLOW_ALL_USERS",
+        "Set to true to accept every Discord user, with no allowlist. Use with care.",
+    ),
+];
+
 const GUEST: BuiltinTemplate = BuiltinTemplate {
     id: "guest",
     name: "Guest",
     description: "Web, files and memory only. No infrastructure access.",
     default_model: "deepseek-v4.1-flash",
     channel: "telegram",
+    env: GUEST_ENV,
     config_yaml: GUEST_CONFIG,
     soul_md: GUEST_SOUL,
 };
@@ -191,6 +225,7 @@ const GUEST_DISCORD: BuiltinTemplate = BuiltinTemplate {
     description: "Same restrictions as guest, connected to Discord.",
     default_model: "deepseek-v4.1-flash",
     channel: "discord",
+    env: GUEST_DISCORD_ENV,
     config_yaml: DISCORD_CONFIG,
     soul_md: DISCORD_SOUL,
 };
@@ -201,6 +236,7 @@ const SOLO: BuiltinTemplate = BuiltinTemplate {
     description: "No messaging platform. Driven from the CLI or the Hermes API.",
     default_model: "deepseek-v4.1-flash",
     channel: "none",
+    env: &[],
     config_yaml: SOLO_CONFIG,
     soul_md: SOLO_SOUL,
 };

@@ -134,6 +134,20 @@ impl From<SecretsError> for ApiError {
     }
 }
 
+impl From<crate::envs::EnvError> for ApiError {
+    fn from(err: crate::envs::EnvError) -> Self {
+        match err {
+            crate::envs::EnvError::Invalid(message) => {
+                ApiError::bad_request("invalid_env", message)
+            }
+            crate::envs::EnvError::Secrets(SecretsError::MissingKey) => {
+                ApiError::conflict(MISSING_KEY_CODE, SecretsError::MissingKey.to_string())
+            }
+            other => ApiError::internal(other.to_string()),
+        }
+    }
+}
+
 /// Truncate on a character boundary (compose stderr may contain UTF-8).
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {

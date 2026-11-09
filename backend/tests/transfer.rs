@@ -217,7 +217,7 @@ fn hostile_archive(instance: &Value, entry_name: &str) -> Bytes {
 }
 
 fn secret_values(harness: &Harness, id: &str) -> BTreeMap<String, String> {
-    fleett::secrets::load(&harness.state.cfg, &harness.state.db, id).expect("secrets readable")
+    fleett::envs::values(&harness.state.cfg, &harness.state.db, id).expect("secrets readable")
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +345,10 @@ async fn export_delete_import_round_trips_the_data() {
         .is_file());
 
     // The imported instance is indexed and holds no secret at all.
-    let stored = fleett::secrets::load(&harness.state.cfg, &harness.state.db, "alice")
+    let stored = fleett::envs::values(&harness.state.cfg, &harness.state.db, "alice")
         .expect("secrets readable");
     assert!(stored.is_empty(), "{stored:?}");
-    assert_eq!(detail["env_keys"], json!([]));
+    assert_eq!(detail["env"], json!([]));
 
     // The warnings tell the operator which tokens to PATCH.
     let warnings: Vec<&str> = detail["warnings"]

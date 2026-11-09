@@ -22,7 +22,7 @@ use crate::driver::Driver;
 use crate::models::{Health, InstanceSpec, Status, HEALTH_UNHEALTHY_MESSAGE};
 use crate::store;
 use axum::middleware;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 #[cfg(not(feature = "embed-web"))]
 use axum::Json;
 use axum::Router;
@@ -74,6 +74,9 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         store::ensure_layout(&cfg)?;
         db::reconcile(&cfg, &db)?;
+        // Import the pre-0.5 encrypted secret maps into `instance_env` (idempotent;
+        // a missing key only logs a warning and leaves them readable in place).
+        crate::envs::migrate_sealed(&cfg, &db);
         Ok(Self {
             cfg: Arc::new(cfg),
             db,
@@ -145,6 +148,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .patch(instances::patch)
                 .delete(instances::delete),
         )
+        .route("/instances/{id}/env", put(instances::put_env))
+        .route("/instances/{id}/env/{key}", delete(instances::delete_env))
         .route("/instances/{id}/export", get(instances::export))
         .route("/instances/{id}/start", post(instances::start))
         .route("/instances/{id}/stop", post(instances::stop))
@@ -285,11 +290,11 @@ pub(crate) async fn apply_compose(
 /// Write `instances/<id>/compose.yaml` from the spec, without touching Docker.
 ///
 /// The declared project is kept (an instance created by an older release stays
-/// on `hermes-<id>`), and the secret keys are re-declared as `${KEY}` so the
-/// driver keeps injecting them at runtime.
+/// on `hermes-<id>`), and every environment variable is re-declared as
+/// `${KEY}` so the driver keeps injecting the values at runtime.
 pub(crate) fn write_compose_file(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
-    let keys = crate::secrets::env_keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
+    let keys = crate::envs::keys(&state.cfg, &state.db, &spec.id).map_err(ApiError::from)?;
     let compose =
         crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
             .map_err(ApiError::from)?;

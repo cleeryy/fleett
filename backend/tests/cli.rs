@@ -200,7 +200,7 @@ fn detail(id: &str, status: &str) -> Value {
         "updated_at": "2026-11-08T01:00:00Z",
         "last_error": null,
         "data_dir": format!("/opt/fleett/instances/{id}/data"),
-        "env_keys": [],
+        "env": [],
         "container": container,
         "compose_yaml": format!("name: fleett-{id}\n")
     })

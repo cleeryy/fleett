@@ -7,13 +7,15 @@ use crate::auth::AuthContext;
 use crate::config::EgressMode;
 use crate::driver::LogsOptions;
 use crate::egress;
+use crate::envs::{self, EnvWrite};
 use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
 use crate::models::{
-    now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
-    validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
-    ChannelKind, ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest,
-    Health, InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
+    env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
+    validate_env_key, validate_env_value, validate_instance_id, validate_mem_limit, validate_model,
+    validate_notes, validate_secret_value, validate_share_name, ChannelKind, ChannelRequest,
+    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput, Health,
+    InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
     TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
     GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
@@ -113,7 +115,7 @@ struct Prepared {
     template: TemplateSource,
     gate_token: Option<String>,
     channel_token: Option<String>,
-    extras: BTreeMap<String, String>,
+    env: Vec<EnvWrite>,
 }
 
 pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSummary>>, ApiError> {
@@ -174,23 +176,28 @@ pub async fn create(
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
 
-    let secrets = render::build_secrets(
+    let values = render::build_secrets(
         &spec,
         prepared.gate_token.as_deref(),
         prepared.channel_token.as_deref(),
-        &prepared.extras,
+        &env_values(&prepared.env),
     );
-    // Refuse a create that could not store its tokens *before* writing any
+    let forced = token_keys(
+        &spec,
+        prepared.gate_token.is_some(),
+        prepared.channel_token.is_some(),
+    );
+    let entries = env_entries(values, &env_flags(&prepared.env), &forced);
+    // Refuse a create that could not store its secrets *before* writing any
     // file, so a refused create leaves nothing behind.
-    crate::secrets::check_storable(&state.cfg, &state.db, &spec.id, &secrets)
-        .map_err(ApiError::from)?;
-    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
+    envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
+    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
 
-    let rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &secret_keys)
+    let rendered = render::render_instance(&state.cfg, &spec, &prepared.template, &env_keys)
         .map_err(ApiError::from)?;
 
     state.db.insert_instance(&spec).map_err(ApiError::from)?;
-    if let Err(err) = crate::secrets::store(&state.cfg, &state.db, &spec.id, &secrets) {
+    if let Err(err) = envs::replace(&state.cfg, &state.db, &spec.id, &entries) {
         let _ = state.db.delete_instance(&spec.id);
         return Err(ApiError::from(err));
     }
@@ -283,13 +290,17 @@ pub async fn clone(
 
     // Tokens are never inherited: every token the source holds has to be
     // replaced by the request. Checked before the first write so a refused
-    // clone leaves nothing behind.
-    let source_secrets =
-        crate::secrets::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    // clone leaves nothing behind. Non-secret variables, on the other hand,
+    // are configuration and are copied.
+    let source_env = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let source_secrets: BTreeMap<String, String> = source_env
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect();
     let mut missing: Vec<String> = Vec::new();
     if gate_token.is_none() {
         missing.extend(
-            gate_secret_keys(&source)
+            gate_env_keys(&source)
                 .into_iter()
                 .filter(|key| source_secrets.contains_key(*key))
                 .map(str::to_string),
@@ -365,21 +376,28 @@ pub async fn clone(
     ensure_lan_network(&state, &clone).await?;
 
     let template = clone_template(&state, &source)?;
-    let secrets = render::build_secrets(
+    let inherited: BTreeMap<String, String> = source_env
+        .iter()
+        .filter(|entry| !entry.secret)
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect();
+    let values = render::build_secrets(
         &clone,
         gate_token.as_deref(),
         channel_token.as_deref(),
-        &BTreeMap::new(),
+        &inherited,
     );
-    crate::secrets::check_storable(&state.cfg, &state.db, &new_id, &secrets)
-        .map_err(ApiError::from)?;
-    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
-    let rendered = render::render_instance(&state.cfg, &clone, &template, &secret_keys)
+    let flags: BTreeMap<String, bool> = inherited.keys().map(|key| (key.clone(), false)).collect();
+    let forced = token_keys(&clone, gate_token.is_some(), channel_token.is_some());
+    let entries = env_entries(values, &flags, &forced);
+    envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
+    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    let rendered = render::render_instance(&state.cfg, &clone, &template, &env_keys)
         .map_err(ApiError::from)?;
 
     // From here on the clone exists: any failure rolls it back completely.
     state.db.insert_instance(&clone).map_err(ApiError::from)?;
-    if let Err(err) = write_clone(&state, &source.id, &clone, &secrets, &rendered, copy_data).await
+    if let Err(err) = write_clone(&state, &source.id, &clone, &entries, &rendered, copy_data).await
     {
         rollback_clone(&state, &new_id);
         return Err(err);
@@ -598,10 +616,10 @@ async fn import_archive(
         .as_deref()
         .and_then(store::compose_image)
         .unwrap_or_else(|| state.cfg.image.clone());
-    let secret_keys = extraction
+    let env_keys = extraction
         .compose_yaml
         .as_deref()
-        .map(crate::instance_archive::compose_secret_keys)
+        .map(crate::instance_archive::compose_env_keys)
         .unwrap_or_default();
 
     let mut warnings = extraction.warnings;
@@ -627,7 +645,7 @@ async fn import_archive(
     expected.sort();
     expected.dedup();
     warnings.push(format!(
-        "the archive carries no secrets: PATCH the instance to set {}",
+        "the archive carries no secrets: PATCH the instance or PUT its env to set {}",
         expected.join(", ")
     ));
 
@@ -635,8 +653,7 @@ async fn import_archive(
     check_egress_policy(state, &spec).await?;
     ensure_lan_network(state, &spec).await?;
 
-    let compose =
-        render::render_compose(&state.cfg, &spec, &secret_keys).map_err(ApiError::from)?;
+    let compose = render::render_compose(&state.cfg, &spec, &env_keys).map_err(ApiError::from)?;
 
     // From here on the instance exists on disk: any failure rolls it back.
     let instance_dir = match store::create_instance_dir(&state.cfg, id) {
@@ -721,23 +738,29 @@ pub async fn patch(
 
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
+    let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
     enforce_caps(&state, Some(&id), &spec)?;
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
 
-    let existing = crate::secrets::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
-    let secrets = render::merge_secrets(
-        existing,
+    let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let mut values = env_values_of(&existing);
+    let mut flags = env_flags_of(&existing);
+    apply_env_merge(&mut values, &mut flags, request.env.as_deref())?;
+    let values = render::merge_secrets(
+        values,
         &spec,
-        request.gate_token.as_deref(),
+        gate_token.as_deref(),
         channel_token.as_deref(),
     );
-    crate::secrets::check_storable(&state.cfg, &state.db, &id, &secrets).map_err(ApiError::from)?;
-    let secret_keys: Vec<String> = secrets.keys().cloned().collect();
-    let rendered = render_for_update(&state, &spec, &secret_keys)?;
-    // Rotation is durable before the compose file starts referencing the new
-    // key name; the driver reads the row on its next `docker compose` call.
-    crate::secrets::store(&state.cfg, &state.db, &id, &secrets).map_err(ApiError::from)?;
+    let forced = token_keys(&spec, gate_token.is_some(), channel_token.is_some());
+    let entries = env_entries(values, &flags, &forced);
+    envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
+    let env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+    let rendered = render_for_update(&state, &spec, &env_keys)?;
+    // The new rows are durable before the compose file starts referencing the
+    // new key names; the driver reads them on its next `docker compose` call.
+    envs::replace(&state.cfg, &state.db, &id, &entries).map_err(ApiError::from)?;
 
     store::write_instance(&state.cfg, &spec, &rendered, false)
         .map_err(|err| ApiError::internal(format!("failed to write instance files: {err}")))?;
@@ -756,6 +779,122 @@ pub async fn patch(
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
+    )))
+}
+
+/// Body of `PUT /api/instances/{id}/env`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PutEnvRequest {
+    #[serde(default)]
+    pub env: Option<Vec<EnvVarInput>>,
+}
+
+/// Replace the whole environment of an instance.
+///
+/// A secret entry may be sent back without its value (`secret: true`,
+/// `value: null`): the stored value is kept, so a console that never received
+/// the secret can still round-trip the list. Every key the request leaves out
+/// is deleted.
+pub async fn put_env(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    Json(request): Json<PutEnvRequest>,
+) -> Result<Json<InstanceDetail>, ApiError> {
+    let vars = request.env.ok_or_else(|| {
+        ApiError::bad_request("invalid_env", "env is required: send {\"env\": [{...}]}")
+    })?;
+
+    let lock = state.locks.for_id(&id);
+    let _guard = lock.lock().await;
+
+    let mut spec = load(&state, &id)?;
+    let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let entries = resolve_full_env(&existing, &vars)?;
+
+    envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
+    envs::replace(&state.cfg, &state.db, &id, &entries).map_err(ApiError::from)?;
+    crate::api::write_compose_file(&state, &spec)?;
+    apply_env_state(&state, &mut spec)?;
+
+    audit::record(
+        &state,
+        &context,
+        "instance.env.update",
+        &spec.id,
+        Some(serde_json::json!({
+            "keys": entries.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+            "secrets": entries.iter().filter(|entry| entry.secret).count(),
+        })),
+    );
+    detail_after_apply(&state, &spec).await
+}
+
+/// `DELETE /api/instances/{id}/env/{key}`: remove one variable and apply.
+pub async fn delete_env(
+    Path((id, key)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+) -> Result<StatusCode, ApiError> {
+    let lock = state.locks.for_id(&id);
+    let _guard = lock.lock().await;
+
+    let mut spec = load(&state, &id)?;
+    let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    if !existing.iter().any(|entry| entry.key == key) {
+        return Err(ApiError::not_found(format!(
+            "instance \"{id}\" has no environment variable \"{key}\""
+        )));
+    }
+    let entries: Vec<EnvWrite> = existing
+        .into_iter()
+        .filter(|entry| entry.key != key)
+        .map(|entry| EnvWrite {
+            key: entry.key,
+            value: entry.value,
+            secret: entry.secret,
+        })
+        .collect();
+
+    envs::replace(&state.cfg, &state.db, &id, &entries).map_err(ApiError::from)?;
+    crate::api::write_compose_file(&state, &spec)?;
+    apply_env_state(&state, &mut spec)?;
+
+    audit::record(
+        &state,
+        &context,
+        "instance.env.delete",
+        &spec.id,
+        Some(serde_json::json!({ "key": key })),
+    );
+    up_and_record(&state, &mut spec).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record the touch of a successful environment write.
+fn apply_env_state(state: &AppState, spec: &mut InstanceSpec) -> Result<(), ApiError> {
+    spec.updated_at = now_iso();
+    spec.status = Status::Created;
+    spec.last_error = None;
+    state.db.update_instance(spec).map_err(ApiError::from)
+}
+
+/// `docker compose ps`, then the full detail of an instance that was just
+/// restarted by an environment change.
+async fn detail_after_apply(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<Json<InstanceDetail>, ApiError> {
+    let mut spec = spec.clone();
+    up_and_record(state, &mut spec).await?;
+    let (status, health, container) = match state.driver.ps(&spec).await {
+        Ok(result) => (result.status, result.health, result.container),
+        Err(_) => (Status::Running, Health::Unknown, None),
+    };
+    record_health(state, &mut spec, health);
+    let warnings = egress::warnings(&state.cfg, spec.allow_lan);
+    Ok(Json(to_detail(
+        state, &spec, status, health, container, warnings,
     )))
 }
 
@@ -987,7 +1126,7 @@ async fn lifecycle(
 fn render_for_update(
     state: &AppState,
     spec: &InstanceSpec,
-    secret_keys: &[String],
+    env_keys: &[String],
 ) -> Result<render::RenderedInstance, ApiError> {
     // Keep the project already declared on disk: an instance created by an
     // older release stays on `hermes-<id>` until it is migrated explicitly.
@@ -1001,7 +1140,7 @@ fn render_for_update(
             spec,
             &template,
             project.as_deref(),
-            secret_keys,
+            env_keys,
         )
         .map_err(ApiError::from),
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
@@ -1017,7 +1156,7 @@ fn render_for_update(
                     &state.cfg,
                     spec,
                     project.as_deref(),
-                    secret_keys,
+                    env_keys,
                 )
                 .map_err(ApiError::from)?,
                 config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
@@ -1234,10 +1373,10 @@ fn to_detail(
     container: Option<ContainerInfo>,
     mut warnings: Vec<String>,
 ) -> InstanceDetail {
-    let env_keys = match crate::secrets::env_keys(&state.cfg, &state.db, &spec.id) {
-        Ok(keys) => keys,
+    let env = match envs::views(&state.cfg, &state.db, &spec.id) {
+        Ok(env) => env,
         Err(err) => {
-            warnings.push(format!("secrets are unreadable: {err}"));
+            warnings.push(format!("environment variables are unreadable: {err}"));
             Vec::new()
         }
     };
@@ -1265,7 +1404,7 @@ fn to_detail(
         updated_at: spec.updated_at.clone(),
         last_error: spec.last_error.clone(),
         data_dir: state.cfg.data_dir(&spec.id).display().to_string(),
-        env_keys,
+        env,
         container,
         compose_yaml: store::read_compose(&state.cfg, &spec.id),
     }
@@ -1351,7 +1490,15 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
     let notes = request.notes.clone().unwrap_or_default();
     validate_notes(&notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
 
-    let extras = validate_extras(request.env.as_ref())?;
+    let env: Vec<EnvWrite> =
+        validate_env_inputs(request.env.as_deref().unwrap_or_default(), true, true)?
+            .into_iter()
+            .map(|var| EnvWrite {
+                key: var.key,
+                value: var.value.unwrap_or_default(),
+                secret: var.secret.unwrap_or(false),
+            })
+            .collect();
     let gate_token = request
         .gate_token
         .as_deref()
@@ -1388,7 +1535,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         template,
         gate_token,
         channel_token,
-        extras,
+        env,
     })
 }
 
@@ -1516,25 +1663,213 @@ fn validate_share_refs(state: &AppState, shares: &[ShareRef]) -> Result<Vec<Shar
     Ok(validated)
 }
 
-fn validate_extras(
-    extras: Option<&BTreeMap<String, String>>,
-) -> Result<BTreeMap<String, String>, ApiError> {
-    let mut out = BTreeMap::new();
-    let Some(extras) = extras else {
-        return Ok(out);
-    };
-    for (key, value) in extras {
-        if crate::models::validate_secret_name(key).is_err() {
+/// One environment variable parsed from a request, before it is resolved
+/// against the stored values.
+struct ParsedEnv {
+    key: String,
+    value: Option<String>,
+    secret: Option<bool>,
+}
+
+fn env_error_code(key: &str) -> &'static str {
+    if env_key_is_reserved(key) {
+        "reserved_env"
+    } else {
+        "invalid_env"
+    }
+}
+
+/// Validate the `env` list of a request.
+///
+/// `require_value` refuses a missing value (create), `require_secret` refuses
+/// a missing secret flag (create and full replace). PATCH accepts both and
+/// merges instead.
+fn validate_env_inputs(
+    vars: &[EnvVarInput],
+    require_value: bool,
+    require_secret: bool,
+) -> Result<Vec<ParsedEnv>, ApiError> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(vars.len());
+    for var in vars {
+        validate_env_key(&var.key)
+            .map_err(|message| ApiError::bad_request(env_error_code(&var.key), message))?;
+        if !seen.insert(var.key.as_str()) {
             return Err(ApiError::bad_request(
-                "invalid_env",
-                format!("\"{key}\" is not a valid environment variable name"),
+                "duplicate_env",
+                format!("environment variable \"{}\" is listed twice", var.key),
             ));
         }
-        validate_secret_value(value)
-            .map_err(|message| ApiError::bad_request("invalid_env", message))?;
-        out.insert(key.clone(), value.clone());
+        match &var.value {
+            Some(value) => validate_env_value(value)
+                .map_err(|message| ApiError::bad_request("invalid_env", message))?,
+            None if require_value => {
+                return Err(ApiError::bad_request(
+                    "invalid_env",
+                    format!("environment variable \"{}\" requires a value", var.key),
+                ))
+            }
+            None => {}
+        }
+        if require_secret && var.secret.is_none() {
+            return Err(ApiError::bad_request(
+                "invalid_env",
+                format!(
+                    "environment variable \"{}\" must say whether it is a secret",
+                    var.key
+                ),
+            ));
+        }
+        out.push(ParsedEnv {
+            key: var.key.clone(),
+            value: var.value.clone(),
+            secret: var.secret,
+        });
     }
     Ok(out)
+}
+
+/// Resolve a full replacement against the stored environment.
+///
+/// A secret entry without a value keeps the stored value (the API never
+/// returned it, so a console cannot send it back); any other entry without a
+/// value is a request error.
+fn resolve_full_env(
+    existing: &[envs::EnvValue],
+    vars: &[EnvVarInput],
+) -> Result<Vec<EnvWrite>, ApiError> {
+    let parsed = validate_env_inputs(vars, false, true)?;
+    let mut entries = Vec::with_capacity(parsed.len());
+    for var in parsed {
+        let secret = var.secret.unwrap_or(false);
+        match var.value {
+            Some(value) => entries.push(EnvWrite {
+                key: var.key,
+                value,
+                secret,
+            }),
+            None => {
+                let stored = existing.iter().find(|entry| entry.key == var.key);
+                match stored {
+                    Some(entry) if entry.secret && secret => entries.push(EnvWrite {
+                        key: var.key,
+                        value: entry.value.clone(),
+                        secret: true,
+                    }),
+                    Some(_) => {
+                        return Err(ApiError::bad_request(
+                            "invalid_env",
+                            format!(
+                                "environment variable \"{}\" is not a secret: a value is required",
+                                var.key
+                            ),
+                        ))
+                    }
+                    None => {
+                        return Err(ApiError::bad_request(
+                            "invalid_env",
+                            format!(
+                                "environment variable \"{}\" is new: a value is required",
+                                var.key
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Merge a `PATCH` env list into the stored values: `null` deletes, `""` keeps
+/// an empty value, a missing secret flag keeps the flag of an existing key.
+fn apply_env_merge(
+    values: &mut BTreeMap<String, String>,
+    flags: &mut BTreeMap<String, bool>,
+    vars: Option<&[EnvVarInput]>,
+) -> Result<(), ApiError> {
+    let Some(vars) = vars else {
+        return Ok(());
+    };
+    let parsed = validate_env_inputs(vars, false, false)?;
+    for var in parsed {
+        match var.value {
+            None => {
+                values.remove(&var.key);
+                flags.remove(&var.key);
+            }
+            Some(value) => {
+                let secret = var
+                    .secret
+                    .unwrap_or_else(|| flags.get(&var.key).copied().unwrap_or(false));
+                values.insert(var.key.clone(), value);
+                flags.insert(var.key, secret);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn env_values(entries: &[EnvWrite]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect()
+}
+
+fn env_flags(entries: &[EnvWrite]) -> BTreeMap<String, bool> {
+    entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.secret))
+        .collect()
+}
+
+fn env_values_of(entries: &[envs::EnvValue]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.value.clone()))
+        .collect()
+}
+
+fn env_flags_of(entries: &[envs::EnvValue]) -> BTreeMap<String, bool> {
+    entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry.secret))
+        .collect()
+}
+
+fn env_entries(
+    values: BTreeMap<String, String>,
+    flags: &BTreeMap<String, bool>,
+    forced_secret: &[&str],
+) -> Vec<EnvWrite> {
+    values
+        .into_iter()
+        .map(|(key, value)| EnvWrite {
+            secret: forced_secret.contains(&key.as_str())
+                || flags.get(&key).copied().unwrap_or(false),
+            key,
+            value,
+        })
+        .collect()
+}
+
+/// Keys supplied by the gate/channel tokens of a request: always secret, even
+/// when the request marks them as plain.
+fn token_keys(spec: &InstanceSpec, gate: bool, channel: bool) -> Vec<&str> {
+    let mut keys = Vec::new();
+    if gate {
+        keys.push(GATE_TOKEN_ENV);
+        if spec.api_key_env != GATE_TOKEN_ENV && spec.api_key_env != DEFAULT_API_KEY_ENV {
+            keys.push(spec.api_key_env.as_str());
+        }
+    }
+    if channel {
+        if let Some(env) = spec.channel.token_env() {
+            keys.push(env);
+        }
+    }
+    keys
 }
 
 fn invalid_tail() -> ApiError {
@@ -1564,7 +1899,7 @@ fn normalize_token(value: Option<&str>, code: &'static str) -> Result<Option<Str
 }
 
 /// Secret keys replaced by `gate_token`.
-fn gate_secret_keys(spec: &InstanceSpec) -> Vec<&str> {
+fn gate_env_keys(spec: &InstanceSpec) -> Vec<&str> {
     let mut keys = vec![GATE_TOKEN_ENV];
     if spec.api_key_env != GATE_TOKEN_ENV {
         keys.push(spec.api_key_env.as_str());
@@ -1617,11 +1952,11 @@ async fn write_clone(
     state: &AppState,
     source_id: &str,
     spec: &InstanceSpec,
-    secrets: &BTreeMap<String, String>,
+    entries: &[EnvWrite],
     rendered: &render::RenderedInstance,
     copy_data: bool,
 ) -> Result<(), ApiError> {
-    crate::secrets::store(&state.cfg, &state.db, &spec.id, secrets).map_err(ApiError::from)?;
+    envs::replace(&state.cfg, &state.db, &spec.id, entries).map_err(ApiError::from)?;
 
     if copy_data {
         let cfg = state.cfg.clone();

@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod driver;
 pub mod egress;
+pub mod envs;
 pub mod instance_archive;
 pub mod logs;
 pub mod metrics;

@@ -1,19 +1,21 @@
-//! Instance secrets encrypted at rest.
+//! Secrets key and legacy secret stores.
 //!
 //! Provider keys and bot tokens used to live in `instances/<id>/secrets.env`,
 //! mode `0600` but plain text: a `tar` of `FLEETT_ROOT` carried every token.
-//! They are now stored as one AES-256-GCM blob per instance in the
-//! `instance_secrets` table, encrypted with a key that lives outside the data
-//! root (`/etc/fleett/secrets.key` by default).
 //!
-//! The compose file references the values through Compose interpolation
-//! (`TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}`); the compose driver decrypts
-//! the instance and injects the values into the `docker compose` child
-//! environment, so no plaintext is ever written to disk.
+//! Values now live in the per-variable `instance_env` table (see
+//! [`crate::envs`]), encrypted with the key managed here. This module owns:
 //!
-//! Existing hosts keep working: an instance that still has a `secrets.env`
-//! file and no encrypted row is read from that file (with a warning) until the
-//! operator runs `fleett secrets migrate --apply`.
+//! * the AES-256-GCM key (outside `FLEETT_ROOT`, `/etc/fleett/secrets.key` by
+//!   default) and the primitives used by [`crate::envs`];
+//! * the one-release compatibility layer: `instance_secrets` (an encrypted
+//!   JSON map per instance) and plaintext `secrets.env` files are imported at
+//!   startup or by `fleett secrets migrate --apply`.
+//!
+//! The compose file references every value through Compose interpolation
+//! (`TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}`); the compose driver injects
+//! the decrypted values into the `docker compose` child environment, so no
+//! plaintext is ever written to disk.
 //!
 //! ```text
 //! sudo fleett secrets init            # generate /etc/fleett/secrets.key (0640)
@@ -84,6 +86,18 @@ pub enum SecretsError {
     Io(#[from] io::Error),
     #[error("invalid secrets payload: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Env(String),
+}
+
+impl From<crate::envs::EnvError> for SecretsError {
+    fn from(err: crate::envs::EnvError) -> Self {
+        match err {
+            crate::envs::EnvError::Invalid(message) => Self::Env(message),
+            crate::envs::EnvError::Secrets(err) => err,
+            crate::envs::EnvError::Db(err) => Self::Db(err),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -250,17 +264,6 @@ fn decode_key(value: &str, name: &str) -> Result<[u8; KEY_LEN], SecretsError> {
 // Storage decisions
 // ---------------------------------------------------------------------------
 
-/// Where the secrets of one instance ended up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Storage {
-    /// Encrypted row in `instance_secrets`.
-    Encrypted,
-    /// Plaintext `secrets.env` (legacy instance, no key yet).
-    LegacyFile,
-    /// The instance has no secret at all.
-    Empty,
-}
-
 /// True when the key file would end up inside the data root.
 ///
 /// Compared lexically: `FLEETT_SECRETS_KEY_FILE` is expected to be a clean
@@ -269,95 +272,8 @@ pub fn key_file_inside_root(cfg: &Config) -> bool {
     cfg.secrets_key_file.starts_with(&cfg.root)
 }
 
-/// Fail early (before any file is written) when the secrets could not be
-/// stored safely.
-///
-/// * an existing encrypted row needs the key to stay readable;
-/// * an existing legacy file keeps the instance in legacy mode;
-/// * a fresh instance needs a key, otherwise the API answers
-///   `409 secrets_key_missing`.
-pub fn check_storable(
-    cfg: &Config,
-    db: &Db,
-    id: &str,
-    secrets: &BTreeMap<String, String>,
-) -> Result<(), SecretsError> {
-    if secrets.is_empty() {
-        return Ok(());
-    }
-    match db.sealed(id)? {
-        Some(_) => match SecretsKey::from_config(cfg)? {
-            Some(_) => Ok(()),
-            None => Err(SecretsError::MissingKey),
-        },
-        None if cfg.secrets_path(id).is_file() => Ok(()),
-        None => match SecretsKey::from_config(cfg)? {
-            Some(_) => Ok(()),
-            None => Err(SecretsError::MissingKey),
-        },
-    }
-}
-
-/// Persist the secrets of one instance, keeping the mode it already uses.
-///
-/// Encrypted instances stay encrypted (a rotation replaces the row with a new
-/// nonce); legacy instances keep their `secrets.env` until
-/// `fleett secrets migrate --apply`; a new instance is encrypted when a key is
-/// available.
-pub fn store(
-    cfg: &Config,
-    db: &Db,
-    id: &str,
-    secrets: &BTreeMap<String, String>,
-) -> Result<Storage, SecretsError> {
-    let key = SecretsKey::from_config(cfg)?;
-    if db.sealed(id)?.is_some() {
-        let key = key.ok_or(SecretsError::MissingKey)?;
-        if secrets.is_empty() {
-            db.delete_sealed(id)?;
-            return Ok(Storage::Empty);
-        }
-        let sealed = encrypt_map(&key, secrets)?;
-        db.put_sealed(id, &sealed.nonce, &sealed.ciphertext)?;
-        return Ok(Storage::Encrypted);
-    }
-    if cfg.secrets_path(id).is_file() {
-        store::write_legacy_secrets(cfg, id, secrets)?;
-        return Ok(Storage::LegacyFile);
-    }
-    let Some(key) = key else {
-        if secrets.is_empty() {
-            return Ok(Storage::Empty);
-        }
-        return Err(SecretsError::MissingKey);
-    };
-    if secrets.is_empty() {
-        return Ok(Storage::Empty);
-    }
-    let sealed = encrypt_map(&key, secrets)?;
-    db.put_sealed(id, &sealed.nonce, &sealed.ciphertext)?;
-    Ok(Storage::Encrypted)
-}
-
-/// Secrets of one instance: encrypted row first, then legacy file, else empty.
-pub fn load(cfg: &Config, db: &Db, id: &str) -> Result<BTreeMap<String, String>, SecretsError> {
-    if let Some(row) = db.sealed(id)? {
-        let key = SecretsKey::from_config(cfg)?.ok_or(SecretsError::MissingKey)?;
-        return decrypt_map(&key, &row.nonce, &row.ciphertext);
-    }
-    if cfg.secrets_path(id).is_file() {
-        return Ok(store::read_legacy_secrets(cfg, id));
-    }
-    Ok(BTreeMap::new())
-}
-
-/// Sorted secret keys of one instance, for `InstanceDetail::env_keys`.
-pub fn env_keys(cfg: &Config, db: &Db, id: &str) -> Result<Vec<String>, SecretsError> {
-    Ok(load(cfg, db, id)?.into_keys().collect())
-}
-
 /// True when a plaintext `secrets.env` is still on disk for this instance
-/// (whether or not an encrypted row already exists).
+/// (whether or not encrypted rows already exist).
 pub fn has_plaintext_file(cfg: &Config, id: &str) -> bool {
     cfg.secrets_path(id).is_file()
 }
@@ -439,7 +355,7 @@ pub fn status(cfg: &Config, db: &Db) -> Status {
         key_file_exists,
         key_file_mode,
         key_file_inside_root: key_file_inside_root(cfg),
-        encrypted_instances: db.sealed_count().unwrap_or(0),
+        encrypted_instances: db.secret_instance_count().unwrap_or(0),
         legacy_files: legacy_entries(cfg)
             .into_iter()
             .map(|entry| entry.path)
@@ -553,9 +469,10 @@ pub fn migrate(cfg: &Config, apply: bool) -> anyhow::Result<MigrateReport> {
     Ok(report)
 }
 
-/// Encrypt one legacy file into the database and rewrite its compose file.
+/// Import one legacy file (or encrypted map) into the per-variable store and
+/// rewrite its compose file.
 ///
-/// When the instance already has an encrypted row, that row wins: a stale
+/// When the instance already has `instance_env` rows, those rows win: a stale
 /// `secrets.env` never reverts a token rotated through the API. The file is
 /// still superseded (compose rewritten, deleted by the caller with `--apply`).
 ///
@@ -568,24 +485,26 @@ pub fn import_entry(
     key: &SecretsKey,
     entry: &LegacyEntry,
 ) -> Result<(), SecretsError> {
-    let keys = match db.sealed(&entry.instance_id)? {
-        Some(row) => {
-            tracing::info!(
-                instance = %entry.instance_id,
-                "secrets: the plaintext secrets.env is superseded by the encrypted row"
-            );
-            decrypt_map(key, &row.nonce, &row.ciphertext)?
-                .into_keys()
-                .collect::<Vec<_>>()
+    let rows = db.list_instance_env(&entry.instance_id)?;
+    let keys = if !rows.is_empty() {
+        rows.into_iter().map(|row| row.key).collect::<Vec<_>>()
+    } else {
+        let secrets = match db.sealed(&entry.instance_id)? {
+            Some(row) => decrypt_map(key, &row.nonce, &row.ciphertext)?,
+            None => store::read_legacy_secrets(cfg, &entry.instance_id),
+        };
+        if !secrets.is_empty() {
+            let entries: Vec<crate::envs::EnvWrite> = secrets
+                .iter()
+                .map(|(key, value)| crate::envs::EnvWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                    secret: true,
+                })
+                .collect();
+            crate::envs::store_rows(cfg, db, &entry.instance_id, &entries)?;
         }
-        None => {
-            let secrets = store::read_legacy_secrets(cfg, &entry.instance_id);
-            if !secrets.is_empty() {
-                let sealed = encrypt_map(key, &secrets)?;
-                db.put_sealed(&entry.instance_id, &sealed.nonce, &sealed.ciphertext)?;
-            }
-            secrets.into_keys().collect()
-        }
+        secrets.into_keys().collect()
     };
     if entry.compose_path.is_file() {
         let text = fs::read_to_string(&entry.compose_path)?;
@@ -623,6 +542,10 @@ pub fn startup(cfg: &Config, db: &Db) {
             None
         }
     };
+
+    // Import the pre-0.5 encrypted maps into the per-variable table before the
+    // legacy files are read, so the driver only ever sees one store.
+    crate::envs::migrate_sealed(cfg, db);
 
     let entries = legacy_entries(cfg);
     if let Some(key) = &key {
@@ -664,7 +587,8 @@ pub fn startup(cfg: &Config, db: &Db) {
         );
     }
 
-    if key.is_none() && db.sealed_count().unwrap_or(0) > 0 {
+    if key.is_none() && db.sealed_count().unwrap_or(0) + db.secret_instance_count().unwrap_or(0) > 0
+    {
         tracing::warn!(
             "secrets: encrypted secrets exist but no key is configured; run \
              `sudo fleett secrets init` or restore the key file"
@@ -1041,138 +965,36 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_instance_is_encrypted_when_a_key_exists() {
+    fn the_encrypted_store_is_per_variable_and_superseded_by_an_import() {
         let (_dir, mut cfg) = temp_config();
         cfg.secrets_key = Some(encode_key(&KEY_BYTES));
         let db = Db::open(&cfg.db_path()).expect("db");
 
-        let storage = store(&cfg, &db, "alice", &sample()).expect("store");
-        assert_eq!(storage, Storage::Encrypted);
-        assert!(!cfg.secrets_path("alice").exists());
-        let row = db.sealed("alice").expect("sealed").expect("row");
-        assert_eq!(load(&cfg, &db, "alice").expect("load"), sample());
+        // The old one-blob store is still read (and reported) before the
+        // startup import moves it to `instance_env`.
+        let sealed = encrypt_map(&key(), &sample()).expect("encrypt");
+        db.put_sealed("alice", &sealed.nonce, &sealed.ciphertext)
+            .expect("legacy row");
         assert_eq!(
-            env_keys(&cfg, &db, "alice").expect("keys"),
+            crate::envs::values(&cfg, &db, "alice").expect("values"),
+            sample()
+        );
+        assert_eq!(status(&cfg, &db).encrypted_instances, 0);
+
+        assert_eq!(crate::envs::migrate_sealed(&cfg, &db), 1);
+        assert!(db.sealed("alice").expect("sealed").is_none());
+        assert_eq!(status(&cfg, &db).encrypted_instances, 1);
+        assert_eq!(
+            crate::envs::values(&cfg, &db, "alice").expect("values"),
+            sample()
+        );
+        assert_eq!(
+            crate::envs::keys(&cfg, &db, "alice").expect("keys"),
             vec![
                 "HERMES_GATE_PROFILE_TOKEN".to_string(),
                 "TELEGRAM_BOT_TOKEN".to_string()
             ]
         );
-        assert_eq!(
-            decrypt_map(&key(), &row.nonce, &row.ciphertext).expect("decrypt"),
-            sample()
-        );
-    }
-
-    #[test]
-    fn a_fresh_instance_without_a_key_is_refused() {
-        let (_dir, cfg) = temp_config();
-        let db = Db::open(&cfg.db_path()).expect("db");
-        let err = store(&cfg, &db, "alice", &sample()).expect_err("no key");
-        assert!(matches!(err, SecretsError::MissingKey));
-        assert!(check_storable(&cfg, &db, "alice", &sample()).is_err());
-        assert!(!cfg.secrets_path("alice").exists());
-        assert!(db.sealed("alice").expect("sealed").is_none());
-
-        // No secret at all is always fine.
-        assert_eq!(
-            store(&cfg, &db, "alice", &BTreeMap::new()).expect("empty"),
-            Storage::Empty
-        );
-        assert!(check_storable(&cfg, &db, "alice", &BTreeMap::new()).is_ok());
-    }
-
-    #[test]
-    fn a_legacy_file_keeps_working_without_a_key() {
-        let (_dir, cfg) = temp_config();
-        let db = Db::open(&cfg.db_path()).expect("db");
-        store::write_legacy_secrets(&cfg, "alice", &sample()).expect("legacy file");
-
-        assert!(has_plaintext_file(&cfg, "alice"));
-        assert!(check_storable(&cfg, &db, "alice", &sample()).is_ok());
-        let storage = store(&cfg, &db, "alice", &sample()).expect("store");
-        assert_eq!(storage, Storage::LegacyFile);
-        assert_eq!(load(&cfg, &db, "alice").expect("load"), sample());
-
-        // Rotation rewrites the plaintext file: the legacy mode is untouched.
-        let mut rotated = sample();
-        rotated.insert("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string());
-        store(&cfg, &db, "alice", &rotated).expect("rotate");
-        assert_eq!(
-            store::read_legacy_secrets(&cfg, "alice")
-                .get("TELEGRAM_BOT_TOKEN")
-                .map(String::as_str),
-            Some("456:DEF")
-        );
-        assert!(db.sealed("alice").expect("sealed").is_none());
-    }
-
-    #[test]
-    fn rotation_replaces_the_encrypted_row() {
-        let (_dir, mut cfg) = temp_config();
-        cfg.secrets_key = Some(encode_key(&KEY_BYTES));
-        let db = Db::open(&cfg.db_path()).expect("db");
-        store(&cfg, &db, "alice", &sample()).expect("store");
-        let first = db.sealed("alice").expect("sealed").expect("row");
-
-        let mut rotated = sample();
-        rotated.insert("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string());
-        assert_eq!(
-            store(&cfg, &db, "alice", &rotated).expect("rotate"),
-            Storage::Encrypted
-        );
-        let second = db.sealed("alice").expect("sealed").expect("row");
-        assert_ne!(first.ciphertext, second.ciphertext);
-        assert_ne!(first.nonce, second.nonce);
-        assert_eq!(
-            load(&cfg, &db, "alice").expect("load"),
-            rotated,
-            "the new token must be readable"
-        );
-    }
-
-    #[test]
-    fn removing_every_secret_drops_the_row() {
-        let (_dir, mut cfg) = temp_config();
-        cfg.secrets_key = Some(encode_key(&KEY_BYTES));
-        let db = Db::open(&cfg.db_path()).expect("db");
-        store(&cfg, &db, "alice", &sample()).expect("store");
-        assert_eq!(
-            store(&cfg, &db, "alice", &BTreeMap::new()).expect("clear"),
-            Storage::Empty
-        );
-        assert!(db.sealed("alice").expect("sealed").is_none());
-    }
-
-    #[test]
-    fn deleting_an_instance_drops_its_encrypted_row() {
-        let (_dir, mut cfg) = temp_config();
-        cfg.secrets_key = Some(encode_key(&KEY_BYTES));
-        let db = Db::open(&cfg.db_path()).expect("db");
-        let spec = crate::models::InstanceSpec {
-            id: "alice".to_string(),
-            name: "alice".to_string(),
-            template: "guest".to_string(),
-            model: "m".to_string(),
-            base_url: "https://example.test/v1".to_string(),
-            api_key_env: crate::models::DEFAULT_API_KEY_ENV.to_string(),
-            channel: crate::models::ChannelKind::None,
-            shares: Vec::new(),
-            mem_limit_mb: crate::models::DEFAULT_MEM_LIMIT_MB,
-            cpu_limit: crate::models::DEFAULT_CPU_LIMIT,
-            image: "hermes-agent:0.22.2-local".to_string(),
-            previous_image: None,
-            allow_lan: false,
-            notes: String::new(),
-            status: crate::models::Status::Created,
-            last_error: None,
-            created_at: crate::models::now_iso(),
-            updated_at: crate::models::now_iso(),
-        };
-        db.insert_instance(&spec).expect("insert");
-        store(&cfg, &db, "alice", &sample()).expect("store");
-        db.delete_instance("alice").expect("delete");
-        assert!(db.sealed("alice").expect("sealed").is_none());
     }
 
     #[test]
@@ -1236,7 +1058,10 @@ mod tests {
         assert!(compose.contains("HERMES_UID: '10000'"), "{compose}");
 
         let db = Db::open(&cfg.db_path()).expect("db");
-        assert_eq!(load(&cfg, &db, "alice").expect("load"), sample());
+        assert_eq!(
+            crate::envs::values(&cfg, &db, "alice").expect("values"),
+            sample()
+        );
 
         // Nothing usable remains in the instance directory.
         let everything = read_tree(&cfg.instance_dir("alice"));
@@ -1248,13 +1073,28 @@ mod tests {
     }
 
     #[test]
-    fn migration_apply_keeps_the_encrypted_row_over_a_stale_file() {
+    fn migration_apply_keeps_the_stored_rows_over_a_stale_file() {
         let (_dir, mut cfg) = temp_config();
         cfg.secrets_key = Some(encode_key(&KEY_BYTES));
         let db = Db::open(&cfg.db_path()).expect("db");
-        let mut rotated = sample();
-        rotated.insert("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string());
-        store(&cfg, &db, "alice", &rotated).expect("store");
+        let rotated = BTreeMap::from([
+            ("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string()),
+            ("HERMES_GATE_PROFILE_TOKEN".to_string(), "gate".to_string()),
+        ]);
+        crate::envs::replace(
+            &cfg,
+            &db,
+            "alice",
+            &rotated
+                .iter()
+                .map(|(key, value)| crate::envs::EnvWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                    secret: true,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("store");
 
         fs::create_dir_all(cfg.instance_dir("alice")).expect("instance dir");
         fs::write(
@@ -1268,12 +1108,12 @@ mod tests {
         assert_eq!(report.migrated, vec!["alice".to_string()]);
         assert!(!cfg.secrets_path("alice").is_file());
         assert_eq!(
-            load(&cfg, &db, "alice")
-                .expect("load")
+            crate::envs::values(&cfg, &db, "alice")
+                .expect("values")
                 .get("TELEGRAM_BOT_TOKEN")
                 .map(String::as_str),
             Some("456:DEF"),
-            "the encrypted row must survive the stale file"
+            "the stored rows must survive the stale file"
         );
         let compose = fs::read_to_string(cfg.compose_path("alice")).expect("compose");
         assert!(compose.contains("TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}"));
@@ -1303,28 +1143,43 @@ mod tests {
         // No key: nothing is imported and the file is kept.
         let db = Db::open(&cfg.db_path()).expect("db");
         startup(&cfg, &db);
-        assert!(db.sealed("alice").expect("sealed").is_none());
+        assert!(db.list_instance_env("alice").expect("env").is_empty());
         assert!(cfg.secrets_path("alice").is_file());
 
-        // Key available, autoimport off: the row is created, the file stays.
+        // Key available, autoimport off: the rows are created, the file stays.
         cfg.secrets_key = Some(encode_key(&KEY_BYTES));
         startup(&cfg, &db);
-        assert!(db.sealed("alice").expect("sealed").is_some());
+        assert_eq!(db.list_instance_env("alice").expect("env").len(), 2);
         assert!(cfg.secrets_path("alice").is_file());
 
         // A rotation through the API must not be reverted by the stale file on
         // the next start.
-        let mut rotated = sample();
-        rotated.insert("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string());
-        store(&cfg, &db, "alice", &rotated).expect("rotate");
+        let rotated = BTreeMap::from([
+            ("TELEGRAM_BOT_TOKEN".to_string(), "456:DEF".to_string()),
+            ("HERMES_GATE_PROFILE_TOKEN".to_string(), "gate".to_string()),
+        ]);
+        crate::envs::replace(
+            &cfg,
+            &db,
+            "alice",
+            &rotated
+                .iter()
+                .map(|(key, value)| crate::envs::EnvWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                    secret: true,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("rotate");
         startup(&cfg, &db);
         assert_eq!(
-            load(&cfg, &db, "alice")
-                .expect("load")
+            crate::envs::values(&cfg, &db, "alice")
+                .expect("values")
                 .get("TELEGRAM_BOT_TOKEN")
                 .map(String::as_str),
             Some("456:DEF"),
-            "the encrypted row wins over a stale secrets.env"
+            "the stored rows win over a stale secrets.env"
         );
 
         // Autoimport on: the imported file is deleted.
@@ -1332,8 +1187,8 @@ mod tests {
         startup(&cfg, &db);
         assert!(!cfg.secrets_path("alice").is_file());
         assert_eq!(
-            load(&cfg, &db, "alice")
-                .expect("load")
+            crate::envs::values(&cfg, &db, "alice")
+                .expect("values")
                 .get("TELEGRAM_BOT_TOKEN")
                 .map(String::as_str),
             Some("456:DEF")
@@ -1395,7 +1250,20 @@ mod tests {
         let (_dir, mut cfg) = temp_config();
         cfg.secrets_key = Some(encode_key(&KEY_BYTES));
         let db = Db::open(&cfg.db_path()).expect("db");
-        store(&cfg, &db, "alice", &sample()).expect("store");
+        crate::envs::replace(
+            &cfg,
+            &db,
+            "alice",
+            &sample()
+                .iter()
+                .map(|(key, value)| crate::envs::EnvWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                    secret: true,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("store");
         fs::create_dir_all(cfg.instance_dir("bob")).expect("instance dir");
         store::write_legacy_secrets(&cfg, "bob", &sample()).expect("legacy");
 

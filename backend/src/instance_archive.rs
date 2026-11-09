@@ -352,7 +352,7 @@ pub fn spec_from_manifest(
 /// The import re-renders the compose file with this build's shape (no
 /// `env_file`, no literal value) but keeps the interpolation names, so a PATCH
 /// with the tokens restores the exact same environment.
-pub fn compose_secret_keys(compose: &str) -> Vec<String> {
+pub fn compose_env_keys(compose: &str) -> Vec<String> {
     let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(compose) else {
         return Vec::new();
     };
@@ -628,9 +628,9 @@ mod tests {
                         \x20     - EXTRA=${EXTRA}\n\
                         \x20     - NOT_A_SECRET=plain\n";
         assert_eq!(
-            compose_secret_keys(composed),
+            compose_env_keys(composed),
             vec!["EXTRA".to_string(), "TELEGRAM_BOT_TOKEN".to_string()]
         );
-        assert!(compose_secret_keys("not: [valid").is_empty());
+        assert!(compose_env_keys("not: [valid").is_empty());
     }
 }
