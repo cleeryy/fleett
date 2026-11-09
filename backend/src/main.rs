@@ -308,6 +308,11 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// Read or change the per-instance access list (client mode).
+    Acl {
+        #[command(subcommand)]
+        action: AclCommands,
+    },
     /// List the cron schedules of an instance (client mode).
     Schedules {
         /// Instance id.
@@ -326,6 +331,21 @@ enum Commands {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum AclCommands {
+    /// Print the access list of one instance.
+    Get { id: String },
+    /// Grant or update one subject.
+    Set {
+        id: String,
+        subject: String,
+        /// `owner`, `operator` or `viewer`.
+        role: String,
+    },
+    /// Remove one subject.
+    Rm { id: String, subject: String },
 }
 
 #[derive(Subcommand)]
@@ -760,6 +780,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Acl { action } => {
+            let command = match action {
+                AclCommands::Get { id } => cli::Command::AclGet(id),
+                AclCommands::Set { id, subject, role } => {
+                    cli::Command::AclSet { id, subject, role }
+                }
+                AclCommands::Rm { id, subject } => cli::Command::AclRm { id, subject },
+            };
+            cli::run(command, json).await
         }
         Commands::Memory { action } => {
             let command = match action {
