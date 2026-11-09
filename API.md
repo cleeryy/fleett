@@ -467,6 +467,42 @@ Start/stop/restart/delete are never blocked by this policy.
 
 `warnings` is a list of operator-facing strings (empty when there is nothing to report).
 
+### Egress destination policy
+
+Per-instance allowlist/blocklist of destinations, enforced by an operator-run
+Squid proxy. Full model and enforcement limits: [docs/EGRESS-POLICY.md](docs/EGRESS-POLICY.md).
+An instance without a policy keeps the legacy `allow_lan` / `FLEETT_EGRESS`
+behaviour; `GET …/egress` always returns that effective projection with
+`source` set to `explicit`, `allow_lan`, `legacy` or `disabled`.
+
+| Method | Route | Body | Effect |
+|---|---|---|---|
+| GET | `/api/instances/{id}/egress` | — | `{instance,source,mode,fqdns,cidrs,ports,updated_at?,proxy?,proxy_acl?,warnings}` |
+| PUT | `/api/instances/{id}/egress` | `{"mode":"deny\|allow","fqdns":[],"cidrs":[],"ports":[]}` | validate, store, rewrite compose, restart; `400 invalid_egress_policy`; audit `egress.policy.update` |
+| DELETE | `/api/instances/{id}/egress` | — | drop the explicit policy (back to legacy); `404` when none; audit `egress.policy.delete` |
+| POST | `/api/instances/{id}/egress/test` | `{"host":"api.github.com","port":443}` | `{allowed,reason,source,mode,enforced,enforcement?,proxy?}` |
+| GET | `/api/instances/{id}/egress/blocks?limit=200` | — | `[{id,instance_id,host,port,reason?,at}]`, newest first |
+| DELETE | `/api/instances/{id}/egress/blocks` | — | `{"removed":N}`; audit `egress.blocks.clear` |
+| GET | `/api/egress/blocks?instance=&limit=` | — | admin view across the fleet |
+| POST | `/api/egress/blocks` | `{"instance","host","port","reason?"}` | `201` refused-destination record; token required, 120/min/instance |
+
+`mode: "deny"` is an allowlist (empty policy denies everything);
+`mode: "allow"` is a blocklist (empty policy allows everything); `ports` empty
+means every port. `fqdns` are lowercased; a leading `*.` matches subdomains
+only. A policy adds `HTTP_PROXY=http://fleett-egress-proxy:3128`,
+`HTTPS_PROXY` and `NO_PROXY` to the container; `FLEETT_EGRESS_PROXY` overrides
+the address, and an empty/`off` value renders no proxy variable.
+
+`POST …/egress/test` never pretends: `allowed` is the policy decision, while
+`enforced` is true only when the proxy TCP endpoint answers (explicit policy,
+instance not on `fleett-lan`) or the host firewall marker matches (legacy
+`restrict`). Every other case returns `enforced:false` with the reason. The
+socket probe does not verify that the proxy ACLs match the stored policy.
+
+`POST /api/egress/blocks` is authenticated (bearer or session, so a `viewer`
+token cannot POST), validates the host/port/reason, answers `404` for an unknown
+instance and `429 rate_limited` beyond 120 records per instance per minute.
+
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
 Requires the `owner` level on the instance (or the admin role): `operator` may write but not

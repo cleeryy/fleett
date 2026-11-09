@@ -2329,6 +2329,474 @@ async fn lifecycle_is_never_blocked_by_the_egress_policy() {
 }
 
 // ---------------------------------------------------------------------------
+// Egress destination policy (issue #41)
+// ---------------------------------------------------------------------------
+
+async fn egress_policy(harness: &Harness, id: &str) -> Value {
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/instances/{id}/egress"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)
+}
+
+#[tokio::test]
+async fn egress_policy_reports_the_legacy_modes() {
+    let harness = Harness::new();
+    let detail = create_instance(&harness, "alice").await;
+    assert_eq!(detail["allow_lan"], false);
+
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "disabled");
+    assert_eq!(policy["mode"], "allow");
+    assert_eq!(policy["fqdns"], json!([]));
+    assert!(policy.get("proxy").is_none());
+    assert!(policy.get("updated_at").is_none());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], false);
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("FLEETT_EGRESS=off")),
+        "{result}"
+    );
+
+    // `allow_lan: true` is projected as an allow-all policy.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "allow_lan");
+    assert_eq!(policy["mode"], "allow");
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], true);
+    assert_eq!(parse(&body)["enforced"], false);
+
+    // The restricted legacy mode denies the RFC 1918 ranges once the host
+    // firewall marker is in place.
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.mock.force_network_subnet(Some("172.18.0.0/16"));
+    harness.write_egress_marker("172.18.0.0/16");
+    create_instance(&harness, "alice").await;
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "legacy");
+    assert_eq!(policy["mode"], "allow");
+    assert_eq!(
+        policy["cidrs"],
+        json!(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], false);
+    assert_eq!(parse(&body)["enforced"], true);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], true);
+}
+
+#[tokio::test]
+async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
+    let harness = Harness::with_config(|cfg| cfg.egress_proxy = "http://127.0.0.1:9".to_string());
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({
+                "mode": "deny",
+                "fqdns": ["API.GitHub.com"],
+                "cidrs": [],
+                "ports": [443]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = parse(&body);
+    assert_eq!(policy["source"], "explicit");
+    assert_eq!(policy["mode"], "deny");
+    assert_eq!(policy["fqdns"], json!(["api.github.com"]));
+    assert_eq!(policy["ports"], json!([443]));
+    assert!(policy["updated_at"].is_string());
+    assert!(policy["proxy_acl"]
+        .as_str()
+        .is_some_and(|acl| acl.contains("http_access allow fleett_alice_domains")));
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    let environment = &compose["services"]["agent"]["environment"];
+    assert_eq!(
+        environment["HTTP_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+    assert_eq!(
+        environment["HTTPS_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+    assert!(environment["NO_PROXY"]
+        .as_str()
+        .is_some_and(|value| value.contains("fleett")));
+
+    // The decision follows the policy; enforcement is reported separately.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], false);
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("unreachable")),
+        "{result}"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], false);
+
+    // A PATCH that does not touch egress keeps the proxy variables.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"name": "Alice Renamed"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(
+        compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+
+    // Deleting the policy returns to the legacy shape and drops the variables.
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/egress", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["source"], "disabled");
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert!(compose["services"]["agent"]["environment"]
+        .get("HTTP_PROXY")
+        .is_none());
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=50", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit = parse(&body);
+    let actions: Vec<&str> = audit
+        .as_array()
+        .expect("audit entries")
+        .iter()
+        .filter_map(|entry| entry["action"].as_str())
+        .collect();
+    assert!(actions.contains(&"egress.policy.update"), "{actions:?}");
+    assert!(actions.contains(&"egress.policy.delete"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn egress_policy_reports_a_reachable_proxy_and_the_allow_lan_bypass() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let harness = Harness::with_config(|cfg| {
+        cfg.egress_proxy = format!("http://{address}");
+    });
+    create_instance(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"], "ports": [443]})),
+        )
+        .await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], true, "{result}");
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("socket only")),
+        "{result}"
+    );
+
+    // allow_lan opens a direct path around the proxy: the policy is reported
+    // as not enforced even when the proxy answers.
+    harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": true})),
+        )
+        .await;
+    let policy = egress_policy(&harness, "alice").await;
+    assert!(
+        policy["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|value| value.contains("bypass"))),
+        "{policy}"
+    );
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["enforced"], false);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn egress_policy_validates_input_and_requires_authentication() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, _) = harness
+        .request_as(Method::GET, "/api/instances/alice/egress", None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = harness
+        .request(Method::GET, "/api/instances/ghost/egress", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for body in [
+        json!({"mode": "deny", "fqdns": ["https://api.github.com"]}),
+        json!({"mode": "deny", "fqdns": ["api.github.com:443"]}),
+        json!({"mode": "maybe", "fqdns": ["api.github.com"]}),
+        json!({"mode": "deny", "cidrs": ["10.0.0.0/33"]}),
+        json!({"mode": "deny", "ports": [0]}),
+    ] {
+        let (status, response) = harness
+            .request(
+                Method::PUT,
+                "/api/instances/alice/egress",
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(parse(&response)["error"]["code"], "invalid_egress_policy");
+    }
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"]})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn egress_blocks_are_ingested_listed_and_cleared() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({
+                "instance": "alice",
+                "host": "10.1.20.1",
+                "port": 443,
+                "reason": "destination denied by policy"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let block = parse(&body);
+    assert_eq!(block["instance_id"], "alice");
+    assert_eq!(block["host"], "10.1.20.1");
+    assert_eq!(block["port"], 443);
+    assert_eq!(block["reason"], "destination denied by policy");
+    assert!(block["at"].is_string());
+    assert!(block["id"].as_i64().is_some_and(|id| id > 0));
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "ghost", "host": "example.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    for body in [
+        json!({"instance": "alice", "host": "", "port": 443}),
+        json!({"instance": "alice", "host": "https://example.com", "port": 443}),
+        json!({"instance": "alice", "host": "example.com", "port": 0}),
+    ] {
+        let (status, response) = harness
+            .request(Method::POST, "/api/egress/blocks", Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/egress/blocks", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "example.com", "port": 443})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, _) = harness
+        .request_as(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "example.com", "port": 443})),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["removed"], 1);
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(parse(&body), json!([]));
+}
+
+#[tokio::test]
+async fn deleting_an_instance_removes_its_policy_and_blocks() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"]})),
+        )
+        .await;
+    harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body), json!([]));
+}
+
+// ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
 

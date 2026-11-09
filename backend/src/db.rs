@@ -534,6 +534,31 @@ CREATE INDEX IF NOT EXISTS idx_log_entries_level ON log_entries (level);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(message, instance_id);
 "#,
+    // its current behaviour after the upgrade.
+    r#"
+CREATE TABLE IF NOT EXISTS egress_policies (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    mode         TEXT NOT NULL,
+    fqdns        TEXT NOT NULL DEFAULT '',
+    cidrs        TEXT NOT NULL DEFAULT '',
+    ports        TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS egress_blocks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id  TEXT NOT NULL,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    reason       TEXT,
+    at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_instance
+    ON egress_blocks (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_at
+    ON egress_blocks (at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -1007,6 +1032,14 @@ impl Db {
         )?;
         transaction.execute("DELETE FROM schedules WHERE instance_id = ?1", params![id])?;
         transaction.execute("DELETE FROM incidents WHERE instance_id = ?1", params![id])?;
+        transaction.execute(
+            "DELETE FROM egress_policies WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM egress_blocks WHERE instance_id = ?1",
+            params![id],
+        )?;
         transaction.execute(
             "DELETE FROM instance_acl WHERE instance_id = ?1",
             params![id],

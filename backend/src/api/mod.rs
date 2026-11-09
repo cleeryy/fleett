@@ -7,6 +7,7 @@ pub mod bus;
 pub mod cost;
 pub mod deployments;
 pub mod desired_state;
+pub mod egress;
 pub mod error;
 pub mod exec;
 pub mod files;
@@ -76,6 +77,8 @@ pub struct AppState {
     pub logstore: Arc<crate::logstore::LogStore>,
     /// Effective command policy of `POST /api/instances/{id}/exec`.
     pub exec_policy: Arc<crate::exec::ExecPolicy>,
+    /// Ingestion budget of `POST /api/egress/blocks`.
+    pub block_ingest: Arc<egress::BlockRateLimiter>,
     /// Rate limiter and progressive authentication lockout.
     pub security: Arc<crate::security::Security>,
     /// Shared HTTP client of the outbound notifications (and nothing else):
@@ -133,6 +136,7 @@ impl AppState {
             exec_policy: Arc::new(exec_policy),
             logstore,
             security: Arc::new(security),
+            block_ingest: Arc::new(egress::BlockRateLimiter::default()),
             http: reqwest::Client::builder()
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()
@@ -298,6 +302,21 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/heal", patch(incidents::patch_heal))
         .route("/instances/{id}/check", get(instances::check))
+        .route(
+            "/instances/{id}/egress",
+            get(egress::get_policy)
+                .put(egress::put_policy)
+                .delete(egress::delete_policy),
+        )
+        .route("/instances/{id}/egress/test", post(egress::test))
+        .route(
+            "/instances/{id}/egress/blocks",
+            get(egress::list_blocks).delete(egress::clear_blocks),
+        )
+        .route(
+            "/egress/blocks",
+            get(egress::list_all_blocks).post(egress::ingest_block),
+        )
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",
@@ -500,9 +519,15 @@ pub(crate) async fn apply_compose(
 pub(crate) fn write_compose_file(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
     let keys = compose_env_keys(state, spec)?;
-    let compose =
-        crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
-            .map_err(ApiError::from)?;
+    let policy = crate::egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
+    let compose = crate::render::render_compose_with_project_and_policy(
+        &state.cfg,
+        spec,
+        project.as_deref(),
+        &keys,
+        policy.as_ref(),
+    )
+    .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
         .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))
 }

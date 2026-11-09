@@ -1,0 +1,50 @@
+# fleett egress proxy — operator example (issue #41).
+#
+# fleett does NOT deploy or supervise this service. It only renders
+# HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the agent containers. Run this file
+# explicitly on the Docker host:
+#
+#   cd docker
+#   cp fleett-proxy.domains.example.txt fleett-proxy.domains.txt
+#   cp fleett-proxy.cidrs.example.txt   fleett-proxy.cidrs.txt
+#   # edit both allowlists, then:
+#   docker compose -f fleett-proxy.example.yaml up -d
+#
+# The proxy joins the external `fleett` network so agents resolve
+# `fleett-egress-proxy:3128`. It publishes no host port.
+#
+# Limitation: one shared proxy cannot enforce a different allowlist per
+# instance. The two allowlist files are the union of the destinations you
+# decide to trust; for true per-instance isolation run one proxy per instance
+# (or an authenticating proxy) and point FLEETT_EGRESS_PROXY at it. See
+# docs/EGRESS-POLICY.md.
+
+name: fleett-proxy
+
+services:
+  fleett-proxy:
+    image: sameersbn/squid:3.5.27-2
+    container_name: fleett-egress-proxy
+    restart: unless-stopped
+    volumes:
+      - ./fleett-proxy.squid.conf:/etc/squid/squid.conf:ro
+      - ./fleett-proxy.domains.txt:/etc/squid/fleett-domains.txt:ro
+      - ./fleett-proxy.cidrs.txt:/etc/squid/fleett-cidrs.txt:ro
+      - squid-cache:/var/spool/squid
+    networks:
+      - fleet
+    # No `ports:` on purpose: the proxy is reachable from the fleett bridge
+    # only, never from the host LAN.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  fleet:
+    external: true
+    name: fleett
+
+volumes:
+  squid-cache:

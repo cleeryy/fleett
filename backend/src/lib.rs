@@ -14,6 +14,7 @@ pub mod db;
 pub mod deployments;
 pub mod driver;
 pub mod egress;
+pub mod egress_policy;
 pub mod envs;
 pub mod exec;
 pub mod files;
