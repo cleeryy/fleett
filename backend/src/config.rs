@@ -356,6 +356,10 @@ pub struct Config {
     pub hardening: Hardening,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Seconds between two automatic usage-log scans (`FLEETT_COST_SCAN_INTERVAL_S`).
+    /// `0` disables the background scanner; ingestion stays available through
+    /// `POST /api/usage/ingest`.
+    pub cost_scan_interval_s: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +582,15 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
 
+        let cost_scan_interval_s = match get("COST_SCAN_INTERVAL_S") {
+            None => crate::cost::DEFAULT_SCAN_INTERVAL_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_COST_SCAN_INTERVAL_S",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
         Ok(Self {
             root,
             bind,
@@ -598,6 +611,7 @@ impl Config {
             web_dist,
             hardening,
             metrics,
+            cost_scan_interval_s,
         })
     }
 
@@ -634,6 +648,9 @@ impl Config {
             hardening: Hardening::Standard,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            // Background log scans are a `serve` concern; tests drive ingestion
+            // explicitly through the API or the module.
+            cost_scan_interval_s: 0,
         }
     }
 

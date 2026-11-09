@@ -328,6 +328,51 @@ when Docker fails, and an empty fleet answers zeros without touching Docker. Und
 The fleet is also checked by `fleett doctor`, which reads `docker`, `secrets` and `egress`
 from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
 
+## Tokens and costs
+
+Token accounting, model prices and monthly budgets ([docs/COST.md](docs/COST.md)).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/cost?from=&to=&group_by=instance\|model\|day` | — | `200 CostReport` · `400 invalid_range` / `invalid_group_by` |
+| GET | `/api/cost/budgets` | — | `200 [BudgetStatus]` |
+| POST | `/api/usage/ingest` | `{"instance":"alice","lines":["…"]}` or `{"instance":"alice","prompt_tokens":1200,"completion_tokens":300}` | `200 IngestSummary` · `404` unknown instance · `400` invalid payload |
+| GET | `/api/models/pricing` | — | `200 [Pricing]` (latest version per model) |
+| POST | `/api/models/pricing` | `{"model":"m","input_per_mtok":0.27,"output_per_mtok":1.1,"currency":"USD","effective_from":"2026-11-01"}` | `200 Pricing` · `400 invalid_pricing` |
+| DELETE | `/api/models/pricing/{model}` | — | `204` · `404` unknown model |
+| GET | `/api/instances/{id}/budget` | — | `200 BudgetView` (`configured:false` when unset) |
+| PUT | `/api/instances/{id}/budget` | `{"monthly_usd":25,"enabled":true}` | `200 BudgetView` · `400 invalid_budget` |
+
+`GET /api/cost` defaults to the current month up to now. `from` is inclusive;
+a bare date for `to` covers the whole day, an RFC 3339 `to` is exclusive.
+`group_by` accepts `instance` (default), `model` and `day`.
+
+```json
+{"from":"2026-11-01T00:00:00Z","to":"2026-11-09T03:00:00Z","group_by":"instance",
+ "currency":"USD",
+ "totals":{"prompt_tokens":1500,"completion_tokens":500,"total_tokens":2000,
+           "cost_usd":0.006,"events":2},
+ "groups":[{"key":"alice","prompt_tokens":1500,"completion_tokens":500,
+            "total_tokens":2000,"cost_usd":0.006,"events":2}],
+ "top_agents":[{"instance_id":"alice","cost_usd":0.006,"total_tokens":2000}],
+ "budgets":[{"instance_id":"alice","month":"2026-11","monthly_usd":25.0,
+             "enabled":true,"used_usd":0.006,"percent":0.024,"exceeded":false,
+             "projected_month_usd":0.1,"updated_at":"2026-11-09T02:00:00Z"}],
+ "projection":{"month":"2026-11","elapsed_fraction":0.27,
+               "month_to_date_usd":0.006,"projected_usd":0.022}}
+```
+
+`IngestSummary` is `{"parsed":1,"inserted":1,"duplicates":0,"ignored":0}`: a
+replayed payload parses but inserts nothing. `Pricing` is
+`{"model":"…","input_per_mtok":0.27,"output_per_mtok":1.1,"currency":"USD","effective_from":"2026-11-01","updated_at":"…"}`.
+
+Prices are **versioned by `effective_from`**: a new effective date adds a row
+and the historical report is recomputed with the price effective on each event
+day. `DELETE /api/models/pricing/{model}` removes every version. A budget past
+its limit produces a `cost.budget` event through `cost::events::emit` (a WARN
+log line until the incident pipeline is merged). Reads are open to viewers;
+every write is admin-only.
+
 ## Images and rolling upgrades
 
 | Method | Route | Body | Response |

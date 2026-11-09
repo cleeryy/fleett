@@ -164,6 +164,47 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — token accounting and costs (issue #35). `usage_events` stores one
+    // row per usage line the gateway printed; the fingerprint (SHA-256 of the
+    // instance and the exact line) makes re-ingesting the same log tail
+    // idempotent. `model_pricing` is versioned by `effective_from` so a price
+    // change never rewrites the cost of a past day. `cost_budgets` holds the
+    // monthly ceiling of one instance (`enabled = 0` keeps it as history).
+    r#"
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id       TEXT NOT NULL,
+    at                TEXT NOT NULL,
+    model             TEXT NOT NULL DEFAULT '',
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    source            TEXT NOT NULL DEFAULT 'log',
+    fingerprint       TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_instance_at
+    ON usage_events (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_at
+    ON usage_events (model, at);
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model            TEXT NOT NULL,
+    input_per_mtok   REAL NOT NULL,
+    output_per_mtok  REAL NOT NULL,
+    currency         TEXT NOT NULL DEFAULT 'USD',
+    effective_from   TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (model, effective_from)
+);
+
+CREATE TABLE IF NOT EXISTS cost_budgets (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    monthly_usd  REAL NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    updated_at   TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -1412,6 +1453,9 @@ mod tests {
             "audit_log",
             "api_tokens",
             "providers",
+            "usage_events",
+            "model_pricing",
+            "cost_budgets",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }

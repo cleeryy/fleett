@@ -51,6 +51,9 @@ fleett stop <id>
 fleett restart <id>
 fleett delete <id> [--purge]
 fleett usage
+fleett cost [--from DATE] [--to DATE] [--group-by instance|model|day]
+fleett pricing [list | set MODEL --input X --output Y [--currency C] [--effective-from DATE]]
+fleett budget <id> [--set USD]
 fleett images
 fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
@@ -137,6 +140,53 @@ fleett --json usage | jq '.totals, .caps'
 
 A stopped instance reports zero CPU/memory usage; its disk usage is still measured. Docker
 failures answer `502 usage_unavailable` with the Docker error.
+
+### `cost`
+
+Token usage and cost of the fleet ([docs/COST.md](COST.md)), aggregated by `instance`
+(default), `model` or `day`. The range defaults to the current month up to now; `--from` and
+`--to` accept `YYYY-MM-DD` or an RFC 3339 timestamp (a bare date for `--to` includes the whole
+day).
+
+```bash
+fleett cost
+fleett cost --from 2026-11-01 --to 2026-11-30
+fleett cost --group-by model
+fleett --json cost --group-by day | jq '.groups[] | {key, cost_usd}'
+```
+
+The table lists `KEY`, `PROMPT`, `COMPLETION`, `TOTAL`, `COST` and `EVENTS`, followed by the
+top agents, the per-instance budgets and the month projection (linear estimate from the
+elapsed fraction of the month). `--json` prints the raw `CostReport`.
+
+### `pricing`
+
+Shows or changes the price of a model, in currency per million tokens:
+
+```bash
+fleett pricing
+fleett pricing set deepseek-v4.1-flash --input 0.27 --output 1.10
+fleett pricing set claude-sonnet-4 --input 3 --output 15 \
+  --currency USD --effective-from 2026-12-01
+```
+
+Prices are versioned by effective date: a new `--effective-from` adds a version and the
+historical cost keeps the price that was effective on each event day. Re-setting the same
+model and date replaces that version. Without `--effective-from`, the price applies from
+today (UTC). `fleett pricing` lists the latest version of each model.
+
+### `budget`
+
+Shows or sets the monthly ceiling of one instance, in USD:
+
+```bash
+fleett budget alice             # configured limit, month-to-date and projection
+fleett budget alice --set 25    # 25 USD per month
+fleett --json budget alice --set 25 | jq '{monthly_usd, percent, exceeded}'
+```
+
+`--set 0` keeps a zero ceiling (it never fires); a crossing is reported as a `cost.budget`
+event (see [COST.md](COST.md#alert-hook)).
 
 ### `images`
 
