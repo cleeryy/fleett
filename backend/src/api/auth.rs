@@ -4,11 +4,12 @@
 //! an invalid expired session does not block a valid bearer header, which is
 //! what automation wants when a browser cookie happens to be in the jar.
 
-use crate::api::error::ApiError;
+use crate::api::error::{truncate_chars, ApiError};
 use crate::api::AppState;
 use crate::auth::oidc::pkce_challenge;
 use crate::auth::session::{
-    OidcState, SessionClaims, CSRF_COOKIE, CSRF_HEADER, OIDC_STATE_COOKIE, SESSION_COOKIE,
+    OidcState, SessionClaims, SessionError, StateSigner, CSRF_COOKIE, CSRF_HEADER,
+    OIDC_STATE_COOKIE, SESSION_COOKIE,
 };
 use crate::auth::tokens;
 use crate::auth::{random_hex, AuthContext, AuthMethod, Role, SessionUser};
@@ -21,9 +22,63 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
-/// Lifetime of the state/nonce cookie, in seconds.
-pub const OIDC_STATE_TTL_SECS: i64 = 600;
+/// Stable callback failure reasons, reported as `error.details.reason`.
+/// The state cookie was never sent: the link was opened in another browser.
+const REASON_COOKIE_MISSING: &str = "cookie_missing";
+/// The state cookie is valid but does not describe this login attempt.
+const REASON_STATE_MISMATCH: &str = "state_mismatch";
+/// The state cookie outlived `FLEETT_OIDC_STATE_TTL_SECS`.
+const REASON_EXPIRED: &str = "expired";
+
+/// Longest `Host`/`User-Agent` fragment copied into the failure log line.
+const MAX_LOG_HEADER_CHARS: usize = 200;
+
+/// Self-contained failure page: no script, no external asset, one action.
+const CALLBACK_ERROR_PAGE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in failed · fleett</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #f6f7f8;
+  color: #1c2126;
+}
+main { max-width: 34rem; padding: 2rem; }
+h1 { margin: 0 0 0.75rem; font-size: 1.5rem; }
+p.cause { margin: 0 0 1.5rem; }
+a {
+  display: inline-block;
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  background: #1c2126;
+  color: #f6f7f8;
+  text-decoration: none;
+}
+@media (prefers-color-scheme: dark) {
+  body { background: #14181b; color: #e8ecef; }
+  a { background: #e8ecef; color: #14181b; }
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Sign-in failed</h1>
+<p class="cause">{cause}</p>
+<a href="/auth/login">Sign in again</a>
+</main>
+</body>
+</html>
+"#;
 
 /// `GET /api/auth/check` — reaching this handler means the request is allowed.
 pub async fn check() -> StatusCode {
@@ -110,11 +165,14 @@ async fn login_inner(state: &AppState) -> Result<Response, ApiError> {
         .state_signer
         .as_ref()
         .ok_or_else(|| ApiError::not_found("OIDC is not enabled"))?;
+    // `FLEETT_OIDC_STATE_TTL_SECS` drives both the cookie `Max-Age` and the
+    // signed `exp`, so the two can never disagree.
+    let state_ttl_secs = state.auth.state_ttl_secs as i64;
     let cookie = signer.sign(&OidcState {
         state: state_value,
         nonce,
         verifier,
-        exp: now + OIDC_STATE_TTL_SECS,
+        exp: now + state_ttl_secs,
     });
 
     let mut response = Redirect::to(&url).into_response();
@@ -123,7 +181,7 @@ async fn login_inner(state: &AppState) -> Result<Response, ApiError> {
         &build_cookie(
             OIDC_STATE_COOKIE,
             &cookie,
-            OIDC_STATE_TTL_SECS,
+            state_ttl_secs,
             true,
             state.auth.cookie_secure,
         ),
@@ -156,7 +214,62 @@ pub async fn callback(
 ) -> Response {
     match callback_inner(&state, query, &headers).await {
         Ok(response) => response,
-        Err(err) => err.into_response(),
+        Err(failure) => failure.respond(&headers),
+    }
+}
+
+/// A refused callback request.
+///
+/// State failures carry one of the stable reasons `cookie_missing`,
+/// `state_mismatch` or `expired` (returned as `error.details.reason`); every
+/// other failure reuses its API error code as the reason.
+#[derive(Debug)]
+struct CallbackFailure {
+    error: ApiError,
+    reason: &'static str,
+    /// Only a missing state cookie is the legitimate "link opened in another
+    /// browser" case: a browser is sent back to the login page.
+    redirect_to_login: bool,
+}
+
+impl CallbackFailure {
+    fn state(reason: &'static str, message: &'static str) -> Self {
+        Self {
+            error: ApiError::bad_request("invalid_state", message)
+                .with_details(serde_json::json!({ "reason": reason })),
+            reason,
+            redirect_to_login: reason == REASON_COOKIE_MISSING,
+        }
+    }
+
+    /// Log one WARN line (reason, requested host, User-Agent — never the code,
+    /// state, nonce or cookie), then pick the representation the client asked
+    /// for: HTML page or redirect for browsers, the unchanged JSON for APIs.
+    fn respond(self, headers: &HeaderMap) -> Response {
+        warn!(
+            reason = self.reason,
+            host = %log_header(headers, header::HOST),
+            user_agent = %log_header(headers, header::USER_AGENT),
+            "OIDC callback rejected"
+        );
+
+        if !wants_html(headers) {
+            return self.error.into_response();
+        }
+        if self.redirect_to_login {
+            return redirect_to_login();
+        }
+        html_failure_page(self.reason)
+    }
+}
+
+impl From<ApiError> for CallbackFailure {
+    fn from(error: ApiError) -> Self {
+        Self {
+            reason: error.code,
+            error,
+            redirect_to_login: false,
+        }
     }
 }
 
@@ -164,7 +277,7 @@ async fn callback_inner(
     state: &AppState,
     query: CallbackQuery,
     headers: &HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<Response, CallbackFailure> {
     let client = oidc_client(state)?;
     if let Some(error) = query.error.as_deref() {
         let detail = query
@@ -174,7 +287,8 @@ async fn callback_inner(
         return Err(ApiError::unauthorized_with(
             "oidc_denied",
             format!("OIDC login refused ({error}): {detail}"),
-        ));
+        )
+        .into());
     }
     let code = query
         .code
@@ -192,19 +306,7 @@ async fn callback_inner(
         .state_signer
         .as_ref()
         .ok_or_else(|| ApiError::not_found("OIDC is not enabled"))?;
-    let raw_cookie = cookie_value(headers, OIDC_STATE_COOKIE).ok_or_else(|| {
-        ApiError::bad_request("invalid_state", "the login state cookie is missing")
-    })?;
-    let now = Utc::now().timestamp();
-    let stored = signer
-        .verify(&raw_cookie, now)
-        .map_err(|_| ApiError::bad_request("invalid_state", "the login state cookie is invalid"))?;
-    if !constant_time_eq(stored.state.as_bytes(), returned_state.as_bytes()) {
-        return Err(ApiError::bad_request(
-            "invalid_state",
-            "the state does not match the login request",
-        ));
-    }
+    let stored = verify_state_cookie(signer, headers, returned_state)?;
 
     let claims = client
         .complete(code, &stored.verifier, &stored.nonce)
@@ -266,6 +368,83 @@ async fn callback_inner(
     );
     headers_mut.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+/// Check the signed state cookie against the `state` returned by the provider.
+fn verify_state_cookie(
+    signer: &StateSigner,
+    headers: &HeaderMap,
+    returned_state: &str,
+) -> Result<OidcState, CallbackFailure> {
+    let raw_cookie = cookie_value(headers, OIDC_STATE_COOKIE).ok_or_else(|| {
+        CallbackFailure::state(REASON_COOKIE_MISSING, "the login state cookie is missing")
+    })?;
+    let now = Utc::now().timestamp();
+    let stored = signer.verify(&raw_cookie, now).map_err(|err| match err {
+        SessionError::Expired => {
+            CallbackFailure::state(REASON_EXPIRED, "the login state cookie has expired")
+        }
+        // Malformed or tampered: present but not a state this server issued.
+        _ => CallbackFailure::state(REASON_STATE_MISMATCH, "the login state cookie is invalid"),
+    })?;
+    if !constant_time_eq(stored.state.as_bytes(), returned_state.as_bytes()) {
+        return Err(CallbackFailure::state(
+            REASON_STATE_MISMATCH,
+            "the state does not match the login request",
+        ));
+    }
+    Ok(stored)
+}
+
+/// Whether the client prefers an HTML error page over the JSON error body.
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.to_ascii_lowercase().contains("text/html"))
+}
+
+/// `302 /auth/login` for a browser whose state cookie is gone.
+fn redirect_to_login() -> Response {
+    let mut response = StatusCode::FOUND.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::LOCATION, HeaderValue::from_static("/auth/login"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Small self-contained page: the cause and one way out.
+fn html_failure_page(reason: &'static str) -> Response {
+    let cause = match reason {
+        REASON_EXPIRED => {
+            "This login link has expired. Login links are short-lived, so start \
+             again to get a fresh one."
+        }
+        REASON_STATE_MISMATCH => {
+            "This login link was opened in another browser or device, or it has \
+             already been used."
+        }
+        _ => "This login link was opened in another browser or device.",
+    };
+    let body = CALLBACK_ERROR_PAGE.replace("{cause}", cause);
+    let mut response = (StatusCode::BAD_REQUEST, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Bounded header value for the failure log line.
+fn log_header(headers: &HeaderMap, name: HeaderName) -> String {
+    let value = headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    truncate_chars(value, MAX_LOG_HEADER_CHARS)
 }
 
 /// `POST /auth/logout` — clear every cookie. Idempotent and unauthenticated:
@@ -592,5 +771,103 @@ mod tests {
             client_ip(&HeaderMap::new(), Some(peer)).as_deref(),
             Some("127.0.0.1")
         );
+    }
+
+    #[test]
+    fn html_is_detected_anywhere_in_the_accept_header() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            !wants_html(&headers),
+            "no Accept header means an API client"
+        );
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        assert!(!wants_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("TEXT/HTML, application/xhtml+xml;q=0.9"),
+        );
+        assert!(wants_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xml;q=0.9,*/*;q=0.8"),
+        );
+        assert!(wants_html(&headers));
+    }
+
+    #[test]
+    fn the_state_failures_carry_stable_reasons() {
+        for (reason, message) in [
+            (REASON_COOKIE_MISSING, "the login state cookie is missing"),
+            (
+                REASON_STATE_MISMATCH,
+                "the state does not match the login request",
+            ),
+            (REASON_EXPIRED, "the login state cookie has expired"),
+        ] {
+            let failure = CallbackFailure::state(reason, message);
+            assert_eq!(failure.error.code, "invalid_state");
+            assert_eq!(failure.error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                failure.error.details.expect("details"),
+                serde_json::json!({ "reason": reason })
+            );
+            assert_eq!(
+                failure.redirect_to_login,
+                reason == REASON_COOKIE_MISSING,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_page_is_html_and_uncached() {
+        for reason in [REASON_EXPIRED, REASON_STATE_MISMATCH] {
+            let response = html_failure_page(reason);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/html; charset=utf-8")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_cookie_redirects_the_browser_to_the_login() {
+        let response = redirect_to_login();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/auth/login")
+        );
+    }
+
+    #[test]
+    fn log_headers_are_bounded() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(log_header(&headers, header::USER_AGENT), "-");
+        let long = "a".repeat(MAX_LOG_HEADER_CHARS + 50);
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_str(&long).expect("ascii"),
+        );
+        let logged = log_header(&headers, header::USER_AGENT);
+        assert_eq!(logged.chars().count(), MAX_LOG_HEADER_CHARS + 1);
+        assert!(logged.ends_with('…'));
     }
 }

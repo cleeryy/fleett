@@ -30,6 +30,7 @@ FLEETT_SESSION_SECRET=...                # openssl rand -base64 32
 # FLEETT_OIDC_SCOPES="openid profile email"
 # FLEETT_OIDC_ADMIN_GROUP=fleett-admins
 # FLEETT_OIDC_VIEWER_GROUP=fleett-viewers
+# FLEETT_OIDC_STATE_TTL_SECS=600
 # FLEETT_SESSION_TTL_SECS=28800
 # FLEETT_COOKIE_SECURE=auto
 ```
@@ -44,6 +45,7 @@ FLEETT_SESSION_SECRET=...                # openssl rand -base64 32
 | `FLEETT_OIDC_SCOPES` | `openid profile email` | `openid` is added when missing |
 | `FLEETT_OIDC_ADMIN_GROUP` | `fleett-admins` | group name, not a UUID |
 | `FLEETT_OIDC_VIEWER_GROUP` | `fleett-viewers` | read-only role |
+| `FLEETT_OIDC_STATE_TTL_SECS` | `600` | lifetime of the state cookie, 60–3600 s (300–900 s recommended) |
 | `FLEETT_SESSION_SECRET` | — | required; base64 of at least 32 random bytes |
 | `FLEETT_SESSION_TTL_SECS` | `28800` | lifetime of the session cookie |
 | `FLEETT_COOKIE_SECURE` | `auto` | `auto` = `Secure` when `PUBLIC_URL` starts with `https://` |
@@ -93,8 +95,17 @@ window if group membership must be revocable quickly.
 ## Flow and cookies
 
 `GET /auth/login` (404 when OIDC is off) redirects to the provider with
-`state`, `nonce`, `code_challenge` (S256) and a signed 10-minute `fleett_oidc`
-cookie (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` per config).
+`state`, `nonce`, `code_challenge` (S256) and a signed `fleett_oidc` cookie
+(`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` per config) valid for
+`FLEETT_OIDC_STATE_TTL_SECS` (600 s by default).
+
+**State lifetime.** Keep `FLEETT_OIDC_STATE_TTL_SECS` short: 300–900 s covers
+an interactive login (password, 2FA/WebAuthn on a phone, consent screens) while
+bounding how long the state cookie can be replayed. The value (accepted range
+60–3600) drives both the cookie `Max-Age` and the signed `exp`, so the two
+cannot drift apart. A login that takes longer fails with
+`invalid_state` / `details.reason = "expired"`; raise the value rather than
+retrying blindly if your users routinely need more.
 
 `GET /auth/callback` verifies the state cookie, exchanges the code (PKCE,
 `client_secret_basic`), verifies the ID token (RS256 signature through the
@@ -115,6 +126,38 @@ then redirects to `/`. `GET /api/auth/me` returns the identity:
 **CSRF.** A cookie-authenticated mutation (`POST`, `PATCH`, `DELETE`) must echo
 the CSRF cookie in the `X-Fleett-CSRF` header. Bearer clients are exempt. A
 missing or wrong header returns `403 {"error":{"code":"csrf_required"}}`.
+
+### Callback failures
+
+The callback can fail on state alone, before the provider is ever contacted.
+Every `invalid_state` response carries a stable `details.reason`, so a support
+report can be triaged without the server logs:
+
+| `details.reason` | Cause | Browser answer |
+|---|---|---|
+| `cookie_missing` | no `fleett_oidc` cookie: the link was opened in another browser/device, a webview, or cookies are blocked | `302 /auth/login` |
+| `state_mismatch` | the cookie is present but does not describe this request (already used, tampered, overwritten by another tab) | HTML page |
+| `expired` | the cookie outlived `FLEETT_OIDC_STATE_TTL_SECS` (slow 2FA, interrupted flow) | HTML page |
+
+API clients (`Accept` without `text/html`, e.g. `application/json`) keep the JSON
+error and the 400 status:
+
+```json
+{"error":{"code":"invalid_state","message":"the login state cookie has expired","details":{"reason":"expired"}}}
+```
+
+Browsers (`Accept: text/html…`) get a small self-contained page with the cause
+and a **Sign in again** link to `/auth/login`; a missing cookie skips the page
+and redirects straight there. Exactly one `WARN` line is logged per failed
+callback with `reason`, the requested `Host` and the `User-Agent` — never the
+code, state, nonce or cookie.
+
+An `invalid_state` therefore always points at the browser, not the server:
+either the link was opened where the cookie is not (another device, an in-app
+webview, a private window) or the login window elapsed. A cookie missing on the
+*same* browser after a few seconds usually means cookies are blocked, the page
+was opened on another host (`http://` vs `https://`), or a reverse proxy
+stripped `Set-Cookie`.
 
 **Roles.** `viewer` may only `GET`/`HEAD` on `/api/*`; every mutation returns
 `403 {"error":{"code":"forbidden"}}`. `GET /api/audit`, `/api/tokens` and

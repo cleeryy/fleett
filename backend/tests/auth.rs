@@ -12,13 +12,14 @@ use fleett::auth::oidc::{
 };
 use fleett::auth::session::{CSRF_COOKIE, CSRF_HEADER, OIDC_STATE_COOKIE, SESSION_COOKIE};
 use fleett::auth::{AuthService, OidcParts};
-use fleett::config::{AuthMode, Config, OidcConfig, OidcSettings};
+use fleett::config::{AuthMode, Config, OidcConfig, OidcSettings, DEFAULT_OIDC_STATE_TTL_SECS};
 use fleett::db::Db;
 use fleett::driver::mock::MockDriver;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
@@ -89,6 +90,11 @@ impl Harness {
 
     /// OIDC-enabled harness (`both`) with a fake verifier for `groups`.
     fn oidc(groups: &[&str]) -> Self {
+        Self::oidc_with_state_ttl(groups, DEFAULT_OIDC_STATE_TTL_SECS)
+    }
+
+    /// Same as [`Harness::oidc`], with an explicit state-cookie lifetime.
+    fn oidc_with_state_ttl(groups: &[&str], state_ttl_secs: u64) -> Self {
         let claims = IdTokenClaims {
             sub: "d80c090d-0000-4000-8000-000000000001".to_string(),
             email: Some("cleeryy@example.test".to_string()),
@@ -103,10 +109,14 @@ impl Harness {
             verifier: Some(Arc::new(FakeVerifier { claims })),
             exchange: Some(Arc::new(FakeExchange)),
         };
-        Self::build(AuthMode::Both, Some(parts), groups)
+        Self::build_with_state_ttl(AuthMode::Both, Some(parts), state_ttl_secs)
     }
 
     fn build(mode: AuthMode, parts: Option<OidcParts>, _groups: &[&str]) -> Self {
+        Self::build_with_state_ttl(mode, parts, DEFAULT_OIDC_STATE_TTL_SECS)
+    }
+
+    fn build_with_state_ttl(mode: AuthMode, parts: Option<OidcParts>, state_ttl_secs: u64) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut cfg = Config::for_tests(dir.path().to_path_buf());
         cfg.auth = mode;
@@ -124,6 +134,7 @@ impl Harness {
             },
             session_secret: SESSION_SECRET.to_vec(),
             session_ttl_secs: 3600,
+            state_ttl_secs,
             cookie_secure: true,
         });
 
@@ -275,6 +286,21 @@ fn parse(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|err| panic!("invalid JSON ({err}): {body}"))
 }
 
+/// The `Accept` a browser sends for a top-level navigation.
+const BROWSER_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+fn accept(value: &str) -> Vec<(&'static str, String)> {
+    vec![("accept", value.to_string())]
+}
+
+fn state_reason(body: &str) -> String {
+    parse(body)["error"]["details"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn error_code(body: &str) -> String {
     parse(body)["error"]["code"]
         .as_str()
@@ -368,24 +394,52 @@ async fn callback_rejects_a_state_that_does_not_match_the_cookie() {
     let (state_cookie, _) = harness.start_login().await;
     let mut cookies = BTreeMap::new();
     cookies.insert(OIDC_STATE_COOKIE.to_string(), state_cookie);
-    let (status, _, body) = harness
+    let (status, headers, body) = harness
         .send(
             Method::GET,
             "/auth/callback?code=the-code&state=forged",
             None,
             None,
             &cookies,
-            &[],
+            &accept("application/json"),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&body), "invalid_state");
+    assert_eq!(state_reason(&body), "state_mismatch");
+    assert!(
+        headers.get(header::LOCATION).is_none(),
+        "a JSON client is never redirected"
+    );
 }
 
 #[tokio::test]
-async fn callback_without_the_state_cookie_is_rejected() {
+async fn callback_without_the_state_cookie_is_cookie_missing_for_json_clients() {
     let harness = Harness::oidc(&[ADMIN_GROUP]);
-    let (status, _, body) = harness
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/auth/callback?code=the-code&state=anything",
+            None,
+            None,
+            &BTreeMap::new(),
+            &accept("application/json"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_state");
+    assert_eq!(state_reason(&body), "cookie_missing");
+    assert!(parse(&body)["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("missing"));
+    assert!(
+        headers.get(header::LOCATION).is_none(),
+        "a JSON client is never redirected"
+    );
+
+    // No `Accept` header at all is the API default: JSON, no redirect.
+    let (status, headers, body) = harness
         .send(
             Method::GET,
             "/auth/callback?code=the-code&state=anything",
@@ -396,7 +450,162 @@ async fn callback_without_the_state_cookie_is_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(state_reason(&body), "cookie_missing");
+    assert!(headers.get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn a_tampered_state_cookie_is_a_state_mismatch() {
+    let harness = Harness::oidc(&[ADMIN_GROUP]);
+    let mut cookies = BTreeMap::new();
+    cookies.insert(OIDC_STATE_COOKIE.to_string(), "v1.abc.def".to_string());
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/auth/callback?code=the-code&state=anything",
+            None,
+            None,
+            &cookies,
+            &accept("application/json"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(&body), "invalid_state");
+    assert_eq!(state_reason(&body), "state_mismatch");
+}
+
+#[tokio::test]
+async fn a_browser_without_the_state_cookie_is_redirected_to_the_login_page() {
+    let harness = Harness::oidc(&[ADMIN_GROUP]);
+    let (status, headers, _) = harness
+        .send(
+            Method::GET,
+            "/auth/callback?code=the-code&state=anything",
+            None,
+            None,
+            &BTreeMap::new(),
+            &accept(BROWSER_ACCEPT),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/auth/login")
+    );
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+}
+
+#[tokio::test]
+async fn a_browser_with_a_mismatched_state_gets_a_self_contained_html_page() {
+    let harness = Harness::oidc(&[ADMIN_GROUP]);
+    let (state_cookie, _) = harness.start_login().await;
+    let mut cookies = BTreeMap::new();
+    cookies.insert(OIDC_STATE_COOKIE.to_string(), state_cookie);
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/auth/callback?code=the-code&state=forged",
+            None,
+            None,
+            &cookies,
+            &accept(BROWSER_ACCEPT),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(body.contains("<title>Sign-in failed"), "{body}");
+    assert!(body.contains("another browser"), "{body}");
+    assert!(body.contains("href=\"/auth/login\""), "{body}");
+    assert!(body.contains("Sign in again"), "{body}");
+    assert!(!body.contains("state="), "the page never echoes the query");
+}
+
+#[tokio::test]
+async fn an_expired_state_cookie_is_reported_as_expired() {
+    // A one-second TTL keeps the test quick while exercising the real clock.
+    let harness = Harness::oidc_with_state_ttl(&[ADMIN_GROUP], 1);
+    let (state_cookie, returned_state) = harness.start_login().await;
+    let mut cookies = BTreeMap::new();
+    cookies.insert(OIDC_STATE_COOKIE.to_string(), state_cookie);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let uri = format!("/auth/callback?code=the-code&state={returned_state}");
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            &uri,
+            None,
+            None,
+            &cookies,
+            &accept("application/json"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_state");
+    assert_eq!(state_reason(&body), "expired");
+    let message = parse(&body)["error"]["message"]
+        .as_str()
+        .expect("message")
+        .to_string();
+    assert!(message.contains("expired"), "{message}");
+
+    // The same failure in a browser is a page, still with a way back in.
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            &uri,
+            None,
+            None,
+            &cookies,
+            &accept(BROWSER_ACCEPT),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(body.contains("login link has expired"), "{body}");
+    assert!(body.contains("href=\"/auth/login\""), "{body}");
+}
+
+#[tokio::test]
+async fn login_honours_the_configured_state_ttl() {
+    let harness = Harness::oidc_with_state_ttl(&[ADMIN_GROUP], 120);
+    let (status, headers, _) = harness
+        .send(
+            Method::GET,
+            "/auth/login",
+            None,
+            None,
+            &BTreeMap::new(),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let state_cookie = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|cookie| cookie.starts_with(&format!("{OIDC_STATE_COOKIE}=")))
+        .expect("state cookie")
+        .to_string();
+    assert!(state_cookie.contains("Max-Age=120"), "{state_cookie}");
+    assert!(!state_cookie.contains("Max-Age=600"), "{state_cookie}");
 }
 
 #[tokio::test]

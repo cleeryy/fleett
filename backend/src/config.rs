@@ -278,6 +278,8 @@ pub struct OidcConfig {
     /// HMAC key of the session and state cookies (at least 32 bytes).
     pub session_secret: Vec<u8>,
     pub session_ttl_secs: u64,
+    /// Lifetime of the `fleett_oidc` state cookie, in seconds.
+    pub state_ttl_secs: u64,
     /// `Secure` attribute of every cookie we set.
     pub cookie_secure: bool,
 }
@@ -295,6 +297,7 @@ impl fmt::Debug for OidcConfig {
             .field("viewer_group", &self.settings.viewer_group)
             .field("session_secret", &"<redacted>")
             .field("session_ttl_secs", &self.session_ttl_secs)
+            .field("state_ttl_secs", &self.state_ttl_secs)
             .field("cookie_secure", &self.cookie_secure)
             .finish()
     }
@@ -308,6 +311,14 @@ pub const DEFAULT_OIDC_SCOPES: &str = "openid profile email";
 pub const DEFAULT_OIDC_ADMIN_GROUP: &str = "fleett-admins";
 pub const DEFAULT_OIDC_VIEWER_GROUP: &str = "fleett-viewers";
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 28800;
+/// Default lifetime of the OIDC state cookie (`FLEETT_OIDC_STATE_TTL_SECS`).
+pub const DEFAULT_OIDC_STATE_TTL_SECS: u64 = 600;
+/// Shortest accepted `FLEETT_OIDC_STATE_TTL_SECS`: a login that completes
+/// faster than a minute is not a realistic flow.
+pub const MIN_OIDC_STATE_TTL_SECS: u64 = 60;
+/// Longest accepted `FLEETT_OIDC_STATE_TTL_SECS`: a state cookie is a
+/// short-lived secret, it must not outlive the login by hours.
+pub const MAX_OIDC_STATE_TTL_SECS: u64 = 3600;
 /// Minimum length of the decoded `FLEETT_SESSION_SECRET`.
 pub const MIN_SESSION_SECRET_BYTES: usize = 32;
 
@@ -743,6 +754,28 @@ fn resolve_oidc(
         }
     };
 
+    let state_ttl_secs = match get("OIDC_STATE_TTL_SECS") {
+        None => DEFAULT_OIDC_STATE_TTL_SECS,
+        Some(value) => {
+            let parsed = value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_OIDC_STATE_TTL_SECS",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?;
+            if !(MIN_OIDC_STATE_TTL_SECS..=MAX_OIDC_STATE_TTL_SECS).contains(&parsed) {
+                return Err(ConfigError::Invalid {
+                    var: "FLEETT_OIDC_STATE_TTL_SECS",
+                    value,
+                    detail: format!(
+                        "expected a number of seconds between {MIN_OIDC_STATE_TTL_SECS} \
+                         and {MAX_OIDC_STATE_TTL_SECS}"
+                    ),
+                });
+            }
+            parsed
+        }
+    };
+
     let cookie_secure = match get("COOKIE_SECURE") {
         None => CookieSecure::Auto,
         Some(value) => CookieSecure::parse(&value).ok_or_else(|| ConfigError::Invalid {
@@ -766,6 +799,7 @@ fn resolve_oidc(
         },
         session_secret,
         session_ttl_secs,
+        state_ttl_secs,
     })
 }
 
@@ -1365,7 +1399,45 @@ FLEETT_NETWORK='fleett-net'
         assert_eq!(oidc.settings.viewer_group, DEFAULT_OIDC_VIEWER_GROUP);
         assert_eq!(oidc.session_secret, vec![9u8; 32]);
         assert_eq!(oidc.session_ttl_secs, DEFAULT_SESSION_TTL_SECS);
+        assert_eq!(oidc.state_ttl_secs, DEFAULT_OIDC_STATE_TTL_SECS);
         assert!(oidc.cookie_secure, "auto follows the https public url");
+    }
+
+    #[test]
+    fn the_oidc_state_ttl_is_configurable_and_bounded() {
+        let secret = base64::engine::general_purpose::STANDARD.encode([6u8; 32]);
+        let with_ttl = |ttl: &str| {
+            let secret = secret.clone();
+            let ttl = ttl.to_string();
+            Config::from_lookup(move |key| match key {
+                "FLEETT_AUTH" => Some("oidc".to_string()),
+                "FLEETT_OIDC_ISSUER" => Some("https://sso.example.test".into()),
+                "FLEETT_OIDC_CLIENT_ID" => Some("client".into()),
+                "FLEETT_OIDC_CLIENT_SECRET" => Some("secret".into()),
+                "FLEETT_SESSION_SECRET" => Some(secret.clone()),
+                "FLEETT_OIDC_STATE_TTL_SECS" => Some(ttl.clone()),
+                _ => None,
+            })
+        };
+
+        for value in [MIN_OIDC_STATE_TTL_SECS, 300, 900, MAX_OIDC_STATE_TTL_SECS] {
+            let cfg = with_ttl(&value.to_string()).expect("valid state ttl");
+            assert_eq!(cfg.oidc.expect("oidc").state_ttl_secs, value);
+        }
+
+        for value in ["0", "59", "3601", "abc", "-1"] {
+            let err = with_ttl(value).expect_err("invalid state ttl");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "FLEETT_OIDC_STATE_TTL_SECS",
+                        ..
+                    }
+                ),
+                "unexpected error for {value}: {err}"
+            );
+        }
     }
 
     #[test]

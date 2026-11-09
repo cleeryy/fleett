@@ -25,6 +25,8 @@ pub struct AuthService {
     pub oidc: Option<Arc<OidcClient>>,
     pub cookie_secure: bool,
     pub session_ttl_secs: u64,
+    /// Lifetime of the `fleett_oidc` state cookie (`FLEETT_OIDC_STATE_TTL_SECS`).
+    pub state_ttl_secs: u64,
     /// `FLEETT_TOKEN`, the bootstrap admin bearer.
     pub bootstrap_token: Option<String>,
 }
@@ -44,6 +46,7 @@ impl AuthService {
                 oidc: None,
                 cookie_secure: false,
                 session_ttl_secs: 0,
+                state_ttl_secs: 0,
                 bootstrap_token: cfg.token.clone(),
             };
         };
@@ -69,6 +72,7 @@ impl AuthService {
             oidc: Some(Arc::new(client)),
             cookie_secure: oidc.cookie_secure,
             session_ttl_secs: oidc.session_ttl_secs,
+            state_ttl_secs: oidc.state_ttl_secs,
             bootstrap_token: cfg.token.clone(),
         }
     }
