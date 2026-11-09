@@ -56,6 +56,12 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett notifications
+fleett notification add --name NAME --kind webhook|discord|telegram|smtp --target T
+                         [--secret S] [--events a,b]
+fleett notification rm <id>
+fleett notification test <id>
+fleett deliveries [--channel ID] [--limit N]
 fleett doctor
 ```
 
@@ -184,6 +190,27 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `notifications` / `notification` / `deliveries`
+
+Manage outbound alert channels ([docs/NOTIFICATIONS.md](NOTIFICATIONS.md)):
+
+```bash
+fleett notifications
+fleett notification add --name ops --kind webhook --target https://hooks.example.test/fleett --events '*'
+fleett notification add --name oncall --kind telegram --target 424242 \
+  --secret '123456:BOT-TOKEN' --events instance.down,instance.up
+fleett notification test 9f2a…            # synthetic notification.test delivery
+fleett notification rm 9f2a…
+fleett deliveries --channel 9f2a… --limit 50
+```
+
+`--events` accepts a comma-separated list of events, `*` or `incident.*`
+(default `*`). The secret is sent to the API, never printed back: `fleett
+notifications` shows a `SECRET` column with `yes`/`no`. `fleett notification
+test` prints the delivery status and attempts, then the error when it failed;
+`fleett deliveries` prints the journal (`ID`, `CHANNEL`, `EVENT`, `STATUS`,
+`ATTEMPTS`, `AT`, `ERROR`). All three commands support `--json`.
 
 ### `doctor`
 

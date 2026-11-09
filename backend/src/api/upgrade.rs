@@ -261,6 +261,30 @@ async fn run_job(state: AppState, context: AuthContext, job_id: String) {
     state.upgrade.finish(&job_id);
     if let Some(job) = state.upgrade.current().filter(|job| job.id == job_id) {
         state.metrics.record_upgrade_job(job_result(&job));
+        // One alert per instance the operator has to look at; a clean job is
+        // silent. Fire-and-forget so the job task never waits on a webhook.
+        for result in job
+            .results
+            .iter()
+            .filter(|result| result.status.needs_attention())
+        {
+            crate::notify::spawn_emit(
+                state.clone(),
+                crate::notify::Event::UpgradeFailed,
+                crate::notify::Payload {
+                    instance_id: Some(result.id.clone()),
+                    instance_name: state
+                        .db
+                        .get(&result.id)
+                        .ok()
+                        .flatten()
+                        .map(|spec| spec.name),
+                    state: Some(result.status.as_str().to_string()),
+                    error: result.error.clone(),
+                    details: Some(format!("image {}", job.image)),
+                },
+            );
+        }
     }
 }
 

@@ -70,6 +70,29 @@ request wins. `secret` on `PATCH` rotates the credential and restarts every
 attached instance sequentially (one `restarted` entry each). Instances without
 a provider keep their own `gate_token`/`api_key_env`.
 
+## Notifications
+
+Outbound alert channels and their delivery journal; see
+[docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md). Mutations are admin only; every
+authenticated role may read. No endpoint ever returns the channel secret:
+`has_secret` says whether one is stored.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/notifications` | — | `[{"id":"…","name":"ops","kind":"webhook\|discord\|telegram\|smtp","target":"…","events":["instance.down"],"enabled":true,"has_secret":false,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/notifications` | `{"name":"ops","kind":"webhook","target":"https://…","secret"?,"events"?:["instance.down"],"enabled"?}` | `201` channel view, admin only |
+| GET | `/api/notifications/{id}` | — | channel view, `404` unknown |
+| PATCH | `/api/notifications/{id}` | `{"name"?,"kind"?,"target"?,"secret"?,"events"?,"enabled"?}` | channel view, admin only. `secret` omitted keeps it, `""` clears it, a value rotates it |
+| DELETE | `/api/notifications/{id}` | — | `204`; the delivery journal is kept, admin only |
+| POST | `/api/notifications/{id}/test` | — | the `notification.test` delivery row (even when the send failed), admin only |
+| GET | `/api/notifications/deliveries?channel=&limit=100` | — | `[{"id":1,"channel_id":"…","event":"instance.down","subject":"…","status":"pending\|sent\|failed\|suppressed","attempts":1,"error":null,"created_at":"…","delivered_at":"…"}]`, newest first, `limit` 1…1000 |
+
+`events` defaults to `["*"]`; `*` and `incident.*` are the only wildcards.
+A secret requires the fleet secrets key: without one the API answers
+`409 secrets_key_missing` (a plain webhook without a secret does not).
+Deliveries are coalesced per channel and event in a five-minute window (later
+ones are recorded `suppressed`) and retried 3 times (`1s`, `5s`, `30s`).
+
 ## Instances
 
 `GET /api/instances` → `InstanceSummary[]`

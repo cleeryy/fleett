@@ -315,6 +315,21 @@ pub enum Command {
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
+    Notifications,
+    NotificationAdd(NotificationAddArgs),
+    NotificationRm(String),
+    NotificationTest(String),
+    Deliveries { channel: Option<String>, limit: u32 },
+}
+
+/// Arguments of `fleett notification add`.
+#[derive(Debug, Clone)]
+pub struct NotificationAddArgs {
+    pub name: String,
+    pub kind: String,
+    pub target: String,
+    pub secret: Option<String>,
+    pub events: Vec<String>,
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +428,13 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Notifications => notifications(&client, json).await,
+        Command::NotificationAdd(args) => notification_add(&client, json, &args).await,
+        Command::NotificationRm(id) => notification_rm(&client, json, &id).await,
+        Command::NotificationTest(id) => notification_test(&client, json, &id).await,
+        Command::Deliveries { channel, limit } => {
+            deliveries(&client, json, channel.as_deref(), limit).await
+        }
     }
 }
 
@@ -850,6 +872,172 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
         return print_json(&value);
     }
     println!("message {message_id} marked as read");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NotificationView {
+    id: String,
+    name: String,
+    kind: String,
+    target: String,
+    events: Vec<String>,
+    enabled: bool,
+    has_secret: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DeliveryView {
+    id: i64,
+    channel_id: String,
+    event: String,
+    subject: String,
+    status: String,
+    attempts: u32,
+    #[serde(default)]
+    error: Option<String>,
+    created_at: String,
+    #[serde(default)]
+    delivered_at: Option<String>,
+}
+
+async fn notifications(client: &Client, json: bool) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/notifications", &[], None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let channels: Vec<NotificationView> = decode(value)?;
+    if channels.is_empty() {
+        println!("no notification channels");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = channels
+        .iter()
+        .map(|channel| {
+            vec![
+                channel.id.clone(),
+                channel.name.clone(),
+                channel.kind.clone(),
+                channel.events.join(","),
+                if channel.enabled { "yes" } else { "no" }.to_string(),
+                if channel.has_secret { "yes" } else { "no" }.to_string(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "NAME", "KIND", "EVENTS", "ENABLED", "SECRET"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn notification_add(
+    client: &Client,
+    json: bool,
+    args: &NotificationAddArgs,
+) -> Result<(), CliError> {
+    let events = if args.events.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        args.events.clone()
+    };
+    let mut body = json!({
+        "name": args.name,
+        "kind": args.kind,
+        "target": args.target,
+        "events": events,
+    });
+    if let Some(secret) = &args.secret {
+        body["secret"] = json!(secret);
+    }
+    let value = client
+        .value(Method::POST, "/api/notifications", &[], Some(body))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let channel: NotificationView = decode(value)?;
+    println!("created notification channel {}", channel.id);
+    Ok(())
+}
+
+async fn notification_rm(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/notifications/{}", encode_path_segment(id));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "id": id, "deleted": true }));
+    }
+    println!("removed notification channel {id}");
+    Ok(())
+}
+
+async fn notification_test(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/notifications/{}/test", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let delivery: DeliveryView = decode(value)?;
+    println!("{} after {} attempt(s)", delivery.status, delivery.attempts);
+    if let Some(error) = delivery.error {
+        println!("{error}");
+    }
+    Ok(())
+}
+
+async fn deliveries(
+    client: &Client,
+    json: bool,
+    channel: Option<&str>,
+    limit: u32,
+) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+    if let Some(channel) = channel.filter(|value| !value.is_empty()) {
+        query.push(("channel", channel.to_string()));
+    }
+    let value = client
+        .value(Method::GET, "/api/notifications/deliveries", &query, None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let deliveries: Vec<DeliveryView> = decode(value)?;
+    if deliveries.is_empty() {
+        println!("no deliveries");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = deliveries
+        .iter()
+        .map(|delivery| {
+            vec![
+                delivery.id.to_string(),
+                delivery.channel_id.clone(),
+                delivery.event.clone(),
+                delivery.status.clone(),
+                delivery.attempts.to_string(),
+                delivery.created_at.clone(),
+                delivery
+                    .error
+                    .clone()
+                    .unwrap_or_default()
+                    .replace('\n', " "),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["ID", "CHANNEL", "EVENT", "STATUS", "ATTEMPTS", "AT", "ERROR"],
+            &rows
+        )
+    );
     Ok(())
 }
 

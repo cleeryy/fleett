@@ -1162,6 +1162,24 @@ async fn lifecycle(
         Lifecycle::Restart => "instance.restart",
     };
     audit::record(&state, &context, audit_action, &id, None);
+
+    // Tell the notifiers that the operator changed the state of an agent. A
+    // restart is intentional and stays silent; a start/stop is the signal an
+    // operator subscribes to. Fire-and-forget: a slow webhook must not delay
+    // the HTTP response.
+    let event = match operation {
+        Lifecycle::Start => Some(crate::notify::Event::InstanceUp),
+        Lifecycle::Stop => Some(crate::notify::Event::InstanceDown),
+        Lifecycle::Restart => None,
+    };
+    if let Some(event) = event {
+        crate::notify::spawn_emit(
+            state.clone(),
+            event,
+            crate::notify::Payload::instance(&spec).with_state(status.as_str()),
+        );
+    }
+
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),
     }))
@@ -1353,38 +1371,64 @@ fn enforce_caps(
     // Float sums of decimal quotas are not exact; 1e-9 absorbs the noise.
     const EPSILON: f64 = 1e-9;
     if cfg.max_total_cpu > 0.0 && used_cpu + spec.cpu_limit > cfg.max_total_cpu + EPSILON {
-        return Err(ApiError::conflict(
-            "cpu_cap_exceeded",
-            format!(
-                "requested cpu_limit {} would bring the fleet to {} CPUs, above the configured cap of {}",
-                spec.cpu_limit,
-                used_cpu + spec.cpu_limit,
-                cfg.max_total_cpu
-            ),
-        )
-        .with_details(serde_json::json!({
-            "used": used_cpu,
-            "requested": spec.cpu_limit,
-            "cap": cfg.max_total_cpu,
-        })));
+        return Err(refuse_quota(
+            state,
+            spec,
+            ApiError::conflict(
+                "cpu_cap_exceeded",
+                format!(
+                    "requested cpu_limit {} would bring the fleet to {} CPUs, above the configured cap of {}",
+                    spec.cpu_limit,
+                    used_cpu + spec.cpu_limit,
+                    cfg.max_total_cpu
+                ),
+            )
+            .with_details(serde_json::json!({
+                "used": used_cpu,
+                "requested": spec.cpu_limit,
+                "cap": cfg.max_total_cpu,
+            })),
+        ));
     }
     if cfg.max_total_mem_mb > 0 && used_mem + u64::from(spec.mem_limit_mb) > cfg.max_total_mem_mb {
-        return Err(ApiError::conflict(
-            "mem_cap_exceeded",
-            format!(
-                "requested mem_limit_mb {} would bring the fleet to {} MB, above the configured cap of {} MB",
-                spec.mem_limit_mb,
-                used_mem + u64::from(spec.mem_limit_mb),
-                cfg.max_total_mem_mb
-            ),
-        )
-        .with_details(serde_json::json!({
-            "used": used_mem,
-            "requested": spec.mem_limit_mb,
-            "cap": cfg.max_total_mem_mb,
-        })));
+        return Err(refuse_quota(
+            state,
+            spec,
+            ApiError::conflict(
+                "mem_cap_exceeded",
+                format!(
+                    "requested mem_limit_mb {} would bring the fleet to {} MB, above the configured cap of {} MB",
+                    spec.mem_limit_mb,
+                    used_mem + u64::from(spec.mem_limit_mb),
+                    cfg.max_total_mem_mb
+                ),
+            )
+            .with_details(serde_json::json!({
+                "used": used_mem,
+                "requested": spec.mem_limit_mb,
+                "cap": cfg.max_total_mem_mb,
+            })),
+        ));
     }
     Ok(())
+}
+
+/// Emit `quota.exceeded` for the refused instance, then return the same error.
+///
+/// Fire-and-forget: the API keeps its `409` without waiting for the notifiers.
+fn refuse_quota(state: &AppState, spec: &InstanceSpec, error: ApiError) -> ApiError {
+    crate::notify::spawn_emit(
+        state.clone(),
+        crate::notify::Event::QuotaExceeded,
+        crate::notify::Payload {
+            instance_id: Some(spec.id.clone()),
+            instance_name: Some(spec.name.clone()),
+            state: None,
+            error: Some(error.message.clone()),
+            details: Some(error.code.to_string()),
+        },
+    );
+    error
 }
 
 /// `docker compose ps` reports `unknown` when no container exists; keep a

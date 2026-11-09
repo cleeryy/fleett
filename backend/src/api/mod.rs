@@ -8,6 +8,7 @@ pub mod files;
 pub mod git;
 pub mod health;
 pub mod instances;
+pub mod notifications;
 pub mod providers;
 pub mod shares;
 pub mod templates;
@@ -38,6 +39,9 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tower_http::trace::TraceLayer;
 
+/// Timeout of one outbound notification HTTP call.
+pub const NOTIFY_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Shared state of every handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +54,9 @@ pub struct AppState {
     pub upgrade: Arc<upgrade::UpgradeManager>,
     /// Prometheus counters and the cached utilisation sample (`GET /metrics`).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Shared HTTP client of the outbound notifications (and nothing else):
+    /// one connection pool, one timeout, no per-alert client.
+    pub http: reqwest::Client,
     pub started_at: Instant,
 }
 
@@ -92,6 +99,10 @@ impl AppState {
             locks: Arc::new(InstanceLocks::default()),
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            http: reqwest::Client::builder()
+                .timeout(NOTIFY_HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             started_at: Instant::now(),
         })
     }
@@ -157,6 +168,18 @@ fn api_routes(state: AppState) -> Router<AppState> {
                 .delete(providers::delete),
         )
         .route("/providers/{id}/test", post(providers::test))
+        .route(
+            "/notifications",
+            get(notifications::list).post(notifications::create),
+        )
+        .route("/notifications/deliveries", get(notifications::deliveries))
+        .route(
+            "/notifications/{id}",
+            get(notifications::get)
+                .patch(notifications::patch)
+                .delete(notifications::delete),
+        )
+        .route("/notifications/{id}/test", post(notifications::test))
         .route("/instances", get(instances::list).post(instances::create))
         .route("/instances/import", post(instances::import))
         .route(

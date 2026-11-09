@@ -229,6 +229,54 @@ enum Commands {
         /// Message id.
         message_id: String,
     },
+    /// List the outbound notification channels (client mode).
+    Notifications,
+    /// Manage outbound notification channels (client mode).
+    Notification {
+        #[command(subcommand)]
+        action: NotificationCommands,
+    },
+    /// List the notification delivery journal (client mode).
+    Deliveries {
+        /// Only the deliveries of one channel.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Maximum rows (1..=1000).
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum NotificationCommands {
+    /// Add a channel (admin token required).
+    Add {
+        /// Display name.
+        #[arg(long)]
+        name: String,
+        /// `webhook`, `discord`, `telegram` or `smtp`.
+        #[arg(long)]
+        kind: String,
+        /// URL, Telegram chat id, or `host:port` for SMTP.
+        #[arg(long)]
+        target: String,
+        /// Channel secret (Telegram bot token); never returned by the API.
+        #[arg(long)]
+        secret: Option<String>,
+        /// Events, comma separated (`instance.down,incident.*`); default `*`.
+        #[arg(long, value_delimiter = ',')]
+        events: Vec<String>,
+    },
+    /// Remove a channel (its delivery journal is kept).
+    Rm {
+        /// Channel id.
+        id: String,
+    },
+    /// Send a synthetic `notification.test` event to one channel.
+    Test {
+        /// Channel id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -466,6 +514,37 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Ack { id, message_id } => {
             cli::run(cli::Command::Ack { id, message_id }, json).await
+        }
+        Commands::Notifications => cli::run(cli::Command::Notifications, json).await,
+        Commands::Notification { action } => match action {
+            NotificationCommands::Add {
+                name,
+                kind,
+                target,
+                secret,
+                events,
+            } => {
+                cli::run(
+                    cli::Command::NotificationAdd(cli::NotificationAddArgs {
+                        name,
+                        kind,
+                        target,
+                        secret,
+                        events,
+                    }),
+                    json,
+                )
+                .await
+            }
+            NotificationCommands::Rm { id } => {
+                cli::run(cli::Command::NotificationRm(id), json).await
+            }
+            NotificationCommands::Test { id } => {
+                cli::run(cli::Command::NotificationTest(id), json).await
+            }
+        },
+        Commands::Deliveries { channel, limit } => {
+            cli::run(cli::Command::Deliveries { channel, limit }, json).await
         }
     };
 
