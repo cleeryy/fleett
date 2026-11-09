@@ -13,6 +13,15 @@ pub const DEFAULT_MEM_LIMIT_MB: u32 = 1536;
 pub const CPU_LIMIT_MIN: f64 = 0.1;
 pub const CPU_LIMIT_MAX: f64 = 8.0;
 pub const DEFAULT_CPU_LIMIT: f64 = 1.0;
+/// Largest per-instance disk quota accepted by the API (1 TiB).
+pub const DISK_QUOTA_MAX_MB: u32 = 1_048_576;
+/// Default quota of a new instance: `0` means unlimited.
+pub const DEFAULT_DISK_QUOTA_MB: u32 = 0;
+/// Percentage of the quota at which the instance is warned.
+pub const DISK_WARN_PERCENT: u64 = 80;
+/// Written to `last_error` when the `freeze` policy stops an instance.
+pub const DISK_QUOTA_EXCEEDED_MESSAGE: &str =
+    "disk quota exceeded: the instance data directory grew above disk_quota_mb";
 /// Written to `last_error` while the container health check keeps failing.
 pub const HEALTH_UNHEALTHY_MESSAGE: &str =
     "container health check failed: the Hermes gateway is not answering on /opt/data/gateway.sock";
@@ -306,6 +315,43 @@ impl std::fmt::Display for Health {
     }
 }
 
+/// How a per-instance disk quota breach is enforced (issue #47).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiskPolicy {
+    /// Alert only: the instance keeps running.
+    #[default]
+    Warn,
+    /// Stop the instance and record [`DISK_QUOTA_EXCEEDED_MESSAGE`].
+    Freeze,
+    /// Stop the instance without flagging it as failed.
+    Stop,
+}
+
+impl DiskPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Freeze => "freeze",
+            Self::Stop => "stop",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "warn" | "alert" => Some(Self::Warn),
+            "freeze" | "read-only" | "readonly" => Some(Self::Freeze),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DiskPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Everything the control plane knows about one agent.
 ///
 /// This is the database row plus the share links; the compose file and the
@@ -344,6 +390,10 @@ pub struct InstanceSpec {
     pub max_restarts: u32,
     /// Base delay between two heal attempts, in seconds.
     pub heal_backoff_s: u64,
+    /// Size bound of the data directory, in MB (`0` = unlimited).
+    pub disk_quota_mb: u32,
+    /// What a breach above 100 % does (`warn`, `freeze` or `stop`).
+    pub disk_policy: DiskPolicy,
     pub notes: String,
     /// Host that runs the container (`hosts.id`, `local` by default).
     pub host: String,
@@ -491,6 +541,10 @@ pub struct InstanceSummary {
     pub allow_lan: bool,
     /// Docker host that runs the instance (`local` by default).
     pub host: String,
+    /// Size bound of the data directory, in MB (`0` = unlimited).
+    pub disk_quota_mb: u32,
+    /// `warn`, `freeze` or `stop`.
+    pub disk_policy: String,
     /// Provider credential in use, when the instance has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -524,6 +578,10 @@ pub struct InstanceDetail {
     pub allow_lan: bool,
     /// Docker host that runs the container (`local` by default).
     pub host: String,
+    /// Size bound of the data directory, in MB (`0` = unlimited).
+    pub disk_quota_mb: u32,
+    /// `warn`, `freeze` or `stop`.
+    pub disk_policy: String,
     /// Operator-facing security warnings (egress firewall, LAN access).
     pub warnings: Vec<String>,
     pub notes: String,
@@ -1059,6 +1117,12 @@ pub struct CreateInstanceRequest {
     /// reachable host with the most free capacity. Defaults to the local host.
     #[serde(default)]
     pub host: Option<String>,
+    /// Disk quota of the data directory, in MB (`0` = unlimited, default 0).
+    #[serde(default)]
+    pub disk_quota_mb: Option<u32>,
+    /// `warn` (default), `freeze` or `stop`.
+    #[serde(default)]
+    pub disk_policy: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
     /// Convenience field: stored as `HERMES_GATE_PROFILE_TOKEN` (and as
@@ -1236,6 +1300,16 @@ pub fn validate_cpu_limit(value: f64) -> Result<(), String> {
     if !value.is_finite() || !(CPU_LIMIT_MIN..=CPU_LIMIT_MAX).contains(&value) {
         return Err(format!(
             "cpu_limit must be between {CPU_LIMIT_MIN} and {CPU_LIMIT_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+/// `0` disables the quota; anything above 1 TiB is a typo.
+pub fn validate_disk_quota_mb(value: u32) -> Result<(), String> {
+    if value > DISK_QUOTA_MAX_MB {
+        return Err(format!(
+            "disk_quota_mb must be between 0 (unlimited) and {DISK_QUOTA_MAX_MB}"
         ));
     }
     Ok(())

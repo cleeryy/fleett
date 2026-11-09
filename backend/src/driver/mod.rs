@@ -240,6 +240,23 @@ pub trait Driver: Send + Sync {
         spec: &'a InstanceSpec,
     ) -> DriverFuture<'a, Result<InspectInfo, DriverError>>;
 
+    /// Path of the container's Docker log file (`LogPath`), when it exists.
+    ///
+    /// Used by `GET /api/instances/{id}/usage/detail`; `Ok(None)` means
+    /// "unknown" and never fails the usage report.
+    fn log_path<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<Option<std::path::PathBuf>, DriverError>>;
+
+    /// Size in bytes of one local image, when Docker can report it.
+    ///
+    /// A missing image is `Ok(None)`, so a detail view never fails on it.
+    fn image_size<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<Option<u64>, DriverError>>;
+
     /// Runtime usage of the given instances, in the same order.
     ///
     /// One call covers the whole fleet: the compose driver runs a single

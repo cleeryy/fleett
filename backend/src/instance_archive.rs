@@ -18,10 +18,10 @@
 use crate::archive;
 use crate::config::{Config, VERSION};
 use crate::models::{
-    now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_instance_id,
-    validate_mem_limit, validate_model, validate_notes, validate_secret_name, validate_share_name,
-    ChannelKind, InstanceSpec, ShareRef, Status, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT,
-    DEFAULT_MEM_LIMIT_MB,
+    now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit, validate_disk_quota_mb,
+    validate_instance_id, validate_mem_limit, validate_model, validate_notes, validate_secret_name,
+    validate_share_name, ChannelKind, DiskPolicy, InstanceSpec, ShareRef, Status,
+    DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -82,6 +82,12 @@ pub struct ArchiveInstance {
     pub mem_limit_mb: u32,
     pub cpu_limit: f64,
     pub allow_lan: bool,
+    /// Disk quota in MB (`0` = unlimited). Missing in archives written before
+    /// issue #47.
+    #[serde(default)]
+    pub disk_quota_mb: u32,
+    #[serde(default = "default_disk_policy")]
+    pub disk_policy: String,
     #[serde(default)]
     pub shares: Vec<ShareRef>,
     #[serde(default)]
@@ -94,6 +100,10 @@ pub struct ArchiveInstance {
 
 fn default_host() -> String {
     crate::hosts::LOCAL_HOST.to_string()
+}
+
+fn default_disk_policy() -> String {
+    crate::models::DiskPolicy::Warn.as_str().to_string()
 }
 
 impl ArchiveInstance {
@@ -110,6 +120,8 @@ impl ArchiveInstance {
             mem_limit_mb: spec.mem_limit_mb,
             cpu_limit: spec.cpu_limit,
             allow_lan: spec.allow_lan,
+            disk_quota_mb: spec.disk_quota_mb,
+            disk_policy: spec.disk_policy.as_str().to_string(),
             shares: spec.shares.clone(),
             notes: spec.notes.clone(),
             host: spec.host.clone(),
@@ -323,6 +335,18 @@ pub fn spec_from_manifest(
     };
     validate_cpu_limit(cpu_limit).map_err(invalid)?;
 
+    validate_disk_quota_mb(manifest.disk_quota_mb).map_err(invalid)?;
+    let disk_policy = if manifest.disk_policy.trim().is_empty() {
+        DiskPolicy::Warn
+    } else {
+        DiskPolicy::parse(&manifest.disk_policy).ok_or_else(|| {
+            invalid(format!(
+                "unsupported disk policy {:?}",
+                manifest.disk_policy
+            ))
+        })?
+    };
+
     validate_notes(&manifest.notes).map_err(invalid)?;
 
     let mut shares = Vec::with_capacity(manifest.shares.len());
@@ -358,6 +382,8 @@ pub fn spec_from_manifest(
         unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
         max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
         heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+        disk_quota_mb: manifest.disk_quota_mb,
+        disk_policy,
         notes: manifest.notes.clone(),
         host: crate::hosts::LOCAL_HOST.to_string(),
         status: Status::Created,
@@ -472,6 +498,8 @@ mod tests {
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: crate::models::DiskPolicy::Warn,
             notes: "ported from staging".to_string(),
             host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Running,

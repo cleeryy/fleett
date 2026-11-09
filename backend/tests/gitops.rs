@@ -413,6 +413,8 @@ async fn api_routes_expose_plan_apply_and_drift() {
             unhealthy_after: fleett::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: fleett::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: fleett::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: fleett::models::DiskPolicy::Warn,
             notes: String::new(),
             status: fleett::models::Status::Created,
             last_error: None,

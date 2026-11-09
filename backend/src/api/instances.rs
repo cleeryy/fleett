@@ -15,13 +15,14 @@ use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
 use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
-    validate_env_key, validate_env_raw_value, validate_instance_id, validate_mem_limit,
-    validate_model, validate_notes, validate_secret_value, validate_share_name, ChannelKind,
-    ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvInput,
-    EnvSuggestion, EnvVarInput, HealPolicy, Health, InstanceDetail, InstanceSpec, InstanceSummary,
-    PatchInstanceRequest, ShareRef, Status, TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT,
-    DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
-    DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
+    validate_disk_quota_mb, validate_env_key, validate_env_raw_value, validate_instance_id,
+    validate_mem_limit, validate_model, validate_notes, validate_secret_value, validate_share_name,
+    ChannelKind, ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest,
+    DiskPolicy, EnvInput, EnvSuggestion, EnvVarInput, HealPolicy, Health, InstanceDetail,
+    InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status, TemplateMeta,
+    DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS,
+    DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE, DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV,
+    HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
@@ -220,6 +221,7 @@ pub async fn create(
     }
 
     enforce_caps(&state, None, &spec)?;
+    crate::api::quota::enforce_host_disk(&state, &spec)?;
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
 
@@ -452,6 +454,7 @@ pub async fn clone(
     clone.updated_at = now;
 
     enforce_caps(&state, None, &clone)?;
+    crate::api::quota::enforce_host_disk(&state, &clone)?;
     check_egress_policy(&state, &clone).await?;
     ensure_lan_network(&state, &clone).await?;
 
@@ -781,6 +784,7 @@ async fn import_archive(
     ));
 
     enforce_caps(state, None, &spec)?;
+    crate::api::quota::enforce_host_disk(state, &spec)?;
     check_egress_policy(state, &spec).await?;
     ensure_lan_network(state, &spec).await?;
 
@@ -1736,6 +1740,8 @@ fn to_summary(
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
         host: spec.host.clone(),
+        disk_quota_mb: spec.disk_quota_mb,
+        disk_policy: spec.disk_policy.as_str().to_string(),
         provider: spec.provider.clone(),
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
@@ -1788,6 +1794,8 @@ fn to_detail(
         cpu_limit: spec.cpu_limit,
         allow_lan: spec.allow_lan,
         host: spec.host.clone(),
+        disk_quota_mb: spec.disk_quota_mb,
+        disk_policy: spec.disk_policy.as_str().to_string(),
         warnings,
         notes: spec.notes.clone(),
         created_at: spec.created_at.clone(),
@@ -1979,6 +1987,21 @@ async fn prepare_create(
         ));
     }
 
+    let disk_quota_mb = request
+        .disk_quota_mb
+        .unwrap_or(crate::models::DEFAULT_DISK_QUOTA_MB);
+    validate_disk_quota_mb(disk_quota_mb)
+        .map_err(|message| ApiError::bad_request("invalid_quota", message))?;
+    let disk_policy = match request.disk_policy.as_deref() {
+        None => DiskPolicy::default(),
+        Some(value) => DiskPolicy::parse(value).ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_policy",
+                "disk_policy must be \"warn\", \"freeze\" or \"stop\"",
+            )
+        })?,
+    };
+
     let notes = request
         .notes
         .clone()
@@ -2042,6 +2065,8 @@ async fn prepare_create(
             unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
             max_restarts: DEFAULT_MAX_RESTARTS,
             heal_backoff_s: DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb,
+            disk_policy,
             notes,
             host,
             status: Status::Created,

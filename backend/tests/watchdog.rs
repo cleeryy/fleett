@@ -61,6 +61,8 @@ impl Harness {
             unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
             max_restarts: 5,
             heal_backoff_s: DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: fleett::models::DiskPolicy::Warn,
             notes: String::new(),
             status: Status::Running,
             last_error: None,

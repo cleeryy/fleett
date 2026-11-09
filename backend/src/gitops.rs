@@ -801,6 +801,10 @@ impl DesiredInstance {
             heal_backoff_s: existing
                 .map(|spec| spec.heal_backoff_s)
                 .unwrap_or(crate::models::DEFAULT_HEAL_BACKOFF_S),
+            disk_quota_mb: existing.map(|spec| spec.disk_quota_mb).unwrap_or(0),
+            disk_policy: existing
+                .map(|spec| spec.disk_policy)
+                .unwrap_or(crate::models::DiskPolicy::Warn),
             notes: self.notes,
             status: existing.map(|spec| spec.status).unwrap_or(Status::Created),
             last_error: existing.and_then(|spec| spec.last_error.clone()),

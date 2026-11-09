@@ -1220,7 +1220,6 @@ mod tests {
         db.with_transaction(|conn| {
             conn.execute_batch(
                 "ALTER TABLE instance_env ADD COLUMN expires_at TEXT;
-                 ALTER TABLE instances ADD COLUMN disk_quota_mb INTEGER;
                  DROP TABLE IF EXISTS incidents;
                  CREATE TABLE incidents (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
                  UPDATE instance_env SET expires_at = datetime('now', '+30 days');
@@ -1283,6 +1282,8 @@ mod tests {
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: crate::models::DiskPolicy::Warn,
             notes: String::new(),
             host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Running,

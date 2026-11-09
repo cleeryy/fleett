@@ -472,6 +472,49 @@ impl Driver for ComposeDriver {
         })
     }
 
+    fn log_path<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+    ) -> DriverFuture<'a, Result<Option<PathBuf>, DriverError>> {
+        Box::pin(async move {
+            let container = self.project(&spec.id);
+            let mut command = Command::new(&self.docker);
+            command
+                .args([
+                    "inspect",
+                    "--type",
+                    "container",
+                    "--format",
+                    "{{.LogPath}}",
+                    &container,
+                ])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            self.apply_endpoint(&mut command, &spec.host)?;
+            let stdout = run_command(command, "inspect", INSPECT_TIMEOUT).await?;
+            let path = stdout.trim();
+            Ok((!path.is_empty() && path != "<no value>").then(|| PathBuf::from(path)))
+        })
+    }
+
+    fn image_size<'a>(
+        &'a self,
+        image: &'a str,
+    ) -> DriverFuture<'a, Result<Option<u64>, DriverError>> {
+        Box::pin(async move {
+            let mut command = Command::new(&self.docker);
+            command
+                .args(["image", "inspect", "--format", "{{.Size}}", image])
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            // A missing tag is not an error for a read-only detail view.
+            match run_command(command, "image inspect", INSPECT_TIMEOUT).await {
+                Ok(stdout) => Ok(stdout.trim().parse::<u64>().ok()),
+                Err(_) => Ok(None),
+            }
+        })
+    }
+
     fn usage<'a>(
         &'a self,
         specs: &'a [InstanceSpec],
@@ -1489,6 +1532,8 @@ mod tests {
             unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
             max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
             heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
+            disk_quota_mb: 0,
+            disk_policy: crate::models::DiskPolicy::Warn,
             notes: String::new(),
             host: crate::hosts::LOCAL_HOST.to_string(),
             status: Status::Created,

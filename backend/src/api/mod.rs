@@ -24,6 +24,7 @@ pub mod notifications;
 pub mod openapi;
 pub mod pipelines;
 pub mod providers;
+pub mod quota;
 pub mod schedules;
 pub mod security;
 pub mod shares;
@@ -85,6 +86,8 @@ pub struct AppState {
     /// Shared HTTP client of the outbound notifications (and nothing else):
     /// one connection pool, one timeout, no per-alert client.
     pub http: reqwest::Client,
+    /// Last disk-quota level of every instance (one event per crossing).
+    pub quota: Arc<crate::quota::QuotaMonitor>,
     pub started_at: Instant,
 }
 
@@ -147,6 +150,7 @@ impl AppState {
                 .timeout(NOTIFY_HTTP_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            quota: Arc::new(crate::quota::QuotaMonitor::new()),
             started_at: Instant::now(),
         })
     }
@@ -317,6 +321,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/acl", get(acl::get).put(acl::put))
         .route("/instances/{id}/acl/{subject}", delete(acl::delete))
+        .route("/instances/{id}/quota", get(quota::get).put(quota::put))
+        .route("/instances/{id}/usage/detail", get(quota::usage_detail))
+        .route("/instances/{id}/quota/cleanup", post(quota::cleanup))
+        .route("/disk/events", get(quota::events))
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
         .route(

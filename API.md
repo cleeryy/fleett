@@ -308,7 +308,8 @@ may read (ACL or token scope), and `role` is the caller's level on that row
  "provider":"9e2c…",
  "channel":{"type":"telegram","token":"123:ABC"},
  "shares":[{"name":"findings","mode":"rw"}],
- "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local","notes":"",
+ "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local",
+ "disk_quota_mb":0,"disk_policy":"warn","notes":"",
  "env":[{"key":"DISCORD_ALLOWED_USERS","value":"123","secret":false}]}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
@@ -326,6 +327,7 @@ deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every en
  "provider":"9e2c…",
  "status":"running","shares":[{"name":"findings","mode":"rw"}],
  "mem_limit_mb":1536,"cpu_limit":1.0,"allow_lan":false,"host":"local",
+ "disk_quota_mb":0,"disk_policy":"warn",
  "warnings":[],"notes":"","created_at":"...","updated_at":"...",
  "last_error":null,"data_dir":"/opt/fleett/instances/alice/data",
  "env":[{"key":"HERMES_GATE_PROFILE_TOKEN","secret":true,"updated_at":"..."},
@@ -356,6 +358,12 @@ compose file and runs `up -d`.
 `cpu_limit` is a float in `0.1..=8.0` (default `1.0`), rendered as `cpus` plus
 `memswap_limit == mem_limit`. Optional fleet caps (`FLEETT_MAX_TOTAL_CPU`,
 `FLEETT_MAX_TOTAL_MEM_MB`) return `409` with `error.details {used, requested, cap}`.
+
+`disk_quota_mb` (default `0` = unlimited) and `disk_policy` (`warn`, `freeze`, `stop`)
+bound the data directory; a create also requires the host to keep
+`max(FLEETT_MIN_FREE_DISK_MB, 2 * disk_quota_mb)` free, otherwise it answers
+`409 insufficient_disk` with `details {free_mb, required_mb}`. See
+[QUOTA.md](QUOTA.md).
 
 ### Environment variables
 
@@ -957,6 +965,26 @@ day. `DELETE /api/models/pricing/{model}` removes every version. A budget past
 its limit produces a `cost.budget` event through `cost::events::emit` (a WARN
 log line until the incident pipeline is merged). Reads are open to viewers;
 every write is admin-only.
+
+## Disk quotas and cleanup
+
+See [QUOTA.md](QUOTA.md) for the semantics (80 % warning, 100 % policy) and the
+cleanup rules. Reads accept any authenticated role; mutations need `admin` and
+are audited as `instance.quota.update` / `instance.quota.cleanup`.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/instances/{id}/quota` | — | `{"instance":"alice","quota_mb":2048,"policy":"freeze","used_bytes":52428800,"quota_bytes":2147483648,"percent":2.44,"state":"ok","warn_percent":80,"last_event":{…}}` |
+| PUT | `/api/instances/{id}/quota` | `{"quota_mb":2048,"policy":"freeze"}` (each field optional) | the same view; `400 invalid_quota` / `400 invalid_policy`, `404` unknown instance |
+| GET | `/api/instances/{id}/usage/detail` | — | `{"instance":"alice","data_dir":"…","data":{"total_bytes":…,"tmp_bytes":…,"cache_bytes":…,"logs_bytes":…,"other_bytes":…,"file_count":…},"docker_log_path":"…","docker_log_bytes":…,"image":"…","image_bytes":…,"quota":{…},"last_event":{…}}` |
+| POST | `/api/instances/{id}/quota/cleanup` | `{}` | `{"instance":"alice","before_bytes":…,"after_bytes":…,"freed_bytes":…,"removed_files":3,"removed_paths":["cache","logs/agent.log.1","tmp"]}` |
+| GET | `/api/disk/events?instance=&limit=50` | — | `[{"id":1,"instance":"alice","at":"…","action":"warn","before_bytes":…,"after_bytes":…,"detail":"…"}]`, newest first, `limit` 1..=500 |
+
+`state` is `ok` (< 80 %), `warn` (>= 80 %) or `exceeded` (>= 100 %). `used_bytes`
+comes from the driver sample (`du`); the detail endpoint falls back to a
+filesystem walk when Docker is unreachable. `docker_log_path`/`docker_log_bytes`
+are omitted when Docker does not report a json-file log. `action` is one of
+`warn`, `freeze`, `stop`, `clean`.
 
 ## Images and rolling upgrades
 

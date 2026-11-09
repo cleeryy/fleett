@@ -24,6 +24,11 @@ pub const DEFAULT_WATCHDOG_INTERVAL_S: u64 = 30;
 pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
 /// Proxy every instance with a destination policy is pointed at (issue #41).
 pub const DEFAULT_EGRESS_PROXY: &str = "http://fleett-egress-proxy:3128";
+
+/// Free space the host must keep around before a create (`FLEETT_MIN_FREE_DISK_MB`).
+pub const DEFAULT_MIN_FREE_DISK_MB: u64 = 2048;
+/// Period of the disk quota tick (`FLEETT_QUOTA_INTERVAL_S`).
+pub const DEFAULT_QUOTA_INTERVAL_S: u64 = 60;
 /// Key file used to encrypt instance secrets at rest.
 ///
 /// Outside `FLEETT_ROOT` on purpose: a backup of the data root must never
@@ -420,6 +425,12 @@ pub struct Config {
     /// Optional fleet-wide caps. `0` (the default) disables the cap.
     pub max_total_cpu: f64,
     pub max_total_mem_mb: u64,
+    /// Free space (MB) the host must keep after a create
+    /// (`FLEETT_MIN_FREE_DISK_MB`, default 2048; `0` disables the guard).
+    pub min_free_disk_mb: u64,
+    /// Period of the disk quota tick (`FLEETT_QUOTA_INTERVAL_S`, default 60;
+    /// `0` disables the background loop for good).
+    pub quota_interval_s: u64,
     /// Enforcement of the host egress firewall (`FLEETT_EGRESS`).
     pub egress: EgressMode,
     /// Marker written by `fleett egress install` (`FLEETT_EGRESS_MARKER`).
@@ -645,6 +656,23 @@ impl Config {
             })?,
         };
 
+        let min_free_disk_mb = match get("MIN_FREE_DISK_MB") {
+            None => DEFAULT_MIN_FREE_DISK_MB,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_MIN_FREE_DISK_MB",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+        let quota_interval_s = match get("QUOTA_INTERVAL_S") {
+            None => DEFAULT_QUOTA_INTERVAL_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_QUOTA_INTERVAL_S",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
         let web_dist = get("WEB_DIST").map(PathBuf::from).or_else(|| {
             ["web/dist", "../web/dist"]
                 .iter()
@@ -770,6 +798,8 @@ impl Config {
             network,
             max_total_cpu,
             max_total_mem_mb,
+            min_free_disk_mb,
+            quota_interval_s,
             egress,
             egress_marker,
             secrets_key,
@@ -815,6 +845,11 @@ impl Config {
             network: DEFAULT_NETWORK.to_string(),
             max_total_cpu: 0.0,
             max_total_mem_mb: 0,
+            // The guard is on by default; tests inject their own free-space
+            // value through `quota::ensure_capacity` instead of `df`.
+            min_free_disk_mb: DEFAULT_MIN_FREE_DISK_MB,
+            // No background loop in tests: they call `quota::tick` directly.
+            quota_interval_s: 0,
             egress: EgressMode::Off,
             egress_marker,
             egress_proxy: DEFAULT_EGRESS_PROXY.to_string(),
