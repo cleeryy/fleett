@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -115,6 +115,9 @@ fn app(state: MockState) -> Router {
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
         .route("/api/health", get(health))
         .route("/api/auth/me", get(me))
+        .route("/api/audit", get(audit_list))
+        .route("/api/audit/export", get(audit_export))
+        .route("/api/audit/expired", axum::routing::delete(audit_purge))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, record))
 }
@@ -144,6 +147,61 @@ async fn record(State(state): State<MockState>, request: Request, next: Next) ->
     });
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
+}
+
+async fn audit_list() -> Json<Value> {
+    Json(json!([
+        {
+            "id": 2,
+            "at": "2026-11-09T10:00:00Z",
+            "actor": "cleeryy@example.test",
+            "role": "admin",
+            "method": "session",
+            "action": "instance.create",
+            "target": "alice",
+            "result": "ok"
+        },
+        {
+            "id": 1,
+            "at": "2026-11-09T09:00:00Z",
+            "actor": "ci",
+            "role": "viewer",
+            "method": "bearer",
+            "action": "auth.mutation_refused",
+            "target": "/api/shares",
+            "result": "refused"
+        }
+    ]))
+}
+
+async fn audit_export() -> Response {
+    let body = concat!(
+        "{\"id\":1,\"at\":\"2026-11-09T09:00:00Z\",\"actor\":\"ci\",\"role\":\"viewer\",",
+        "\"method\":\"bearer\",\"action\":\"share.create\",\"target\":\"findings\",\"result\":\"ok\"}\n"
+    );
+    let signature = format!(
+        "sha256={}",
+        fleett::audit::sign(b"cli-test-key", body.as_bytes())
+    );
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    headers.insert(
+        "x-fleett-signature",
+        HeaderValue::from_str(&signature).expect("signature header"),
+    );
+    response
+}
+
+async fn audit_purge() -> Json<Value> {
+    Json(json!({
+        "removed": 2,
+        "cutoff": "2026-08-11T00:00:00Z",
+        "retention": "90d"
+    }))
 }
 
 fn status_of(id: &str) -> &'static str {
@@ -931,4 +989,99 @@ async fn images_json_passes_the_server_payload_through() {
     let images = value.as_array().expect("array");
     assert_eq!(images.len(), 2);
     assert_eq!(images[0]["instances"], json!(["alice"]));
+}
+
+#[tokio::test]
+async fn audit_lists_filters_and_exports_a_verified_file() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["audit", "--actor", "cleeryy@example.test", "--limit", "5"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("instance.create"), "{text}");
+    assert!(text.contains("refused"), "{text}");
+    let request = server.request("GET", "/api/audit");
+    assert_eq!(request.query("actor"), Some("cleeryy@example.test"));
+    assert_eq!(request.query("limit"), Some("5"));
+
+    let file = home.path().join("audit.jsonl");
+    let path = file.to_str().expect("UTF-8 path");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "audit",
+            "export",
+            "--from",
+            "2026-11-01",
+            "--to",
+            "2026-11-30",
+            "-f",
+            path,
+            "--key",
+            "cli-test-key",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("signature verified"), "{text}");
+    let exported = std::fs::read_to_string(&file).expect("exported file");
+    assert!(exported.contains("\"action\":\"share.create\""));
+    let signature = std::fs::read_to_string(format!("{path}.sig")).expect("signature file");
+    assert!(
+        signature.starts_with("sha256="),
+        "signature file: {signature}"
+    );
+    let request = server.request("GET", "/api/audit/export");
+    assert_eq!(request.query("from"), Some("2026-11-01"));
+    assert_eq!(request.query("to"), Some("2026-11-30"));
+
+    // A wrong key must refuse the export instead of writing it.
+    let rejected = home.path().join("rejected.jsonl");
+    let rejected_path = rejected.to_str().expect("UTF-8 path");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "audit",
+            "export",
+            "--from",
+            "2026-11-01",
+            "--to",
+            "2026-11-30",
+            "-f",
+            rejected_path,
+            "--key",
+            "wrong-key",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("does not match"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!rejected.exists(), "a rejected export must not be kept");
+
+    let output = run_against(&server, home.path(), &["audit", "purge"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("removed 2 audit entries"),
+        "{}",
+        stdout(&output)
+    );
+    server.request("DELETE", "/api/audit/expired");
+
+    let output = run_against(&server, home.path(), &["--json", "audit", "--limit", "1"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value[0]["action"], "instance.create");
 }

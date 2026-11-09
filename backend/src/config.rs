@@ -356,6 +356,10 @@ pub struct Config {
     pub hardening: Hardening,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Key signing `GET /api/audit/export` (`FLEETT_AUDIT_HMAC_KEY`), decoded.
+    pub audit_hmac_key: Option<crate::audit::AuditKey>,
+    /// Rows older than this are pruned (`FLEETT_AUDIT_RETENTION`, default 90d).
+    pub audit_retention: chrono::Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +582,28 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
 
+        let audit_hmac_key = match get("AUDIT_HMAC_KEY") {
+            None => None,
+            Some(value) => Some(crate::audit::AuditKey::new(
+                crate::audit::parse_key(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_HMAC_KEY",
+                    value: "<redacted>".to_string(),
+                    detail,
+                })?,
+            )),
+        };
+        let audit_retention = match get("AUDIT_RETENTION") {
+            None => crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("the default retention is valid"),
+            Some(value) => {
+                crate::audit::parse_retention(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_RETENTION",
+                    value: value.clone(),
+                    detail,
+                })?
+            }
+        };
+
         Ok(Self {
             root,
             bind,
@@ -598,6 +624,8 @@ impl Config {
             web_dist,
             hardening,
             metrics,
+            audit_hmac_key,
+            audit_retention,
         })
     }
 
@@ -634,6 +662,9 @@ impl Config {
             hardening: Hardening::Standard,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            audit_hmac_key: None,
+            audit_retention: crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("the default retention is valid"),
         }
     }
 
@@ -1484,6 +1515,42 @@ FLEETT_NETWORK='fleett-net'
         assert!(!debug.contains("super-client-secret"), "{debug}");
         assert!(!debug.contains(&secret), "{debug}");
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn audit_export_key_and_retention_are_resolved_and_redacted() {
+        let hex = "ab".repeat(32);
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("token".to_string()),
+            "FLEETT_AUDIT_HMAC_KEY" => Some(hex.clone()),
+            "FLEETT_AUDIT_RETENTION" => Some("24h".to_string()),
+            _ => None,
+        })
+        .expect("audit config resolves");
+        assert_eq!(
+            cfg.audit_hmac_key.as_ref().expect("key").as_bytes(),
+            vec![0xabu8; 32].as_slice()
+        );
+        assert_eq!(cfg.audit_retention, chrono::Duration::hours(24));
+        let debug = format!("{:?}", cfg);
+        assert!(!debug.contains(&hex), "{debug}");
+        assert!(debug.contains("AuditKey(<redacted>)"), "{debug}");
+
+        // The default retention is 90 days; an invalid value refuses to start.
+        let cfg = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("token".to_string()),
+            _ => None,
+        })
+        .expect("defaults");
+        assert_eq!(cfg.audit_retention, chrono::Duration::days(90));
+
+        let err = Config::from_lookup(|key| match key {
+            "FLEETT_TOKEN" => Some("token".to_string()),
+            "FLEETT_AUDIT_RETENTION" => Some("next year".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid retention");
+        assert!(err.to_string().contains("FLEETT_AUDIT_RETENTION"), "{err}");
     }
 
     #[test]

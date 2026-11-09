@@ -142,6 +142,8 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/auth/check", get(auth::check))
         .route("/auth/me", get(auth::me))
         .route("/audit", get(audit::list))
+        .route("/audit/export", get(audit::export))
+        .route("/audit/expired", delete(audit::purge))
         .route("/messages", get(bus::list))
         .route("/messages/expired", delete(bus::purge))
         .route("/memory", get(memory::list).post(memory::write))

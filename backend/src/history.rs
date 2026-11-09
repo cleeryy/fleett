@@ -1003,6 +1003,7 @@ mod tests {
             method,
             user: None,
             ip: None,
+            user_agent: None,
         }
     }
 
@@ -1017,6 +1018,7 @@ mod tests {
                 name: Some("Cleeryy".to_string()),
             }),
             ip: None,
+            user_agent: None,
         }
     }
 

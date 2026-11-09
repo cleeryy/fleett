@@ -153,6 +153,9 @@ pub enum CliError {
     /// `fleett upgrade` already printed the per-instance results.
     #[error("one or more instances were not upgraded")]
     UpgradeIncomplete,
+    /// `fleett audit export --key` could not reproduce the server signature.
+    #[error("{0}")]
+    Verification(String),
 }
 
 impl CliError {
@@ -165,6 +168,7 @@ impl CliError {
             Self::Decode(_) => "decode_error",
             Self::ChecksFailed => "checks_failed",
             Self::UpgradeIncomplete => "upgrade_incomplete",
+            Self::Verification(_) => "signature_mismatch",
         }
     }
 
@@ -291,6 +295,42 @@ impl Client {
             Err(parse_api_error(status, &text))
         }
     }
+
+    /// Like [`Client::text`], also returning `X-Fleett-Signature`, so
+    /// `fleett audit export` can verify the exact downloaded body.
+    async fn download(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(String, Option<String>), CliError> {
+        let url = format!("{}{}", self.base, path);
+        let mut request = self.http.get(&url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        let response = request.send().await.map_err(|err| CliError::Transport {
+            url: url.clone(),
+            detail: err.to_string(),
+        })?;
+        let status = response.status().as_u16();
+        let signature = response
+            .headers()
+            .get("x-fleett-signature")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let text = response.text().await.map_err(|err| CliError::Transport {
+            url: url.clone(),
+            detail: err.to_string(),
+        })?;
+        if (200..300).contains(&status) {
+            Ok((text, signature))
+        } else {
+            Err(parse_api_error(status, &text))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +356,38 @@ pub enum Command {
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
     Memory(MemoryCommand),
+    Audit(AuditCommand),
+}
+
+/// Sub-commands of `fleett audit`.
+#[derive(Debug, Clone)]
+pub enum AuditCommand {
+    List(AuditListArgs),
+    Export(AuditExportArgs),
+    Purge,
+}
+
+/// Filters of `fleett audit` (list mode).
+#[derive(Debug, Clone, Default)]
+pub struct AuditListArgs {
+    pub actor: Option<String>,
+    pub action: Option<String>,
+    pub target: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub result: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// Arguments of `fleett audit export`.
+#[derive(Debug, Clone)]
+pub struct AuditExportArgs {
+    pub from: String,
+    pub to: String,
+    pub file: PathBuf,
+    /// Key used to verify the signature (`hex:`/`raw:` or auto-detected).
+    pub key: Option<String>,
 }
 
 /// Sub-commands of `fleett memory`.
@@ -454,6 +526,7 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
         Command::Memory(command) => memory(&client, json, &command).await,
+        Command::Audit(command) => audit(&client, json, &command).await,
     }
 }
 
@@ -894,6 +967,26 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
     Ok(())
 }
 
+/// One row of `GET /api/audit`, the subset the table prints.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AuditEntryView {
+    id: i64,
+    at: String,
+    actor: String,
+    action: String,
+    target: String,
+    #[serde(default)]
+    result: String,
+}
+
+/// Response of `DELETE /api/audit/expired`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AuditPurgeView {
+    removed: usize,
+    cutoff: String,
+    retention: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MemoryEntryView {
     id: i64,
@@ -1274,6 +1367,143 @@ async fn images(client: &Client, json: bool) -> Result<(), CliError> {
         render_table(&["TAG", "ID", "SIZE", "CREATED", "INSTANCES"], &rows)
     );
     Ok(())
+}
+
+async fn audit(client: &Client, json: bool, command: &AuditCommand) -> Result<(), CliError> {
+    match command {
+        AuditCommand::List(args) => {
+            let mut query: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
+            if args.offset > 0 {
+                query.push(("offset", args.offset.to_string()));
+            }
+            for (name, value) in [
+                ("actor", &args.actor),
+                ("action", &args.action),
+                ("target", &args.target),
+                ("from", &args.from),
+                ("to", &args.to),
+                ("result", &args.result),
+            ] {
+                if let Some(value) = value {
+                    query.push((name, value.clone()));
+                }
+            }
+            let value = client
+                .value(Method::GET, "/api/audit", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<AuditEntryView> = decode(value)?;
+            if entries.is_empty() {
+                println!("no audit entries");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.to_string(),
+                        entry.at.clone(),
+                        entry.actor.clone(),
+                        entry.action.clone(),
+                        entry.target.clone(),
+                        entry.result.clone(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "AT", "ACTOR", "ACTION", "TARGET", "RESULT"], &rows)
+            );
+            Ok(())
+        }
+        AuditCommand::Export(args) => {
+            let query = [("from", args.from.clone()), ("to", args.to.clone())];
+            let (body, signature) = client.download("/api/audit/export", &query).await?;
+            let signature = signature.ok_or_else(|| {
+                CliError::Decode(
+                    "the server returned no X-Fleett-Signature header: refusing to keep an \
+                     unverifiable export"
+                        .to_string(),
+                )
+            })?;
+            let key = args
+                .key
+                .as_deref()
+                .map(crate::audit::parse_key)
+                .transpose()
+                .map_err(CliError::Config)?;
+            let verified = match &key {
+                Some(key) => {
+                    let expected = format!(
+                        "{}{}",
+                        crate::audit::SIGNATURE_PREFIX,
+                        crate::audit::sign(key, body.as_bytes())
+                    );
+                    if expected != signature {
+                        return Err(CliError::Verification(format!(
+                            "the export signature does not match the supplied key: server \
+                             {signature}, computed {expected}"
+                        )));
+                    }
+                    true
+                }
+                None => false,
+            };
+            std::fs::write(&args.file, body.as_bytes()).map_err(|err| {
+                CliError::Config(format!("cannot write {}: {err}", args.file.display()))
+            })?;
+            let signature_file = signature_path(&args.file);
+            std::fs::write(&signature_file, format!("{signature}\n")).map_err(|err| {
+                CliError::Config(format!("cannot write {}: {err}", signature_file.display()))
+            })?;
+            let records = body.lines().filter(|line| !line.trim().is_empty()).count();
+            if json {
+                return print_json(&json!({
+                    "file": args.file.display().to_string(),
+                    "signature_file": signature_file.display().to_string(),
+                    "signature": signature,
+                    "records": records,
+                    "verified": verified,
+                }));
+            }
+            println!(
+                "wrote {records} audit entries to {} ({signature})",
+                args.file.display()
+            );
+            if verified {
+                println!("signature verified with the supplied key");
+            } else {
+                println!(
+                    "signature saved to {}; re-verify with `--key`",
+                    signature_file.display()
+                );
+            }
+            Ok(())
+        }
+        AuditCommand::Purge => {
+            let value = client
+                .value(Method::DELETE, "/api/audit/expired", &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let report: AuditPurgeView = decode(value)?;
+            println!(
+                "removed {} audit entries older than {} (retention {})",
+                report.removed, report.cutoff, report.retention
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `entries.jsonl` → `entries.jsonl.sig`.
+fn signature_path(file: &Path) -> PathBuf {
+    let mut name = file.file_name().unwrap_or_default().to_os_string();
+    name.push(".sig");
+    file.with_file_name(name)
 }
 
 async fn upgrade(client: &Client, json: bool, args: &UpgradeArgs) -> Result<(), CliError> {

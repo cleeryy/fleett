@@ -234,6 +234,57 @@ enum Commands {
         #[command(subcommand)]
         action: MemoryCommands,
     },
+    /// Consult, export or prune the audit trail (client mode).
+    ///
+    /// Without a sub-command, lists the newest entries. See docs/AUDIT.md.
+    Audit {
+        /// Exact actor (email, token name or `bootstrap`).
+        #[arg(long)]
+        actor: Option<String>,
+        /// Exact action (`instance.create`).
+        #[arg(long)]
+        action: Option<String>,
+        /// Exact target (instance id, token id…).
+        #[arg(long)]
+        target: Option<String>,
+        /// RFC 3339 instant or YYYY-MM-DD (inclusive).
+        #[arg(long)]
+        from: Option<String>,
+        /// RFC 3339 instant or YYYY-MM-DD (inclusive).
+        #[arg(long)]
+        to: Option<String>,
+        /// `ok`, `failed` or `refused`.
+        #[arg(long)]
+        result: Option<String>,
+        /// Page size (1..=1000).
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+        /// Rows to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        #[command(subcommand)]
+        command: Option<AuditCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Download one range as signed JSON Lines (HMAC-SHA256).
+    Export {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        /// Destination file (the signature is written next to it, `<file>.sig`).
+        #[arg(long, short = 'f', value_name = "FILE")]
+        file: PathBuf,
+        /// Key used to verify the signature (hex or raw); verification is
+        /// mandatory when provided.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Delete every row older than FLEETT_AUDIT_RETENTION and journal it.
+    Purge,
 }
 
 #[derive(Subcommand)]
@@ -559,6 +610,43 @@ async fn main() -> anyhow::Result<()> {
             };
             cli::run(cli::Command::Memory(command), json).await
         }
+        Commands::Audit {
+            actor,
+            action,
+            target,
+            from,
+            to,
+            result,
+            limit,
+            offset,
+            command,
+        } => {
+            let command = match command {
+                Some(AuditCommands::Export {
+                    from,
+                    to,
+                    file,
+                    key,
+                }) => cli::AuditCommand::Export(cli::AuditExportArgs {
+                    from,
+                    to,
+                    file,
+                    key,
+                }),
+                Some(AuditCommands::Purge) => cli::AuditCommand::Purge,
+                None => cli::AuditCommand::List(cli::AuditListArgs {
+                    actor,
+                    action,
+                    target,
+                    from,
+                    to,
+                    result,
+                    limit,
+                    offset,
+                }),
+            };
+            cli::run(cli::Command::Audit(command), json).await
+        }
     };
 
     if code != 0 {
@@ -632,6 +720,8 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state.clone());
 
+    spawn_audit_housekeeping(state.clone());
+
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
     }
@@ -653,6 +743,35 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())
+}
+
+/// Apply `FLEETT_AUDIT_RETENTION` once a day for the life of the process.
+///
+/// The endpoint `DELETE /api/audit/expired` applies the same policy on demand;
+/// both journal the purge when they remove something. The first tick is one
+/// period away: a restart must not masquerade as a daily housekeeping run.
+fn spawn_audit_housekeeping(state: AppState) {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(86_400);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        loop {
+            ticker.tick().await;
+            match fleett::api::audit::purge_expired(&state, None) {
+                Ok(report) if report.removed > 0 => tracing::info!(
+                    removed = report.removed,
+                    cutoff = %report.cutoff,
+                    retention = %report.retention,
+                    "audit retention applied"
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    code = err.code,
+                    detail = %err.message,
+                    "audit retention failed"
+                ),
+            }
+        }
+    });
 }
 
 /// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).

@@ -64,6 +64,10 @@ fleett memory history <id>
 fleett memory restore <id> <version>
 fleett memory delete <id>
 fleett memory promote <id> [--namespace global]
+fleett audit [--actor A] [--action A] [--target T] [--from D] [--to D] [--result ok|failed|refused]
+             [--limit N] [--offset N]
+fleett audit export --from D --to D -f FILE [--key HEX]
+fleett audit purge
 fleett doctor
 ```
 
@@ -207,6 +211,28 @@ fleett memory promote 12 --namespace global
 
 Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
 the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+
+### `audit`
+
+Consult the audit trail ([docs/AUDIT.md](AUDIT.md)), export a signed range, or
+apply the retention:
+
+```bash
+fleett audit --actor cleeryy@example.test --from 2026-11-01 --limit 50
+fleett audit --action instance.delete --result ok
+fleett audit export --from 2026-11-01 --to 2026-11-30 -f audit.jsonl --key "$FLEETT_AUDIT_HMAC_KEY"
+fleett audit purge
+fleett --json audit --limit 10 | jq '.[] | {at, actor, action, target, result}'
+```
+
+Without a sub-command it prints the newest first (`ID`, `AT`, `ACTOR`, `ACTION`,
+`TARGET`, `RESULT`). `--json` prints the raw rows. `export` downloads
+`application/x-ndjson`, checks `X-Fleett-Signature` when `--key` is given (hex
+or raw, same grammar as `FLEETT_AUDIT_HMAC_KEY`), writes the file and its
+`<file>.sig` signature, and exits `1` on a mismatch without writing anything.
+`purge` calls `DELETE /api/audit/expired` and prints the number of removed
+entries, the cutoff and the configured retention (`90d` by default).
+`--key` is only used for verification: the server already signed the body.
 
 ### `doctor`
 
