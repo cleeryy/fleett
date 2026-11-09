@@ -61,8 +61,8 @@ release: a `.deb` (systemd unit, UID 10000, secrets key) and the image
 <summary><strong>Debian / Ubuntu</strong></summary>
 
 ```bash
-curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.5.0_amd64.deb
-sudo dpkg -i fleett_0.5.0_amd64.deb
+curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.6.0_amd64.deb
+sudo dpkg -i fleett_0.6.0_amd64.deb
 sudoedit /etc/fleett/fleett.env   # set FLEETT_TOKEN
 sudo systemctl enable --now fleett
 ```
@@ -79,7 +79,7 @@ docker run -d --name fleett \
   -e FLEETT_TOKEN=change-me \
   -e FLEETT_DRIVER=compose \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-  ghcr.io/cleeryy/fleett:0.5.0
+  ghcr.io/cleeryy/fleett:0.6.0
 ```
 </details>
 
