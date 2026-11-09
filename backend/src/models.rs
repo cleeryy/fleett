@@ -35,6 +35,95 @@ pub const RESERVED_ENV_KEYS: [&str; 4] = ["HERMES_UID", "HERMES_GID", "PATH", "H
 /// Prefix reserved for the control plane itself.
 pub const RESERVED_ENV_PREFIX: &str = "FLEETT_";
 
+/// Default number of consecutive unhealthy samples before the watchdog opens an
+/// incident (and, when healing is enabled, before it acts).
+pub const DEFAULT_UNHEALTHY_AFTER: u32 = 3;
+/// Default number of heal attempts before the watchdog gives up.
+pub const DEFAULT_MAX_RESTARTS: u32 = 5;
+/// Default base delay between two heal attempts, in seconds.
+pub const DEFAULT_HEAL_BACKOFF_S: u64 = 30;
+/// Longest delay between two heal attempts (exponential backoff cap).
+pub const HEAL_BACKOFF_CAP_S: u64 = 30 * 60;
+/// Bounds accepted by the API for `unhealthy_after`.
+pub const UNHEALTHY_AFTER_MIN: u32 = 1;
+pub const UNHEALTHY_AFTER_MAX: u32 = 100;
+/// Bounds accepted by the API for `max_restarts` (0 disables healing attempts
+/// while incidents are still recorded).
+pub const MAX_RESTARTS_MAX: u32 = 100;
+/// Bounds accepted by the API for `heal_backoff_s`.
+pub const HEAL_BACKOFF_MIN_S: u64 = 1;
+pub const HEAL_BACKOFF_MAX_S: u64 = 3600;
+
+/// Self-healing policy of one instance (issue #32).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealPolicy {
+    /// Observe only: incidents are recorded, no container action is taken.
+    #[default]
+    Off,
+    /// `docker compose restart` after the unhealthy threshold.
+    Restart,
+    /// `docker compose down` then `up -d`: the container is rebuilt.
+    Recreate,
+}
+
+impl HealPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Restart => "restart",
+            Self::Recreate => "recreate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "observe" => Some(Self::Off),
+            "restart" => Some(Self::Restart),
+            "recreate" => Some(Self::Recreate),
+            _ => None,
+        }
+    }
+
+    /// `true` when the watchdog may touch the container.
+    pub fn heals(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for HealPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn validate_unhealthy_after(value: u32) -> Result<(), String> {
+    if !(UNHEALTHY_AFTER_MIN..=UNHEALTHY_AFTER_MAX).contains(&value) {
+        return Err(format!(
+            "unhealthy_after must be between {UNHEALTHY_AFTER_MIN} and {UNHEALTHY_AFTER_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_max_restarts(value: u32) -> Result<(), String> {
+    if value > MAX_RESTARTS_MAX {
+        return Err(format!(
+            "max_restarts must be between 0 and {MAX_RESTARTS_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_heal_backoff(value: u64) -> Result<(), String> {
+    if !(HEAL_BACKOFF_MIN_S..=HEAL_BACKOFF_MAX_S).contains(&value) {
+        return Err(format!(
+            "heal_backoff_s must be between {HEAL_BACKOFF_MIN_S} and {HEAL_BACKOFF_MAX_S}"
+        ));
+    }
+    Ok(())
+}
+
 /// Messaging platform of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
@@ -246,6 +335,14 @@ pub struct InstanceSpec {
     pub previous_image: Option<String>,
     /// Join the unrestricted `<network>-lan` network as well (LAN access).
     pub allow_lan: bool,
+    /// Watchdog policy (issue #32): observe only, restart or recreate.
+    pub heal: HealPolicy,
+    /// Consecutive unhealthy samples before an incident is opened.
+    pub unhealthy_after: u32,
+    /// Heal attempts allowed before the watchdog gives up.
+    pub max_restarts: u32,
+    /// Base delay between two heal attempts, in seconds.
+    pub heal_backoff_s: u64,
     pub notes: String,
     pub status: Status,
     pub last_error: Option<String>,
@@ -1107,6 +1204,35 @@ mod tests {
             assert!(validate_image(invalid).is_err(), "{invalid:?}");
         }
         assert!(validate_image(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn heal_policies_round_trip_and_validate() {
+        for (text, expected) in [
+            ("off", HealPolicy::Off),
+            ("NONE", HealPolicy::Off),
+            ("restart", HealPolicy::Restart),
+            (" Recreate ", HealPolicy::Recreate),
+        ] {
+            assert_eq!(HealPolicy::parse(text), Some(expected), "{text}");
+        }
+        assert_eq!(HealPolicy::parse("heal"), None);
+        assert!(!HealPolicy::Off.heals());
+        assert!(HealPolicy::Restart.heals());
+        assert!(HealPolicy::Recreate.heals());
+        assert_eq!(HealPolicy::Recreate.to_string(), "recreate");
+
+        assert!(validate_unhealthy_after(1).is_ok());
+        assert!(validate_unhealthy_after(100).is_ok());
+        assert!(validate_unhealthy_after(0).is_err());
+        assert!(validate_unhealthy_after(101).is_err());
+        assert!(validate_max_restarts(0).is_ok());
+        assert!(validate_max_restarts(100).is_ok());
+        assert!(validate_max_restarts(101).is_err());
+        assert!(validate_heal_backoff(1).is_ok());
+        assert!(validate_heal_backoff(3600).is_ok());
+        assert!(validate_heal_backoff(0).is_err());
+        assert!(validate_heal_backoff(3601).is_err());
     }
 
     #[test]

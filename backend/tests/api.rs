@@ -2661,6 +2661,7 @@ async fn the_detail_reports_the_docker_inspect_failure() {
             state: "exited".to_string(),
             exit_code: Some(137),
             oom_killed: true,
+            restart_count: 0,
             error: Some("task: non-zero exit (137)".to_string()),
             started_at: None,
         },

@@ -56,7 +56,7 @@ port must not go unnoticed.
 | `fleett_instance_mem_limit_bytes` | gauge | `id` | Memory limit of one container. |
 | `fleett_instance_disk_bytes` | gauge | `id` | Size of the instance data directory (`du`). |
 | `fleett_api_requests_total` | counter | `method`, `status` | HTTP requests served by the API, per method and status code. |
-| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `upgrade`, `rollback`) and result (`ok`, `error`). |
+| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `recreate`, `upgrade`, `rollback`) and result (`ok`, `error`). |
 | `fleett_upgrade_jobs_total` | counter | `result` | Finished rolling upgrade jobs, per final result (`success`, `rolled_back`, `failed`). |
 | `fleett_usage_ok` | gauge | — | `1` when the last utilisation sample could be read from Docker, `0` otherwise (the per-instance usage series are then stale or absent). |
 

@@ -56,6 +56,10 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett incidents [--status open|closed] [--instance ID] [--limit N]
+fleett heal <id> --policy off|restart|recreate
+              [--unhealthy-after N] [--max-restarts N] [--backoff SECONDS]
+fleett incident close <incident-id>
 fleett doctor
 ```
 
@@ -184,6 +188,25 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `incidents` / `heal` / `incident close`
+
+Read the watchdog incident registry and change the self-healing policy
+([docs/WATCHDOG.md](WATCHDOG.md)):
+
+```bash
+fleett incidents
+fleett incidents --status open --instance alice
+fleett heal alice --policy restart --unhealthy-after 2 --max-restarts 3 --backoff 15
+fleett heal alice --policy off
+fleett incident close 3f2a…
+```
+
+`incidents` prints `OPENED`, `INSTANCE`, `CAUSE`, `STATUS`, `RESTARTS` and
+`DETAIL`, newest first. `--json` prints the raw incident array. `heal` prints the
+resulting policy (`id: heal=restart unhealthy_after=2 max_restarts=3 backoff=15s`);
+`incident close` prints the closed incident. Both mutations require an admin
+token and are written to the audit log.
 
 ### `doctor`
 

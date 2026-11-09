@@ -62,6 +62,8 @@ pub struct InspectInfo {
     pub state: String,
     pub exit_code: Option<i32>,
     pub oom_killed: bool,
+    /// `RestartCount`: how many times Docker restarted the container.
+    pub restart_count: u32,
     /// `State.Error`, when Docker recorded one.
     pub error: Option<String>,
     /// `State.StartedAt` as RFC 3339, when the container has ever started.

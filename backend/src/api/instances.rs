@@ -14,9 +14,10 @@ use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
     validate_env_key, validate_env_value, validate_instance_id, validate_mem_limit, validate_model,
     validate_notes, validate_secret_value, validate_share_name, ChannelKind, ChannelRequest,
-    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput, Health,
+    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvVarInput, HealPolicy, Health,
     InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
-    TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_HEAL_BACKOFF_S,
+    DEFAULT_MAX_RESTARTS, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE, DEFAULT_UNHEALTHY_AFTER,
     GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
@@ -1584,6 +1585,10 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             image: state.cfg.image.clone(),
             previous_image: None,
             allow_lan,
+            heal: HealPolicy::Off,
+            unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: DEFAULT_HEAL_BACKOFF_S,
             notes,
             status: Status::Created,
             last_error: None,

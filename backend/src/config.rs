@@ -18,6 +18,8 @@ pub const DEFAULT_ROOT: &str = "/opt/fleett";
 pub const DEFAULT_BIND: &str = "127.0.0.1:8090";
 pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
 pub const DEFAULT_NETWORK: &str = "fleett";
+/// Default sampling interval of the watchdog (`FLEETT_WATCHDOG_INTERVAL_S`).
+pub const DEFAULT_WATCHDOG_INTERVAL_S: u64 = 30;
 /// Marker written by `fleett egress install` and read by the control plane.
 pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
 /// Key file used to encrypt instance secrets at rest.
@@ -356,6 +358,10 @@ pub struct Config {
     pub hardening: Hardening,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Sampling interval of the watchdog, in seconds (`FLEETT_WATCHDOG_INTERVAL_S`,
+    /// default 30). `0` disables the background loop; `fleett incidents` still
+    /// reads the registry.
+    pub watchdog_interval_s: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +584,15 @@ impl Config {
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
 
+        let watchdog_interval_s = match get("WATCHDOG_INTERVAL_S") {
+            None => DEFAULT_WATCHDOG_INTERVAL_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_WATCHDOG_INTERVAL_S",
+                value: value.clone(),
+                detail: format!("{err} (0 disables the watchdog loop)"),
+            })?,
+        };
+
         Ok(Self {
             root,
             bind,
@@ -598,6 +613,7 @@ impl Config {
             web_dist,
             hardening,
             metrics,
+            watchdog_interval_s,
         })
     }
 
@@ -634,6 +650,8 @@ impl Config {
             hardening: Hardening::Standard,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            // Tests drive `watchdog::tick` explicitly; no background loop runs.
+            watchdog_interval_s: 0,
         }
     }
 

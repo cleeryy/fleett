@@ -283,6 +283,41 @@ the path id). 16 KiB max, TTL 30 s … 30 days. A conversation that reaches 8 ho
 
 `DELETE /api/messages/expired` → `{"removed": N}` (admin only).
 
+## Watchdog and incidents
+
+Self-healing is opt-in per instance; see [docs/WATCHDOG.md](docs/WATCHDOG.md).
+The watchdog fills the registry from `docker ps`/`docker inspect` every 30 s
+(`FLEETT_WATCHDOG_INTERVAL_S`).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/incidents?status=open\|closed&instance=&limit=` | — | `Incident[]`, newest first (limit 1…500, default 100) |
+| GET | `/api/instances/{id}/incidents?limit=` | — | `Incident[]` of one instance |
+| POST | `/api/incidents/{id}/close` | — | `Incident` · `409 incident_closed` when already closed (admin) |
+| PATCH | `/api/instances/{id}/heal` | `{"heal":"off\|restart\|recreate","unhealthy_after":3,"max_restarts":5,"heal_backoff_s":30}` | policy view (admin) |
+
+```json
+{
+  "id": "6f1c…",
+  "instance_id": "alice",
+  "cause": "unhealthy",
+  "status": "open",
+  "opened_at": "2026-11-09T10:00:00Z",
+  "detail": "container health check failed for 3 consecutive sample(s) (threshold 3)",
+  "actions": [{"at": "2026-11-09T10:00:30Z", "action": "restart", "result": "ok"}],
+  "restart_count": 0,
+  "last_seen_at": "2026-11-09T10:00:30Z"
+}
+```
+
+`cause`: `oom` · `crashloop` · `unhealthy` · `image_missing` · `heal_failed`.
+`status`: `open` · `closed`; `closed_at` is present once closed. A clean stop
+never opens an incident, and an incident closes by itself on the first healthy
+sample. Both `PATCH …/heal` and the manual close are written to the audit log
+(`instance.heal`, `incident.close`). Invalid policy values answer
+`400 invalid_heal_policy`, `400 invalid_unhealthy_after`,
+`400 invalid_max_restarts` or `400 invalid_heal_backoff_s`.
+
 ## Shares
 
 | Method | Route | Body | Response |
