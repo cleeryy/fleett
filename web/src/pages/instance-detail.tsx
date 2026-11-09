@@ -43,6 +43,7 @@ import { DataList, Section } from "@/components/data-list";
 import { DeleteInstanceDialog } from "@/components/delete-instance-dialog";
 import { DuplicateInstanceDialog } from "@/components/duplicate-instance-dialog";
 import { EmptyState } from "@/components/empty-state";
+import { InstanceMemoryTab, InstanceMessagesTab } from "@/components/instance-bus";
 import { InstanceEnvironment } from "@/components/instance-env";
 import { InstanceFiles } from "@/components/instance-files";
 import { InstanceHistory } from "@/components/instance-history";
@@ -1069,6 +1070,8 @@ export function InstanceDetailPage({ id }: { id: string }) {
             <TabsTrigger value="overview">Overview</TabsTrigger>
             {canEdit ? <TabsTrigger value="configuration">Configuration</TabsTrigger> : null}
             <TabsTrigger value="files">Files</TabsTrigger>
+            <TabsTrigger value="messages">Messages</TabsTrigger>
+            <TabsTrigger value="memory">Memory</TabsTrigger>
             <TabsTrigger value="history">History</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
             <TabsTrigger value="compose">Compose</TabsTrigger>
@@ -1118,6 +1121,14 @@ export function InstanceDetailPage({ id }: { id: string }) {
               onRestarted={() => setNonce((value) => value + 1)}
             />
           ) : null}
+        </TabsContent>
+
+        <TabsContent value="messages" className="mt-4">
+          <InstanceMessagesTab id={data.id} canEdit={canEdit} />
+        </TabsContent>
+
+        <TabsContent value="memory" className="mt-4">
+          <InstanceMemoryTab id={data.id} canEdit={canEdit} />
         </TabsContent>
 
         <TabsContent value="history" className="mt-4">

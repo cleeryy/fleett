@@ -30,7 +30,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | | |
 |---|---|
 | **Lifecycle** | Create from a template, start, stop, restart, delete (data kept or purged), clone with fresh credentials. |
-| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions; per-key `secret` flag; encrypted at rest, values never returned. |
+| **Templates & env** | `guest`, `guest-discord`, `solo`; allowlist suggestions with `example`/`format`/`required`, pre-filled fields and API-validated ids; missing allowlist warning on the instance and in `fleett doctor`; per-key `secret` flag; encrypted at rest, values never returned. |
 | **Providers** | Share one credential across agents, test it, rotate once and restart every linked agent with a per-instance report. |
 | **Files** | Browse and edit `SOUL.md`, skills and notes from the console; ETag conflicts, timestamped backups, “save & restart”. |
 | **History** | One git repo per agent, actor-attributed commits, diff, restore. Readable while the agent is stopped. |
@@ -38,7 +38,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | **Backups** | Rotating host backups, portable instance export/import, restore into a fresh root. |
 | **Upgrades** | Move the whole fleet to a new image: one at a time, health-checked, automatic rollback to the previous tag. |
 | **Security** | OIDC/Authentik with `admin`/`viewer`, CSRF, audit log, named revocable tokens, encrypted secrets, LAN egress firewall, opt-in strict hardening. |
-| **Ops** | Real healthcheck, Prometheus `/metrics`, usage, `fleett doctor`, compose integration in CI. |
+| **Ops** | Real healthcheck, Prometheus `/metrics` with an importable Grafana dashboard and alert rules, usage, `fleett doctor`, compose integration in CI. |
 
 ## Quick start
 
@@ -129,6 +129,8 @@ it — the agents keep running. The SQLite database is a rebuildable index; `ins
   `${KEY}`, and no endpoint returns a secret value.
 - **Humans**: OIDC/Authentik, signed session cookies, `admin`/`viewer`, CSRF double-submit,
   named tokens stored as digests, every mutation in the audit log.
+- **API**: sliding-window rate limits per IP and credential, a progressive lockout after
+  failed logins, and CSP/HSTS/framing headers on every response (`fleett security`).
 
 ## CLI
 
@@ -140,6 +142,7 @@ fleett usage
 fleett upgrade --image hermes-agent:0.23.0-local
 fleett backup --keep 7
 fleett doctor
+fleett security
 ```
 
 Every command accepts `--json`; the server URL and token come from
@@ -151,8 +154,9 @@ Every command accepts `--json`; the server URL and token come from
 |---|---|
 | [Install](docs/INSTALL.md) · [Deploy](docs/DEPLOY.md) · [Packaging](docs/PACKAGING.md) | how to run it, as a binary, a `.deb` or a container |
 | [Security: secrets](docs/SECRETS.md) · [egress](docs/EGRESS.md) · [hardening](docs/HARDENING.md) · [OIDC](docs/OIDC.md) | the guarantees and how to operate them |
-| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [templates](docs/TEMPLATES.md) · [providers](docs/PROVIDERS.md) | the per-agent surface |
+| [Files](docs/FILES.md) · [git](docs/GIT.md) · [env](docs/ENV.md) · [templates](docs/TEMPLATES.md) · [providers](docs/PROVIDERS.md) · [schedules](docs/SCHEDULES.md) | the per-agent surface |
 | [Backup](docs/BACKUP.md) · [upgrade](docs/UPGRADE.md) · [CLI](docs/CLI.md) · [metrics](docs/METRICS.md) · [CI](docs/CI.md) | day-two operations |
+| [MCP](docs/MCP.md) | the fleet as tools for an orchestrating agent |
 
 ## Development
 

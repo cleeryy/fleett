@@ -91,6 +91,10 @@ pub struct ResolvedTemplate {
     /// Parent declared by this template (the chain itself is not exposed).
     pub parent: Option<String>,
     pub read_only: bool,
+    /// `required` keys declared by custom layers of the chain. Built-in
+    /// templates are read-only: their allowlists stay warnings (#27) and never
+    /// make an instance impossible to create.
+    pub enforced_required: Vec<String>,
     pub meta: TemplateMeta,
     pub defaults: TemplateDefaults,
     pub config_yaml: String,
@@ -343,10 +347,22 @@ fn resolve_layer(
         .unwrap_or_default()
         .over(&parent_defaults);
 
+    let mut enforced_required = parent
+        .as_ref()
+        .map(|resolved| resolved.enforced_required.clone())
+        .unwrap_or_default();
+    if !layer.read_only {
+        for entry in &own_env {
+            if entry.required && !enforced_required.contains(&entry.key) {
+                enforced_required.push(entry.key.clone());
+            }
+        }
+    }
     let mut resolved = ResolvedTemplate {
         id: layer.id.clone(),
         parent: clean(meta.parent.as_deref()),
         read_only: layer.read_only,
+        enforced_required,
         meta,
         defaults,
         config_yaml,
@@ -392,6 +408,18 @@ fn model_of(config_yaml: &str) -> Option<String> {
     (!model.is_empty()).then(|| model.to_string())
 }
 
+/// Map a compact built-in declaration onto the API environment suggestion.
+fn builtin_suggestion(entry: &templates_builtin::BuiltinEnv) -> EnvSuggestion {
+    EnvSuggestion {
+        key: entry.key.to_string(),
+        description: entry.description.to_string(),
+        example: entry.example.map(str::to_string),
+        required: entry.required,
+        format: entry.format.map(str::to_string),
+        secret: false,
+    }
+}
+
 fn load_layer(cfg: &Config, id: &str) -> Result<Layer, TemplateError> {
     // Built-ins are compiled constants: a hand-written directory with the same
     // name never shadows them.
@@ -404,13 +432,7 @@ fn load_layer(cfg: &Config, id: &str) -> Result<Layer, TemplateError> {
                 parent: None,
                 default_model: Some(builtin.default_model.to_string()),
                 channel: Some(builtin.channel.to_string()),
-                env: Some(
-                    builtin
-                        .env
-                        .iter()
-                        .map(|(key, description)| EnvSuggestion::new(*key, *description))
-                        .collect(),
-                ),
+                env: Some(builtin.env.iter().map(builtin_suggestion).collect()),
                 source_instance: None,
             },
             config_yaml: Some(builtin.config_yaml.to_string()),
@@ -944,13 +966,7 @@ pub fn reindex(cfg: &Config, db: &Db) -> Result<(), TemplateError> {
             parent: None,
             default_model: Some(builtin.default_model.to_string()),
             channel: Some(builtin.channel.to_string()),
-            env: Some(
-                builtin
-                    .env
-                    .iter()
-                    .map(|(key, description)| EnvSuggestion::new(*key, *description))
-                    .collect(),
-            ),
+            env: Some(builtin.env.iter().map(builtin_suggestion).collect()),
             source_instance: None,
         };
         upsert_index(db, builtin.id, &meta, true, &now)?;

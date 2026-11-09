@@ -8,14 +8,21 @@ Base: `http://127.0.0.1:8090`. Every `/api/*` route requires a bearer token
 Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 (`400` invalid input, `401` missing/wrong credential, `403` role or CSRF
 refusal, `404` unknown, `409` conflict, `422` invalid YAML/compose,
-`502` Docker or provider failure). Unauthenticated API calls never redirect:
-`401` JSON, always.
+`429` rate limit or authentication lockout, `502` Docker or provider failure).
+A `429` always carries `Retry-After` (whole seconds) and
+`details.retry_after_s`. Unauthenticated API calls never redirect: `401` JSON,
+always.
 
 Credentials are resolved in this order: session cookie, then bearer token
-(`FLEETT_TOKEN` = admin, then named tokens). `viewer` tokens and sessions may
-only `GET`/`HEAD`; a mutation returns `403 forbidden`. A cookie-authenticated
-mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
-`403 csrf_required`; bearer clients are exempt.
+(`FLEETT_TOKEN` = admin, then named tokens). Authorization is granted per
+instance: `owner`, `operator` and `viewer` levels come from an `instance_acl`
+row, from a scoped token's `instances` list, or from the global `admin` role.
+See `docs/RBAC.md`. A `viewer` **session** only sees the instances an ACL grants
+it; a bearer token created before scopes existed keeps its global viewer read.
+A write outside an instance route, or a write an instance ACL does not allow,
+returns `403 forbidden`. A cookie-authenticated mutation must also echo the
+`fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise `403 csrf_required`; bearer
+clients are exempt.
 
 ## Health and auth
 
@@ -24,7 +31,7 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 | GET | `/api/health` | `{"ok":true,"version":"0.3.0","driver":"mock\|compose","docker":{"ok":true},"uptime_s":42,"secrets":{"key":true,"key_error":null,"encrypted":2,"plaintext":0},"egress":{"mode":"restrict\|off","marker":true}}` |
 | GET | `/api/auth/config` | `{"mode":"bearer\|oidc\|both","oidc":{"enabled":true,"login_url":"/auth/login"},"bearer":{"enabled":true}}` |
 | GET | `/api/auth/check` | `204` when the credential is valid |
-| GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions) |
+| GET | `/api/auth/me` | `{"authenticated":true,"actor":"…","subject":"…","role":"admin\|viewer","method":"session\|bearer","user":{"sub":"…","email":"…","name":"…"}}` (`user` only for sessions; `subject` is the key matched against `instance_acl.subject`) |
 | GET | `/auth/login` | `303` to the IdP; `404` when OIDC is disabled |
 | GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; failures carry `details.reason` (`cookie_missing`, `state_mismatch`, `expired`). Browsers (`Accept: text/html`) get an HTML page with a retry link, and a missing state cookie redirects to `/auth/login`; API clients keep JSON `400`/`401`/`403`. State lifetime: `FLEETT_OIDC_STATE_TTL_SECS` (default 600) |
 | POST | `/auth/logout` | `204`, clears the fleett cookies |
@@ -33,13 +40,76 @@ mutation must also echo the `fleett_csrf` cookie in `X-Fleett-CSRF`, otherwise
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/audit?limit=200` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","details":{…}}]`, newest first, admin only |
-| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null}]`, never the secret, admin only |
-| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin"}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
+| GET | `/api/audit` | — | `[{"id":1,"at":"…","actor":"…","role":"admin","method":"session","action":"instance.create","target":"alice","ip":"…","user_agent":"…","result":"ok","request_id":null,"details":{…}}]`, newest first, admin only |
+| GET | `/api/audit/export?from=&to=` | — | `200 application/x-ndjson`, one JSON object per line, `Content-Disposition: attachment; filename="fleett-audit-<ts>.jsonl"`, `X-Fleett-Signature: sha256=<hex HMAC-SHA256 of the exact body>`; `409 audit_key_missing` without `FLEETT_AUDIT_HMAC_KEY`, `400 missing_range` without both bounds, admin only |
+| DELETE | `/api/audit/expired` | — | `{"removed":12,"cutoff":"…","retention":"90d"}` deletes rows older than `FLEETT_AUDIT_RETENTION` and appends an `audit.purge` row, admin only |
+`GET /api/audit` filters: `limit` (default 200, max 1000), `offset`, `actor`,
+`action`, `target`, `from`, `to`, `result` (`ok|failed|refused`). `actor`,
+`action`, `target` and `result` are exact matches; `from`/`to` accept RFC 3339
+or `YYYY-MM-DD` (a date-only `to` covers the whole day). The legacy `?limit=`
+behaviour is unchanged.
+
+| GET | `/api/tokens` | — | `[{"id":"…","name":"ci","role":"viewer","created_at":"…","revoked_at":null,"scope":{"instances":["probe"],"actions":["read"]}}]`, never the secret, admin only |
+| POST | `/api/tokens` | `{"name":"ci","role":"viewer\|admin","scope"?}` | `201` with the one-time `token` (`flt_<32 hex>`), admin only |
 | DELETE | `/api/tokens/{id}` | — | `204` (sets `revoked_at`), `404` unknown, admin only |
 
-`role` defaults to `viewer`. Revoking is idempotent. Tokens are stored as a
-SHA-256 digest only.
+`role` defaults to `viewer`. `scope` is optional: `{"instances":["probe"],
+"actions":["read","write","exec"]}` restricts the token to those instance ids
+and actions. Every instance must exist, `actions` is a non-empty subset of
+`read`/`write`/`exec`; violations answer `400 invalid_scope`. An omitted scope
+keeps the legacy global role, and `scope` is absent from `GET /api/tokens` for
+such rows. A scope always intersects the ACL, even for an `admin` token. See
+`docs/RBAC.md`. Revoking is idempotent. Tokens are stored as a SHA-256 digest
+only.
+
+## Instance ACL
+
+Per-instance grants; admin or an `owner` of the instance only. See
+`docs/RBAC.md` for the role matrix and enforcement points.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/instances/{id}/acl` | — | `{"instance":"probe","acl":[{"subject":"cle@example.test","role":"owner","created_at":"…"}]}`, `404` unknown instance |
+| PUT | `/api/instances/{id}/acl` | `{"acl":[{"subject":"…","role":"owner\|operator\|viewer"}]}` | `200` with the new list; replaces every row; `400 invalid_acl` on a bad role/subject/duplicate |
+| DELETE | `/api/instances/{id}/acl/{subject}` | — | `204`, `404` when the subject has no row |
+
+The level is read from SQLite on every request: a grant, a role change or a
+removal applies to the next call. Changes are audited as
+`instance.acl.update` / `instance.acl.delete` with the affected `subject` in
+`details`.
+
+## Security
+
+Every `/api/*` request is rate-limited per `(client IP, credential, route class)`
+and every failed authentication feeds a progressive lockout; see
+[HARDENING.md](docs/HARDENING.md#api-and-control-plane-hardening) for the
+implementation and the environment variables. The limits apply before the route
+handler, so an invalid credential is always a constant `401`, never a `404` that
+would reveal whether an instance exists.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/security/status` | — | `{"rate_limit":{"enabled":true,"limits":{"per_min":120,"auth_per_min":10,"heavy_per_min":30}},"lockout":{"failures":10,"window_s":600,"lockout_s":900,"locked_ips":0},"headers":{"csp":"…","x_frame_options":"DENY","referrer_policy":"no-referrer","permissions_policy":"camera=(), microphone=(), geolocation=()","x_content_type_options":"nosniff","hsts":true},"tokens":{"expired_or_revoked":0,"active":2},"auth_mode":"bearer"}`, admin only |
+
+`429` bodies name the bucket that refused the request:
+
+```json
+{"error":{"code":"rate_limited","message":"too many requests: retry in 42 second(s)",
+  "details":{"retry_after_s":42,"class":"api"}}}
+```
+
+`details.class` is `api`, `auth` or `heavy` for a rate limit;
+`details.reason = "lockout"` identifies a progressive authentication lockout
+(the lock is audited as `auth.lockout`). A `0` limit disables the bucket;
+setting every limit to `0` disables rate limiting.
+
+`/api/health` and `/api/auth/config` are exempt. `/auth/login` and
+`/auth/callback` use the `auth` bucket; routes containing an `exec`, `logs`,
+`files` or `export` segment use the `heavy` bucket. Every response — console,
+API, errors — also carries the security headers (`Content-Security-Policy`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
+`X-Content-Type-Options: nosniff`, and `Strict-Transport-Security` only when
+`FLEETT_PUBLIC_URL` is https).
 
 ## Templates
 
@@ -89,6 +159,48 @@ a template with a `required` env entry the request does not supply returns
 When an env entry omits `secret`, the template schema decides; an explicit
 `secret` in the request wins.
 
+A built-in template looks like:
+
+```json
+[{"id":"guest","name":"Guest","description":"Web + memory, no infra access",
+  "default_model":"deepseek-v4.1-flash","channel":"telegram",
+  "env":[{"key":"TELEGRAM_ALLOWED_USERS","description":"Comma-separated Telegram user ids",
+          "secret":false,"example":"123456789","required":true,"format":"csv-of-ids"},
+         {"key":"GATEWAY_ALLOW_ALL_USERS","description":"Accept every user…",
+          "secret":false,"example":"false","required":false,"format":"bool"}]}]
+```
+
+`example` is the value the console should pre-fill, `required` marks the
+allowlists that make the gateway refuse every message when unset, and `format`
+is enforced by the write endpoints (`csv-of-ids`, `bool`, `url`, `text`). The
+three fields are optional on input: a `templates/<id>/template.yaml` written for
+an older release still parses.
+
+### Instance check
+
+`GET /api/instances/{id}/check` compares the template `required` suggestions
+against the stored environment and the live container health:
+```json
+{"ok":false,
+ "warnings":[{"code":"allowlist_missing","key":"DISCORD_ALLOWED_USERS",
+              "message":"DISCORD_ALLOWED_USERS is required by the guest-discord template but is not set: …",
+              "field":"env.DISCORD_ALLOWED_USERS"}],
+ "template":"guest-discord"}
+```
+
+- `allowlist_missing`: a required key is absent or empty (warning for every
+  channel, stopped or running);
+- `gateway_may_refuse`: the container is `healthy` while a required key is
+  missing;
+- `ok` is `true` iff `warnings` is empty;
+- `field` is the console form field to focus (`env.<KEY>`);
+- `template` is the template id (`InstanceDetail.template`).
+
+The same messages are appended to `InstanceDetail.warnings` (after the
+egress/LAN and plaintext-secrets warnings), so the console does not need to call
+`/check` to display them. Read-only: no health/last_error write, no compose
+call.
+
 ## Providers
 
 Reusable API credentials shared by several agents; see `docs/PROVIDERS.md`.
@@ -109,6 +221,27 @@ request wins. `secret` on `PATCH` rotates the credential and restarts every
 attached instance sequentially (one `restarted` entry each). Instances without
 a provider keep their own `gate_token`/`api_key_env`.
 
+## Declarative state (GitOps)
+
+One document describes the whole fleet; see `docs/GITOPS.md`. The document is
+the raw `fleet.yaml` text (or a JSON object) and never contains a secret value,
+only `secret_ref` references resolved by the control plane at apply time.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/desired-state` | — | `{"applied_at":"…","source":"cli","document_text":"…","document":{…},"in_sync":false,"drift":{…}}`; `document`/`applied_at` are absent before the first apply |
+| GET | `/api/desired-state/drift` | — | `{"found":true,"applied_at":"…","source":"api","in_sync":false,"drift":{…}}` |
+| POST | `/api/desired-state/plan` | `{"document":"<yaml>"}` or the raw document | `Plan`, no write |
+| POST | `/api/desired-state/apply[?allow_delete=true]` | `{"document":"<yaml>","allow_delete":false,"source":"api"}` | `{"plan":{…},"applied":[…],"applied_at":"…","source":"api"}`, admin only |
+
+`Plan` has four arrays of `{"action":"create|update|delete","resource":
+"provider|instance","id":"alice","name":"Alice","fields":[{"field":"model",
+"from":"…","to":"…"}]}`: `create`, `update`, `delete` (executed) and `refused`
+(deletions blocked because `allow_delete` was not set). Applying an equivalent
+document returns an empty plan. Every apply is audited as `gitops.apply`;
+deletions require `allow_delete` (query or body). `409 gitops_conflict` is
+returned when a provider deletion would orphan an instance.
+
 ## Instances
 
 `GET /api/instances` → `InstanceSummary[]`
@@ -116,10 +249,15 @@ a provider keep their own `gate_token`/`api_key_env`.
 {"id":"alice","name":"Alice","template":"guest","model":"deepseek-v4.1-flash",
  "image":"hermes-agent:0.22.2-local","channel":"telegram","status":"running",
  "health":"healthy","cpu_limit":1.0,"allow_lan":false,"provider":"9e2c…",
- "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z"}
+ "shares":["findings"],"last_error":null,"created_at":"2026-11-08T01:00:00Z",
+ "role":"owner"}
 ```
 
-`POST /api/instances` → `201 InstanceDetail`
+The list is filtered server-side: a non-admin only receives the instances it
+may read (ACL or token scope), and `role` is the caller's level on that row
+(`owner`, `operator` or `viewer`). See `docs/RBAC.md`.
+
+`POST /api/instances` → `201 InstanceDetail` (admin only)
 ```json
 {"id":"alice","name":"Alice","template":"guest",
  "model":"deepseek-v4.1-flash",
@@ -132,7 +270,9 @@ a provider keep their own `gate_token`/`api_key_env`.
  "env":[{"key":"DISCORD_ALLOWED_USERS","value":"123","secret":false}]}
 ```
 `id`: `[a-z0-9-]{2,32}`, unique. `channel.type`: `telegram`, `discord` or `none`.
-The token is **never** returned by the API.
+The token is **never** returned by the API. `env` is a list of `{key, value, secret}`; the
+deprecated v0.4.0 map (`{"KEY": "value"}`) is still accepted and stores every entry as a secret
+(see [Environment variables](#environment-variables)).
 
 `GET /api/instances/{id}` → `InstanceDetail`
 ```json
@@ -159,6 +299,12 @@ two differ while an upgrade is in flight or after a failed rollback.
 unhealthy, or the `docker inspect` cause (`State.Error`, `OOMKilled`, non-zero exit code) when
 the container is not healthy. It is `null` for a healthy container and for a clean stop.
 
+`warnings` is a list of human-readable strings. It starts with the host egress/LAN warnings and
+the plaintext-`secrets.env` warning, then carries one line per template warning (missing
+`required` allowlist, gateway healthy but refusing because of it). See "Instance check" above;
+the structured form (with `code`, `key` and `field`) comes from
+`GET /api/instances/{id}/check`.
+
 `PATCH /api/instances/{id}` → `200 InstanceDetail`. Editable fields: `name`, `model`,
 `base_url`, `api_key_env`, `provider` (`null` detaches), `channel` (`token` optional =
 rotation), `shares`, `mem_limit_mb`, `cpu_limit`, `allow_lan`, `notes`, `env`. Rewrites the
@@ -170,10 +316,22 @@ compose file and runs `up -d`.
 
 ### Environment variables
 
+`env` is a **list of objects**:
+
+```json
+[{"key": "DISCORD_ALLOWED_USERS", "value": "123,456", "secret": false}]
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `key` | string | yes | `^[A-Z_][A-Z0-9_]{0,63}$`, not a reserved name |
+| `value` | string \| null | create: yes; PATCH: no; PUT: for a new or non-secret key | `null` deletes on PATCH and keeps a stored secret on PUT |
+| `secret` | boolean | create/PUT: yes; PATCH: no | encrypted at rest and never returned; a missing flag on PATCH keeps the current one (`false` for a new key) |
+
 Every env entry is rendered as `${KEY}` in the compose file and injected by the driver, so no
 value is written to disk. `secret=true` values are encrypted at rest (AES-GCM, same key as the
 instance secrets) and are never returned; `secret=false` values are readable and are returned
-as `value`.
+as `value` by `GET /api/instances/{id}`.
 
 | Method | Route | Body | Effect |
 |---|---|---|---|
@@ -181,11 +339,70 @@ as `value`.
 | DELETE | `/api/instances/{id}/env/{key}` | — | remove one and apply |
 | PATCH | `/api/instances/{id}` | `"env":[…]` | merge: `value:null` deletes, `""` keeps an empty value, missing `secret` keeps the flag |
 
+Two copy-paste examples:
+
+```bash
+# PATCH: merge one key (rewrites compose and runs up -d)
+curl -X PATCH https://fleett.example/api/instances/tchouniz \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[{"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false}]}'
+```
+
+```bash
+# PUT: replace the whole environment
+curl -X PUT https://fleett.example/api/instances/tchouniz/env \
+  -H "Authorization: Bearer $FLEETT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"env":[
+        {"key":"DISCORD_ALLOWED_USERS","value":"123456789","secret":false},
+        {"key":"DISCORD_BOT_TOKEN","secret":true}
+      ]}'
+```
+
 To keep a stored secret in a full replace, resend `{"key":"TOKEN","secret":true}` without a
 `value` (or with `null`). Keys match `^[A-Z_][A-Z0-9_]{0,63}$`; reserved names (`HERMES_UID`,
 `HERMES_GID`, `PATH`, `HOME`, `FLEETT_*`) are refused. `409 secrets_key_missing` means the host
 has no secrets key yet (`sudo fleett secrets init`). Templates expose suggested variables in
-their `env` field (Telegram/Discord allowlists).
+their `env` field (Telegram/Discord allowlists) with `example`, `required` and `format`.
+
+A value that does not match the `format` of its template suggestion is refused on create,
+clone, `PATCH` and `PUT .../env` with `400 invalid_env_format` and
+`details {key, expected, received}`. Unknown keys are never rejected. Formats:
+`csv-of-ids` (comma-separated ASCII digits, spaces allowed), `bool`
+(`true`/`false`/`1`/`0`/`yes`/`no`), `url` (absolute http(s) with a host), `text`
+(non-empty). See `docs/ENV.md`.
+
+#### Deprecated v0.4.0 object form
+
+Releases up to v0.4.0 sent `"env": {"KEY": "value"}` on create. That form is **still accepted**
+by `POST /api/instances`, `PATCH /api/instances/{id}` and `PUT /api/instances/{id}/env`, but it
+is deprecated and logs `deprecated=env_map` at `warn` level. Every entry of it is stored with
+`secret: true` (the v0.4.0 behaviour), so the values are encrypted and never returned by `GET`.
+Migrate to the list form: a non-secret allowlist has to be resent explicitly with
+`"secret": false` (a `PUT` replaces the whole set). The object form is never returned: the
+response `env` is always a list.
+
+A malformed `env` (a string, a number, an array entry that is not an object, an object value
+that is not a string) is a `400 invalid_env` that names the expected schema and the received
+JSON type, instead of axum's raw deserialization text:
+
+```json
+{"error":{"code":"invalid_env","message":"env must be a list of {key,value,secret}","details":{"expected":"sequence","received":"map","example":[{"key":"DISCORD_ALLOWED_USERS","value":"123,456","secret":false}]}}}
+```
+
+Any other deserialization failure of these bodies is a `400 invalid_body`; `error.details.path`
+names the offending field when serde reports one (for example `mem_limit_mb`).
+
+#### Precedence with the historical `secrets.env`
+
+The per-key `instance_env` rows written by the `env` API are the only source the compose file
+interpolates. The historical plaintext `instances/<id>/secrets.env` is still injected by the
+driver while the instance has no row, and `GET` lists its keys as secrets; the first env write
+(`POST`, `PATCH`, `PUT .../env`, `DELETE .../env/{key}`) supersedes it and removes the file. An
+`env` entry therefore always wins over a key of the same name in `secrets.env`, and a value
+that exists only there disappears from the compose file after that write. See `docs/ENV.md` and
+`docs/SECRETS.md`.
 
 ### Instance files
 
@@ -232,6 +449,63 @@ bearer token). A change made outside the API is recorded as `sync: …` by
 `fleett <fleett@localhost>` at startup and after every compose apply. Nothing
 here talks to Docker: a stopped instance still serves its log, diff and revert.
 
+### Snapshots (restore points)
+
+Per-instance restore points for the data of one agent: `data/`, compose,
+rendered config, `SOUL.md` and the `instance_env` rows (secrets stay
+encrypted). Reads need any role, every mutation needs `admin`. The full
+semantics are in [docs/SNAPSHOTS.md](docs/SNAPSHOTS.md).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/snapshots` | `{"label":"before upgrade","ttl_s":604800}` (both optional) | `201 Snapshot`, `400 invalid_snapshot` for a bad label/TTL |
+| GET | `/api/instances/{id}/snapshots` | — | `Snapshot[]`, newest first |
+| POST | `/api/instances/{id}/snapshots/compare` | `{"a":"<id>","b":"<id>"}` | `SnapshotDiff` |
+| GET | `/api/snapshots/{sid}` | — | `Snapshot`, `404` unknown |
+| DELETE | `/api/snapshots/{sid}` | — | `204`, files removed too |
+| POST | `/api/snapshots/{sid}/restore` | — | `200 RestoreReport`, `409 restore_failed` (already rolled back) |
+| DELETE | `/api/snapshots/expired` | — | `{"removed":N,"failed":M}` |
+
+```json
+{"id":"0f0e…","instance_id":"alice",
+ "path":"/opt/fleett/snapshots/0f0e…/20261109-183512.tgz",
+ "label":"before upgrade","created_at":"2026-11-09T18:35:12Z",
+ "expires_at":"2026-11-16T18:35:12Z","size_bytes":1048576,
+ "status":"ok","error":null}
+```
+
+`status`: `ok`, `restoring` (a restore is in progress) or `failed` (the last
+restore was rolled back; `error` carries the reason). `ttl_s` is
+`1..=7776000` (90 days), default 7 days.
+
+`SnapshotDiff`:
+
+```json
+{"instance_id":"alice","a":"<id>","b":"<id>",
+ "added":[{"path":"data/NEW.md","size":12,"sha256":"…"}],
+ "removed":[{"path":"data/OLD.md","size":8,"sha256":"…"}],
+ "changed":[{"path":"data/SOUL.md","size_a":210,"size_b":212,
+             "sha256_a":"…","sha256_b":"…"}],
+ "unchanged":42}
+```
+
+`RestoreReport`:
+
+```json
+{"snapshot":{…},"instance_id":"alice","files":37,"status":"running",
+ "env_restored":true,"compose_restored":true,
+ "previous_data_dir":"/opt/fleett/instances/alice/data.pre-restore-20261109-184001"}
+```
+
+A restore stops the instance, moves `data/` to a `.pre-restore-<ts>` sibling
+(kept, never deleted), extracts the archive, restores the compose file and env
+rows, starts the instance and waits up to 180 s for a healthy container. On any
+failure it puts the previous data directory, compose file and env rows back,
+restarts the instance and answers `409 restore_failed` with
+`error.details {"snapshot","rolled_back":true}`. An `auto:` snapshot is taken
+before upgrades, environment writes and git reverts (best effort: a failed
+snapshot never blocks the operation).
+
 ### LAN access and egress enforcement
 
 `allow_lan` is `false` by default: the instance only joins the restricted `fleett` network.
@@ -248,10 +522,48 @@ Start/stop/restart/delete are never blocked by this policy.
 
 `warnings` is a list of operator-facing strings (empty when there is nothing to report).
 
+### Egress destination policy
+
+Per-instance allowlist/blocklist of destinations, enforced by an operator-run
+Squid proxy. Full model and enforcement limits: [docs/EGRESS-POLICY.md](docs/EGRESS-POLICY.md).
+An instance without a policy keeps the legacy `allow_lan` / `FLEETT_EGRESS`
+behaviour; `GET …/egress` always returns that effective projection with
+`source` set to `explicit`, `allow_lan`, `legacy` or `disabled`.
+
+| Method | Route | Body | Effect |
+|---|---|---|---|
+| GET | `/api/instances/{id}/egress` | — | `{instance,source,mode,fqdns,cidrs,ports,updated_at?,proxy?,proxy_acl?,warnings}` |
+| PUT | `/api/instances/{id}/egress` | `{"mode":"deny\|allow","fqdns":[],"cidrs":[],"ports":[]}` | validate, store, rewrite compose, restart; `400 invalid_egress_policy`; audit `egress.policy.update` |
+| DELETE | `/api/instances/{id}/egress` | — | drop the explicit policy (back to legacy); `404` when none; audit `egress.policy.delete` |
+| POST | `/api/instances/{id}/egress/test` | `{"host":"api.github.com","port":443}` | `{allowed,reason,source,mode,enforced,enforcement?,proxy?}` |
+| GET | `/api/instances/{id}/egress/blocks?limit=200` | — | `[{id,instance_id,host,port,reason?,at}]`, newest first |
+| DELETE | `/api/instances/{id}/egress/blocks` | — | `{"removed":N}`; audit `egress.blocks.clear` |
+| GET | `/api/egress/blocks?instance=&limit=` | — | admin view across the fleet |
+| POST | `/api/egress/blocks` | `{"instance","host","port","reason?"}` | `201` refused-destination record; token required, 120/min/instance |
+
+`mode: "deny"` is an allowlist (empty policy denies everything);
+`mode: "allow"` is a blocklist (empty policy allows everything); `ports` empty
+means every port. `fqdns` are lowercased; a leading `*.` matches subdomains
+only. A policy adds `HTTP_PROXY=http://fleett-egress-proxy:3128`,
+`HTTPS_PROXY` and `NO_PROXY` to the container; `FLEETT_EGRESS_PROXY` overrides
+the address, and an empty/`off` value renders no proxy variable.
+
+`POST …/egress/test` never pretends: `allowed` is the policy decision, while
+`enforced` is true only when the proxy TCP endpoint answers (explicit policy,
+instance not on `fleett-lan`) or the host firewall marker matches (legacy
+`restrict`). Every other case returns `enforced:false` with the reason. The
+socket probe does not verify that the proxy ACLs match the stored policy.
+
+`POST /api/egress/blocks` is authenticated (bearer or session, so a `viewer`
+token cannot POST), validates the host/port/reason, answers `404` for an unknown
+instance and `429 rate_limited` beyond 120 records per instance per minute.
+
 `POST /api/instances/{id}/start|stop|restart` → `200 {"status":"running|stopped"}`
 `DELETE /api/instances/{id}` → `204` (data preserved) · `?purge=true` erases `data/`.
+Requires the `owner` level on the instance (or the admin role): `operator` may write but not
+destroy.
 
-`POST /api/instances/{id}/clone` → `201 InstanceDetail`. Body:
+`POST /api/instances/{id}/clone` → `201 InstanceDetail` (admin only). Body:
 ```json
 {"new_id":"bob","name":"Bob","model":"…",
  "gate_token":"…","channel_token":"…",
@@ -279,13 +591,36 @@ with a timestamp, and `[{"line":"…"}]` otherwise. Invalid values answer `400` 
 the error/warn lines of a bounded window (at most 2000 lines) without returning the log.
 `last_at` is the parsed timestamp of the last matching line (`null` when it has none).
 
+## Exec
+
+One-shot command execution inside an instance container, **admin only** (including the SSE
+route, which is a `GET`). Full security model in [docs/EXEC.md](docs/EXEC.md): argv only
+(no shell), allowlist of basenames, hard denylist, basename-only names, 1..=300 s timeout,
+256 KiB per stream and an `instance.exec` audit row for every attempt.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/exec` | `{"argv":["ls","/opt/data"],"timeout_s":5}` or `{"cmd":"df -h","timeout_s":5}` | `{"exit_code":0,"stdout":"…","stderr":"","timed_out":false,"duration_ms":12,"truncated":false}`; `403 exec_refused` (details: `reason`, `argv`, `allowlist`, `denylist`, `wildcard`); `400 invalid_exec`/`invalid_timeout`; `404`; `502 driver_error` |
+| GET | `/api/instances/{id}/exec/stream?cmd=ls%20%2Fopt%2Fdata&timeout_s=5` | — | `text/event-stream`: `event: stdout` / `event: stderr` with `data: {"line":"…"}`, then `event: exit` with `{"exit_code","timed_out","duration_ms","truncated"}`; a refusal is a JSON `403 exec_refused` before any event |
+| GET | `/api/exec/policy` | — | `{"wildcard":false,"source":"default","allowlist":[…],"denylist":[…],"max_args":32,"max_arg_bytes":4096,"max_output_bytes":262144,"timeout_s":{"default":30,"min":1,"max":300}}`, admin only |
+
+`cmd` is split on whitespace and never given to a shell; it refuses `; | & $ ` < > ( ) \ " '`
+and newlines (`400 invalid_exec`). Send `argv` for an argument containing a space or a quote.
+Default allowlist: `ls cat tail head grep env ps df du date which pwd id uname uptime free echo`
+(`FLEETT_EXEC_ALLOWLIST` replaces it, `*` disables it while the denylist stays in force).
+`env` accepts no argument in allowlist mode. A timeout answers `200` with
+`"timed_out":true` and `"exit_code":null` (the streams are empty); it is not an HTTP error.
+The SSE route is **one-shot**: the command runs to completion, then the captured output is
+emitted and the stream closes — there is no stdin, PTY or session, and `EventSource` cannot
+send a bearer header (use `fetch`). See `docs/EXEC.md`.
+
 `GET /api/instances/{id}/export` → `application/gzip`, `Content-Disposition: attachment;
 filename="<id>.tgz"`. A gzipped tar with `manifest.json` (format/version, `created_at` and the
 instance metadata: id, name, template, model, base_url, api_key_env, channel, mem_limit_mb,
 cpu_limit, allow_lan, shares, notes), `compose.yaml` and `data/` (the full Hermes home).
 Share contents and secrets are never included: no `secrets.env`, no `*.key`, no token value.
 
-`POST /api/instances/import?id=<new_id>&start=false` → `201 InstanceDetail`. The raw gzip
+`POST /api/instances/import?id=<new_id>&start=false` → `201 InstanceDetail` (admin only). The raw gzip
 archive is the request body (`Content-Type: application/gzip`); the id is required and must be
 free (`409 instance_exists`, nothing overwritten). Compression size cap: 2 GiB (`413
 archive_too_large`). Every archive entry is checked first: an absolute path or a `..` component
@@ -297,6 +632,39 @@ Secrets are not restored: `warnings` lists the variables to PATCH
 (`HERMES_GATE_PROFILE_TOKEN`, the platform bot token), and shares named by the manifest are
 attached only when they already exist on this host. Nothing is started unless `start=true`.
 See `docs/BACKUP.md`.
+
+## Shared memory
+
+Key/value knowledge base with FTS5 search, TTL and history. See
+[docs/MEMORY.md](docs/MEMORY.md). Values are knowledge, never secrets.
+
+`POST /api/memory` → `201` (create) or `200` (update) `{"entry": MemoryEntry, "created": bool}`
+
+```json
+{"namespace":"instance:probe","key":"runbook","value":"restart the gateway after an upgrade",
+ "tags":["ops"],"ttl_s":86400}
+```
+
+`namespace`: `global`, `shared`, `instance:<id>` or `project:<name>`. `ttl_s` is optional
+(60 … 31536000). `PUT /api/memory/{id}` updates by id.
+
+`GET /api/memory?namespace=&tag=&limit=50` → `MemoryEntry[]` (newest first, expired and
+deleted entries excluded).
+
+`GET /api/memory/search?q=&namespace=&tags=a,b&limit=50` → `MemoryEntry[]`. Every search
+term is quoted before it reaches FTS5, so `OR`, `NEAR` and column filters are inert. Tags are
+ANDed.
+
+`GET /api/memory/by-key?namespace=&key=` → `MemoryEntry`, `404` when absent.
+
+`GET /api/memory/{id}/history` → `MemoryVersion[]` (newest first). Every write appends a
+version; `DELETE` is a soft delete and stays restorable.
+
+`POST /api/memory/{id}/rollback` `{"version":1}` → `MemoryEntry` (a new version).
+
+`POST /api/memory/{id}/promote` `{"namespace":"global"}` → `MemoryEntry` (copy).
+
+`DELETE /api/memory/{id}` → `204`. `DELETE /api/memory/expired` → `{"removed": N}`.
 
 ## Agent-to-agent messages
 
@@ -321,6 +689,85 @@ the path id). 16 KiB max, TTL 30 s … 30 days. A conversation that reaches 8 ho
 `GET /api/messages?instance=&from=&to=&kind=&limit=` → `Message[]` (admin only).
 
 `DELETE /api/messages/expired` → `{"removed": N}` (admin only).
+
+## Cron schedules
+
+Per-agent cron schedules and their run history; see [docs/SCHEDULES.md](docs/SCHEDULES.md)
+for cron semantics, overlap, catch-up and the run command contract.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| POST | `/api/instances/{id}/schedules` | `{"name","cron","prompt","enabled"?,"timezone"?,"overlap"?,"timeout"?,"catchup"?}` | `201 Schedule` · `400 invalid_cron\|invalid_timeout\|invalid_overlap\|…` · `404 unknown_instance` · `409 schedule_exists` |
+| GET | `/api/instances/{id}/schedules` | — | `[Schedule]`, ordered by name |
+| PATCH | `/api/schedules/{sid}` | every create field, all optional | `200 Schedule` · `404 not_found` |
+| DELETE | `/api/schedules/{sid}` | — | `204` (history included) · `404` |
+| POST | `/api/schedules/{sid}/run` | — | `201 ScheduleRun` (executed inline) · `409 run_in_progress` |
+| GET | `/api/instances/{id}/runs?limit=50` | — | `[ScheduleRun]`, newest first, `limit` `1..=500` |
+| GET | `/api/schedules` | — | `[ScheduleView]`, admin only |
+
+`Schedule`:
+```json
+{"id":"2b6d…","instance_id":"alice","name":"every-five","cron":"*/5 * * * *",
+ "prompt":"summarize","enabled":true,"timezone":"UTC","overlap":"skip",
+ "timeout":300,"catchup":false,
+ "last_run_at":"2026-11-09T10:05:00Z","next_run_at":"2026-11-09T10:10:00Z",
+ "created_at":"…","updated_at":"…"}
+```
+
+`cron` is a five-field expression evaluated in UTC (`*`, `*/n`, lists, ranges,
+stepped ranges; day-of-month and day-of-week are ORed when both are
+restricted). `overlap` is `skip` (default; a due occurrence is recorded as
+`skipped` while the previous run is still going) or `queue` (it waits for the
+next tick after the run finishes). `timeout` is `1..=3600` seconds (default
+300; `timeout_s` is accepted as an alias). `catchup` defaults to `false`: at
+startup a schedule whose slot is long past is moved to its next future
+occurrence; `true` fires exactly one catch-up run. `timezone` is stored but
+evaluation is UTC for now. A disabled schedule has no `next_run_at`.
+
+`ScheduleRun.status`: `running`, `ok`, `error`, `timeout` or `skipped`.
+`exit_code` is the command exit code (`null` on timeout or Docker failure).
+`output` combines stdout and stderr, truncated to 64 KiB. `duration_ms` is the
+wall-clock duration of the command.
+
+`ScheduleView` is a `Schedule` flattened with
+`{"last_run": ScheduleRun|null, "runs_total": 12, "runs_failed": 2,
+"failure_rate": 0.1667}`. Failures are `error` and `timeout`; `skipped` and
+`running` runs are not counted in the rate. Deleting an instance removes its
+schedules and run history.
+## Watchdog and incidents
+
+Self-healing is opt-in per instance; see [docs/WATCHDOG.md](docs/WATCHDOG.md).
+The watchdog fills the registry from `docker ps`/`docker inspect` every 30 s
+(`FLEETT_WATCHDOG_INTERVAL_S`).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/incidents?status=open\|closed&instance=&limit=` | — | `Incident[]`, newest first (limit 1…500, default 100) |
+| GET | `/api/instances/{id}/incidents?limit=` | — | `Incident[]` of one instance |
+| POST | `/api/incidents/{id}/close` | — | `Incident` · `409 incident_closed` when already closed (admin) |
+| PATCH | `/api/instances/{id}/heal` | `{"heal":"off\|restart\|recreate","unhealthy_after":3,"max_restarts":5,"heal_backoff_s":30}` | policy view (admin) |
+
+```json
+{
+  "id": "6f1c…",
+  "instance_id": "alice",
+  "cause": "unhealthy",
+  "status": "open",
+  "opened_at": "2026-11-09T10:00:00Z",
+  "detail": "container health check failed for 3 consecutive sample(s) (threshold 3)",
+  "actions": [{"at": "2026-11-09T10:00:30Z", "action": "restart", "result": "ok"}],
+  "restart_count": 0,
+  "last_seen_at": "2026-11-09T10:00:30Z"
+}
+```
+
+`cause`: `oom` · `crashloop` · `unhealthy` · `image_missing` · `heal_failed`.
+`status`: `open` · `closed`; `closed_at` is present once closed. A clean stop
+never opens an incident, and an incident closes by itself on the first healthy
+sample. Both `PATCH …/heal` and the manual close are written to the audit log
+(`instance.heal`, `incident.close`). Invalid policy values answer
+`400 invalid_heal_policy`, `400 invalid_unhealthy_after`,
+`400 invalid_max_restarts` or `400 invalid_heal_backoff_s`.
 
 ## Shares
 
@@ -367,19 +814,65 @@ when Docker fails, and an empty fleet answers zeros without touching Docker. Und
 The fleet is also checked by `fleett doctor`, which reads `docker`, `secrets` and `egress`
 from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
 
+## Tokens and costs
+
+Token accounting, model prices and monthly budgets ([docs/COST.md](docs/COST.md)).
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/cost?from=&to=&group_by=instance\|model\|day` | — | `200 CostReport` · `400 invalid_range` / `invalid_group_by` |
+| GET | `/api/cost/budgets` | — | `200 [BudgetStatus]` |
+| POST | `/api/usage/ingest` | `{"instance":"alice","lines":["…"]}` or `{"instance":"alice","prompt_tokens":1200,"completion_tokens":300}` | `200 IngestSummary` · `404` unknown instance · `400` invalid payload |
+| GET | `/api/models/pricing` | — | `200 [Pricing]` (latest version per model) |
+| POST | `/api/models/pricing` | `{"model":"m","input_per_mtok":0.27,"output_per_mtok":1.1,"currency":"USD","effective_from":"2026-11-01"}` | `200 Pricing` · `400 invalid_pricing` |
+| DELETE | `/api/models/pricing/{model}` | — | `204` · `404` unknown model |
+| GET | `/api/instances/{id}/budget` | — | `200 BudgetView` (`configured:false` when unset) |
+| PUT | `/api/instances/{id}/budget` | `{"monthly_usd":25,"enabled":true}` | `200 BudgetView` · `400 invalid_budget` |
+
+`GET /api/cost` defaults to the current month up to now. `from` is inclusive;
+a bare date for `to` covers the whole day, an RFC 3339 `to` is exclusive.
+`group_by` accepts `instance` (default), `model` and `day`.
+
+```json
+{"from":"2026-11-01T00:00:00Z","to":"2026-11-09T03:00:00Z","group_by":"instance",
+ "currency":"USD",
+ "totals":{"prompt_tokens":1500,"completion_tokens":500,"total_tokens":2000,
+           "cost_usd":0.006,"events":2},
+ "groups":[{"key":"alice","prompt_tokens":1500,"completion_tokens":500,
+            "total_tokens":2000,"cost_usd":0.006,"events":2}],
+ "top_agents":[{"instance_id":"alice","cost_usd":0.006,"total_tokens":2000}],
+ "budgets":[{"instance_id":"alice","month":"2026-11","monthly_usd":25.0,
+             "enabled":true,"used_usd":0.006,"percent":0.024,"exceeded":false,
+             "projected_month_usd":0.1,"updated_at":"2026-11-09T02:00:00Z"}],
+ "projection":{"month":"2026-11","elapsed_fraction":0.27,
+               "month_to_date_usd":0.006,"projected_usd":0.022}}
+```
+
+`IngestSummary` is `{"parsed":1,"inserted":1,"duplicates":0,"ignored":0}`: a
+replayed payload parses but inserts nothing. `Pricing` is
+`{"model":"…","input_per_mtok":0.27,"output_per_mtok":1.1,"currency":"USD","effective_from":"2026-11-01","updated_at":"…"}`.
+
+Prices are **versioned by `effective_from`**: a new effective date adds a row
+and the historical report is recomputed with the price effective on each event
+day. `DELETE /api/models/pricing/{model}` removes every version. A budget past
+its limit produces a `cost.budget` event through `cost::events::emit` (a WARN
+log line until the incident pipeline is merged). Reads are open to viewers;
+every write is admin-only.
+
 ## Images and rolling upgrades
 
 | Method | Route | Body | Response |
 |---|---|---|---|
 | GET | `/api/images` | — | `[{"tag":"hermes-agent:0.22.2-local","id":"sha256:…","size":"1.2GB","created":"…","instances":["alice"]}]` |
-| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180}` | `202 UpgradeJob` · `409 upgrade_in_progress` · `502 image_unavailable` |
+| POST | `/api/upgrade` | `{"image":"<tag>","parallel":1,"dry_run":false,"timeout_s":180,"canary":0,"soak_s":600,"at":"sun 04:00","window":"nightly"}` | `202 UpgradeJob` · `202 Deployment` when `at` is in the future · `400 invalid_*` · `403 maintenance_window` · `409 upgrade_in_progress` · `502 image_unavailable` |
 | GET | `/api/upgrade` | — | `200 UpgradeJob` (current or last) · `404` before the first job |
 
 `UpgradeJob`:
 ```json
 {"id":"2b6d…","image":"hermes-agent:0.23.0-local",
  "started_at":"2026-11-08T01:00:00Z","finished_at":"2026-11-08T01:04:12Z",
- "dry_run":false,"parallel":1,"timeout_s":180,
+ "dry_run":false,"parallel":1,"timeout_s":180,"canary":1,"soak_s":600,
+ "deployment_id":"2b6d…",
  "results":[{"id":"alice","from":"hermes-agent:0.22.2-local",
              "to":"hermes-agent:0.23.0-local","status":"healthy"},
             {"id":"bob","from":"hermes-agent:0.22.2-local",
@@ -389,14 +882,33 @@ from `/api/health` plus `GET /api/auth/me`; see `docs/CLI.md`.
 
 `status` per instance: `pending`, `upgrading`, `healthy`, `rolled_back`, `failed`. `from` is
 `null` only when the instance had no image recorded yet. `finished_at` is absent while the job
-runs and on a dry run is equal to `started_at`.
+runs and on a dry run is equal to `started_at`. `canary` and `soak_s` are additive fields
+(`0`/`0` for a plain rolling upgrade); `deployment_id` is absent on a dry run.
 
 `POST /api/upgrade` pulls the image first (`docker image inspect`, then `docker pull`) and
 answers `502 image_unavailable` with the Docker detail when it cannot; nothing is written in
-that case. Requests are validated: `image` is required (`400 invalid_image`), `parallel` is
-`1..=16` (default `1`, i.e. sequential), `timeout_s` is `1..=3600` (default `180`). A second
-job while one runs answers `409 upgrade_in_progress`, whatever the body. Admin only: a viewer
-gets `403 forbidden` like every other mutation.
+that case, but the failed attempt is journaled as a `failed` deployment. Requests are
+validated: `image` is required (`400 invalid_image`), `parallel` is `1..=16` (default `1`,
+i.e. sequential), `timeout_s` is `1..=3600` (default `180`), `canary` is at most the fleet size
+(`400 invalid_canary`), `soak_s` is `0..=3600` (default `600`, `400 invalid_soak`) and `window`
+must name an enabled window (`400 invalid_window`). A second job while one runs answers
+`409 upgrade_in_progress`, whatever the body. Admin only: a viewer gets `403 forbidden` like
+every other mutation.
+
+Before the pull, the maintenance gate runs: when at least one enabled window exists and none is
+open, the request answers `403 maintenance_window` with `details.next_open` (see below). A past
+`at` is `400 invalid_at`.
+
+With `canary: N`, the first N instances move first and must stay healthy for `soak_s` seconds
+(probed every 10 s) before the rest moves; a canary that fails — during its own upgrade or
+during the soak — stops the deployment and the other instances stay untouched (`pending`, with
+`error: "not attempted: …"`). A canary that degrades during the soak is rolled back to its
+previous image. See `docs/DEPLOYMENTS.md`.
+
+With a future `at` (RFC 3339 or `sun 04:00`, UTC), nothing is pulled now: the response is
+`202` with the `Deployment` row (`status: "scheduled"`, `started_at` = planned time,
+`result.request` = the deferred body). The server fires it within 30 s of the due time; the
+window is re-evaluated then (a closed window `cancelled` the row).
 
 Per instance, the job:
 
@@ -415,4 +927,75 @@ file, pulls nothing and audits nothing.
 
 The compose file is the source of truth: the database `image` column is resynchronised from
 `services.agent.image` at startup, so a hand edit or a restore is picked up. See
+`docs/UPGRADE.md` for the operator procedure and `docs/DEPLOYMENTS.md` for the windows, canary
+and journal details.
+
+## Maintenance windows
+
+Recurring UTC day/time ranges that gate destructive operations (`POST /api/upgrade` and
+`DELETE /api/instances/{id}`). Enforcement is inert while no enabled window exists;
+`FLEETT_MAINTENANCE_ENFORCE=0` disables it entirely. Admin only for mutations.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/maintenance-windows` | — | `[{"id":"…","name":"nightly","days":["mon","tue"],"start_minute":120,"end_minute":300,"enabled":true,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/maintenance-windows` | `{"name":"nightly","days":["mon","tue"],"start_minute":120,"end_minute":300,"enabled":true}` | `201` window · `400 invalid_window` |
+| PATCH | `/api/maintenance-windows/{id}` | any subset of the fields | `200` window · `400 invalid_window` · `404` |
+| DELETE | `/api/maintenance-windows/{id}` | — | `204` · `404` |
+| GET | `/api/maintenance-windows/status` | — | `{"open":false,"next_open":"2026-11-10T02:00:00Z","enforce":true}` |
+
+`days` accepts a JSON array or a `"mon,tue"` string. Minutes are UTC (`0..=1439`), `start` is
+inclusive and `end` exclusive; `end < start` is an overnight window owned by its start day and
+`start == end` covers the whole day. The status `open` field is `true` when a destructive
+operation would be allowed right now (`next_open` is then `null`). A refused operation is
+`403 maintenance_window` with `details.next_open`:
+
+```json
+{"error":{"code":"maintenance_window",
+          "message":"no maintenance window is open; the next opening is 2026-11-10T02:00:00Z",
+          "details":{"next_open":"2026-11-10T02:00:00Z"}}}
+```
+
+## Deployments
+
+Durable journal of every upgrade (immediate, canary or scheduled), newest first.
+
+| Method | Route | Body | Response |
+|---|---|---|---|
+| GET | `/api/deployments?limit=50&status=ok` | — | `[Deployment]` · `400 invalid_limit` · `400 invalid_status` |
+| GET | `/api/deployments/{id}` | — | `200 Deployment` · `404` |
+
+`Deployment`:
+```json
+{"id":"0b7e…","image":"hermes-agent:0.23.0-local","status":"ok",
+ "instances":["alice","bob"],"canary":1,"soak_s":600,
+ "started_at":"2026-11-09T03:00:00Z","finished_at":"2026-11-09T03:12:40Z",
+ "result":[{"id":"alice","from":"hermes-agent:0.22.2-local",
+            "to":"hermes-agent:0.23.0-local","status":"healthy"}],
+ "error":null,"rollback":false,"created_by":"cleeryy"}
+```
+
+`status`: `pending`, `canary`, `running`, `scheduled`, `ok`, `failed`, `rolled_back`,
+`cancelled`. `limit` is `1..=500` (default `50`). While a row is `scheduled`, `result` holds
+`{"request":{…}}` (the deferred `POST /api/upgrade` body) and `started_at` is the planned
+time; after firing it holds the per-instance results and `started_at` is the real start.
+`rollback` is `true` when at least one instance was restored to its previous image.
+
 `docs/UPGRADE.md` for the operator procedure.
+
+## MCP server (client-side)
+
+This document describes the control plane routes; `fleett mcp` adds **no API route**. It is a
+client of the routes above: every MCP tool is one authenticated API call made with the token
+of `~/.config/fleett/config.toml` (`FLEETT_URL` / `FLEETT_TOKEN`), so the role check, the audit
+entry of a mutation and the error envelope are exactly the ones documented here. A
+`403 forbidden` from the API is returned to the MCP client as a tool error carrying the API
+message.
+
+`fleett mcp --http <addr>` is a separate, optional listener that serves JSON-RPC on
+`POST /mcp`; it is not part of the control plane router and is not proxied by `/api`. It has
+no authentication of its own: it acts with the token of its own process, so bind it to
+loopback (or front it with an authenticating proxy). SSE streaming is not implemented.
+
+See [docs/MCP.md](docs/MCP.md) for the tool catalog, the Hermes configuration and the
+limitations.

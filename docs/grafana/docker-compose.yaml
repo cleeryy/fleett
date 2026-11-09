@@ -1,0 +1,50 @@
+name: fleett-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      # Lets the container reach the fleett host on Linux. Docker Desktop
+      # already provides host.docker.internal.
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed -e "s|fleett.invalid:8090|$${FLEETT_METRICS_URL:-host.docker.internal:8090}|g" \
+            -e "s|__FLEETT_TOKEN__|$${FLEETT_METRICS_TOKEN:-}|g" \
+            /etc/prometheus/prometheus.yml > /tmp/prometheus.yml
+        exec /bin/prometheus \
+          --config.file=/tmp/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./fleett-alerts.yaml:/etc/prometheus/fleett-alerts.yaml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-fleett}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Read-only demo: open http://localhost:3000 without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./fleett-dashboard.json:/var/lib/grafana/dashboards/fleett-dashboard.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

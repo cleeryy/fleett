@@ -4,13 +4,13 @@
 //! the host; the commands below are a thin HTTP client so the fleet is
 //! scriptable from cron, CI or a runbook. See `docs/CLI.md`.
 
+use crate::logstore::LogEntry;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
 /// Client configuration, relative to `$HOME`.
 pub const CONFIG_RELATIVE_PATH: &str = ".config/fleett/config.toml";
 /// Overrides the `[server] url` of the configuration file.
@@ -213,14 +213,15 @@ fn parse_api_error(status: u16, text: &str) -> CliError {
 // HTTP client
 // ---------------------------------------------------------------------------
 
-struct Client {
+#[derive(Clone)]
+pub(crate) struct Client {
     base: String,
     token: Option<String>,
     http: reqwest::Client,
 }
 
 impl Client {
-    fn new(cfg: &ClientConfig) -> Result<Self, CliError> {
+    pub(crate) fn new(cfg: &ClientConfig) -> Result<Self, CliError> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -243,7 +244,7 @@ impl Client {
         serde_json::from_value(value).map_err(|err| CliError::Decode(err.to_string()))
     }
 
-    async fn value(
+    pub(crate) async fn value(
         &self,
         method: Method,
         path: &str,
@@ -258,7 +259,7 @@ impl Client {
         serde_json::from_str(trimmed).map_err(|err| CliError::Decode(format!("{err}: {trimmed}")))
     }
 
-    async fn text(
+    pub(crate) async fn text(
         &self,
         method: Method,
         path: &str,
@@ -301,22 +302,64 @@ impl Client {
 #[derive(Debug, Clone)]
 pub enum Command {
     Ls,
-    Ps { all: bool },
+    Ps {
+        all: bool,
+    },
     Logs(LogsArgs),
+    LogsSearch(LogSearchArgs),
+    LogsTail(LogTailArgs),
+    LogsExport(LogExportArgs),
     Create(CreateArgs),
     Start(String),
     Stop(String),
     Restart(String),
-    Delete { id: String, purge: bool },
+    Delete {
+        id: String,
+        purge: bool,
+    },
     Usage,
+    Cost(CostArgs),
+    Pricing(PricingAction),
+    Budget(BudgetArgs),
     Images,
     Upgrade(UpgradeArgs),
     Doctor,
+    Incidents(IncidentsArgs),
+    Heal(HealArgs),
+    IncidentClose(String),
     Say(SayArgs),
     Messages(MessagesArgs),
-    Ack { id: String, message_id: String },
+    Ack {
+        id: String,
+        message_id: String,
+    },
     Templates,
     Template(TemplateCommand),
+    Schedules {
+        id: String,
+    },
+    ScheduleAdd(ScheduleAddArgs),
+    ScheduleRm {
+        schedule_id: String,
+    },
+    ScheduleRun {
+        schedule_id: String,
+    },
+    Runs {
+        id: String,
+        limit: usize,
+    },
+    Memory(MemoryCommand),
+    AclGet(String),
+    AclSet {
+        id: String,
+        subject: String,
+        role: String,
+    },
+    AclRm {
+        id: String,
+        subject: String,
+    },
 }
 
 /// Arguments of `fleett template <action>`.
@@ -359,6 +402,77 @@ pub struct TemplateCreateArgs {
     pub env: Vec<String>,
 }
 
+/// Arguments of `fleett schedule add`.
+#[derive(Debug, Clone)]
+pub struct ScheduleAddArgs {
+    pub id: String,
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    pub enabled: Option<bool>,
+    pub overlap: Option<String>,
+    pub timeout_s: Option<u64>,
+    pub timezone: Option<String>,
+    pub catchup: bool,
+}
+
+/// Sub-commands of `fleett memory`.
+#[derive(Debug, Clone)]
+pub enum MemoryCommand {
+    Set {
+        namespace: String,
+        key: String,
+        value: String,
+        tags: Vec<String>,
+        ttl_s: Option<u64>,
+    },
+    Get {
+        namespace: String,
+        key: String,
+    },
+    List {
+        namespace: Option<String>,
+        limit: usize,
+    },
+    Search {
+        query: String,
+        namespace: Option<String>,
+        limit: usize,
+    },
+    History {
+        id: i64,
+    },
+    Restore {
+        id: i64,
+        version: u32,
+    },
+    Delete {
+        id: i64,
+    },
+    Promote {
+        id: i64,
+        namespace: String,
+    },
+}
+
+/// Arguments of `fleett incidents`.
+#[derive(Debug, Clone)]
+pub struct IncidentsArgs {
+    pub status: Option<String>,
+    pub instance: Option<String>,
+    pub limit: usize,
+}
+
+/// Arguments of `fleett heal`.
+#[derive(Debug, Clone)]
+pub struct HealArgs {
+    pub id: String,
+    pub policy: String,
+    pub unhealthy_after: Option<u32>,
+    pub max_restarts: Option<u32>,
+    pub backoff_s: Option<u64>,
+}
+
 /// Arguments of `fleett say`.
 #[derive(Debug, Clone)]
 pub struct SayArgs {
@@ -377,6 +491,38 @@ pub struct MessagesArgs {
     pub view: String,
     pub status: Option<String>,
     pub limit: usize,
+}
+
+/// Arguments of `fleett cost`.
+#[derive(Debug, Clone)]
+pub struct CostArgs {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub group_by: String,
+}
+
+/// Arguments of `fleett pricing set`.
+#[derive(Debug, Clone)]
+pub struct PricingArgs {
+    pub model: String,
+    pub input: f64,
+    pub output: f64,
+    pub currency: String,
+    pub effective_from: Option<String>,
+}
+
+/// `fleett pricing` subcommand.
+#[derive(Debug, Clone)]
+pub enum PricingAction {
+    List,
+    Set(PricingArgs),
+}
+
+/// Arguments of `fleett budget`.
+#[derive(Debug, Clone)]
+pub struct BudgetArgs {
+    pub id: String,
+    pub set: Option<f64>,
 }
 
 /// Arguments of `fleett upgrade`.
@@ -406,6 +552,48 @@ pub struct LogsArgs {
     pub since: Option<String>,
     pub grep: Option<String>,
     pub level: Option<String>,
+}
+
+/// Filters shared by `fleett logs search` and `fleett logs export`.
+#[derive(Debug, Clone)]
+pub struct LogSearchArgs {
+    pub q: Option<String>,
+    /// One id, or a comma-separated list.
+    pub instance: Option<String>,
+    pub level: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub limit: u32,
+}
+
+impl Default for LogSearchArgs {
+    fn default() -> Self {
+        Self {
+            q: None,
+            instance: None,
+            level: None,
+            since: None,
+            until: None,
+            limit: 100,
+        }
+    }
+}
+
+/// Arguments of `fleett logs tail`.
+#[derive(Debug, Clone, Default)]
+pub struct LogTailArgs {
+    pub instance: Option<String>,
+    pub q: Option<String>,
+    pub level: Option<String>,
+    pub since: Option<String>,
+}
+
+/// Arguments of `fleett logs export`.
+#[derive(Debug, Clone)]
+pub struct LogExportArgs {
+    pub format: String,
+    pub out: PathBuf,
+    pub filters: LogSearchArgs,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -443,20 +631,38 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Ls => ls(&client, json).await,
         Command::Ps { all } => ps(&client, json, all).await,
         Command::Logs(args) => logs(&client, json, &args).await,
+        Command::LogsSearch(args) => logs_search(&client, json, &args).await,
+        Command::LogsTail(args) => logs_tail(&client, json, &args).await,
+        Command::LogsExport(args) => logs_export(&client, json, &args).await,
         Command::Create(args) => create(&client, json, &args).await,
         Command::Start(id) => lifecycle(&client, json, &id, "start").await,
         Command::Stop(id) => lifecycle(&client, json, &id, "stop").await,
         Command::Restart(id) => lifecycle(&client, json, &id, "restart").await,
         Command::Delete { id, purge } => delete(&client, json, &id, purge).await,
         Command::Usage => usage(&client, json).await,
+        Command::Cost(args) => cost(&client, json, &args).await,
+        Command::Pricing(action) => pricing(&client, json, &action).await,
+        Command::Budget(args) => budget(&client, json, &args).await,
         Command::Images => images(&client, json).await,
         Command::Upgrade(args) => upgrade(&client, json, &args).await,
         Command::Doctor => doctor(&client, json, &config.url).await,
+        Command::Incidents(args) => incidents(&client, json, &args).await,
+        Command::Heal(args) => heal(&client, json, &args).await,
+        Command::IncidentClose(id) => incident_close(&client, json, &id).await,
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
         Command::Templates => templates_command(&client, json).await,
         Command::Template(action) => template_command(&client, json, &action).await,
+        Command::Memory(command) => memory(&client, json, &command).await,
+        Command::AclGet(id) => acl_get(&client, json, &id).await,
+        Command::AclSet { id, subject, role } => acl_set(&client, json, &id, &subject, &role).await,
+        Command::AclRm { id, subject } => acl_rm(&client, json, &id, &subject).await,
+        Command::Schedules { id } => schedules(&client, json, &id).await,
+        Command::ScheduleAdd(args) => schedule_add(&client, json, &args).await,
+        Command::ScheduleRm { schedule_id } => schedule_rm(&client, json, &schedule_id).await,
+        Command::ScheduleRun { schedule_id } => schedule_run(&client, json, &schedule_id).await,
+        Command::Runs { id, limit } => runs(&client, json, &id, limit).await,
     }
 }
 
@@ -556,6 +762,89 @@ struct UsageReport {
     instances: Vec<UsageEntry>,
     totals: UsageTotals,
     caps: UsageCaps,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostTotalsView {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    events: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostGroupView {
+    key: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+    events: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentCostView {
+    instance_id: String,
+    cost_usd: f64,
+    total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectionView {
+    month: String,
+    elapsed_fraction: f64,
+    month_to_date_usd: f64,
+    projected_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BudgetStatusView {
+    instance_id: String,
+    monthly_usd: f64,
+    used_usd: f64,
+    percent: f64,
+    projected_month_usd: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CostReportView {
+    from: String,
+    to: String,
+    group_by: String,
+    currency: String,
+    totals: CostTotalsView,
+    #[serde(default)]
+    groups: Vec<CostGroupView>,
+    #[serde(default)]
+    top_agents: Vec<AgentCostView>,
+    #[serde(default)]
+    budgets: Vec<BudgetStatusView>,
+    projection: ProjectionView,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PricingView {
+    model: String,
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    currency: String,
+    effective_from: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BudgetView {
+    instance_id: String,
+    month: String,
+    #[serde(default)]
+    monthly_usd: Option<f64>,
+    enabled: bool,
+    configured: bool,
+    used_usd: f64,
+    percent: f64,
+    #[serde(default)]
+    exceeded: bool,
+    projected_month_usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -776,6 +1065,181 @@ async fn logs(client: &Client, json: bool, args: &LogsArgs) -> Result<(), CliErr
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct LogSearchResponse {
+    entries: Vec<LogEntry>,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    limit: usize,
+}
+
+fn log_filter_pairs(args: &LogSearchArgs) -> Vec<(&'static str, String)> {
+    let mut query: Vec<(&'static str, String)> = vec![("limit", args.limit.to_string())];
+    if let Some(q) = args
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("q", q.to_string()));
+    }
+    if let Some(instance) = args
+        .instance
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("instances", instance.to_string()));
+    }
+    if let Some(level) = args
+        .level
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("level", level.to_string()));
+    }
+    if let Some(since) = args
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("since", since.to_string()));
+    }
+    if let Some(until) = args
+        .until
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        query.push(("until", until.to_string()));
+    }
+    query
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+async fn logs_search(client: &Client, json: bool, args: &LogSearchArgs) -> Result<(), CliError> {
+    let value = client
+        .value(Method::GET, "/api/logs", &log_filter_pairs(args), None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let response: LogSearchResponse = decode(value)?;
+    if response.entries.is_empty() {
+        println!("no matching log lines");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = response
+        .entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.at.clone(),
+                entry.instance.clone(),
+                entry.level.as_str().to_string(),
+                truncate_chars(&entry.message, 160),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["AT", "INSTANCE", "LEVEL", "MESSAGE"], &rows)
+    );
+    eprintln!(
+        "{} line(s) shown (limit {})",
+        response.count, response.limit
+    );
+    Ok(())
+}
+
+async fn logs_tail(client: &Client, json: bool, args: &LogTailArgs) -> Result<(), CliError> {
+    let mut search = LogSearchArgs {
+        q: args.q.clone(),
+        instance: args.instance.clone(),
+        level: args.level.clone(),
+        since: args.since.clone(),
+        until: None,
+        limit: 200,
+    };
+    let mut last_id = 0i64;
+    let mut first = true;
+    loop {
+        if !first {
+            // Poll the window since the newest line we printed. The id cursor
+            // drops lines that share the same timestamp.
+            search.since = Some("30s".to_string());
+        }
+        let value = client
+            .value(Method::GET, "/api/logs", &log_filter_pairs(&search), None)
+            .await?;
+        let response: LogSearchResponse = decode(value)?;
+        let mut entries = response.entries;
+        entries.sort_by_key(|entry| entry.id);
+        for entry in entries {
+            if entry.id <= last_id {
+                continue;
+            }
+            last_id = entry.id;
+            if json {
+                let line = serde_json::to_string(&entry)
+                    .map_err(|err| CliError::Decode(err.to_string()))?;
+                println!("{line}");
+            } else {
+                println!(
+                    "{} {} {:<5} {}",
+                    entry.at,
+                    entry.instance,
+                    entry.level.as_str(),
+                    entry.message
+                );
+            }
+        }
+        first = false;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn logs_export(client: &Client, json: bool, args: &LogExportArgs) -> Result<(), CliError> {
+    let format = args.format.trim().to_ascii_lowercase();
+    if !matches!(format.as_str(), "json" | "csv") {
+        return Err(CliError::Config(
+            "format must be \"json\" or \"csv\"".to_string(),
+        ));
+    }
+    let mut query = log_filter_pairs(&args.filters);
+    query.push(("format", format.clone()));
+    let text = client
+        .text(Method::GET, "/api/logs/export", &query, None)
+        .await?;
+    std::fs::write(&args.out, &text)
+        .map_err(|err| CliError::Config(format!("cannot write {}: {err}", args.out.display())))?;
+    if json {
+        print_json(&json!({
+            "path": args.out.display().to_string(),
+            "format": format,
+            "bytes": text.len(),
+        }))?;
+    } else {
+        println!(
+            "wrote {} ({} bytes, {format})",
+            args.out.display(),
+            text.len()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct MessageView {
     id: String,
     from: String,
@@ -792,6 +1256,49 @@ struct MessageView {
     delivered_at: Option<String>,
     #[serde(default)]
     read_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ScheduleView {
+    id: String,
+    instance_id: String,
+    name: String,
+    cron: String,
+    #[serde(default)]
+    prompt: String,
+    enabled: bool,
+    #[serde(default)]
+    timezone: String,
+    overlap: String,
+    #[serde(default)]
+    timeout: u64,
+    #[serde(default)]
+    catchup: bool,
+    #[serde(default)]
+    last_run_at: Option<String>,
+    #[serde(default)]
+    next_run_at: Option<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ScheduleRunView {
+    id: String,
+    schedule_id: String,
+    instance_id: String,
+    started_at: String,
+    #[serde(default)]
+    finished_at: Option<String>,
+    status: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    duration_ms: Option<i64>,
 }
 
 async fn say(client: &Client, json: bool, args: &SayArgs) -> Result<(), CliError> {
@@ -894,6 +1401,492 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
         return print_json(&value);
     }
     println!("message {message_id} marked as read");
+    Ok(())
+}
+
+async fn schedules(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/schedules", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let schedules: Vec<ScheduleView> = decode(value)?;
+    if schedules.is_empty() {
+        println!("no schedules");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = schedules
+        .iter()
+        .map(|schedule| {
+            vec![
+                schedule.name.clone(),
+                schedule.cron.clone(),
+                if schedule.enabled { "yes" } else { "no" }.to_string(),
+                schedule
+                    .next_run_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                schedule
+                    .last_run_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                schedule.overlap.clone(),
+                format!("{}s", schedule.timeout),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["NAME", "CRON", "ENABLED", "NEXT", "LAST", "OVERLAP", "TIMEOUT"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn schedule_add(client: &Client, json: bool, args: &ScheduleAddArgs) -> Result<(), CliError> {
+    let mut body = json!({
+        "name": args.name,
+        "cron": args.cron,
+        "prompt": args.prompt,
+    });
+    let object = body.as_object_mut().expect("object");
+    if let Some(enabled) = args.enabled {
+        object.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(overlap) = &args.overlap {
+        object.insert("overlap".to_string(), json!(overlap));
+    }
+    if let Some(timeout) = args.timeout_s {
+        object.insert("timeout".to_string(), json!(timeout));
+    }
+    if let Some(timezone) = &args.timezone {
+        object.insert("timezone".to_string(), json!(timezone));
+    }
+    if args.catchup {
+        object.insert("catchup".to_string(), json!(true));
+    }
+    let path = format!("/api/instances/{}/schedules", encode_path_segment(&args.id));
+    let value = client.value(Method::POST, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let schedule: ScheduleView = decode(value)?;
+    println!(
+        "created schedule {} ({} on {}, next {})",
+        schedule.id,
+        schedule.name,
+        schedule.cron,
+        schedule.next_run_at.as_deref().unwrap_or("-")
+    );
+    Ok(())
+}
+
+async fn schedule_rm(client: &Client, json: bool, schedule_id: &str) -> Result<(), CliError> {
+    let path = format!("/api/schedules/{}", encode_path_segment(schedule_id));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "id": schedule_id, "deleted": true }));
+    }
+    println!("deleted schedule {schedule_id}");
+    Ok(())
+}
+
+async fn schedule_run(client: &Client, json: bool, schedule_id: &str) -> Result<(), CliError> {
+    let path = format!("/api/schedules/{}/run", encode_path_segment(schedule_id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let run: ScheduleRunView = decode(value)?;
+    let mut line = format!(
+        "run {}: {}{}",
+        run.id,
+        run.status,
+        run.duration_ms
+            .map(|duration| format!(" ({duration} ms)"))
+            .unwrap_or_default()
+    );
+    if let Some(code) = run.exit_code {
+        line.push_str(&format!(", exit {code}"));
+    }
+    println!("{line}");
+    if run.status != "ok" {
+        if let Some(output) = run.output.as_deref().filter(|text| !text.trim().is_empty()) {
+            for line in output.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn runs(client: &Client, json: bool, id: &str, limit: usize) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/runs", encode_path_segment(id));
+    let query = vec![("limit", limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let runs: Vec<ScheduleRunView> = decode(value)?;
+    if runs.is_empty() {
+        println!("no runs");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = runs
+        .iter()
+        .map(|run| {
+            vec![
+                run.started_at.clone(),
+                run.status.clone(),
+                run.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                run.duration_ms
+                    .map(|duration| format!("{duration}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                run.output
+                    .as_deref()
+                    .map(|output| single_line(output, 80))
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["STARTED", "STATUS", "EXIT", "DURATION", "OUTPUT"], &rows)
+    );
+    Ok(())
+}
+
+/// First `max` characters of `text` on one line.
+fn single_line(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut out: String = collapsed.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoryEntryView {
+    id: i64,
+    namespace: String,
+    key: String,
+    value: String,
+    tags: Vec<String>,
+    owner: String,
+    version: u32,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoryVersionView {
+    version: u32,
+    value: String,
+    tags: Vec<String>,
+    owner: String,
+    action: String,
+    at: String,
+}
+
+async fn memory(client: &Client, json: bool, command: &MemoryCommand) -> Result<(), CliError> {
+    match command {
+        MemoryCommand::Set {
+            namespace,
+            key,
+            value,
+            tags,
+            ttl_s,
+        } => {
+            let mut body = json!({
+                "namespace": namespace,
+                "key": key,
+                "value": value,
+                "tags": tags,
+            });
+            if let Some(ttl) = ttl_s {
+                body["ttl_s"] = json!(ttl);
+            }
+            let value = client
+                .value(Method::POST, "/api/memory", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value["entry"].clone())?;
+            println!(
+                "{} {}/{} (version {}, id {})",
+                if value["created"].as_bool().unwrap_or(false) {
+                    "created"
+                } else {
+                    "updated"
+                },
+                entry.namespace,
+                entry.key,
+                entry.version,
+                entry.id
+            );
+        }
+        MemoryCommand::Get { namespace, key } => {
+            let query = [("namespace", namespace.clone()), ("key", key.clone())];
+            let value = client
+                .value(Method::GET, "/api/memory/by-key", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!(
+                "{} / {} (version {})",
+                entry.namespace, entry.key, entry.version
+            );
+            println!("{}", entry.value);
+            if !entry.tags.is_empty() {
+                println!("tags: {}", entry.tags.join(", "));
+            }
+        }
+        MemoryCommand::List { namespace, limit } => {
+            let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+            if let Some(namespace) = namespace {
+                query.push(("namespace", namespace.clone()));
+            }
+            let value = client
+                .value(Method::GET, "/api/memory", &query, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<MemoryEntryView> = decode(value)?;
+            if entries.is_empty() {
+                println!("memory is empty");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.to_string(),
+                        entry.namespace.clone(),
+                        entry.key.clone(),
+                        entry.value.replace('\n', " "),
+                        entry.tags.join(","),
+                        entry.version.to_string(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "NAMESPACE", "KEY", "VALUE", "TAGS", "VER"], &rows)
+            );
+        }
+        MemoryCommand::Search {
+            query,
+            namespace,
+            limit,
+        } => {
+            let mut params: Vec<(&str, String)> =
+                vec![("q", query.clone()), ("limit", limit.to_string())];
+            if let Some(namespace) = namespace {
+                params.push(("namespace", namespace.clone()));
+            }
+            let value = client
+                .value(Method::GET, "/api/memory/search", &params, None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entries: Vec<MemoryEntryView> = decode(value)?;
+            if entries.is_empty() {
+                println!("no match");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.id.to_string(),
+                        entry.namespace.clone(),
+                        entry.key.clone(),
+                        entry.value.replace('\n', " "),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["ID", "NAMESPACE", "KEY", "VALUE"], &rows)
+            );
+        }
+        MemoryCommand::History { id } => {
+            let value = client
+                .value(Method::GET, &format!("/api/memory/{id}/history"), &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let versions: Vec<MemoryVersionView> = decode(value)?;
+            let rows: Vec<Vec<String>> = versions
+                .iter()
+                .map(|version| {
+                    vec![
+                        version.version.to_string(),
+                        version.action.clone(),
+                        version.owner.clone(),
+                        version.at.clone(),
+                        version.value.replace('\n', " "),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(&["VER", "ACTION", "ACTOR", "AT", "VALUE"], &rows)
+            );
+        }
+        MemoryCommand::Restore { id, version } => {
+            let body = json!({ "version": version });
+            let value = client
+                .value(
+                    Method::POST,
+                    &format!("/api/memory/{id}/rollback"),
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!(
+                "restored {}/{} as version {}",
+                entry.namespace, entry.key, entry.version
+            );
+        }
+        MemoryCommand::Delete { id } => {
+            client
+                .text(Method::DELETE, &format!("/api/memory/{id}"), &[], None)
+                .await?;
+            if json {
+                println!("{}", json!({"deleted": id}));
+            } else {
+                println!("deleted memory entry {id}");
+            }
+        }
+        MemoryCommand::Promote { id, namespace } => {
+            let body = json!({ "namespace": namespace });
+            let value = client
+                .value(
+                    Method::POST,
+                    &format!("/api/memory/{id}/promote"),
+                    &[],
+                    Some(body),
+                )
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let entry: MemoryEntryView = decode(value)?;
+            println!("promoted {} to {}", entry.key, entry.namespace);
+        }
+    }
+    Ok(())
+}
+
+/// One `instance_acl` row as returned by the API.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AclItemView {
+    subject: String,
+    role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AclView {
+    instance: String,
+    #[serde(default)]
+    acl: Vec<AclItemView>,
+}
+
+fn acl_path(id: &str) -> String {
+    format!("/api/instances/{}/acl", encode_path_segment(id))
+}
+
+fn print_acl(view: &AclView, json: bool) -> Result<(), CliError> {
+    if json {
+        return print_json(view);
+    }
+    if view.acl.is_empty() {
+        println!("{}: no ACL entries", view.instance);
+        return Ok(());
+    }
+    println!("{}:", view.instance);
+    let width = view
+        .acl
+        .iter()
+        .map(|item| item.subject.chars().count())
+        .max()
+        .unwrap_or(0);
+    for item in &view.acl {
+        println!("  {:width$}  {}", item.subject, item.role);
+    }
+    Ok(())
+}
+
+/// `fleett acl get <id>`.
+async fn acl_get(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let view: AclView = client.json(Method::GET, &acl_path(id), &[], None).await?;
+    print_acl(&view, json)
+}
+
+/// `fleett acl set <id> <subject> <role>` — upsert one grant, keep the rest.
+async fn acl_set(
+    client: &Client,
+    json: bool,
+    id: &str,
+    subject: &str,
+    role: &str,
+) -> Result<(), CliError> {
+    let role = role.trim().to_ascii_lowercase();
+    if !matches!(role.as_str(), "owner" | "operator" | "viewer") {
+        return Err(CliError::Config(
+            "role must be \"owner\", \"operator\" or \"viewer\"".to_string(),
+        ));
+    }
+    let path = acl_path(id);
+    let mut view: AclView = client.json(Method::GET, &path, &[], None).await?;
+    let subject = subject.trim().to_string();
+    match view.acl.iter_mut().find(|item| item.subject == subject) {
+        Some(item) => item.role = role,
+        None => view.acl.push(AclItemView {
+            subject,
+            role,
+            created_at: None,
+        }),
+    }
+    let body = json!({ "acl": view.acl });
+    let updated: AclView = client.json(Method::PUT, &path, &[], Some(body)).await?;
+    print_acl(&updated, json)
+}
+
+/// `fleett acl rm <id> <subject>`.
+async fn acl_rm(client: &Client, json: bool, id: &str, subject: &str) -> Result<(), CliError> {
+    let path = format!("{}/{}", acl_path(id), encode_path_segment(subject.trim()));
+    let value = client.value(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({
+            "instance": id,
+            "subject": subject.trim(),
+            "removed": true,
+            "response": value,
+        }));
+    }
+    println!("removed \"{}\" from the ACL of {}", subject.trim(), id);
     Ok(())
 }
 
@@ -1022,6 +2015,202 @@ async fn usage(client: &Client, json: bool) -> Result<(), CliError> {
     );
     println!("{}", caps_line(&report.caps));
     Ok(())
+}
+
+async fn cost(client: &Client, json: bool, args: &CostArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("group_by", args.group_by.clone())];
+    if let Some(from) = args.from.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("from", from.to_string()));
+    }
+    if let Some(to) = args.to.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("to", to.to_string()));
+    }
+    let value = client.value(Method::GET, "/api/cost", &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let report: CostReportView = decode(value)?;
+    let mut rows: Vec<Vec<String>> = report
+        .groups
+        .iter()
+        .map(|group| {
+            vec![
+                group.key.clone(),
+                group.prompt_tokens.to_string(),
+                group.completion_tokens.to_string(),
+                group.total_tokens.to_string(),
+                format_cost(group.cost_usd),
+                group.events.to_string(),
+            ]
+        })
+        .collect();
+    rows.push(vec![
+        "TOTAL".to_string(),
+        report.totals.prompt_tokens.to_string(),
+        report.totals.completion_tokens.to_string(),
+        report.totals.total_tokens.to_string(),
+        format_cost(report.totals.cost_usd),
+        report.totals.events.to_string(),
+    ]);
+    println!(
+        "cost {} -> {} by {} ({} tokens, {})",
+        report.from, report.to, report.group_by, report.totals.total_tokens, report.currency
+    );
+    print!(
+        "{}",
+        render_table(
+            &["KEY", "PROMPT", "COMPLETION", "TOTAL", "COST", "EVENTS"],
+            &rows
+        )
+    );
+    for agent in &report.top_agents {
+        println!(
+            "top {:<16} {} {} ({} tokens)",
+            agent.instance_id,
+            format_cost(agent.cost_usd),
+            report.currency,
+            agent.total_tokens
+        );
+    }
+    for budget in &report.budgets {
+        println!(
+            "budget {:<16} {} / {} {} ({:.1}%) projected {}",
+            budget.instance_id,
+            format_cost(budget.used_usd),
+            format_cost(budget.monthly_usd),
+            report.currency,
+            budget.percent,
+            format_cost(budget.projected_month_usd)
+        );
+    }
+    println!(
+        "month {}: {} {} so far, {} projected ({:.0}% elapsed)",
+        report.projection.month,
+        format_cost(report.projection.month_to_date_usd),
+        report.currency,
+        format_cost(report.projection.projected_usd),
+        report.projection.elapsed_fraction * 100.0
+    );
+    Ok(())
+}
+
+async fn pricing(client: &Client, json: bool, action: &PricingAction) -> Result<(), CliError> {
+    match action {
+        PricingAction::List => {
+            let value = client
+                .value(Method::GET, "/api/models/pricing", &[], None)
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let prices: Vec<PricingView> = decode(value)?;
+            if prices.is_empty() {
+                println!("no price configured");
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = prices
+                .iter()
+                .map(|price| {
+                    vec![
+                        price.model.clone(),
+                        format!("{}", price.input_per_mtok),
+                        format!("{}", price.output_per_mtok),
+                        price.currency.clone(),
+                        price.effective_from.clone(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render_table(
+                    &[
+                        "MODEL",
+                        "INPUT/MTOK",
+                        "OUTPUT/MTOK",
+                        "CURRENCY",
+                        "EFFECTIVE"
+                    ],
+                    &rows
+                )
+            );
+            Ok(())
+        }
+        PricingAction::Set(args) => {
+            let mut body = json!({
+                "model": args.model,
+                "input_per_mtok": args.input,
+                "output_per_mtok": args.output,
+                "currency": args.currency,
+            });
+            if let Some(effective_from) = &args.effective_from {
+                body["effective_from"] = json!(effective_from);
+            }
+            let value = client
+                .value(Method::POST, "/api/models/pricing", &[], Some(body))
+                .await?;
+            if json {
+                return print_json(&value);
+            }
+            let price: PricingView = decode(value)?;
+            println!(
+                "price {}: input {} / output {} {} per Mtok, effective {}",
+                price.model,
+                price.input_per_mtok,
+                price.output_per_mtok,
+                price.currency,
+                price.effective_from
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn budget(client: &Client, json: bool, args: &BudgetArgs) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/budget", encode_path_segment(&args.id));
+    let value = match args.set {
+        Some(monthly_usd) => {
+            client
+                .value(
+                    Method::PUT,
+                    &path,
+                    &[],
+                    Some(json!({"monthly_usd": monthly_usd, "enabled": true})),
+                )
+                .await?
+        }
+        None => client.value(Method::GET, &path, &[], None).await?,
+    };
+    if json {
+        return print_json(&value);
+    }
+    let view: BudgetView = decode(value)?;
+    match view.monthly_usd {
+        Some(monthly_usd) => println!(
+            "{}: {} / {} USD ({:.1}%) in {}{}, projected {} USD",
+            view.instance_id,
+            format_cost(view.used_usd),
+            format_cost(monthly_usd),
+            view.percent,
+            view.month,
+            if view.exceeded { ", EXCEEDED" } else { "" },
+            format_cost(view.projected_month_usd)
+        ),
+        None => println!(
+            "{}: no budget configured ({} USD used in {})",
+            view.instance_id,
+            format_cost(view.used_usd),
+            view.month
+        ),
+    }
+    Ok(())
+}
+
+fn format_cost(value: f64) -> String {
+    if value != 0.0 && value.abs() < 1.0 {
+        format!("{value:.6}")
+    } else {
+        format!("{value:.2}")
+    }
 }
 
 async fn images(client: &Client, json: bool) -> Result<(), CliError> {
@@ -1161,6 +2350,117 @@ fn short_id(id: &str) -> String {
     // `sha256:` plus the first 12 hex characters, like `docker ps`.
     let digest = id.strip_prefix("sha256:").unwrap_or(id);
     digest.chars().take(12).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog: incidents and heal policy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct IncidentView {
+    id: String,
+    instance_id: String,
+    cause: String,
+    status: String,
+    opened_at: String,
+    #[serde(default)]
+    closed_at: Option<String>,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    restart_count: u32,
+    #[serde(default)]
+    actions: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HealView {
+    id: String,
+    heal: String,
+    unhealthy_after: u32,
+    max_restarts: u32,
+    heal_backoff_s: u64,
+}
+
+async fn incidents(client: &Client, json: bool, args: &IncidentsArgs) -> Result<(), CliError> {
+    let mut query: Vec<(&str, String)> = vec![("limit", args.limit.to_string())];
+    if let Some(status) = args.status.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("status", status.to_string()));
+    }
+    if let Some(instance) = args.instance.as_deref().filter(|value| !value.is_empty()) {
+        query.push(("instance", instance.to_string()));
+    }
+    let value = client
+        .value(Method::GET, "/api/incidents", &query, None)
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let incidents: Vec<IncidentView> = decode(value)?;
+    if incidents.is_empty() {
+        println!("no incidents");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = incidents
+        .iter()
+        .map(|incident| {
+            vec![
+                incident.opened_at.clone(),
+                incident.instance_id.clone(),
+                incident.cause.clone(),
+                incident.status.clone(),
+                incident.restart_count.to_string(),
+                incident.detail.replace('\n', " "),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["OPENED", "INSTANCE", "CAUSE", "STATUS", "RESTARTS", "DETAIL"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn heal(client: &Client, json: bool, args: &HealArgs) -> Result<(), CliError> {
+    let mut body = json!({ "heal": args.policy });
+    let object = body.as_object_mut().expect("object");
+    if let Some(unhealthy_after) = args.unhealthy_after {
+        object.insert("unhealthy_after".to_string(), json!(unhealthy_after));
+    }
+    if let Some(max_restarts) = args.max_restarts {
+        object.insert("max_restarts".to_string(), json!(max_restarts));
+    }
+    if let Some(backoff_s) = args.backoff_s {
+        object.insert("heal_backoff_s".to_string(), json!(backoff_s));
+    }
+    let path = format!("/api/instances/{}/heal", encode_path_segment(&args.id));
+    let value = client.value(Method::PATCH, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: HealView = decode(value)?;
+    println!(
+        "{}: heal={} unhealthy_after={} max_restarts={} backoff={}s",
+        view.id, view.heal, view.unhealthy_after, view.max_restarts, view.heal_backoff_s
+    );
+    Ok(())
+}
+
+async fn incident_close(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/incidents/{}/close", encode_path_segment(id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let incident: IncidentView = decode(value)?;
+    println!(
+        "closed incident {} ({} on {})",
+        incident.id, incident.cause, incident.instance_id
+    );
+    Ok(())
 }
 
 async fn doctor(client: &Client, json: bool, url: &str) -> Result<(), CliError> {
@@ -1342,6 +2642,36 @@ async fn run_doctor(client: &Client) -> Vec<Check> {
         None => checks.push(Check::warn(
             "egress",
             "this server does not report the egress state",
+        )),
+    }
+
+    // Instance warnings (missing allowlists, plaintext secrets, LAN egress):
+    // one `warn` line per warning, so the operator sees the same message as
+    // the console without opening the instance. A clean fleet adds no line.
+    match client
+        .json::<Vec<InstanceSummary>>(Method::GET, "/api/instances", &[], None)
+        .await
+    {
+        Ok(instances) => {
+            for instance in instances {
+                let path = format!("/api/instances/{}", instance.id);
+                let Ok(detail) = client
+                    .json::<InstanceDetail>(Method::GET, &path, &[], None)
+                    .await
+                else {
+                    continue;
+                };
+                for warning in detail.warnings {
+                    checks.push(Check::warn(
+                        "warnings",
+                        format!("{}: {warning}", instance.id),
+                    ));
+                }
+            }
+        }
+        Err(err) => checks.push(Check::warn(
+            "warnings",
+            format!("the instance list is unreadable: {err}"),
         )),
     }
 
@@ -1779,7 +3109,7 @@ fn caps_line(caps: &UsageCaps) -> String {
 }
 
 /// Percent-encode one path segment (instance ids are already safe).
-fn encode_path_segment(value: &str) -> String {
+pub(crate) fn encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

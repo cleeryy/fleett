@@ -1,6 +1,7 @@
 //! Domain types, API payloads and input validation.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const INSTANCE_ID_MIN: usize = 2;
 pub const INSTANCE_ID_MAX: usize = 32;
@@ -34,6 +35,95 @@ pub const ENV_VALUE_MAX_BYTES: usize = 8 * 1024;
 pub const RESERVED_ENV_KEYS: [&str; 4] = ["HERMES_UID", "HERMES_GID", "PATH", "HOME"];
 /// Prefix reserved for the control plane itself.
 pub const RESERVED_ENV_PREFIX: &str = "FLEETT_";
+
+/// Default number of consecutive unhealthy samples before the watchdog opens an
+/// incident (and, when healing is enabled, before it acts).
+pub const DEFAULT_UNHEALTHY_AFTER: u32 = 3;
+/// Default number of heal attempts before the watchdog gives up.
+pub const DEFAULT_MAX_RESTARTS: u32 = 5;
+/// Default base delay between two heal attempts, in seconds.
+pub const DEFAULT_HEAL_BACKOFF_S: u64 = 30;
+/// Longest delay between two heal attempts (exponential backoff cap).
+pub const HEAL_BACKOFF_CAP_S: u64 = 30 * 60;
+/// Bounds accepted by the API for `unhealthy_after`.
+pub const UNHEALTHY_AFTER_MIN: u32 = 1;
+pub const UNHEALTHY_AFTER_MAX: u32 = 100;
+/// Bounds accepted by the API for `max_restarts` (0 disables healing attempts
+/// while incidents are still recorded).
+pub const MAX_RESTARTS_MAX: u32 = 100;
+/// Bounds accepted by the API for `heal_backoff_s`.
+pub const HEAL_BACKOFF_MIN_S: u64 = 1;
+pub const HEAL_BACKOFF_MAX_S: u64 = 3600;
+
+/// Self-healing policy of one instance (issue #32).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealPolicy {
+    /// Observe only: incidents are recorded, no container action is taken.
+    #[default]
+    Off,
+    /// `docker compose restart` after the unhealthy threshold.
+    Restart,
+    /// `docker compose down` then `up -d`: the container is rebuilt.
+    Recreate,
+}
+
+impl HealPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Restart => "restart",
+            Self::Recreate => "recreate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "observe" => Some(Self::Off),
+            "restart" => Some(Self::Restart),
+            "recreate" => Some(Self::Recreate),
+            _ => None,
+        }
+    }
+
+    /// `true` when the watchdog may touch the container.
+    pub fn heals(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for HealPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn validate_unhealthy_after(value: u32) -> Result<(), String> {
+    if !(UNHEALTHY_AFTER_MIN..=UNHEALTHY_AFTER_MAX).contains(&value) {
+        return Err(format!(
+            "unhealthy_after must be between {UNHEALTHY_AFTER_MIN} and {UNHEALTHY_AFTER_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_max_restarts(value: u32) -> Result<(), String> {
+    if value > MAX_RESTARTS_MAX {
+        return Err(format!(
+            "max_restarts must be between 0 and {MAX_RESTARTS_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_heal_backoff(value: u64) -> Result<(), String> {
+    if !(HEAL_BACKOFF_MIN_S..=HEAL_BACKOFF_MAX_S).contains(&value) {
+        return Err(format!(
+            "heal_backoff_s must be between {HEAL_BACKOFF_MIN_S} and {HEAL_BACKOFF_MAX_S}"
+        ));
+    }
+    Ok(())
+}
 
 /// Messaging platform of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +336,14 @@ pub struct InstanceSpec {
     pub previous_image: Option<String>,
     /// Join the unrestricted `<network>-lan` network as well (LAN access).
     pub allow_lan: bool,
+    /// Watchdog policy (issue #32): observe only, restart or recreate.
+    pub heal: HealPolicy,
+    /// Consecutive unhealthy samples before an incident is opened.
+    pub unhealthy_after: u32,
+    /// Heal attempts allowed before the watchdog gives up.
+    pub max_restarts: u32,
+    /// Base delay between two heal attempts, in seconds.
+    pub heal_backoff_s: u64,
     pub notes: String,
     pub status: Status,
     pub last_error: Option<String>,
@@ -395,6 +493,10 @@ pub struct InstanceSummary {
     pub shares: Vec<String>,
     pub last_error: Option<String>,
     pub created_at: String,
+    /// Level of the caller on this instance (`owner|operator|viewer`), when it
+    /// has one (issue #37).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,9 +574,13 @@ pub const UPGRADE_PARALLEL_MAX: usize = 16;
 pub const UPGRADE_TIMEOUT_DEFAULT_S: u64 = 180;
 /// Upper bound of the per-instance health timeout.
 pub const UPGRADE_TIMEOUT_MAX_S: u64 = 3600;
+/// Default canary soak time, in seconds (issue #39).
+pub const UPGRADE_SOAK_DEFAULT_S: u64 = 600;
+/// Upper bound of the canary soak time.
+pub const UPGRADE_SOAK_MAX_S: u64 = 3600;
 
 /// Body of `POST /api/upgrade`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UpgradeRequest {
     /// Image tag every instance is moved to (required).
     #[serde(default)]
@@ -488,6 +594,22 @@ pub struct UpgradeRequest {
     /// Per-instance health timeout, in seconds (default `180`).
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Instances moved to the new image first, watched during the soak
+    /// (default `0`: no canary). Capped at the fleet size.
+    #[serde(default)]
+    pub canary: Option<usize>,
+    /// Seconds the healthy canaries are watched before the rest moves
+    /// (default `600`, `0` skips the soak, max `3600`).
+    #[serde(default)]
+    pub soak_s: Option<u64>,
+    /// Start later: RFC 3339 or a `sun 04:00` day+time expression (UTC).
+    /// A scheduled deployment is journaled and fired by the server.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// Maintenance window that must contain the run (id or name), or `null`
+    /// for "any open window".
+    #[serde(default)]
+    pub window: Option<String>,
 }
 
 /// State of one instance inside an upgrade job.
@@ -552,6 +674,15 @@ pub struct UpgradeJob {
     pub dry_run: bool,
     pub parallel: usize,
     pub timeout_s: u64,
+    /// Number of canary instances moved first (`0`: no canary phase).
+    #[serde(default)]
+    pub canary: usize,
+    /// Seconds the healthy canaries were watched before the rest moved.
+    #[serde(default)]
+    pub soak_s: u64,
+    /// Journal row of the deployment (`GET /api/deployments/{id}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
     pub results: Vec<UpgradeResult>,
 }
 
@@ -652,6 +783,12 @@ impl TemplateDefaults {
     }
 }
 
+/// Formats a template may attach to an environment variable.
+///
+/// An unknown format is accepted and not enforced, so a custom template can
+/// carry its own vocabulary without breaking an older control plane.
+pub const ENV_FORMATS: [&str; 4] = ["csv-of-ids", "bool", "url", "text"];
+
 /// One environment variable a template suggests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSuggestion {
@@ -750,6 +887,126 @@ pub struct EnvVarInput {
     pub secret: Option<bool>,
 }
 
+/// The `env` field of a request, in either accepted shape.
+///
+/// The canonical shape is a list of [`EnvVarInput`]. Releases up to v0.4.0
+/// accepted an object of `"KEY": "value"` pairs on create; it is still read
+/// for compatibility and every entry of it is stored as a secret, as v0.4.0
+/// did.
+#[derive(Debug, Clone)]
+pub enum EnvInput {
+    /// `[{"key": "…", "value": "…", "secret": false}, …]` (canonical).
+    List(Vec<EnvVarInput>),
+    /// `{"KEY": "value"}` (deprecated v0.4.0 shape; every entry is a secret).
+    Map(BTreeMap<String, String>),
+}
+
+/// Why a JSON value could not be read as an [`EnvInput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvShapeError {
+    /// JSON type that was received (`sequence`, `map`, `string`, …).
+    pub received: &'static str,
+    /// Human-readable reason (the offending entry, for example).
+    pub detail: String,
+}
+
+impl std::fmt::Display for EnvShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for EnvShapeError {}
+
+impl EnvInput {
+    /// Parse either accepted shape from a raw JSON value.
+    ///
+    /// The error carries the JSON type that was received so the API can answer
+    /// `400 invalid_env` with both accepted shapes instead of axum's generic
+    /// deserialization text.
+    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, EnvShapeError> {
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value(value.clone())
+                .map(Self::List)
+                .map_err(|err| EnvShapeError {
+                    received: "sequence",
+                    detail: err.to_string(),
+                }),
+            serde_json::Value::Object(entries) => {
+                let mut map = BTreeMap::new();
+                for (key, value) in entries {
+                    match value {
+                        serde_json::Value::String(value) => {
+                            map.insert(key.clone(), value.clone());
+                        }
+                        other => {
+                            return Err(EnvShapeError {
+                                received: "map",
+                                detail: format!(
+                                    "env[\"{key}\"] must be a string, got {}",
+                                    json_type(other)
+                                ),
+                            })
+                        }
+                    }
+                }
+                Ok(Self::Map(map))
+            }
+            other => Err(EnvShapeError {
+                received: json_type(other),
+                detail: "env must be a list of {key,value,secret}".to_string(),
+            }),
+        }
+    }
+
+    /// Canonical list of this request, consuming it.
+    ///
+    /// The deprecated object form logs one warning per request. Every entry of
+    /// it is a secret: that is what the v0.4.0 create path did.
+    pub fn into_vars(self) -> Vec<EnvVarInput> {
+        match self {
+            Self::List(vars) => vars,
+            Self::Map(entries) => {
+                tracing::warn!(
+                    deprecated = "env_map",
+                    keys = entries.len(),
+                    "env: the object form is deprecated; send a list of {{key,value,secret}}"
+                );
+                entries
+                    .into_iter()
+                    .map(|(key, value)| EnvVarInput {
+                        key,
+                        value: Some(value),
+                        secret: Some(true),
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// JSON type name used by [`EnvShapeError`].
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "sequence",
+        serde_json::Value::Object(_) => "map",
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelRequest {
     #[serde(rename = "type")]
@@ -794,11 +1051,13 @@ pub struct CreateInstanceRequest {
     /// `api_key_env` when the two differ).
     #[serde(default)]
     pub gate_token: Option<String>,
-    /// Additional environment variables. Every entry must state whether it is a
-    /// secret; the gate token and the platform token are always secret and win
-    /// over an entry with the same key.
+    /// Additional environment variables. The canonical shape is a list of
+    /// `{key, value, secret}`; the deprecated v0.4.0 object form
+    /// (`{"KEY": "value"}`) is accepted too and stores every entry as a secret.
+    /// The gate token and the platform token are always secret and win over an
+    /// entry with the same key.
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 /// `POST /api/instances/{id}/clone`.
@@ -860,9 +1119,11 @@ pub struct PatchInstanceRequest {
     #[serde(default)]
     pub gate_token: Option<String>,
     /// Merge into the current environment: `null` deletes a key, `""` keeps an
-    /// empty value, a missing `secret` keeps the flag of an existing key.
+    /// empty value, a missing `secret` keeps the flag of an existing key. The
+    /// deprecated v0.4.0 object form is accepted and stores its entries as
+    /// secrets.
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1086,7 +1347,7 @@ pub fn validate_env_key(key: &str) -> Result<(), String> {
 }
 
 /// Validate an instance environment variable value.
-pub fn validate_env_value(value: &str) -> Result<(), String> {
+pub fn validate_env_raw_value(value: &str) -> Result<(), String> {
     if value.len() > ENV_VALUE_MAX_BYTES {
         return Err(format!(
             "environment variable values must be at most {} KiB",
@@ -1099,6 +1360,55 @@ pub fn validate_env_value(value: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Validate a value against the format a template attaches to its key.
+///
+/// The four built-in formats are `csv-of-ids` (comma-separated ASCII digits,
+/// spaces around entries allowed), `bool` (`true`/`false`/`1`/`0`/`yes`/`no`,
+/// case-insensitive), `url` (`http`/`https` with a host) and `text` (non-empty).
+/// An unknown format is not enforced: the template may come from another
+/// release.
+pub fn validate_env_value(format: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    match format.trim() {
+        "csv-of-ids" => {
+            if trimmed.is_empty() {
+                return Err("must be a comma-separated list of numeric ids".to_string());
+            }
+            for part in trimmed.split(',') {
+                let id = part.trim();
+                if id.is_empty() {
+                    return Err("must not contain an empty id".to_string());
+                }
+                if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!(
+                        "\"{id}\" is not a numeric id: use comma-separated ASCII digits"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "bool" => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "false" | "1" | "0" | "yes" | "no" => Ok(()),
+            _ => Err("must be true, false, 1, 0, yes or no".to_string()),
+        },
+        "url" => {
+            let parsed = url::Url::parse(trimmed)
+                .map_err(|err| format!("must be an absolute http(s) URL: {err}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err("must be an absolute http(s) URL with a host".to_string());
+            }
+            Ok(())
+        }
+        "text" => {
+            if trimmed.is_empty() {
+                return Err("must not be empty".to_string());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn validate_notes(value: &str) -> Result<(), String> {
@@ -1194,13 +1504,73 @@ mod tests {
 
     #[test]
     fn env_values_are_bounded_and_single_line() {
-        assert!(validate_env_value("").is_ok());
-        assert!(validate_env_value("123,456").is_ok());
-        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES)).is_ok());
-        assert!(validate_env_value(&"a".repeat(ENV_VALUE_MAX_BYTES + 1)).is_err());
-        assert!(validate_env_value("a\nb").is_err());
-        assert!(validate_env_value("a\rb").is_err());
-        assert!(validate_env_value("a\0b").is_err());
+        assert!(validate_env_raw_value("").is_ok());
+        assert!(validate_env_raw_value("123,456").is_ok());
+        assert!(validate_env_raw_value(&"a".repeat(ENV_VALUE_MAX_BYTES)).is_ok());
+        assert!(validate_env_raw_value(&"a".repeat(ENV_VALUE_MAX_BYTES + 1)).is_err());
+        assert!(validate_env_raw_value("a\nb").is_err());
+        assert!(validate_env_raw_value("a\rb").is_err());
+        assert!(validate_env_raw_value("a\0b").is_err());
+    }
+
+    #[test]
+    fn env_suggestions_keep_template_yaml_backward_compatible() {
+        // A `template.yaml` written before #27 only has key/description.
+        let legacy: EnvSuggestion =
+            serde_yaml::from_str("key: DISCORD_ALLOWED_USERS\ndescription: ids\n")
+                .expect("legacy suggestion");
+        assert_eq!(legacy.key, "DISCORD_ALLOWED_USERS");
+        assert!(legacy.example.is_none());
+        assert!(legacy.format.is_none());
+        assert!(!legacy.required);
+        assert!(!legacy.secret);
+
+        let full: EnvSuggestion = serde_yaml::from_str(
+            "key: DISCORD_ALLOWED_USERS\n\
+             description: ids\n\
+             secret: false\n\
+             example: '274575374111866880'\n\
+             required: true\n\
+             format: csv-of-ids\n",
+        )
+        .expect("typed suggestion");
+        assert_eq!(full.example.as_deref(), Some("274575374111866880"));
+        assert!(full.required);
+        assert_eq!(full.format.as_deref(), Some("csv-of-ids"));
+    }
+
+    #[test]
+    fn env_formats_are_enforced() {
+        for valid in ["123", "123,456", " 123 , 456 ", "274575374111866880"] {
+            assert!(validate_env_value("csv-of-ids", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "  ", "12a", "123,", ",123", "123,,456", "123 456"] {
+            assert!(
+                validate_env_value("csv-of-ids", invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        for valid in ["true", "FALSE", "1", "0", "yes", "No"] {
+            assert!(validate_env_value("bool", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "maybe", "2", "on"] {
+            assert!(validate_env_value("bool", invalid).is_err(), "{invalid:?}");
+        }
+
+        for valid in ["https://example.test", "http://10.1.20.1:8090/api"] {
+            assert!(validate_env_value("url", valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", "example.test", "ftp://example.test", "https://"] {
+            assert!(validate_env_value("url", invalid).is_err(), "{invalid:?}");
+        }
+
+        assert!(validate_env_value("text", "hello").is_ok());
+        assert!(validate_env_value("text", "  ").is_err());
+        assert!(validate_env_value("text", "").is_err());
+
+        // An unknown format is not enforced (forward compatibility).
+        assert!(validate_env_value("number-of-ids", "").is_ok());
     }
 
     #[test]
@@ -1217,6 +1587,89 @@ mod tests {
             assert!(validate_image(invalid).is_err(), "{invalid:?}");
         }
         assert!(validate_image(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn env_accepts_the_list_and_the_legacy_map() {
+        let list = serde_json::json!([
+            {"key": "DISCORD_ALLOWED_USERS", "value": "123", "secret": false}
+        ]);
+        let parsed = EnvInput::from_json_value(&list).expect("list");
+        let vars = parsed.into_vars();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "DISCORD_ALLOWED_USERS");
+        assert_eq!(vars[0].value.as_deref(), Some("123"));
+        assert_eq!(vars[0].secret, Some(false));
+
+        let map = serde_json::json!({"DISCORD_BOT_TOKEN": "secret"});
+        let parsed = EnvInput::from_json_value(&map).expect("map");
+        let vars = parsed.into_vars();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].key, "DISCORD_BOT_TOKEN");
+        assert_eq!(vars[0].value.as_deref(), Some("secret"));
+        assert_eq!(vars[0].secret, Some(true), "the map defaults to secret");
+    }
+
+    #[test]
+    fn env_shape_errors_name_the_received_type() {
+        let number = serde_json::json!(42);
+        assert_eq!(
+            EnvInput::from_json_value(&number)
+                .expect_err("number")
+                .received,
+            "number"
+        );
+        let string = serde_json::json!("nope");
+        assert_eq!(
+            EnvInput::from_json_value(&string)
+                .expect_err("string")
+                .received,
+            "string"
+        );
+        let bad_entry = serde_json::json!([{"key": 1}]);
+        assert_eq!(
+            EnvInput::from_json_value(&bad_entry)
+                .expect_err("bad entry")
+                .received,
+            "sequence"
+        );
+        let bad_map_value = serde_json::json!({"KEY": 1});
+        assert_eq!(
+            EnvInput::from_json_value(&bad_map_value)
+                .expect_err("bad map value")
+                .received,
+            "map"
+        );
+    }
+
+    #[test]
+
+    fn heal_policies_round_trip_and_validate() {
+        for (text, expected) in [
+            ("off", HealPolicy::Off),
+            ("NONE", HealPolicy::Off),
+            ("restart", HealPolicy::Restart),
+            (" Recreate ", HealPolicy::Recreate),
+        ] {
+            assert_eq!(HealPolicy::parse(text), Some(expected), "{text}");
+        }
+        assert_eq!(HealPolicy::parse("heal"), None);
+        assert!(!HealPolicy::Off.heals());
+        assert!(HealPolicy::Restart.heals());
+        assert!(HealPolicy::Recreate.heals());
+        assert_eq!(HealPolicy::Recreate.to_string(), "recreate");
+
+        assert!(validate_unhealthy_after(1).is_ok());
+        assert!(validate_unhealthy_after(100).is_ok());
+        assert!(validate_unhealthy_after(0).is_err());
+        assert!(validate_unhealthy_after(101).is_err());
+        assert!(validate_max_restarts(0).is_ok());
+        assert!(validate_max_restarts(100).is_ok());
+        assert!(validate_max_restarts(101).is_err());
+        assert!(validate_heal_backoff(1).is_ok());
+        assert!(validate_heal_backoff(3600).is_ok());
+        assert!(validate_heal_backoff(0).is_err());
+        assert!(validate_heal_backoff(3601).is_err());
     }
 
     #[test]

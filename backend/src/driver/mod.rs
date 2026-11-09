@@ -62,6 +62,8 @@ pub struct InspectInfo {
     pub state: String,
     pub exit_code: Option<i32>,
     pub oom_killed: bool,
+    /// `RestartCount`: how many times Docker restarted the container.
+    pub restart_count: u32,
     /// `State.Error`, when Docker recorded one.
     pub error: Option<String>,
     /// `State.StartedAt` as RFC 3339, when the container has ever started.
@@ -101,6 +103,54 @@ impl InspectInfo {
         })
     }
 }
+
+/// Result of one command executed inside an instance container.
+///
+/// A non-zero exit code is a *successful* driver call: the command ran and its
+/// code is part of the result (the scheduler and the pipelines record it).
+/// `timed_out` means the command was killed after the requested budget;
+/// `stdout`/`stderr` then hold whatever was captured, if anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecResult {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    /// Wall-clock duration of the command, when measured.
+    pub duration_ms: u64,
+    /// At least one stream was cut at the output cap.
+    pub truncated: bool,
+}
+
+impl ExecResult {
+    /// `true` when the command exited cleanly before its timeout.
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out && self.exit_code == Some(0)
+    }
+
+    /// Operator-facing failure detail for a non-zero exit or a timeout.
+    pub fn failure_detail(&self) -> Option<String> {
+        if self.succeeded() {
+            return None;
+        }
+        if self.timed_out {
+            return Some("the command timed out".to_string());
+        }
+        let stderr = self.stderr.trim();
+        let stdout = self.stdout.trim();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        Some(match self.exit_code {
+            Some(code) if detail.is_empty() => format!("the command exited with code {code}"),
+            Some(code) => format!("exited with code {code}: {detail}"),
+            None if detail.is_empty() => "the command was terminated".to_string(),
+            None => detail.to_string(),
+        })
+    }
+}
+
+/// Historical name kept for the pipelines module (issue #31 merged after the
+/// scheduler); both names designate the same result type.
+pub type ExecOutput = ExecResult;
 
 /// A failed driver call, carrying the compose stderr.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -184,6 +234,19 @@ pub trait Driver: Send + Sync {
         specs: &'a [InstanceSpec],
     ) -> DriverFuture<'a, Result<Vec<UsageSample>, DriverError>>;
 
+    /// Run one command inside the instance container.
+    ///
+    /// `argv` is a complete argument vector (`["gateway", "ask", "<prompt>"]`
+    /// for the scheduler): it is never interpreted by a shell. A non-zero exit
+    /// code is returned as [`ExecResult`], not as an error; only a failure to
+    /// start Docker or `docker compose exec` itself is a [`DriverError`].
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecResult, DriverError>>;
+
     /// Make sure `image` is present locally, pulling it when it is not.
     ///
     /// `docker image inspect` first so a local tag is never re-pulled; the
@@ -266,5 +329,45 @@ mod tests {
         let options = LogsOptions::default();
         assert_eq!(options.tail, 200);
         assert!(options.since.is_none());
+    }
+
+    #[test]
+    fn exec_outputs_distinguish_success_from_a_command_failure() {
+        let success = ExecOutput {
+            exit_code: Some(0),
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            duration_ms: 0,
+            truncated: false,
+        };
+        assert!(success.succeeded());
+        assert_eq!(success.failure_detail(), None);
+
+        let failed = ExecOutput {
+            exit_code: Some(2),
+            stdout: String::new(),
+            stderr: "boom".to_string(),
+            timed_out: false,
+            duration_ms: 0,
+            truncated: false,
+        };
+        assert!(!failed.succeeded());
+        let detail = failed.failure_detail().expect("detail");
+        assert!(detail.contains("code 2"), "{detail}");
+        assert!(detail.contains("boom"), "{detail}");
+
+        let timed_out = ExecOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            duration_ms: 0,
+            truncated: false,
+        };
+        assert!(!timed_out.succeeded());
+        assert!(timed_out
+            .failure_detail()
+            .is_some_and(|detail| detail.contains("timed out")));
     }
 }

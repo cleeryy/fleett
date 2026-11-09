@@ -18,8 +18,12 @@ pub const DEFAULT_ROOT: &str = "/opt/fleett";
 pub const DEFAULT_BIND: &str = "127.0.0.1:8090";
 pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
 pub const DEFAULT_NETWORK: &str = "fleett";
+/// Default sampling interval of the watchdog (`FLEETT_WATCHDOG_INTERVAL_S`).
+pub const DEFAULT_WATCHDOG_INTERVAL_S: u64 = 30;
 /// Marker written by `fleett egress install` and read by the control plane.
 pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
+/// Proxy every instance with a destination policy is pointed at (issue #41).
+pub const DEFAULT_EGRESS_PROXY: &str = "http://fleett-egress-proxy:3128";
 /// Key file used to encrypt instance secrets at rest.
 ///
 /// Outside `FLEETT_ROOT` on purpose: a backup of the data root must never
@@ -306,6 +310,73 @@ impl fmt::Debug for OidcConfig {
 /// Default bind of the dedicated Prometheus listener (`GET /metrics`).
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9100";
 
+/// Requests per minute allowed on `/api/*`, per client and credential
+/// (`FLEETT_RATE_LIMIT_PER_MIN`); `0` disables the limiter.
+pub const DEFAULT_RATE_LIMIT_PER_MIN: u32 = 120;
+/// Requests per minute allowed on the browser authentication pages
+/// (`FLEETT_RATE_LIMIT_AUTH_PER_MIN`); `0` disables the bucket.
+pub const DEFAULT_RATE_LIMIT_AUTH_PER_MIN: u32 = 10;
+/// Requests per minute allowed on the heavy instance routes — `/exec`, `/logs`,
+/// `/files`, `/export` (`FLEETT_RATE_LIMIT_HEAVY_PER_MIN`); `0` disables the
+/// bucket.
+pub const DEFAULT_RATE_LIMIT_HEAVY_PER_MIN: u32 = 30;
+/// Failed authentications tolerated from one IP and credential shape before the
+/// progressive lockout engages (`FLEETT_AUTH_LOCKOUT_FAILURES`); `0` disables
+/// the lockout.
+pub const DEFAULT_AUTH_LOCKOUT_FAILURES: u32 = 10;
+/// Sliding window of the failure counter (`FLEETT_AUTH_LOCKOUT_WINDOW_S`).
+pub const DEFAULT_AUTH_LOCKOUT_WINDOW_S: u64 = 600;
+/// How long the lockout refuses new attempts (`FLEETT_AUTH_LOCKOUT_S`).
+pub const DEFAULT_AUTH_LOCKOUT_S: u64 = 900;
+
+/// API hardening: rate limits, progressive lockout and header posture.
+///
+/// A rate limit of `0` disables that bucket; `FLEETT_AUTH_LOCKOUT_FAILURES=0`
+/// disables the lockout entirely, so the window and duration are only used
+/// when at least one failure is tolerated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityConfig {
+    /// `FLEETT_RATE_LIMIT_PER_MIN`, `0` = disabled.
+    pub rate_limit_per_min: u32,
+    /// `FLEETT_RATE_LIMIT_AUTH_PER_MIN`, `0` = disabled.
+    pub rate_limit_auth_per_min: u32,
+    /// `FLEETT_RATE_LIMIT_HEAVY_PER_MIN`, `0` = disabled.
+    pub rate_limit_heavy_per_min: u32,
+    /// `FLEETT_AUTH_LOCKOUT_FAILURES`, `0` = disabled.
+    pub lockout_failures: u32,
+    /// `FLEETT_AUTH_LOCKOUT_WINDOW_S`.
+    pub lockout_window_s: u64,
+    /// `FLEETT_AUTH_LOCKOUT_S`.
+    pub lockout_s: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_min: DEFAULT_RATE_LIMIT_PER_MIN,
+            rate_limit_auth_per_min: DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
+            rate_limit_heavy_per_min: DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
+            lockout_failures: DEFAULT_AUTH_LOCKOUT_FAILURES,
+            lockout_window_s: DEFAULT_AUTH_LOCKOUT_WINDOW_S,
+            lockout_s: DEFAULT_AUTH_LOCKOUT_S,
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Whether at least one rate-limit bucket is active.
+    pub fn limiting_enabled(&self) -> bool {
+        self.rate_limit_per_min > 0
+            || self.rate_limit_auth_per_min > 0
+            || self.rate_limit_heavy_per_min > 0
+    }
+
+    /// Whether the progressive authentication lockout is active.
+    pub fn lockout_enabled(&self) -> bool {
+        self.lockout_failures > 0
+    }
+}
+
 pub const DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:8090";
 pub const DEFAULT_OIDC_SCOPES: &str = "openid profile email";
 pub const DEFAULT_OIDC_ADMIN_GROUP: &str = "fleett-admins";
@@ -321,12 +392,21 @@ pub const MIN_OIDC_STATE_TTL_SECS: u64 = 60;
 pub const MAX_OIDC_STATE_TTL_SECS: u64 = 3600;
 /// Minimum length of the decoded `FLEETT_SESSION_SECRET`.
 pub const MIN_SESSION_SECRET_BYTES: usize = 32;
+/// Default retention of the persistent log center (`FLEETT_LOG_RETENTION`).
+pub const DEFAULT_LOG_RETENTION: &str = "7d";
+/// Default row cap of the persistent log center (`FLEETT_LOG_MAX_ROWS`).
+pub const DEFAULT_LOG_MAX_ROWS: u64 = 500_000;
 
 /// Fully resolved configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
     pub bind: SocketAddr,
+    /// Public base URL (`FLEETT_PUBLIC_URL`); used by HSTS and notification links.
+    pub public_url: String,
+    /// Proxy rendered into instances that have a destination policy
+    /// (`FLEETT_EGRESS_PROXY`). Empty or `off` renders no proxy variables.
+    pub egress_proxy: String,
     /// `None` only when `FLEETT_ALLOW_NO_AUTH=1` or OIDC is the only mode.
     pub token: Option<String>,
     pub allow_no_auth: bool,
@@ -354,8 +434,34 @@ pub struct Config {
     pub web_dist: Option<PathBuf>,
     /// Security posture of the rendered agent containers (`FLEETT_HARDENING`).
     pub hardening: Hardening,
+    /// Enforce `maintenance_windows` (`FLEETT_MAINTENANCE_ENFORCE`, default on).
+    ///
+    /// Enforcement only kicks in when at least one enabled window exists, so a
+    /// fresh install is never locked out.
+    pub maintenance_enforce: bool,
     /// Dedicated Prometheus listener (`FLEETT_METRICS_*`).
     pub metrics: MetricsConfig,
+    /// Sampling interval of the watchdog, in seconds (`FLEETT_WATCHDOG_INTERVAL_S`,
+    /// default 30). `0` disables the background loop; `fleett incidents` still
+    /// reads the registry.
+    pub watchdog_interval_s: u64,
+    /// Seconds between two automatic usage-log scans (`FLEETT_COST_SCAN_INTERVAL_S`).
+    /// `0` disables the background scanner; ingestion stays available through
+    /// `POST /api/usage/ingest`.
+    pub cost_scan_interval_s: u64,
+    /// Raw `FLEETT_EXEC_ALLOWLIST` (`None` keeps the built-in allowlist).
+    pub exec_allowlist: Option<String>,
+    /// Retention window of the persistent log center (`FLEETT_LOG_RETENTION`).
+    pub log_retention: std::time::Duration,
+    /// Row cap of the log center; `0` disables the cap (`FLEETT_LOG_MAX_ROWS`).
+    pub log_max_rows: u64,
+    /// API hardening: rate limits and auth lockout (`FLEETT_RATE_LIMIT_*`,
+    /// `FLEETT_AUTH_LOCKOUT_*`). See docs/HARDENING.md.
+    pub security: SecurityConfig,
+    /// Key signing `GET /api/audit/export` (`FLEETT_AUDIT_HMAC_KEY`), decoded.
+    pub audit_hmac_key: Option<crate::audit::AuditKey>,
+    /// Rows older than this are pruned (`FLEETT_AUDIT_RETENTION`, default 90d).
+    pub audit_retention: chrono::Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -557,6 +663,8 @@ impl Config {
         let egress_marker = get("EGRESS_MARKER")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_EGRESS_MARKER));
+        let egress_proxy =
+            get_raw("EGRESS_PROXY").unwrap_or_else(|| DEFAULT_EGRESS_PROXY.to_string());
 
         let secrets_key = get("SECRETS_KEY");
         let secrets_key_file = get("SECRETS_KEY_FILE")
@@ -577,10 +685,82 @@ impl Config {
         };
 
         let metrics = resolve_metrics(get_raw("METRICS_BIND"), get("METRICS_TOKEN"))?;
+        let security = resolve_security(&get)?;
+        let audit_hmac_key = match get("AUDIT_HMAC_KEY") {
+            None => None,
+            Some(value) => Some(crate::audit::AuditKey::new(
+                crate::audit::parse_key(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_HMAC_KEY",
+                    value: "<redacted>".to_string(),
+                    detail,
+                })?,
+            )),
+        };
+        let audit_retention = match get("AUDIT_RETENTION") {
+            None => crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("the default retention is valid"),
+            Some(value) => {
+                crate::audit::parse_retention(&value).map_err(|detail| ConfigError::Invalid {
+                    var: "FLEETT_AUDIT_RETENTION",
+                    value: value.clone(),
+                    detail,
+                })?
+            }
+        };
+        let public_url = get("PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
+        let exec_allowlist = get("EXEC_ALLOWLIST");
+
+        let cost_scan_interval_s = match get("COST_SCAN_INTERVAL_S") {
+            None => 300,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_COST_SCAN_INTERVAL_S",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
+
+        let watchdog_interval_s = match get("WATCHDOG_INTERVAL_S") {
+            None => DEFAULT_WATCHDOG_INTERVAL_S,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_WATCHDOG_INTERVAL_S",
+                value: value.clone(),
+                detail: format!("{err} (0 disables the watchdog loop)"),
+            })?,
+        };
+
+        // `FLEETT_MAINTENANCE_ENFORCE=0` disables the upkeep windows entirely;
+        // any other value (or no value) keeps the default, which only blocks
+        // once an enabled window exists.
+        let maintenance_enforce = match get("MAINTENANCE_ENFORCE") {
+            None => true,
+            Some(value) => !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+        };
+
+        let log_retention = match get("LOG_RETENTION") {
+            None => parse_log_retention(DEFAULT_LOG_RETENTION).expect("default retention is valid"),
+            Some(value) => parse_log_retention(&value).ok_or_else(|| ConfigError::Invalid {
+                var: "FLEETT_LOG_RETENTION",
+                value: value.clone(),
+                detail: "expected a positive duration such as 7d, 24h or 1h30m".to_string(),
+            })?,
+        };
+        let log_max_rows = match get("LOG_MAX_ROWS") {
+            None => DEFAULT_LOG_MAX_ROWS,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_LOG_MAX_ROWS",
+                value: value.clone(),
+                detail: err.to_string(),
+            })?,
+        };
 
         Ok(Self {
             root,
             bind,
+            public_url,
+            egress_proxy,
             token,
             allow_no_auth,
             auth,
@@ -597,7 +777,16 @@ impl Config {
             secrets_autoimport,
             web_dist,
             hardening,
+            maintenance_enforce,
             metrics,
+            cost_scan_interval_s,
+            watchdog_interval_s,
+            exec_allowlist,
+            log_retention,
+            log_max_rows,
+            security,
+            audit_hmac_key,
+            audit_retention,
         })
     }
 
@@ -616,6 +805,7 @@ impl Config {
             bind: "127.0.0.1:0"
                 .parse()
                 .expect("literal socket address is valid"),
+            public_url: DEFAULT_PUBLIC_URL.to_string(),
             token: Some("test-token".to_string()),
             allow_no_auth: false,
             auth: AuthMode::Bearer,
@@ -627,19 +817,65 @@ impl Config {
             max_total_mem_mb: 0,
             egress: EgressMode::Off,
             egress_marker,
+            egress_proxy: DEFAULT_EGRESS_PROXY.to_string(),
             secrets_key: None,
             secrets_key_file,
             secrets_autoimport: false,
             web_dist: None,
             hardening: Hardening::Standard,
+            maintenance_enforce: true,
             // The listener is started by `serve` only: tests never bind a port.
             metrics: MetricsConfig::default(),
+            // Tests drive `watchdog::tick` explicitly; no background loop runs.
+            watchdog_interval_s: 0,
+            // Tests ingest usage explicitly; no background scanner.
+            cost_scan_interval_s: 0,
+            exec_allowlist: None,
+            log_retention: parse_log_retention(DEFAULT_LOG_RETENTION).expect("valid default"),
+            log_max_rows: DEFAULT_LOG_MAX_ROWS,
+            // Tests exercise the limiter explicitly; by default they are never
+            // rate-limited.
+            security: SecurityConfig {
+                rate_limit_per_min: 0,
+                rate_limit_auth_per_min: 0,
+                rate_limit_heavy_per_min: 0,
+                lockout_failures: 0,
+                ..SecurityConfig::default()
+            },
+            audit_hmac_key: None,
+            audit_retention: crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
+                .expect("valid default"),
         }
     }
 
     /// Name of the unrestricted network attached to `allow_lan` instances.
     pub fn lan_network(&self) -> String {
         format!("{}-lan", self.network)
+    }
+
+    pub fn hsts_enabled(&self) -> bool {
+        self.public_url
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("https://")
+    }
+
+    /// Proxy URL rendered into an instance with a destination policy.
+    ///
+    /// `None` when `FLEETT_EGRESS_PROXY` is empty, `off` or `none`: the policy
+    /// is still stored, but no `HTTP(S)_PROXY` variable is written (an honest
+    /// gap the API reports).
+    pub fn egress_proxy_url(&self) -> Option<&str> {
+        let value = self.egress_proxy.trim();
+        if value.is_empty()
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("none")
+            || value.eq_ignore_ascii_case("disabled")
+        {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -861,6 +1097,43 @@ fn resolve_metrics(
     Ok(MetricsConfig { bind, token })
 }
 
+/// Parse a log retention window.
+///
+/// Accepts one or more `<number><unit>` groups (`7d`, `24h`, `1h30m`) or a bare
+/// number of seconds. Units are `s`, `m`, `h`, `d` and `w`; the result must be
+/// strictly positive.
+pub fn parse_log_retention(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+    }
+    let mut rest = value;
+    let mut total = 0u64;
+    while !rest.is_empty() {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let (number, tail) = rest.split_at(digits);
+        let number: u64 = number.parse().ok()?;
+        let unit = tail.chars().next()?;
+        let unit_seconds = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            'w' => 7 * 24 * 60 * 60,
+            _ => return None,
+        };
+        total = total.checked_add(number.checked_mul(unit_seconds)?)?;
+        rest = &tail[unit.len_utf8()..];
+    }
+    (total > 0).then(|| std::time::Duration::from_secs(total))
+}
+
 /// Resolve one configuration variable: `FLEETT_<suffix>` then `FLEET_<suffix>`.
 fn resolve_var(lookup: &dyn Fn(&str) -> Option<String>, suffix: &str) -> Option<String> {
     resolve_var_raw(lookup, suffix).filter(|value| !value.is_empty())
@@ -1016,10 +1289,126 @@ fn unquote(value: &str) -> String {
     out
 }
 
+fn resolve_security(get: &dyn Fn(&str) -> Option<String>) -> Result<SecurityConfig, ConfigError> {
+    fn env_u32(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u32,
+    ) -> Result<u32, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u32>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    fn env_u64(
+        get: &dyn Fn(&str) -> Option<String>,
+        suffix: &str,
+        var: &'static str,
+        default: u64,
+    ) -> Result<u64, ConfigError> {
+        match get(suffix) {
+            None => Ok(default),
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var,
+                value: value.clone(),
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    let rate_limit_per_min = env_u32(
+        get,
+        "RATE_LIMIT_PER_MIN",
+        "FLEETT_RATE_LIMIT_PER_MIN",
+        DEFAULT_RATE_LIMIT_PER_MIN,
+    )?;
+    let rate_limit_auth_per_min = env_u32(
+        get,
+        "RATE_LIMIT_AUTH_PER_MIN",
+        "FLEETT_RATE_LIMIT_AUTH_PER_MIN",
+        DEFAULT_RATE_LIMIT_AUTH_PER_MIN,
+    )?;
+    let rate_limit_heavy_per_min = env_u32(
+        get,
+        "RATE_LIMIT_HEAVY_PER_MIN",
+        "FLEETT_RATE_LIMIT_HEAVY_PER_MIN",
+        DEFAULT_RATE_LIMIT_HEAVY_PER_MIN,
+    )?;
+    let lockout_failures = env_u32(
+        get,
+        "AUTH_LOCKOUT_FAILURES",
+        "FLEETT_AUTH_LOCKOUT_FAILURES",
+        DEFAULT_AUTH_LOCKOUT_FAILURES,
+    )?;
+    let lockout_window_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_WINDOW_S",
+        "FLEETT_AUTH_LOCKOUT_WINDOW_S",
+        DEFAULT_AUTH_LOCKOUT_WINDOW_S,
+    )?;
+    let lockout_s = env_u64(
+        get,
+        "AUTH_LOCKOUT_S",
+        "FLEETT_AUTH_LOCKOUT_S",
+        DEFAULT_AUTH_LOCKOUT_S,
+    )?;
+
+    for (var, value) in [
+        ("FLEETT_AUTH_LOCKOUT_WINDOW_S", lockout_window_s),
+        ("FLEETT_AUTH_LOCKOUT_S", lockout_s),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::Invalid {
+                var,
+                value: "0".to_string(),
+                detail: "expected a positive number of seconds".to_string(),
+            });
+        }
+    }
+
+    Ok(SecurityConfig {
+        rate_limit_per_min,
+        rate_limit_auth_per_min,
+        rate_limit_heavy_per_min,
+        lockout_failures,
+        lockout_window_s,
+        lockout_s,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn log_retention_windows_are_parsed() {
+        assert_eq!(
+            parse_log_retention("7d"),
+            Some(std::time::Duration::from_secs(7 * 24 * 3600))
+        );
+        assert_eq!(
+            parse_log_retention("24h"),
+            Some(std::time::Duration::from_secs(24 * 3600))
+        );
+        assert_eq!(
+            parse_log_retention("1h30m"),
+            Some(std::time::Duration::from_secs(90 * 60))
+        );
+        assert_eq!(
+            parse_log_retention("3600"),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        for invalid in ["", "0", "0d", "d", "1x", "-1h", "1.5h"] {
+            assert_eq!(parse_log_retention(invalid), None, "{invalid:?}");
+        }
+    }
 
     #[test]
     fn parses_env_file_and_ignores_comments() {
@@ -1324,6 +1713,7 @@ FLEETT_NETWORK='fleett-net'
             .expect("defaults resolve");
         assert_eq!(cfg.egress, EgressMode::Restrict);
         assert_eq!(cfg.egress_marker, PathBuf::from(DEFAULT_EGRESS_MARKER));
+        assert_eq!(cfg.egress_proxy_url(), Some(DEFAULT_EGRESS_PROXY));
         assert_eq!(cfg.lan_network(), "fleett-lan");
 
         for value in ["off", "OFF", "disabled"] {

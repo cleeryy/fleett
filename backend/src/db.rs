@@ -12,7 +12,7 @@
 
 use crate::config::Config;
 use crate::models::{
-    now_iso, ChannelKind, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
+    now_iso, ChannelKind, HealPolicy, InstanceSpec, ProviderSpec, ShareMode, ShareRef, Status,
 };
 use crate::store;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -164,7 +164,411 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
-    // v10 — versioned custom templates (issue #43). The files stay on disk
+    // v10 — shared fleet memory (issue #29): key/value entries with FTS5
+    // search, TTL and a full version history. Values are operator knowledge,
+    // never credentials; secrets stay in `instance_env` / `providers`.
+    r#"
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '',
+    owner       TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    expires_at  TEXT,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (namespace, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory_entries (namespace);
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id   INTEGER NOT NULL,
+    namespace  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    tags       TEXT NOT NULL,
+    owner      TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    action     TEXT NOT NULL,
+    at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_versions_entry ON memory_versions (entry_id, version);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+    USING fts5(namespace, key, value, tags, tokenize = 'unicode61');
+"#,
+    // v11 — per-agent cron schedules and their run history (issue #30).
+    // `schedules.next_run_at` is NULL while the schedule is disabled; the
+    // background loop only reads enabled rows, so a disabled schedule never
+    // affects another instance. `schedule_runs.status` is one of `running`,
+    // `ok`, `error`, `timeout` or `skipped`; a `running` row left behind by a
+    // crash is turned into `error` at startup.
+    r#"
+CREATE TABLE IF NOT EXISTS schedules (
+    id           TEXT PRIMARY KEY NOT NULL,
+    instance_id  TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    cron         TEXT NOT NULL,
+    prompt       TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    timezone     TEXT NOT NULL DEFAULT 'UTC',
+    overlap      TEXT NOT NULL DEFAULT 'skip',
+    timeout_s    INTEGER NOT NULL DEFAULT 300,
+    catchup      INTEGER NOT NULL DEFAULT 0,
+    last_run_at  TEXT,
+    next_run_at  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE (instance_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_instance ON schedules (instance_id, name);
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules (enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    id           TEXT PRIMARY KEY NOT NULL,
+    schedule_id  TEXT NOT NULL,
+    instance_id  TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    output       TEXT,
+    duration_ms  INTEGER,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_schedule
+    ON schedule_runs (schedule_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_instance
+    ON schedule_runs (instance_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_status
+    ON schedule_runs (status, started_at);
+"#,
+    // v12 — DAG pipelines (issue #31). The definition is stored as canonical
+    // JSON (validated before the write); every run is a new UUID and keeps its
+    // own step rows, so history is never overwritten.
+    r#"
+CREATE TABLE IF NOT EXISTS pipelines (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL UNIQUE,
+    definition  TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipelines_trigger ON pipelines (trigger, enabled);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id          TEXT PRIMARY KEY NOT NULL,
+    pipeline_id TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    trigger     TEXT NOT NULL,
+    context     TEXT,
+    started_at  TEXT,
+    finished_at TEXT,
+    error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline
+    ON pipeline_runs (pipeline_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs (status);
+
+CREATE TABLE IF NOT EXISTS pipeline_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    step_id     TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    attempt     INTEGER NOT NULL DEFAULT 0,
+    output      TEXT,
+    error       TEXT,
+    started_at  TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_steps_run
+    ON pipeline_steps (run_id, step_id);
+"#,
+    // v13 — watchdog: self-healing policy per instance and the incident
+    // registry (issue #32). Existing rows keep healing disabled, so an upgrade
+    // never starts touching containers on its own.
+    r#"
+CREATE TABLE IF NOT EXISTS incidents (
+    id            TEXT PRIMARY KEY NOT NULL,
+    instance_id   TEXT NOT NULL,
+    cause         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    opened_at     TEXT NOT NULL,
+    closed_at     TEXT,
+    detail        TEXT NOT NULL DEFAULT '',
+    actions       TEXT NOT NULL DEFAULT '[]',
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    last_seen_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_instance_status
+    ON incidents (instance_id, status);
+
+ALTER TABLE instances ADD COLUMN heal TEXT NOT NULL DEFAULT 'off';
+ALTER TABLE instances ADD COLUMN unhealthy_after INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE instances ADD COLUMN max_restarts INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE instances ADD COLUMN heal_backoff_s INTEGER NOT NULL DEFAULT 30;
+"#,
+    // v14 — outbound alert channels and their delivery journal (issue #33).
+    // A channel secret is optional (a plain webhook needs none) and, when
+    // present, encrypted exactly like a provider secret. Deliveries are kept
+    // after the channel is deleted: they are the audit trail of what was sent.
+    r#"
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    nonce       BLOB,
+    ciphertext  BLOB,
+    events      TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id   TEXT NOT NULL,
+    event        TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    delivered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
+    ON notification_deliveries (channel_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_event
+    ON notification_deliveries (event, created_at);
+"#,
+    // v15 — per-instance restore points (issue #38). A snapshot archives the
+    // instance data, its rendered compose/config/SOUL and the *encrypted* env
+    // rows; the row tracks the archive file, its retention and the outcome of
+    // the last restore. Files live in `<root>/snapshots/<id>/<ts>.tgz`.
+    r#"
+CREATE TABLE IF NOT EXISTS snapshots (
+    id           TEXT PRIMARY KEY NOT NULL,
+    instance_id  TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'ok',
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_instance
+    ON snapshots (instance_id, created_at);
+"#,
+    // v16 — maintenance windows and the deployment journal (issue #39). (issue #39).
+    // A window restricts destructive operations to a day/time range; a
+    // deployment row keeps the trace of one upgrade (immediate or scheduled)
+    // after the in-memory job is gone. `days` is a comma-separated subset of
+    // `mon..sun`; minutes are UTC minutes since midnight (0..1439).
+    r#"
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id            TEXT PRIMARY KEY NOT NULL,
+    name          TEXT NOT NULL,
+    days          TEXT NOT NULL,
+    start_minute  INTEGER NOT NULL,
+    end_minute    INTEGER NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deployments (
+    id          TEXT PRIMARY KEY NOT NULL,
+    image       TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    instances   TEXT NOT NULL,
+    canary      INTEGER NOT NULL DEFAULT 0,
+    soak_s      INTEGER NOT NULL DEFAULT 0,
+    started_at  TEXT,
+    finished_at TEXT,
+    result      TEXT,
+    error       TEXT,
+    rollback    INTEGER NOT NULL DEFAULT 0,
+    created_by  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_started ON deployments (started_at);
+CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments (status);
+"#,
+    // a secret value, only `secret_ref` references.
+    r#"
+CREATE TABLE IF NOT EXISTS desired_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    document   TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    source     TEXT NOT NULL
+);
+"#,
+    // monthly ceiling of one instance (`enabled = 0` keeps it as history).
+    r#"
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id       TEXT NOT NULL,
+    at                TEXT NOT NULL,
+    model             TEXT NOT NULL DEFAULT '',
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    source            TEXT NOT NULL DEFAULT 'log',
+    fingerprint       TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_instance_at
+    ON usage_events (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_at
+    ON usage_events (model, at);
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model            TEXT NOT NULL,
+    input_per_mtok   REAL NOT NULL,
+    output_per_mtok  REAL NOT NULL,
+    currency         TEXT NOT NULL DEFAULT 'USD',
+    effective_from   TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (model, effective_from)
+);
+
+CREATE TABLE IF NOT EXISTS cost_budgets (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    monthly_usd  REAL NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    updated_at   TEXT NOT NULL
+);
+"#,
+    // v19 — per-instance RBAC and scoped tokens (issue #37). `instance_acl`
+    // grants an `owner|operator|viewer` level to one subject per instance;
+    // `api_tokens.scope` optionally restricts a named token to a JSON
+    // `{"instances":[…],"actions":["read","write","exec"]}` list. NULL keeps
+    // the legacy global role behaviour.
+    r#"
+CREATE TABLE IF NOT EXISTS instance_acl (
+    instance_id  TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (instance_id, subject)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instance_acl_subject ON instance_acl (subject);
+
+ALTER TABLE api_tokens ADD COLUMN scope TEXT;
+"#,
+    // recorded so `GET /api/webhooks/{id}/deliveries` can explain a failure.
+    r#"
+CREATE TABLE IF NOT EXISTS webhooks (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    events      TEXT NOT NULL,
+    nonce       BLOB NOT NULL,
+    ciphertext  BLOB NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    webhook_id      TEXT NOT NULL REFERENCES webhooks (id) ON DELETE CASCADE,
+    event           TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    response_status INTEGER,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    delivered_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook
+    ON webhook_deliveries (webhook_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
+    ON webhook_deliveries (status);
+"#,
+    // v22 — persistent log center (issue #42). `log_entries` keeps the lines
+    // tailed from every instance container; `log_fts` is a standalone FTS5
+    // index over the message, whose rowid is `log_entries.id` (it is written
+    // and deleted by the log store in the same transaction as the row).
+    // `line_hash` makes repeated tails idempotent: the same raw line of the
+
+    // same instance is never stored twice.
+    r#"
+CREATE TABLE IF NOT EXISTS log_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    level       TEXT NOT NULL DEFAULT 'info',
+    message     TEXT NOT NULL,
+    raw         TEXT NOT NULL,
+    line_hash   TEXT NOT NULL,
+    UNIQUE (instance_id, line_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_entries_at ON log_entries (at);
+CREATE INDEX IF NOT EXISTS idx_log_entries_instance_at
+    ON log_entries (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_log_entries_level ON log_entries (level);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(message, instance_id);
+"#,
+    // its current behaviour after the upgrade.
+    r#"
+CREATE TABLE IF NOT EXISTS egress_policies (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    mode         TEXT NOT NULL,
+    fqdns        TEXT NOT NULL DEFAULT '',
+    cidrs        TEXT NOT NULL DEFAULT '',
+    ports        TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS egress_blocks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id  TEXT NOT NULL,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    reason       TEXT,
+    at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_instance
+    ON egress_blocks (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_at
+    ON egress_blocks (at);
+"#,
+    // correlation id. Existing rows keep NULL/`ok`.
+    r#"
+ALTER TABLE audit_log ADD COLUMN user_agent TEXT;
+ALTER TABLE audit_log ADD COLUMN result TEXT NOT NULL DEFAULT 'ok';
+ALTER TABLE audit_log ADD COLUMN request_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action);
+"#,
+    // v23 — versioned custom templates (issue #43). The files stay on disk
     // under `templates/<id>/` (source of truth); this is the index rebuilt at
     // startup plus the history of every create/update/delete/restore.
     r#"
@@ -251,6 +655,12 @@ pub struct AuditRecord {
     pub action: String,
     pub target: String,
     pub ip: Option<String>,
+    /// Client `User-Agent`, bounded by the middleware before it is stored.
+    pub user_agent: Option<String>,
+    /// Outcome: `ok`, `failed` or `refused`.
+    pub result: String,
+    /// Correlation id, when the caller supplied one.
+    pub request_id: Option<String>,
     /// JSON text, when the action carries structured details.
     pub details: Option<String>,
 }
@@ -265,7 +675,57 @@ pub struct NewAuditRecord {
     pub action: String,
     pub target: String,
     pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    /// `ok` for a successful mutation, `failed`/`refused` otherwise.
+    pub result: String,
+    pub request_id: Option<String>,
     pub details: Option<String>,
+}
+
+impl NewAuditRecord {
+    /// A successful entry, the shape used by [`crate::api::audit::record`].
+    pub fn ok(
+        at: impl Into<String>,
+        actor: impl Into<String>,
+        role: impl Into<String>,
+        method: impl Into<String>,
+        action: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            at: at.into(),
+            actor: actor.into(),
+            role: role.into(),
+            method: method.into(),
+            action: action.into(),
+            target: target.into(),
+            ip: None,
+            user_agent: None,
+            result: "ok".to_string(),
+            request_id: None,
+            details: None,
+        }
+    }
+}
+
+/// Filters accepted by [`Db::query_audit`], newest first.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// Exact actor match.
+    pub actor: Option<String>,
+    /// Exact action match (`instance.create`).
+    pub action: Option<String>,
+    /// Exact target match (an instance id, a token id…).
+    pub target: Option<String>,
+    /// Inclusive lower bound, RFC 3339 (normalised by the HTTP layer).
+    pub from: Option<String>,
+    /// Inclusive upper bound, RFC 3339 (normalised by the HTTP layer).
+    pub to: Option<String>,
+    /// Exact outcome (`ok`, `failed`, `refused`).
+    pub result: Option<String>,
+    /// Page size; `None` returns every match (export).
+    pub limit: Option<usize>,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +736,55 @@ pub struct ProviderRecord {
     pub ciphertext: Vec<u8>,
 }
 
+/// One outbound alert channel (`notification_channels`).
+///
+/// `nonce` and `ciphertext` are both `None` for a channel without a secret
+/// (a plain webhook or Discord URL); when set they hold the AES-256-GCM blob
+/// of the channel secret, never its plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationChannelRecord {
+    pub id: String,
+    pub name: String,
+    /// `webhook`, `discord`, `telegram` or `smtp`.
+    pub kind: String,
+    pub target: String,
+    pub nonce: Option<Vec<u8>>,
+    pub ciphertext: Option<Vec<u8>>,
+    /// Comma-separated event subscriptions (`*`, `incident.*` or one event).
+    pub events: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One row of `notification_deliveries`: the journal of an alert attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationDeliveryRecord {
+    pub id: i64,
+    pub channel_id: String,
+    pub event: String,
+    pub subject: String,
+    /// `pending`, `sent`, `failed` or `suppressed`.
+    pub status: String,
+    pub attempts: usize,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+}
+
+/// A delivery row to insert (the id is allocated by SQLite).
+#[derive(Debug, Clone)]
+pub struct NewNotificationDelivery {
+    pub channel_id: String,
+    pub event: String,
+    pub subject: String,
+    pub status: String,
+    pub attempts: usize,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub delivered_at: Option<String>,
+}
+
 /// A named API token. The secret is never stored, only its digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiTokenRecord {
@@ -284,6 +793,8 @@ pub struct ApiTokenRecord {
     pub role: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+    /// JSON `{instances,actions}` text; `None` is a legacy global token.
+    pub scope: Option<String>,
 }
 
 impl ApiTokenRecord {
@@ -299,6 +810,18 @@ pub struct NewApiToken {
     pub name: String,
     pub role: String,
     pub hash: String,
+    pub created_at: String,
+    /// JSON `{instances,actions}` text; `None` keeps the global role.
+    pub scope: Option<String>,
+}
+
+/// One row of `instance_acl` (issue #37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclRecord {
+    pub instance_id: String,
+    pub subject: String,
+    /// `owner`, `operator` or `viewer`; callers validate it.
+    pub role: String,
     pub created_at: String,
 }
 
@@ -371,8 +894,8 @@ impl Db {
         let stored = conn
             .query_row(
                 "SELECT id, name, template, model, base_url, api_key_env, provider, channel, \
-                 status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
-                 updated_at \
+                 status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
+                 unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at \
                  FROM instances WHERE id = ?1",
                 params![id],
                 row_to_stored,
@@ -389,8 +912,8 @@ impl Db {
         let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, name, template, model, base_url, api_key_env, provider, channel, status, \
-             last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, created_at, \
-             updated_at \
+             last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, unhealthy_after, \
+             max_restarts, heal_backoff_s, notes, created_at, updated_at \
              FROM instances ORDER BY id",
         )?;
         let stored = statement
@@ -435,9 +958,10 @@ impl Db {
         }
         transaction.execute(
             "INSERT INTO instances (id, name, template, model, base_url, api_key_env, provider, \
-             channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, notes, \
-             created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             channel, status, last_error, mem_limit_mb, cpu_limit, image, allow_lan, heal, \
+             unhealthy_after, max_restarts, heal_backoff_s, notes, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                     ?17, ?18, ?19, ?20, ?21)",
             params![
                 spec.id,
                 spec.name,
@@ -453,6 +977,10 @@ impl Db {
                 spec.cpu_limit,
                 spec.image,
                 spec.allow_lan,
+                spec.heal.as_str(),
+                spec.unhealthy_after,
+                spec.max_restarts,
+                spec.heal_backoff_s as i64,
                 spec.notes,
                 spec.created_at,
                 spec.updated_at,
@@ -471,8 +999,9 @@ impl Db {
         let updated = transaction.execute(
             "UPDATE instances SET name = ?2, template = ?3, model = ?4, base_url = ?5, \
              api_key_env = ?6, provider = ?7, channel = ?8, status = ?9, last_error = ?10, \
-             mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, notes = ?15, \
-             updated_at = ?16 \
+             mem_limit_mb = ?11, cpu_limit = ?12, image = ?13, allow_lan = ?14, heal = ?15, \
+             unhealthy_after = ?16, max_restarts = ?17, heal_backoff_s = ?18, notes = ?19, \
+             updated_at = ?20 \
              WHERE id = ?1",
             params![
                 spec.id,
@@ -489,6 +1018,10 @@ impl Db {
                 spec.cpu_limit,
                 spec.image,
                 spec.allow_lan,
+                spec.heal.as_str(),
+                spec.unhealthy_after,
+                spec.max_restarts,
+                spec.heal_backoff_s as i64,
                 spec.notes,
                 spec.updated_at,
             ],
@@ -541,6 +1074,33 @@ impl Db {
         Ok(())
     }
 
+    /// Record the watchdog policy of one instance.
+    ///
+    /// Only the policy columns (and `updated_at`) move: a policy change must
+    /// never rewrite the notes, the limits or the share links of the instance.
+    pub fn set_heal_policy(
+        &self,
+        id: &str,
+        heal: HealPolicy,
+        unhealthy_after: u32,
+        max_restarts: u32,
+        heal_backoff_s: u64,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE instances SET heal = ?2, unhealthy_after = ?3, max_restarts = ?4, \
+             heal_backoff_s = ?5, updated_at = ?6 WHERE id = ?1",
+            params![
+                id,
+                heal.as_str(),
+                unhealthy_after,
+                max_restarts,
+                heal_backoff_s as i64,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_instance(&self, id: &str) -> Result<(), DbError> {
         let mut conn = self.lock();
         let transaction = conn.transaction()?;
@@ -554,6 +1114,27 @@ impl Db {
         )?;
         transaction.execute(
             "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
+        // Schedules have no foreign key (a deleted instance must not keep an
+        // orphan that fails on every tick), so their history is removed with
+        // the instance.
+        transaction.execute(
+            "DELETE FROM schedule_runs WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute("DELETE FROM schedules WHERE instance_id = ?1", params![id])?;
+        transaction.execute("DELETE FROM incidents WHERE instance_id = ?1", params![id])?;
+        transaction.execute(
+            "DELETE FROM egress_policies WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM egress_blocks WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1",
             params![id],
         )?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
@@ -1003,8 +1584,9 @@ impl Db {
     pub fn record_audit(&self, entry: &NewAuditRecord) -> Result<i64, DbError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO audit_log (at, actor, role, method, action, target, ip, details) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO audit_log \
+             (at, actor, role, method, action, target, ip, user_agent, result, request_id, details) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.at,
                 entry.actor,
@@ -1013,6 +1595,9 @@ impl Db {
                 entry.action,
                 entry.target,
                 entry.ip,
+                entry.user_agent,
+                entry.result,
+                entry.request_id,
                 entry.details,
             ],
         )?;
@@ -1021,13 +1606,62 @@ impl Db {
 
     /// Most recent entries first.
     pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditRecord>, DbError> {
+        self.query_audit(&AuditFilter {
+            limit: Some(limit),
+            ..AuditFilter::default()
+        })
+    }
+
+    /// Filtered audit entries, newest first (id descending).
+    ///
+    /// `limit = None` returns every match: the export must contain the whole
+    /// range it signs. Callers that serve a page always pass a bound.
+    pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT id, at, actor, role, method, action, target, ip, user_agent, result, \
+             request_id, details FROM audit_log",
+        );
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(actor) = &filter.actor {
+            clauses.push("actor = ?");
+            values.push(rusqlite::types::Value::Text(actor.clone()));
+        }
+        if let Some(action) = &filter.action {
+            clauses.push("action = ?");
+            values.push(rusqlite::types::Value::Text(action.clone()));
+        }
+        if let Some(target) = &filter.target {
+            clauses.push("target = ?");
+            values.push(rusqlite::types::Value::Text(target.clone()));
+        }
+        if let Some(from) = &filter.from {
+            clauses.push("at >= ?");
+            values.push(rusqlite::types::Value::Text(from.clone()));
+        }
+        if let Some(to) = &filter.to {
+            clauses.push("at <= ?");
+            values.push(rusqlite::types::Value::Text(to.clone()));
+        }
+        if let Some(result) = &filter.result {
+            clauses.push("result = ?");
+            values.push(rusqlite::types::Value::Text(result.clone()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
+        // SQLite reads a negative LIMIT as "no limit".
+        values.push(rusqlite::types::Value::Integer(
+            filter.limit.map_or(-1, |limit| limit as i64),
+        ));
+        values.push(rusqlite::types::Value::Integer(filter.offset as i64));
+
         let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT id, at, actor, role, method, action, target, ip, details \
-             FROM audit_log ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut statement = conn.prepare(&sql)?;
         let rows = statement
-            .query_map(params![limit as i64], |row| {
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
                 Ok(AuditRecord {
                     id: row.get(0)?,
                     at: row.get(1)?,
@@ -1037,23 +1671,35 @@ impl Db {
                     action: row.get(5)?,
                     target: row.get(6)?,
                     ip: row.get(7)?,
-                    details: row.get(8)?,
+                    user_agent: row.get(8)?,
+                    result: row.get(9)?,
+                    request_id: row.get(10)?,
+                    details: row.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
+    /// Delete every row strictly older than `cutoff` (RFC 3339), returning the
+    /// number of rows removed.
+    pub fn purge_audit_before(&self, cutoff: &str) -> Result<usize, DbError> {
+        let conn = self.lock();
+        let removed = conn.execute("DELETE FROM audit_log WHERE at < ?1", params![cutoff])?;
+        Ok(removed)
+    }
+
     pub fn insert_api_token(&self, token: &NewApiToken) -> Result<(), DbError> {
         self.lock().execute(
-            "INSERT INTO api_tokens (id, name, role, hash, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO api_tokens (id, name, role, hash, created_at, scope) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 token.id,
                 token.name,
                 token.role,
                 token.hash,
-                token.created_at
+                token.created_at,
+                token.scope
             ],
         )?;
         Ok(())
@@ -1062,7 +1708,8 @@ impl Db {
     pub fn list_api_tokens(&self) -> Result<Vec<ApiTokenRecord>, DbError> {
         let conn = self.lock();
         let mut statement = conn.prepare(
-            "SELECT id, name, role, created_at, revoked_at FROM api_tokens ORDER BY created_at, id",
+            "SELECT id, name, role, created_at, revoked_at, scope FROM api_tokens \
+             ORDER BY created_at, id",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -1072,6 +1719,7 @@ impl Db {
                     role: row.get(2)?,
                     created_at: row.get(3)?,
                     revoked_at: row.get(4)?,
+                    scope: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1105,7 +1753,7 @@ impl Db {
         let conn = self.lock();
         let record = conn
             .query_row(
-                "SELECT id, name, role, created_at, revoked_at FROM api_tokens \
+                "SELECT id, name, role, created_at, revoked_at, scope FROM api_tokens \
                  WHERE hash = ?1 AND revoked_at IS NULL",
                 params![hash],
                 |row| {
@@ -1115,11 +1763,74 @@ impl Db {
                         role: row.get(2)?,
                         created_at: row.get(3)?,
                         revoked_at: row.get(4)?,
+                        scope: row.get(5)?,
                     })
                 },
             )
             .optional()?;
         Ok(record)
+    }
+
+    /// Every ACL row of one instance, oldest subject first.
+    pub fn list_instance_acl(&self, instance_id: &str) -> Result<Vec<AclRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id, subject, role, created_at FROM instance_acl \
+             WHERE instance_id = ?1 ORDER BY subject",
+        )?;
+        let rows = statement
+            .query_map(params![instance_id], row_to_acl)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every ACL row of one subject, across instances (the request path loads
+    /// these once per call: no caching, a revoked grant is gone immediately).
+    pub fn acl_for_subject(&self, subject: &str) -> Result<Vec<AclRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT instance_id, subject, role, created_at FROM instance_acl \
+             WHERE subject = ?1 ORDER BY instance_id",
+        )?;
+        let rows = statement
+            .query_map(params![subject], row_to_acl)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace every ACL row of one instance inside a single transaction.
+    pub fn replace_instance_acl(
+        &self,
+        instance_id: &str,
+        acl: &[(String, String)],
+        at: &str,
+    ) -> Result<(), DbError> {
+        let mut conn = self.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1",
+            params![instance_id],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO instance_acl (instance_id, subject, role, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (subject, role) in acl {
+                insert.execute(params![instance_id, subject, role, at])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Delete one ACL row. Returns `false` when it did not exist.
+    pub fn delete_instance_acl(&self, instance_id: &str, subject: &str) -> Result<bool, DbError> {
+        let deleted = self.lock().execute(
+            "DELETE FROM instance_acl WHERE instance_id = ?1 AND subject = ?2",
+            params![instance_id, subject],
+        )?;
+        Ok(deleted > 0)
     }
 }
 
@@ -1171,6 +1882,10 @@ struct StoredRow {
     cpu_limit: f64,
     image: String,
     allow_lan: bool,
+    heal: String,
+    unhealthy_after: i64,
+    max_restarts: i64,
+    heal_backoff_s: i64,
     notes: String,
     created_at: String,
     updated_at: String,
@@ -1199,6 +1914,10 @@ impl StoredRow {
             // reads it back when the instance is rendered.
             previous_image: None,
             allow_lan: self.allow_lan,
+            heal: HealPolicy::parse(&self.heal).unwrap_or(HealPolicy::Off),
+            unhealthy_after: self.unhealthy_after.clamp(0, u32::MAX as i64) as u32,
+            max_restarts: self.max_restarts.clamp(0, u32::MAX as i64) as u32,
+            heal_backoff_s: self.heal_backoff_s.clamp(0, i64::MAX) as u64,
             notes: self.notes,
             status: Status::parse(&self.status).unwrap_or(Status::Unknown),
             last_error: self.last_error,
@@ -1206,6 +1925,15 @@ impl StoredRow {
             updated_at: self.updated_at,
         }
     }
+}
+
+fn row_to_acl(row: &Row<'_>) -> rusqlite::Result<AclRecord> {
+    Ok(AclRecord {
+        instance_id: row.get(0)?,
+        subject: row.get(1)?,
+        role: row.get(2)?,
+        created_at: row.get(3)?,
+    })
 }
 
 fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
@@ -1224,6 +1952,10 @@ fn row_to_stored(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         cpu_limit: row.get("cpu_limit")?,
         image: row.get("image")?,
         allow_lan: row.get("allow_lan")?,
+        heal: row.get("heal")?,
+        unhealthy_after: row.get("unhealthy_after")?,
+        max_restarts: row.get("max_restarts")?,
+        heal_backoff_s: row.get("heal_backoff_s")?,
         notes: row.get("notes")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -1350,6 +2082,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -1439,7 +2175,9 @@ mod tests {
             "instance_env",
             "audit_log",
             "api_tokens",
+            "instance_acl",
             "providers",
+            "incidents",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -1454,6 +2192,21 @@ mod tests {
         assert!(columns.iter().any(|column| column == "allow_lan"));
         assert!(columns.iter().any(|column| column == "image"));
         assert!(columns.iter().any(|column| column == "provider"));
+        for column in ["heal", "unhealthy_after", "max_restarts", "heal_backoff_s"] {
+            assert!(
+                columns.iter().any(|c| c == column),
+                "missing column {column}"
+            );
+        }
+
+        let token_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(api_tokens)")
+            .expect("table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns");
+        assert!(token_columns.iter().any(|column| column == "scope"));
     }
 
     #[test]
@@ -1625,6 +2378,9 @@ mod tests {
                 action: action.to_string(),
                 target: "alice".to_string(),
                 ip: Some("10.1.20.50".to_string()),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                result: "ok".to_string(),
+                request_id: Some(format!("req-{index}")),
                 details: None,
             })
             .expect("record");
@@ -1636,7 +2392,102 @@ mod tests {
         assert_eq!(entries[1].action, "instance.create");
         assert_eq!(entries[0].actor, "cleeryy@example.test");
         assert_eq!(entries[0].ip.as_deref(), Some("10.1.20.50"));
+        assert_eq!(entries[0].user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(entries[0].result, "ok");
+        assert_eq!(entries[0].request_id.as_deref(), Some("req-1"));
         assert_eq!(db.list_audit(1).expect("limit").len(), 1);
+    }
+
+    #[test]
+    fn audit_entries_are_filtered_paginated_and_purged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        let actions = [
+            (
+                "2026-09-01T00:00:00Z",
+                "alice@example.test",
+                "instance.create",
+                "alice",
+                "ok",
+            ),
+            (
+                "2026-09-02T00:00:00Z",
+                "alice@example.test",
+                "instance.start",
+                "alice",
+                "ok",
+            ),
+            (
+                "2026-09-03T00:00:00Z",
+                "bob@example.test",
+                "instance.create",
+                "bob",
+                "failed",
+            ),
+            (
+                "2026-09-04T00:00:00Z",
+                "bob@example.test",
+                "token.revoke",
+                "tok-1",
+                "refused",
+            ),
+        ];
+        for (at, actor, action, target, result) in actions {
+            let mut entry = NewAuditRecord::ok(at, actor, "admin", "session", action, target);
+            entry.result = result.to_string();
+            db.record_audit(&entry).expect("record");
+        }
+
+        let filter = |configure: &dyn Fn(&mut AuditFilter)| {
+            let mut filter = AuditFilter {
+                limit: Some(100),
+                ..AuditFilter::default()
+            };
+            configure(&mut filter);
+            db.query_audit(&filter).expect("query")
+        };
+
+        assert_eq!(filter(&|_| {}).len(), 4);
+        assert_eq!(
+            filter(&|f| f.actor = Some("alice@example.test".to_string())).len(),
+            2
+        );
+        assert_eq!(
+            filter(&|f| f.action = Some("instance.create".to_string())).len(),
+            2
+        );
+        assert_eq!(filter(&|f| f.target = Some("bob".to_string())).len(), 1);
+        assert_eq!(filter(&|f| f.result = Some("failed".to_string())).len(), 1);
+        assert_eq!(
+            filter(&|f| {
+                f.from = Some("2026-09-02T00:00:00Z".to_string());
+                f.to = Some("2026-09-03T00:00:00Z".to_string());
+            })
+            .len(),
+            2,
+            "bounds are inclusive"
+        );
+        assert_eq!(
+            filter(&|f| {
+                f.limit = Some(1);
+                f.offset = 1;
+            })
+            .len(),
+            1
+        );
+
+        // The newest match comes first even with a filter.
+        let newest = filter(&|f| f.target = Some("bob".to_string()));
+        assert_eq!(newest[0].action, "instance.create");
+
+        let removed = db
+            .purge_audit_before("2026-09-03T00:00:00Z")
+            .expect("purge");
+        assert_eq!(removed, 2);
+        let remaining = filter(&|_| {});
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].action, "token.revoke");
     }
 
     #[test]
@@ -1689,6 +2540,7 @@ mod tests {
             role: "viewer".to_string(),
             hash: hash.clone(),
             created_at: "2026-11-08T00:00:00Z".to_string(),
+            scope: Some(r#"{"instances":["probe"],"actions":["read"]}"#.to_string()),
         })
         .expect("insert");
 
@@ -1698,6 +2550,10 @@ mod tests {
             .expect("active");
         assert_eq!(found.name, "ci");
         assert_eq!(found.role, "viewer");
+        assert_eq!(
+            found.scope.as_deref(),
+            Some(r#"{"instances":["probe"],"actions":["read"]}"#)
+        );
         assert!(found.is_active());
         assert!(db
             .active_token_by_hash(&"b".repeat(64))
@@ -1718,8 +2574,67 @@ mod tests {
             listed[0].revoked_at.as_deref(),
             Some("2026-11-08T01:00:00Z")
         );
+        assert!(listed[0].scope.is_some());
         assert!(db.api_token_exists("tok-1").expect("exists"));
         assert!(!db.api_token_exists("tok-2").expect("exists"));
+    }
+
+    #[test]
+    fn instance_acl_rows_replace_and_follow_the_instance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        db.insert_instance(&spec("alice")).expect("insert");
+
+        db.replace_instance_acl(
+            "alice",
+            &[
+                ("owner@example.test".to_string(), "owner".to_string()),
+                ("operator@example.test".to_string(), "operator".to_string()),
+            ],
+            "2026-11-09T00:00:00Z",
+        )
+        .expect("replace");
+        let rows = db.list_instance_acl("alice").expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].subject, "operator@example.test");
+        assert_eq!(rows[0].role, "operator");
+        assert_eq!(rows[0].created_at, "2026-11-09T00:00:00Z");
+
+        let by_subject = db.acl_for_subject("owner@example.test").expect("list");
+        assert_eq!(by_subject.len(), 1);
+        assert_eq!(by_subject[0].instance_id, "alice");
+
+        // Replacing drops the rows the new list omits.
+        db.replace_instance_acl(
+            "alice",
+            &[("viewer@example.test".to_string(), "viewer".to_string())],
+            "2026-11-09T01:00:00Z",
+        )
+        .expect("replace again");
+        let rows = db.list_instance_acl("alice").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "viewer@example.test");
+
+        assert!(db
+            .delete_instance_acl("alice", "viewer@example.test")
+            .expect("delete"));
+        assert!(!db
+            .delete_instance_acl("alice", "viewer@example.test")
+            .expect("delete again"));
+        assert!(db.list_instance_acl("alice").expect("list").is_empty());
+
+        // Deleting the instance removes its grants too.
+        db.replace_instance_acl(
+            "alice",
+            &[("viewer@example.test".to_string(), "viewer".to_string())],
+            "2026-11-09T01:00:00Z",
+        )
+        .expect("replace");
+        db.delete_instance("alice").expect("delete instance");
+        assert!(db
+            .acl_for_subject("viewer@example.test")
+            .expect("list")
+            .is_empty());
     }
 
     #[test]
@@ -1733,5 +2648,290 @@ mod tests {
         }
         let err = Db::open(&path).expect_err("newer schema is refused");
         assert!(matches!(err, DbError::SchemaNewer { found: 99, .. }));
+    }
+}
+
+impl Db {
+    /// Insert one notification channel and its optional encrypted secret.
+    pub fn insert_notification_channel(
+        &self,
+        record: &NotificationChannelRecord,
+        secret: Option<(&[u8], &[u8])>,
+    ) -> Result<(), DbError> {
+        let (nonce, ciphertext) = match secret {
+            Some((nonce, ciphertext)) => (Some(nonce), Some(ciphertext)),
+            None => (None, None),
+        };
+        self.lock().execute(
+            "INSERT INTO notification_channels (id, name, kind, target, nonce, ciphertext, \
+             events, enabled, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.name,
+                record.kind,
+                record.target,
+                nonce,
+                ciphertext,
+                record.events,
+                record.enabled,
+                record.created_at,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update one channel. `secret` carries a fresh nonce and ciphertext to
+    /// rotate the secret, `Some(None)` clears it, `None` keeps the stored one.
+    pub fn update_notification_channel(
+        &self,
+        record: &NotificationChannelRecord,
+        secret: Option<Option<(&[u8], &[u8])>>,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        let updated = match secret {
+            Some(Some((nonce, ciphertext))) => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 nonce = ?5, ciphertext = ?6, events = ?7, enabled = ?8, updated_at = ?9 \
+                 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    nonce,
+                    ciphertext,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+            Some(None) => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 nonce = NULL, ciphertext = NULL, events = ?5, enabled = ?6, updated_at = ?7 \
+                 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE notification_channels SET name = ?2, kind = ?3, target = ?4, \
+                 events = ?5, enabled = ?6, updated_at = ?7 WHERE id = ?1",
+                params![
+                    record.id,
+                    record.name,
+                    record.kind,
+                    record.target,
+                    record.events,
+                    record.enabled,
+                    record.updated_at,
+                ],
+            )?,
+        };
+        if updated == 0 {
+            return Err(DbError::Conflict(record.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// One notification channel, secret blobs included.
+    pub fn notification_channel(
+        &self,
+        id: &str,
+    ) -> Result<Option<NotificationChannelRecord>, DbError> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, name, kind, target, nonce, ciphertext, events, enabled, \
+                 created_at, updated_at FROM notification_channels WHERE id = ?1",
+                params![id],
+                notification_channel_record,
+            )
+            .optional()?)
+    }
+
+    /// Every notification channel, sorted by name. Used by the delivery loop,
+    /// so the encrypted blobs are read in the same round trip.
+    pub fn list_notification_channels(&self) -> Result<Vec<NotificationChannelRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, name, kind, target, nonce, ciphertext, events, enabled, \
+             created_at, updated_at FROM notification_channels ORDER BY name, id",
+        )?;
+        let rows = statement
+            .query_map([], notification_channel_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete one channel. Deliveries stay in the journal.
+    pub fn delete_notification_channel(&self, id: &str) -> Result<bool, DbError> {
+        let deleted = self.lock().execute(
+            "DELETE FROM notification_channels WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Append one delivery row and return its id.
+    pub fn insert_notification_delivery(
+        &self,
+        delivery: &NewNotificationDelivery,
+    ) -> Result<i64, DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO notification_deliveries (channel_id, event, subject, status, attempts, \
+             error, created_at, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                delivery.channel_id,
+                delivery.event,
+                delivery.subject,
+                delivery.status,
+                delivery.attempts as i64,
+                delivery.error,
+                delivery.created_at,
+                delivery.delivered_at,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update the outcome of one delivery row.
+    pub fn update_notification_delivery(
+        &self,
+        id: i64,
+        status: &str,
+        attempts: usize,
+        error: Option<&str>,
+        delivered_at: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "UPDATE notification_deliveries SET status = ?2, attempts = ?3, error = ?4, \
+             delivered_at = ?5 WHERE id = ?1",
+            params![id, status, attempts as i64, error, delivered_at],
+        )?;
+        Ok(())
+    }
+
+    /// Deliveries, newest first, optionally filtered by channel.
+    pub fn list_notification_deliveries(
+        &self,
+        channel: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<NotificationDeliveryRecord>, DbError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, channel_id, event, subject, status, attempts, error, created_at, \
+             delivered_at FROM notification_deliveries \
+             WHERE (?1 IS NULL OR channel_id = ?1) ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![channel, limit as i64], notification_delivery_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Id of the most recent delivery for one channel and event at or after
+    /// `since` (RFC 3339, same format as [`now_iso`]). Used to coalesce alerts.
+    pub fn recent_notification_delivery(
+        &self,
+        channel_id: &str,
+        event: &str,
+        since: &str,
+    ) -> Result<Option<i64>, DbError> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM notification_deliveries \
+                 WHERE channel_id = ?1 AND event = ?2 AND created_at >= ?3 \
+                 AND status != 'suppressed' \
+                 ORDER BY id DESC LIMIT 1",
+                params![channel_id, event, since],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+fn notification_channel_record(row: &Row<'_>) -> rusqlite::Result<NotificationChannelRecord> {
+    Ok(NotificationChannelRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        target: row.get(3)?,
+        nonce: row.get(4)?,
+        ciphertext: row.get(5)?,
+        events: row.get(6)?,
+        enabled: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn notification_delivery_record(row: &Row<'_>) -> rusqlite::Result<NotificationDeliveryRecord> {
+    let attempts: i64 = row.get(5)?;
+    Ok(NotificationDeliveryRecord {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        event: row.get(2)?,
+        subject: row.get(3)?,
+        status: row.get(4)?,
+        attempts: attempts.max(0) as usize,
+        error: row.get(6)?,
+        created_at: row.get(7)?,
+        delivered_at: row.get(8)?,
+    })
+}
+
+/// The last applied declarative document (`desired_state`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredStateRecord {
+    /// Raw `fleet.yaml` text, as submitted (secret references only).
+    pub document: String,
+    pub applied_at: String,
+    /// Where the apply came from (`api`, `cli`, …).
+    pub source: String,
+}
+
+impl Db {
+    /// The last applied declarative document, when one has been applied.
+    pub fn desired_state(&self) -> Result<Option<DesiredStateRecord>, DbError> {
+        let conn = self.lock();
+        let record = conn
+            .query_row(
+                "SELECT document, applied_at, source FROM desired_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok(DesiredStateRecord {
+                        document: row.get(0)?,
+                        applied_at: row.get(1)?,
+                        source: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// Record the document an apply just converged the fleet to.
+    pub fn put_desired_state(
+        &self,
+        document: &str,
+        applied_at: &str,
+        source: &str,
+    ) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO desired_state (id, document, applied_at, source) VALUES (1, ?1, ?2, ?3) \
+             ON CONFLICT (id) DO UPDATE SET document = excluded.document, \
+             applied_at = excluded.applied_at, source = excluded.source",
+            params![document, applied_at, source],
+        )?;
+        Ok(())
     }
 }

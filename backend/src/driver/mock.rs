@@ -5,11 +5,12 @@
 //! Docker.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecOutput, ExecResult, ImageRecord, InspectInfo,
+    LogsOptions, PsResult, UsageSample,
 };
 use crate::config::DEFAULT_IMAGE;
 use crate::models::{ContainerInfo, Health, InstanceSpec, Status};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
@@ -28,6 +29,14 @@ pub struct MockCall {
     pub instance: String,
 }
 
+/// One recorded `exec` call (pipelines, issue #31).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockExecCall {
+    pub instance: String,
+    pub argv: Vec<String>,
+    pub timeout_s: u64,
+}
+
 #[derive(Debug)]
 struct MockInstance {
     status: Status,
@@ -36,6 +45,7 @@ struct MockInstance {
     image: String,
     started_at: Option<SystemTime>,
     ups: u32,
+    restart_count: u32,
 }
 
 /// Deterministic, Docker-free driver.
@@ -67,6 +77,16 @@ pub struct MockDriver {
     up_delay: Mutex<Option<Duration>>,
     in_flight_ups: AtomicUsize,
     max_in_flight_ups: AtomicUsize,
+    /// Every `exec` call, oldest first.
+    exec_calls: Mutex<Vec<MockExecCall>>,
+    /// Canned results consumed by the next `exec` calls, per instance.
+    exec_results: Mutex<HashMap<String, VecDeque<ExecOutput>>>,
+    /// Persistent canned result (`force_exec`), consumed by every call.
+    exec_sticky: Mutex<HashMap<String, ExecOutput>>,
+    /// `exec` sleeps this long, so pipeline tests can observe concurrency.
+    exec_delay: Mutex<Option<Duration>>,
+    in_flight_execs: AtomicUsize,
+    max_in_flight_execs: AtomicUsize,
 }
 
 impl Default for MockDriver {
@@ -103,6 +123,12 @@ impl MockDriver {
             up_delay: Mutex::new(None),
             in_flight_ups: AtomicUsize::new(0),
             max_in_flight_ups: AtomicUsize::new(0),
+            exec_calls: Mutex::new(Vec::new()),
+            exec_results: Mutex::new(HashMap::new()),
+            exec_sticky: Mutex::new(HashMap::new()),
+            exec_delay: Mutex::new(None),
+            in_flight_execs: AtomicUsize::new(0),
+            max_in_flight_execs: AtomicUsize::new(0),
         }
     }
 
@@ -113,6 +139,17 @@ impl MockDriver {
     /// simulate a broken image without Docker.
     pub fn set_image_health(&self, image: &str, health: Health) {
         lock(&self.image_health).insert(image.to_string(), health);
+    }
+
+    /// Change the health of one *existing* simulated container.
+    ///
+    /// Unlike [`MockDriver::set_image_health`], which applies at the next
+    /// `up`, this models a container that was healthy and degrades later (the
+    /// canary soak of issue #39).
+    pub fn set_instance_health(&self, id: &str, health: Health) {
+        if let Some(entry) = lock(&self.state).get_mut(id) {
+            entry.health = health;
+        }
     }
 
     /// Make `ensure_image` fail for one tag, as a registry would.
@@ -142,6 +179,56 @@ impl MockDriver {
     /// Every image passed to `ensure_image`, oldest first.
     pub fn image_calls(&self) -> Vec<String> {
         lock(&self.image_calls).clone()
+    }
+
+    /// Report a canned result for the next `exec` call of one instance.
+    ///
+    /// Compatibility helper from the scheduler branch: it queues exactly one
+    /// result, like [`MockDriver::push_exec_result`].
+    pub fn force_exec(&self, id: &str, result: ExecOutput) {
+        lock(&self.exec_sticky).insert(id.to_string(), result);
+    }
+
+    /// Compatibility helper of the exec API tests: queue one result.
+    pub fn set_exec_result(&self, id: &str, result: ExecResult) {
+        self.force_exec(id, result);
+    }
+
+    /// Drop every queued `exec` result of one instance.
+    pub fn clear_exec(&self, id: &str) {
+        lock(&self.exec_results).remove(id);
+        lock(&self.exec_sticky).remove(id);
+    }
+
+    /// Queue one simulated `exec` result for the next call on `id`.
+    ///
+    /// Results are consumed in order, so a retry test can queue a failure and
+    /// then a success. Without a queued result, `exec` echoes the last argument.
+    pub fn push_exec_result(&self, id: &str, output: ExecOutput) {
+        lock(&self.exec_results)
+            .entry(id.to_string())
+            .or_default()
+            .push_back(output);
+    }
+
+    /// Drop every queued `exec` result.
+    pub fn clear_exec_results(&self) {
+        lock(&self.exec_results).clear();
+    }
+
+    /// Every `exec` call recorded so far, oldest first.
+    pub fn exec_calls(&self) -> Vec<MockExecCall> {
+        lock(&self.exec_calls).clone()
+    }
+
+    /// Make every `exec` sleep, so a test can observe how many run at once.
+    pub fn set_exec_delay(&self, delay: Duration) {
+        *lock(&self.exec_delay) = Some(delay);
+    }
+
+    /// Highest number of `exec` calls that ran at the same time.
+    pub fn max_concurrent_execs(&self) -> usize {
+        self.max_in_flight_execs.load(Ordering::SeqCst)
     }
 
     /// Image the simulated container of `id` currently runs.
@@ -215,6 +302,7 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: Some(SystemTime::now()),
             ups: 0,
+            restart_count: 0,
         });
         entry.status = status;
         if status != Status::Running {
@@ -232,8 +320,22 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: Some(SystemTime::now()),
             ups: 0,
+            restart_count: 0,
         });
         entry.health = health;
+    }
+
+    /// Force the `docker inspect` restart count of one instance.
+    pub fn force_restart_count(&self, id: &str, count: u32) {
+        let mut state = self.ensure_instance(id);
+        if let Some(entry) = state.get_mut(id) {
+            entry.restart_count = count;
+        }
+    }
+
+    /// Current simulated status of one instance.
+    pub fn status_of(&self, id: &str) -> Option<Status> {
+        lock(&self.state).get(id).map(|entry| entry.status)
     }
 
     fn record(&self, operation: &'static str, id: &str) {
@@ -260,6 +362,7 @@ impl MockDriver {
             image: self.image.clone(),
             started_at: None,
             ups: 0,
+            restart_count: 0,
         });
         state
     }
@@ -313,6 +416,7 @@ impl MockDriver {
                 state: entry.status.as_str().to_string(),
                 exit_code: Some(0),
                 oom_killed: false,
+                restart_count: entry.restart_count,
                 error: None,
                 started_at: entry.started_at.map(|started| {
                     chrono::DateTime::<chrono::Utc>::from(started)
@@ -532,6 +636,50 @@ impl Driver for MockDriver {
                 .collect())
         })
     }
+
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecOutput, DriverError>> {
+        Box::pin(async move {
+            self.record("exec", &spec.id);
+            lock(&self.exec_calls).push(MockExecCall {
+                instance: spec.id.clone(),
+                argv: argv.to_vec(),
+                timeout_s,
+            });
+            self.fail_if_requested("exec")?;
+            let delay = *lock(&self.exec_delay);
+            if let Some(delay) = delay {
+                let running = self.in_flight_execs.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight_execs
+                    .fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                self.in_flight_execs.fetch_sub(1, Ordering::SeqCst);
+            }
+            if let Some(result) = lock(&self.exec_sticky).get(&spec.id) {
+                return Ok(result.clone());
+            }
+            let queued = lock(&self.exec_results)
+                .get_mut(&spec.id)
+                .and_then(|results| results.pop_front());
+            if let Some(output) = queued {
+                return Ok(output);
+            }
+            // A deterministic answer that keeps the prompt visible: pipeline
+            // tests that do not queue a result can still assert substitution.
+            Ok(ExecOutput {
+                exit_code: Some(0),
+                stdout: format!("[mock] exec in {}: {}", spec.id, argv.join(" ")),
+                stderr: String::new(),
+                timed_out: false,
+                duration_ms: 0,
+                truncated: false,
+            })
+        })
+    }
 }
 
 /// Stable simulated usage, derived from the instance id only.
@@ -584,6 +732,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: crate::models::HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,
@@ -624,6 +776,7 @@ mod tests {
                 state: "exited".to_string(),
                 exit_code: Some(137),
                 oom_killed: true,
+                restart_count: 0,
                 error: None,
                 started_at: None,
             },
@@ -743,5 +896,61 @@ mod tests {
         let tags: Vec<&str> = images.iter().map(|image| image.tag.as_str()).collect();
         assert!(tags.contains(&"agent:1"), "{tags:?}");
         assert!(!tags.contains(&"agent:9"), "a failed pull is not local");
+    }
+
+    #[tokio::test]
+    async fn exec_records_calls_and_consumes_queued_results() {
+        let driver = MockDriver::new();
+        let instance = spec("alice");
+        driver.push_exec_result(
+            "alice",
+            ExecOutput {
+                exit_code: Some(0),
+                stdout: "queued".to_string(),
+                stderr: String::new(),
+                timed_out: false,
+                duration_ms: 0,
+                truncated: false,
+            },
+        );
+        let argv = vec![
+            "gateway".to_string(),
+            "ask".to_string(),
+            "hello".to_string(),
+        ];
+        let output = driver.exec(&instance, &argv, 30).await.expect("exec");
+        assert_eq!(output.stdout, "queued");
+        let second = driver.exec(&instance, &argv, 30).await.expect("exec");
+        assert!(second.stdout.contains("hello"), "{}", second.stdout);
+        assert!(second.succeeded());
+
+        let calls = driver.exec_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].instance, "alice");
+        assert_eq!(calls[0].argv, argv);
+        assert_eq!(calls[0].timeout_s, 30);
+
+        driver.fail_next("exec", "container is not running");
+        let err = driver
+            .exec(&instance, &argv, 30)
+            .await
+            .expect_err("injected exec failure");
+        assert!(err.detail.contains("not running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exec_delay_observes_parallelism() {
+        let driver = MockDriver::new();
+        let first = spec("alice");
+        let second = spec("bob");
+        let argv = vec!["gateway".to_string(), "ask".to_string(), "x".to_string()];
+        driver.set_exec_delay(Duration::from_millis(50));
+        let (left, right) = tokio::join!(
+            driver.exec(&first, &argv, 30),
+            driver.exec(&second, &argv, 30)
+        );
+        left.expect("first exec");
+        right.expect("second exec");
+        assert_eq!(driver.max_concurrent_execs(), 2);
     }
 }

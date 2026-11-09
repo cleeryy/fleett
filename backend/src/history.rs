@@ -999,16 +999,20 @@ mod tests {
     fn context(method: AuthMethod) -> AuthContext {
         AuthContext {
             actor: "cleeryy@example.test".to_string(),
+            subject: "cleeryy@example.test".to_string(),
             role: Role::Admin,
             method,
             user: None,
+            scope: None,
             ip: None,
+            user_agent: None,
         }
     }
 
     fn session() -> AuthContext {
         AuthContext {
             actor: "cleeryy@example.test".to_string(),
+            subject: "cleeryy@example.test".to_string(),
             role: Role::Admin,
             method: AuthMethod::Session,
             user: Some(SessionUser {
@@ -1016,7 +1020,9 @@ mod tests {
                 email: Some("cleeryy@example.test".to_string()),
                 name: Some("Cleeryy".to_string()),
             }),
+            scope: None,
             ip: None,
+            user_agent: None,
         }
     }
 
@@ -1044,6 +1050,10 @@ mod tests {
             image: "agent:1".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: crate::models::HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: crate::models::Status::Running,
             last_error: None,

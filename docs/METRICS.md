@@ -55,9 +55,17 @@ port must not go unnoticed.
 | `fleett_instance_mem_used_bytes` | gauge | `id` | Memory used by one container. |
 | `fleett_instance_mem_limit_bytes` | gauge | `id` | Memory limit of one container. |
 | `fleett_instance_disk_bytes` | gauge | `id` | Size of the instance data directory (`du`). |
+| `fleett_instance_health` | gauge | `instance` | `1` when the recorded container health is `healthy`, `0` otherwise (unhealthy, stopped or unknown). |
+| `fleett_instance_restarts_total` | counter | `instance` | Restarts requested through the control plane, counted from the `instance.restart` audit entries. Docker-driven restarts (a crashloop) are not included. |
+| `fleett_disk_quota_bytes` | gauge | `instance` | Per-instance disk quota in bytes; `0` until the quota feature (issue #47) is installed. |
+| `fleett_disk_used_bytes` | gauge | `instance` | Data directory size measured against the quota; `0` when the instance has no quota. |
+| `fleett_secrets_expiring_days` | gauge | `instance` | Days until the earliest secret of the instance expires. `-1` means the expiry is unknown (the current schema has no expiry column); instances without secrets are omitted. |
+| `fleett_incidents_open` | gauge | — | Incidents the watchdog registry still reports as open; `0` when the registry (issue #32) is not installed. |
 | `fleett_api_requests_total` | counter | `method`, `status` | HTTP requests served by the API, per method and status code. |
-| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `upgrade`, `rollback`) and result (`ok`, `error`). |
+| `fleett_compose_actions_total` | counter | `action`, `result` | Compose actions, per verb (`up`, `start`, `stop`, `restart`, `down`, `recreate`, `upgrade`, `rollback`) and result (`ok`, `error`). |
 | `fleett_upgrade_jobs_total` | counter | `result` | Finished rolling upgrade jobs, per final result (`success`, `rolled_back`, `failed`). |
+| `fleett_upgrades_total` | counter | `status` | Same counter as `fleett_upgrade_jobs_total`, with the `status` label the alert rules use; the three statuses keep a `0` series before the first job. |
+| `fleett_rollbacks_total` | counter | — | Rolling upgrade jobs that rolled at least one instance back. |
 | `fleett_usage_ok` | gauge | — | `1` when the last utilisation sample could be read from Docker, `0` otherwise (the per-instance usage series are then stale or absent). |
 
 Notes:
@@ -74,6 +82,16 @@ Notes:
   instance reports `none`.
 - **Unseen statuses keep their series** (`0`), so a dashboard query never turns
   empty when the last instance of a given status disappears.
+- **Label names differ on purpose.** The historical per-instance series use
+  `id`; the series added for the alert bundle use `instance`
+  (`fleett_instance_health`, `fleett_instance_restarts_total`,
+  `fleett_disk_quota_bytes`, `fleett_disk_used_bytes`,
+  `fleett_secrets_expiring_days`).
+- **Optional features are detected at scrape time.** Incidents, disk quotas and
+  secret expiry are read by inspecting `PRAGMA table_info` and catching errors.
+  A missing table or column yields the stable fallback (`0`, empty series or
+  `-1`) instead of a failed scrape, so the same binary works before and after
+  issues #32 and #47 land.
 
 ## Prometheus scrape config
 
@@ -107,19 +125,128 @@ curl -fsS -H "Authorization: Bearer $FLEETT_METRICS_TOKEN" \
 `promtool check metrics` exits silently when the exposition is valid and prints
 one line per problem otherwise.
 
-## Grafana: three panels
+## Grafana bundle: dashboard, alerts and demo stack
 
-**1. Fleet status (time series or stat, instant query).**
+Everything lives in [`docs/grafana/`](grafana/):
+
+| File | Purpose |
+|---|---|
+| [`fleett-dashboard.json`](grafana/fleett-dashboard.json) | Importable Grafana dashboard (schema version 39): fleet overview, CPU/RAM/disk per instance, API error rate, upgrades/rollbacks, quotas, incidents and secrets. |
+| [`fleett-alerts.yaml`](grafana/fleett-alerts.yaml) | Prometheus alerting rules: `InstanceDown`, `InstanceUnhealthy`, `InstanceRestarting`, `DiskQuotaHigh`, `FleettScrapeFailing`, `UpgradeRolledBack`. |
+| [`docker-compose.yaml`](grafana/docker-compose.yaml) | Prometheus + Grafana, with the datasource, dashboard and rules provisioned. |
+| [`prometheus.yml`](grafana/prometheus.yml) | Scrape config and `rule_files` used by the demo stack. |
+| [`grafana/provisioning/`](grafana/grafana/provisioning/) | Grafana datasource and dashboard providers. |
+
+### One-command demo
+
+```bash
+cd docs/grafana
+docker compose up -d
+# Grafana:    http://localhost:3000  (anonymous viewer, admin / fleett)
+# Prometheus: http://localhost:9090  (Status → Targets, Status → Alerts)
+```
+
+The demo scrape target defaults to `host.docker.internal:8090/metrics` and can be
+overridden without editing a file:
+
+```bash
+FLEETT_METRICS_URL=host.docker.internal:9100 docker compose up -d
+```
+
+`FLEETT_METRICS_URL` is a `host:port` (no scheme). fleett's own default metrics
+listener is `127.0.0.1:9100`; the demo defaults to `8090` because that is the
+address the deployment exposes. A container cannot reach the host loopback, so
+the control plane must bind a reachable address and, because that address is not
+loopback, set a token:
+
+```bash
+FLEETT_METRICS_BIND=0.0.0.0:9100 \
+FLEETT_METRICS_TOKEN="$(openssl rand -hex 32)" \
+fleett
+# Then, in the demo stack:
+FLEETT_METRICS_URL=host.docker.internal:9100 \
+FLEETT_METRICS_TOKEN="<the same token>" \
+docker compose up -d
+```
+
+The compose entrypoint substitutes both values into a temporary
+`/tmp/prometheus.yml`; the tracked file keeps placeholders so
+`promtool check config` works without a live environment.
+
+### Import the dashboard by hand
+
+1. Grafana → **Dashboards** → **New** → **Import**.
+2. Upload `docs/grafana/fleett-dashboard.json` (or paste it).
+3. When Grafana asks for the **Prometheus** input (`DS_PROMETHEUS`), pick the
+   datasource that scrapes fleett. The dashboard uses
+   `datasource: {"type":"prometheus","uid":"${DS_PROMETHEUS}"}`, so the same
+   JSON works against any Prometheus instance.
+4. Save. The default time range is six hours, refreshed every 30 s.
+
+With the demo stack the datasource is provisioned with UID `prometheus`, and
+the dashboard's `DS_PROMETHEUS` variable defaults to it: no manual step.
+
+### Validate the rules
+
+```bash
+promtool check rules docs/grafana/fleett-alerts.yaml
+# Checking docs/grafana/fleett-alerts.yaml
+#   SUCCESS: 6 rules found
+```
+
+`promtool check config docs/grafana/prometheus.yml` cannot run from the repo
+root as-is: `rule_files` points at `/etc/prometheus/fleett-alerts.yaml`, the path
+the demo container mounts. Check both files in the image instead:
+
+```bash
+docker run --rm --entrypoint promtool \
+  -v "$PWD/docs/grafana/prometheus.yml":/work/prometheus.yml:ro \
+  -v "$PWD/docs/grafana/fleett-alerts.yaml":/etc/prometheus/fleett-alerts.yaml:ro \
+  prom/prometheus:v2.55.1 check config /work/prometheus.yml
+#   SUCCESS: 1 rule files found
+#   SUCCESS: /work/prometheus.yml is valid prometheus config file syntax
+#   SUCCESS: 6 rules found
+```
+
+CI can run the same command when `promtool` is available, and the rule file is a
+plain YAML list (`groups[].rules[]`, each with `alert`, `expr`, `for`,
+`labels.severity`, `annotations.summary` and `annotations.description`), so a
+small Python `yaml.safe_load` check can gate a runner without the binary.
+
+The rules and what they mean:
+
+| Alert | Expression (short) | `for` | Severity |
+|---|---|---|---|
+| `InstanceDown` | `up{job="fleett"} == 0` | 2m | critical |
+| `InstanceUnhealthy` | `fleett_instance_health{instance=~".+"} == 0` | 5m | warning |
+| `InstanceRestarting` | `increase(fleett_instance_restarts_total[15m]) > 0` | 0m | warning |
+| `DiskQuotaHigh` | disk used / quota > 90 %, quota > 0 | 10m | warning |
+| `FleettScrapeFailing` | `fleett_usage_ok == 0` or `up{job="fleett"} == 0` | 5m | critical |
+| `UpgradeRolledBack` | `increase(fleett_rollbacks_total[1h]) > 0` | 0m | warning |
+
+`InstanceUnhealthy` reports any instance that is not currently healthy,
+including one that was stopped on purpose. Silence it for a planned stop, or
+use the `fleett_instances{status="running"}` aggregate to scope a dashboard: the
+per-instance lifecycle status is not a series yet.
+
+### Queries behind the panels
+
+Fleet status and unhealthy count:
 
 ```promql
 sum by (status, health) (fleett_instances)
+sum(fleett_instances{health="unhealthy"})
 ```
 
-One line per status/health pair. A panel that only shows `running` should use
-`sum(fleett_instances{status="running"})`; the number of instances that need
-attention is `sum(fleett_instances{health="unhealthy"})`.
+CPU, memory and disk per instance:
 
-**2. API error rate, in percent of the requests (time series).**
+```promql
+fleett_instance_cpu_percent
+fleett_instance_mem_used_bytes
+fleett_instance_disk_bytes
+```
+
+API error rate, in percent of the requests:
 
 ```promql
 100 * (
@@ -129,22 +256,18 @@ attention is `sum(fleett_instances{health="unhealthy"})`.
 )
 ```
 
-Alert on `> 5` for ten minutes. The denominator is clamped so a fleet with no
-traffic draws `0` instead of a gap.
-
-**3. Memory pressure of the fleet (time series or gauge).**
+Upgrades and rollbacks:
 
 ```promql
-100 * (
-  sum(fleett_instance_mem_used_bytes)
-  /
-  clamp_min(sum(fleett_instance_mem_limit_bytes), 1)
-)
+sum by (status) (increase(fleett_upgrades_total[$__rate_interval]))
+increase(fleett_rollbacks_total[24h])
 ```
 
-Pair it with `sum(fleett_compose_actions_total{result="error"})` (or its
-`rate()`) to see whether the containers that are eating memory are also the ones
-failing lifecycle actions.
+Quota usage (silent until issue #47 lands, because the denominator is 0):
+
+```promql
+100 * fleett_disk_used_bytes / on(instance) (fleett_disk_quota_bytes > 0)
+```
 
 ## Security
 

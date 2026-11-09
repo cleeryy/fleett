@@ -8,7 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use fleett::cli::{TOKEN_ENV, URL_ENV};
 use serde_json::{json, Value};
@@ -44,6 +44,8 @@ impl Recorded {
 struct MockState {
     requests: Arc<Mutex<Vec<Recorded>>>,
     docker_ok: bool,
+    /// Report one extra instance (`warned`) whose detail carries a warning.
+    warned_instance: bool,
 }
 
 impl MockState {
@@ -62,9 +64,19 @@ struct MockServer {
 
 impl MockServer {
     async fn start(docker_ok: bool) -> Self {
+        Self::start_with(docker_ok, false).await
+    }
+
+    /// Same server with one instance (`warned`) whose detail carries a warning.
+    async fn start_with_warnings() -> Self {
+        Self::start_with(true, true).await
+    }
+
+    async fn start_with(docker_ok: bool, warned_instance: bool) -> Self {
         let state = MockState {
             requests: Arc::new(Mutex::new(Vec::new())),
             docker_ok,
+            warned_instance,
         };
         let app = app(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -110,6 +122,8 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/stop", post(stop_instance))
         .route("/api/instances/{id}/restart", post(restart_instance))
         .route("/api/instances/{id}/logs", get(logs))
+        .route("/api/instances/{id}/acl", get(acl_get).put(acl_put))
+        .route("/api/instances/{id}/acl/{subject}", delete(acl_rm))
         .route("/api/usage", get(usage))
         .route("/api/images", get(images))
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
@@ -222,14 +236,15 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
-async fn list_instances() -> Json<Value> {
-    Json(json!([
-        summary("alice", "running"),
-        summary("bob", "stopped")
-    ]))
+async fn list_instances(State(state): State<MockState>) -> Json<Value> {
+    let mut instances = vec![summary("alice", "running"), summary("bob", "stopped")];
+    if state.warned_instance {
+        instances.push(summary("warned", "running"));
+    }
+    Json(Value::Array(instances))
 }
 
-async fn get_instance(Path(id): Path<String>) -> Response {
+async fn get_instance(State(state): State<MockState>, Path(id): Path<String>) -> Response {
     if id == "ghost" {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -237,7 +252,14 @@ async fn get_instance(Path(id): Path<String>) -> Response {
             "instance \"ghost\" not found",
         );
     }
-    Json(detail(&id, status_of(&id))).into_response()
+    let mut value = detail(&id, status_of(&id));
+    if state.warned_instance && id == "warned" {
+        value["warnings"] = json!([
+            "DISCORD_ALLOWED_USERS is required by the guest-discord template but is not set: \
+             the gateway will refuse every message until it is"
+        ]);
+    }
+    Json(value).into_response()
 }
 
 async fn create_instance(Json(body): Json<Value>) -> Response {
@@ -377,6 +399,28 @@ async fn me() -> Json<Value> {
         "role": "admin",
         "method": "bearer"
     }))
+}
+
+fn acl_payload(id: &str) -> Value {
+    json!({
+        "instance": id,
+        "acl": [
+            {"subject": "cle@example.test", "role": "owner", "created_at": "2026-11-09T10:00:00Z"},
+            {"subject": "ci-robot", "role": "viewer", "created_at": "2026-11-09T10:00:00Z"}
+        ]
+    })
+}
+
+async fn acl_get(Path(id): Path<String>) -> Json<Value> {
+    Json(acl_payload(&id))
+}
+
+async fn acl_put(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({"instance": id, "acl": body["acl"]}))
+}
+
+async fn acl_rm(Path((_id, _subject)): Path<(String, String)>) -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 fn template_info(id: &str, name: &str, parent: Option<&str>, read_only: bool) -> Value {
@@ -767,6 +811,35 @@ async fn doctor_prints_a_checklist() {
 }
 
 #[tokio::test]
+async fn doctor_surfaces_one_line_per_instance_warning() {
+    let server = MockServer::start_with_warnings().await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["doctor"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("warnings"), "{text}");
+    assert!(text.contains("warned"), "{text}");
+    assert!(text.contains("DISCORD_ALLOWED_USERS"), "{text}");
+
+    // A warning is not a failing check: `--json` keeps `ok: true` and adds the
+    // line after the five host checks.
+    let output = run_against(&server, home.path(), &["--json", "doctor"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["ok"], true);
+    let checks = value["checks"].as_array().expect("checks");
+    assert_eq!(checks.len(), 6);
+    let warning = checks
+        .iter()
+        .find(|check| check["name"] == "warnings")
+        .expect("warning check");
+    assert_eq!(warning["state"], "warn");
+    assert!(warning["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("DISCORD_ALLOWED_USERS")));
+}
+
+#[tokio::test]
 async fn doctor_fails_when_docker_is_down() {
     let server = MockServer::start(false).await;
     let home = tempfile::tempdir().expect("home");
@@ -1006,6 +1079,73 @@ async fn images_json_passes_the_server_payload_through() {
     let images = value.as_array().expect("array");
     assert_eq!(images.len(), 2);
     assert_eq!(images[0]["instances"], json!(["alice"]));
+}
+
+#[tokio::test]
+async fn acl_get_set_and_rm_use_the_acl_endpoints() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+
+    let output = run_against(&server, home.path(), &["acl", "get", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("cle@example.test"), "{text}");
+    assert!(text.contains("owner"), "{text}");
+    assert!(text.contains("ci-robot"), "{text}");
+    assert_eq!(
+        server
+            .request("GET", "/api/instances/alice/acl")
+            .authorization
+            .as_deref(),
+        Some("Bearer test-token")
+    );
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["acl", "set", "alice", "ci-robot", "operator"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let put = server.request("PUT", "/api/instances/alice/acl");
+    let acl = put.body.expect("body")["acl"]
+        .as_array()
+        .expect("acl")
+        .clone();
+    assert_eq!(acl.len(), 2, "the other entry is preserved: {acl:?}");
+    let robot = acl
+        .iter()
+        .find(|item| item["subject"] == "ci-robot")
+        .expect("ci-robot row");
+    assert_eq!(robot["role"], "operator");
+    assert!(acl.iter().any(|item| item["subject"] == "cle@example.test"));
+
+    let output = run_against(&server, home.path(), &["acl", "rm", "alice", "ci-robot"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    server.request("DELETE", "/api/instances/alice/acl/ci-robot");
+
+    // An unknown role never reaches the API.
+    let before = server.requests().len();
+    let output = run_against(
+        &server,
+        home.path(),
+        &["acl", "set", "alice", "ci-robot", "root"],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("owner"));
+    assert_eq!(server.requests().len(), before, "no request expected");
+}
+
+#[tokio::test]
+async fn acl_json_prints_the_payload() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["--json", "acl", "get", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("JSON output");
+    assert_eq!(value["instance"], "alice");
+    assert_eq!(value["acl"].as_array().expect("acl").len(), 2);
 }
 
 // ---------------------------------------------------------------------------

@@ -51,7 +51,12 @@ fleett stop <id>
 fleett restart <id>
 fleett delete <id> [--purge]
 fleett usage
+fleett cost [--from DATE] [--to DATE] [--group-by instance|model|day]
+fleett pricing [list | set MODEL --input X --output Y [--currency C] [--effective-from DATE]]
+fleett budget <id> [--set USD]
 fleett images
+fleett exec <id> [--timeout N] -- <argv...>
+fleett exec-policy
 fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
@@ -65,7 +70,19 @@ fleett template from-instance <instance> --id <new> [--name NAME]
 fleett template rm <id>
 fleett template versions <id>
 fleett template restore <id> <version>
+fleett schedules <id>
+fleett schedule add <id> --name NAME --cron EXPR --prompt TEXT
+                [--enabled|--disabled] [--overlap skip|queue] [--timeout S]
+                [--timezone TZ] [--catchup]
+fleett schedule rm <schedule-id>
+fleett schedule run <schedule-id>
+fleett runs <id> [--limit N]
+fleett incidents [--status open|closed] [--instance ID] [--limit N]
+fleett heal <id> --policy off|restart|recreate
+              [--unhealthy-after N] [--max-restarts N] [--backoff SECONDS]
+fleett incident close <incident-id>
 fleett doctor
+fleett mcp [--http ADDR]
 ```
 
 Every command accepts the global `--json` flag (before or after the subcommand). Human
@@ -147,6 +164,53 @@ fleett --json usage | jq '.totals, .caps'
 A stopped instance reports zero CPU/memory usage; its disk usage is still measured. Docker
 failures answer `502 usage_unavailable` with the Docker error.
 
+### `cost`
+
+Token usage and cost of the fleet ([docs/COST.md](COST.md)), aggregated by `instance`
+(default), `model` or `day`. The range defaults to the current month up to now; `--from` and
+`--to` accept `YYYY-MM-DD` or an RFC 3339 timestamp (a bare date for `--to` includes the whole
+day).
+
+```bash
+fleett cost
+fleett cost --from 2026-11-01 --to 2026-11-30
+fleett cost --group-by model
+fleett --json cost --group-by day | jq '.groups[] | {key, cost_usd}'
+```
+
+The table lists `KEY`, `PROMPT`, `COMPLETION`, `TOTAL`, `COST` and `EVENTS`, followed by the
+top agents, the per-instance budgets and the month projection (linear estimate from the
+elapsed fraction of the month). `--json` prints the raw `CostReport`.
+
+### `pricing`
+
+Shows or changes the price of a model, in currency per million tokens:
+
+```bash
+fleett pricing
+fleett pricing set deepseek-v4.1-flash --input 0.27 --output 1.10
+fleett pricing set claude-sonnet-4 --input 3 --output 15 \
+  --currency USD --effective-from 2026-12-01
+```
+
+Prices are versioned by effective date: a new `--effective-from` adds a version and the
+historical cost keeps the price that was effective on each event day. Re-setting the same
+model and date replaces that version. Without `--effective-from`, the price applies from
+today (UTC). `fleett pricing` lists the latest version of each model.
+
+### `budget`
+
+Shows or sets the monthly ceiling of one instance, in USD:
+
+```bash
+fleett budget alice             # configured limit, month-to-date and projection
+fleett budget alice --set 25    # 25 USD per month
+fleett --json budget alice --set 25 | jq '{monthly_usd, percent, exceeded}'
+```
+
+`--set 0` keeps a zero ceiling (it never fires); a crossing is reported as a `cost.budget`
+event (see [COST.md](COST.md#alert-hook)).
+
 ### `images`
 
 Lists the container images present on the host, with the instances that use each tag:
@@ -159,6 +223,43 @@ fleett --json images | jq '.[] | select(.instances | length > 0)'
 Columns: `TAG` (`repository:tag`), `ID` (first 12 hex characters), `SIZE`, `CREATED` and
 `INSTANCES` (comma-separated ids, `-` when the tag is unused). Dangling images (`<none>:<none>`)
 are omitted. A Docker failure answers `502 images_unavailable` with the Docker error.
+
+### `exec`
+
+Runs one allowlisted command **inside the instance container**, without SSH and without a
+host-side `docker exec`. Full security model in [docs/EXEC.md](EXEC.md).
+
+```bash
+fleett exec alice -- ls /opt/data
+fleett exec alice --timeout 10 -- df -h
+fleett exec alice -- cat /opt/data/config.yaml
+fleett --json exec alice -- ls /opt/data | jq -r .stdout
+```
+
+The command and its arguments come after `--` and are sent as an argv array: no shell is
+involved, locally or remotely. stdout goes to stdout, stderr to stderr. `--timeout` defaults
+to 30 s and is bounded to 1..=300. The exit code of the remote command becomes the exit code
+of `fleett exec` (`124` after a timeout), so scripts can branch on it. `--json` prints the
+full `{"exit_code","stdout","stderr","timed_out","duration_ms","truncated"}` object.
+
+The default allowlist is `ls cat tail head grep env ps df du date which pwd id uname uptime
+free echo`; the server answers `403 exec_refused` with the reason and the effective allowlist
+for anything else, and a hard denylist refuses `rm`, shells, package managers and other
+destructive binaries even when `FLEETT_EXEC_ALLOWLIST=*`. Every call is audited as
+`instance.exec` (`result`, `argv`, exit code, duration, truncation).
+
+### `exec-policy`
+
+Prints the effective policy of the control plane: source, wildcard flag, allowlist, denylist,
+timeout bounds and argument/output caps.
+
+```bash
+fleett exec-policy
+fleett --json exec-policy | jq .allowlist
+```
+
+Admin only. On the server, `FLEETT_EXEC_ALLOWLIST` (comma-separated basenames) replaces the
+default allowlist; `*` disables it while the hard denylist stays in force.
 
 ### `upgrade`
 
@@ -224,6 +325,61 @@ fleett template rm house          # 409 template_in_use while an instance uses i
 
 `fleett template rm` refuses a built-in (`409 read_only`) and a template still used by an
 instance or a child template (`409 template_in_use`). `--json` prints the raw API payload.
+### `schedules` / `schedule` / `runs`
+
+Manage the cron schedules of an instance ([docs/SCHEDULES.md](SCHEDULES.md)):
+
+```bash
+fleett schedule add alice --name every-five --cron '*/5 * * * *' \
+  --prompt 'summarize the incidents' --timeout 120
+fleett schedules alice
+fleett schedule run <schedule-id>
+fleett schedule rm <schedule-id>
+fleett runs alice --limit 20
+```
+
+`schedules` prints one row per schedule: `NAME`, `CRON`, `ENABLED`, `NEXT`,
+`LAST`, `OVERLAP`, `TIMEOUT`. `schedule add` accepts `--name`, `--cron` and
+`--prompt` (required), plus `--enabled` (the default), `--disabled`,
+`--overlap skip|queue`, `--timeout` (1..=3600 s), `--timezone` (stored, UTC
+evaluation for now) and `--catchup`. `schedule run` executes the schedule
+immediately and prints `run <id>: <status> (<duration> ms), exit <code>`; a
+non-`ok` run prints its output indented. `runs` prints `STARTED`, `STATUS`,
+`EXIT`, `DURATION` and the first 80 characters of `OUTPUT`. Every command
+accepts `--json` and prints the raw `Schedule` / `ScheduleRun` objects.
+
+### `memory`
+
+Read and write the shared knowledge base ([docs/MEMORY.md](MEMORY.md)):
+
+```bash
+fleett memory set instance:probe runbook "restart the gateway after an upgrade" --tag ops
+fleett memory search "gateway upgrade"
+fleett memory history 12
+fleett memory restore 12 1
+fleett memory promote 12 --namespace global
+```
+
+Namespaces: `global`, `shared`, `instance:<id>`, `project:<name>`. `global` writes require
+the admin role. `--json` prints the raw `MemoryEntry` / `MemoryVersion` objects.
+### `incidents` / `heal` / `incident close`
+
+Read the watchdog incident registry and change the self-healing policy
+([docs/WATCHDOG.md](WATCHDOG.md)):
+
+```bash
+fleett incidents
+fleett incidents --status open --instance alice
+fleett heal alice --policy restart --unhealthy-after 2 --max-restarts 3 --backoff 15
+fleett heal alice --policy off
+fleett incident close 3f2a…
+```
+
+`incidents` prints `OPENED`, `INSTANCE`, `CAUSE`, `STATUS`, `RESTARTS` and
+`DETAIL`, newest first. `--json` prints the raw incident array. `heal` prints the
+resulting policy (`id: heal=restart unhealthy_after=2 max_restarts=3 backoff=15s`);
+`incident close` prints the closed incident. Both mutations require an admin
+token and are written to the audit log.
 
 ### `doctor`
 
@@ -235,11 +391,41 @@ Prints a checklist and exits non-zero when a check fails:
 - `secrets`: an encryption key is configured (`fleett secrets init`)
 - `egress`: `FLEETT_EGRESS=restrict` has a fresh firewall marker (`fleett egress install`);
   `FLEETT_EGRESS=off` is reported as a warning
+- instance warnings: one `warn` line per warning reported by `GET /api/instances/{id}`
+  (missing template allowlist, plaintext `secrets.env`, LAN access, …), prefixed with the
+  instance id. A clean fleet adds no line; warnings never change the exit code.
 
 ```bash
 fleett doctor
 fleett --json doctor
 ```
+
+A `guest-discord` instance created without an allowlist therefore reads:
+
+```
+  warn  warnings alice: DISCORD_ALLOWED_USERS is required by the guest-discord template but is
+                       not set: the gateway will refuse every message until it is
+```
+
+### `mcp`
+
+Runs a Model Context Protocol server that exposes the fleet as nineteen strict tools
+(`list_instances`, `get_instance`, `create_instance`, `start/stop/restart/delete_instance`,
+`logs`, `env_set/env_unset`, `read_file/write_file`, `git_log/git_status/git_revert`,
+`list_providers`, `test_provider`, `usage`, `run_pipeline`). Every tool is an HTTP API call
+made with the same URL and token as the other client commands, so the API keeps enforcing the
+token role and auditing every mutation; the server adds no privilege. See
+[docs/MCP.md](MCP.md) for the full catalog, the Hermes configuration and the HTTP mode.
+
+```bash
+fleett mcp                              # stdio: one JSON-RPC message per line
+fleett mcp --http 127.0.0.1:8091        # Streamable HTTP: POST /mcp
+```
+
+Stdout only carries JSON-RPC responses (diagnostics go to stderr). The global `--json` flag
+is ignored: tool results are MCP `content` + `structuredContent`, and execution errors are
+`isError` results carrying the API code. A token without the required role is refused by the
+API and the refusal is returned as-is (for example `code: "forbidden", status: 403`).
 
 ## Output and exit codes
 
@@ -248,6 +434,8 @@ fleett --json doctor
 | `0` | success |
 | `1` | API error, connection error, configuration error, a failed `doctor` check, or an `upgrade` with a rolled-back/failed instance |
 | `2` | invalid command line (clap) |
+| `3..255` | `fleett exec`: the remote command's exit code is mirrored |
+| `124` | `fleett exec`: the command was killed at its timeout |
 
 API errors print the API `error.message` and `error.code` on stderr:
 

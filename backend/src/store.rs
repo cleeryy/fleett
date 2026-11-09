@@ -265,6 +265,17 @@ pub fn remove_instance(cfg: &Config, id: &str, purge: bool) -> io::Result<()> {
         if data.exists() {
             fs::remove_dir_all(&data)?;
         }
+        // A snapshot restore keeps the previous data in a `data.pre-restore-*`
+        // sibling; `--purge` erases those too, or the instance directory would
+        // survive with data the operator asked to delete.
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("data.pre-restore-") {
+                    fs::remove_dir_all(entry.path())?;
+                }
+            }
+        }
         // The history dies with the data: a purged instance is forgotten, and
         // the directory must be empty for `remove_dir` below to succeed.
         let git = dir.join(crate::history::GIT_DIR);
@@ -506,6 +517,10 @@ fn reconstruct_spec(cfg: &Config, id: &str, compose: &Value) -> InstanceSpec {
         image,
         previous_image,
         allow_lan,
+        heal: models::HealPolicy::Off,
+        unhealthy_after: models::DEFAULT_UNHEALTHY_AFTER,
+        max_restarts: models::DEFAULT_MAX_RESTARTS,
+        heal_backoff_s: models::DEFAULT_HEAL_BACKOFF_S,
         notes: String::new(),
         status: Status::Unknown,
         last_error: None,

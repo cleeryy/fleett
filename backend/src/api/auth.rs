@@ -12,7 +12,9 @@ use crate::auth::session::{
     OIDC_STATE_COOKIE, SESSION_COOKIE,
 };
 use crate::auth::tokens;
-use crate::auth::{random_hex, AuthContext, AuthMethod, Role, SessionUser};
+use crate::auth::{
+    random_hex, AuthContext, AuthMethod, Role, SessionUser, TokenScope, MAX_USER_AGENT_CHARS,
+};
 use axum::extract::{ConnectInfo, Extension, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -121,6 +123,8 @@ pub async fn config(State(state): State<AppState>) -> Json<AuthConfigResponse> {
 pub struct MeResponse {
     pub authenticated: bool,
     pub actor: String,
+    /// Identity matched against `instance_acl.subject`.
+    pub subject: String,
     pub role: &'static str,
     pub method: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +136,7 @@ pub async fn me(Extension(ctx): Extension<AuthContext>) -> Json<MeResponse> {
     Json(MeResponse {
         authenticated: true,
         actor: ctx.actor,
+        subject: ctx.subject,
         role: ctx.role.as_str(),
         method: ctx.method.as_str(),
         user: ctx.user,
@@ -214,7 +219,7 @@ pub async fn callback(
 ) -> Response {
     match callback_inner(&state, query, &headers).await {
         Ok(response) => response,
-        Err(failure) => failure.respond(&headers),
+        Err(failure) => failure.respond(&state, &headers),
     }
 }
 
@@ -243,14 +248,38 @@ impl CallbackFailure {
     }
 
     /// Log one WARN line (reason, requested host, User-Agent — never the code,
-    /// state, nonce or cookie), then pick the representation the client asked
-    /// for: HTML page or redirect for browsers, the unchanged JSON for APIs.
-    fn respond(self, headers: &HeaderMap) -> Response {
+    /// state, nonce or cookie), append a failed `auth.login` row and pick the
+    /// representation the client asked for: HTML page or redirect for browsers,
+    /// the unchanged JSON for APIs.
+    fn respond(self, state: &AppState, headers: &HeaderMap) -> Response {
         warn!(
             reason = self.reason,
             host = %log_header(headers, header::HOST),
             user_agent = %log_header(headers, header::USER_AGENT),
             "OIDC callback rejected"
+        );
+
+        crate::api::audit::record_entry(
+            state,
+            crate::db::NewAuditRecord {
+                at: crate::models::now_iso(),
+                actor: "anonymous".to_string(),
+                role: "none".to_string(),
+                method: "session".to_string(),
+                action: "auth.login".to_string(),
+                target: "oidc".to_string(),
+                ip: client_ip(headers, None),
+                user_agent: bounded_user_agent(headers),
+                result: "failed".to_string(),
+                request_id: None,
+                details: Some(
+                    serde_json::json!({
+                        "reason": self.reason,
+                        "code": self.error.code,
+                    })
+                    .to_string(),
+                ),
+            },
         );
 
         if !wants_html(headers) {
@@ -338,6 +367,25 @@ async fn callback_inner(
         exp: issued_at + state.auth.session_ttl_secs as i64,
     });
     let csrf = random_hex(16);
+
+    // The login itself is a security event: who signed in, from where.
+    let actor = claims.email.clone().unwrap_or_else(|| claims.sub.clone());
+    crate::api::audit::record_entry(
+        state,
+        crate::db::NewAuditRecord {
+            at: crate::models::now_iso(),
+            actor,
+            role: role.as_str().to_string(),
+            method: "session".to_string(),
+            action: "auth.login".to_string(),
+            target: "oidc".to_string(),
+            ip: client_ip(headers, None),
+            user_agent: bounded_user_agent(headers),
+            result: "ok".to_string(),
+            request_id: None,
+            details: Some(serde_json::json!({ "provider": client.settings.issuer }).to_string()),
+        },
+    );
 
     let mut response = Redirect::to("/").into_response();
     let headers_mut = response.headers_mut();
@@ -448,16 +496,44 @@ fn log_header(headers: &HeaderMap, name: HeaderName) -> String {
 }
 
 /// `POST /auth/logout` — clear every cookie. Idempotent and unauthenticated:
-/// logging out someone who is not logged in is harmless.
-pub async fn logout(State(state): State<AppState>) -> Response {
+/// logging out someone who is not logged in is harmless. A valid session is
+/// identified in the audit trail before its cookie is cleared.
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
-    let headers = response.headers_mut();
+    let headers_mut = response.headers_mut();
     for name in [SESSION_COOKIE, CSRF_COOKIE, OIDC_STATE_COOKIE] {
         append_cookie(
-            headers,
+            headers_mut,
             &build_cookie(name, "", 0, true, state.auth.cookie_secure),
         );
     }
+
+    let (actor, role) = cookie_value(&headers, SESSION_COOKIE)
+        .and_then(|cookie| {
+            state
+                .auth
+                .verify_session(&cookie, Utc::now().timestamp())
+                .ok()
+        })
+        .map(|claims| (claims.user().actor(), claims.role.as_str()))
+        .unwrap_or_else(|| ("anonymous".to_string(), "none"));
+
+    crate::api::audit::record_entry(
+        &state,
+        crate::db::NewAuditRecord {
+            at: crate::models::now_iso(),
+            actor: actor.clone(),
+            role: role.to_string(),
+            method: "session".to_string(),
+            action: "auth.logout".to_string(),
+            target: actor,
+            ip: client_ip(&headers, None),
+            user_agent: bounded_user_agent(&headers),
+            result: "ok".to_string(),
+            request_id: None,
+            details: None,
+        },
+    );
     response
 }
 
@@ -468,6 +544,7 @@ pub async fn require_auth(
     next: Next,
 ) -> Result<Response, ApiError> {
     let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -482,6 +559,10 @@ pub async fn require_auth(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let ip = client_ip(headers, peer);
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| truncate_chars(value, MAX_USER_AGENT_CHARS));
 
     let mut context = None;
 
@@ -490,12 +571,16 @@ pub async fn require_auth(
             match state.auth.verify_session(value, Utc::now().timestamp()) {
                 Ok(claims) => {
                     let user = claims.user();
+                    let subject = user.actor();
                     context = Some(AuthContext {
-                        actor: user.actor(),
+                        actor: subject.clone(),
+                        subject,
                         role: claims.role,
                         method: AuthMethod::Session,
                         user: Some(user),
+                        scope: None,
                         ip: None,
+                        user_agent: None,
                     });
                 }
                 Err(err) => {
@@ -508,13 +593,16 @@ pub async fn require_auth(
 
     if context.is_none() && state.auth.bearer_enabled() {
         if let Some(token) = bearer.as_deref() {
-            if let Some((actor, role)) = bearer_identity(&state, token)? {
+            if let Some((subject, role, scope)) = bearer_identity(&state, token)? {
                 context = Some(AuthContext {
-                    actor,
+                    actor: subject.clone(),
+                    subject,
                     role,
                     method: AuthMethod::Bearer,
                     user: None,
+                    scope,
                     ip: None,
+                    user_agent: None,
                 });
             }
         }
@@ -523,10 +611,13 @@ pub async fn require_auth(
     if context.is_none() && state.auth.allow_no_auth {
         context = Some(AuthContext {
             actor: "anonymous".to_string(),
+            subject: "anonymous".to_string(),
             role: Role::Admin,
             method: AuthMethod::Bearer,
             user: None,
+            scope: None,
             ip: None,
+            user_agent: None,
         });
     }
 
@@ -534,12 +625,29 @@ pub async fn require_auth(
         return Err(ApiError::unauthorized());
     };
     context.ip = ip;
+    context.user_agent = user_agent;
 
     if context.role == Role::Viewer && !is_read_method(&method) {
-        return Err(ApiError::forbidden(
-            "forbidden",
-            "the viewer role is read-only",
-        ));
+        // A per-instance ACL may grant write (operator) or exec (owner) on an
+        // instance route; `authz::require_instance_access` decides there.
+        // Every other mutation stays admin-only.
+        if crate::authz::route_target(request.uri().path(), &method).is_none() {
+            crate::api::audit::record_result(
+                &state,
+                &context,
+                "auth.mutation_refused",
+                &path,
+                Some(serde_json::json!({
+                    "method": method.as_str(),
+                    "reason": "viewer_read_only",
+                })),
+                "refused",
+            );
+            return Err(ApiError::forbidden(
+                "forbidden",
+                "the viewer role is read-only",
+            ));
+        }
     }
 
     // Bearer clients are not vulnerable to CSRF; cookies are, unless the
@@ -552,6 +660,17 @@ pub async fn require_auth(
             _ => false,
         };
         if !valid {
+            crate::api::audit::record_result(
+                &state,
+                &context,
+                "auth.mutation_refused",
+                &path,
+                Some(serde_json::json!({
+                    "method": method.as_str(),
+                    "reason": "csrf_required",
+                })),
+                "refused",
+            );
             return Err(ApiError::forbidden(
                 "csrf_required",
                 format!("cookie-authenticated mutations require the {CSRF_HEADER} header"),
@@ -563,11 +682,14 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-/// Resolve a bearer token to `(actor, role)`.
-fn bearer_identity(state: &AppState, token: &str) -> Result<Option<(String, Role)>, ApiError> {
+/// Resolve a bearer token to `(actor/subject, role, scope)`.
+fn bearer_identity(
+    state: &AppState,
+    token: &str,
+) -> Result<Option<(String, Role, Option<TokenScope>)>, ApiError> {
     if let Some(expected) = state.auth.bootstrap_token.as_deref() {
         if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
-            return Ok(Some(("bootstrap".to_string(), Role::Admin)));
+            return Ok(Some(("bootstrap".to_string(), Role::Admin, None)));
         }
     }
     if !tokens::looks_like_token(token) {
@@ -580,7 +702,8 @@ fn bearer_identity(state: &AppState, token: &str) -> Result<Option<(String, Role
         .map_err(ApiError::from)?;
     Ok(record.map(|record| {
         let role = Role::parse(&record.role).unwrap_or(Role::Viewer);
-        (record.name, role)
+        let scope = TokenScope::parse_stored(record.scope.as_deref());
+        (record.name, role, scope)
     }))
 }
 
@@ -629,7 +752,7 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// First non-empty `Cookie:` header value with that name.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     for value in headers.get_all(header::COOKIE) {
         let Ok(raw) = value.to_str() else {
             continue;
@@ -650,8 +773,16 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// Best-effort client address, for the audit log.
-fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
+/// `User-Agent` as stored in the audit log, bounded to a sane length.
+pub(crate) fn bounded_user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| truncate_chars(value, MAX_USER_AGENT_CHARS))
+}
+
+/// Best-effort client address, for the audit log and the rate limiter.
+pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<String> {
     let forwarded_for = HeaderName::from_static("x-forwarded-for");
     if let Some(value) = headers.get(&forwarded_for).and_then(|v| v.to_str().ok()) {
         if let Some(first) = value.split(',').map(str::trim).find(|s| !s.is_empty()) {

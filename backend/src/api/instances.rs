@@ -2,22 +2,26 @@
 
 use crate::api::audit;
 use crate::api::error::ApiError;
+use crate::api::json::ApiJson;
 use crate::api::{up_and_record, AppState};
 use crate::auth::AuthContext;
+use crate::checks::{self, CheckReport};
 use crate::config::EgressMode;
 use crate::driver::LogsOptions;
 use crate::egress;
+use crate::egress_policy;
 use crate::envs::{self, EnvWrite};
 use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
 use crate::models::{
     env_key_is_reserved, now_iso, validate_api_key_env, validate_base_url, validate_cpu_limit,
-    validate_env_key, validate_env_value, validate_instance_id, validate_mem_limit, validate_model,
-    validate_notes, validate_secret_value, validate_share_name, ChannelKind, ChannelRequest,
-    CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvSuggestion, EnvVarInput, Health,
-    InstanceDetail, InstanceSpec, InstanceSummary, PatchInstanceRequest, ShareRef, Status,
-    TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
-    GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
+    validate_env_key, validate_env_raw_value, validate_instance_id, validate_mem_limit,
+    validate_model, validate_notes, validate_secret_value, validate_share_name, ChannelKind,
+    ChannelRequest, CloneInstanceRequest, ContainerInfo, CreateInstanceRequest, EnvInput,
+    EnvSuggestion, EnvVarInput, HealPolicy, Health, InstanceDetail, InstanceSpec, InstanceSummary,
+    PatchInstanceRequest, ShareRef, Status, TemplateMeta, DEFAULT_API_KEY_ENV, DEFAULT_CPU_LIMIT,
+    DEFAULT_HEAL_BACKOFF_S, DEFAULT_MAX_RESTARTS, DEFAULT_MEM_LIMIT_MB, DEFAULT_TEMPLATE,
+    DEFAULT_UNHEALTHY_AFTER, GATE_TOKEN_ENV, HEALTH_UNHEALTHY_MESSAGE,
 };
 use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
@@ -118,10 +122,27 @@ struct Prepared {
     env: Vec<EnvWrite>,
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSummary>>, ApiError> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+) -> Result<Json<Vec<InstanceSummary>>, ApiError> {
     let mut specs = state.db.list().map_err(ApiError::from)?;
-    let mut summaries = Vec::with_capacity(specs.len());
-    for spec in &mut specs {
+    // The filter is server-side: a caller never receives the id of an instance
+    // it may not read, even if the console were to ignore a flag.
+    let acl = if context.role == crate::auth::Role::Admin && context.scope.is_none() {
+        Vec::new()
+    } else {
+        crate::authz::entries(
+            state
+                .db
+                .acl_for_subject(&context.subject)
+                .map_err(ApiError::from)?,
+        )
+    };
+    let all_ids: Vec<String> = specs.iter().map(|spec| spec.id.clone()).collect();
+    let visible = crate::authz::visible_instances(&context, &acl, &all_ids);
+    let mut summaries = Vec::with_capacity(visible.len());
+    for spec in specs.iter_mut().filter(|spec| visible.contains(&spec.id)) {
         let mut health = Health::Unknown;
         if let Ok(result) = state.driver.ps(spec).await {
             health = result.health;
@@ -134,7 +155,11 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<InstanceSumm
             }
             record_health(&state, spec, health);
         }
-        summaries.push(to_summary(spec, health));
+        summaries.push(to_summary(
+            spec,
+            health,
+            crate::authz::instance_role(&context, &acl, &spec.id),
+        ));
     }
     Ok(Json(summaries))
 }
@@ -152,11 +177,33 @@ pub async fn get(
     )))
 }
 
+/// `GET /api/instances/{id}/check`: template allowlists against the live state.
+///
+/// Read-only: it never records health, never writes a file and never talks to
+/// `docker compose` beyond `ps`.
+pub async fn check(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<CheckReport>, ApiError> {
+    let spec = load(&state, &id)?;
+    let health = state
+        .driver
+        .ps(&spec)
+        .await
+        .map(|result| result.health)
+        .unwrap_or(Health::Unknown);
+    let env = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    Ok(Json(checks::report(&state.cfg, &spec, health, &env)))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<CreateInstanceRequest>,
+    ApiJson(request): ApiJson<CreateInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // Creating an instance is fleet-level: only an admin may do it in v1
+    // (a per-instance ACL cannot grant an instance that does not exist yet).
+    audit::require_admin(&context)?;
     let prepared = prepare_create(&state, &request)?;
     let mut spec = prepared.spec;
 
@@ -248,6 +295,8 @@ pub async fn clone(
     Extension(context): Extension<AuthContext>,
     Json(request): Json<CloneInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // A clone is a new fleet member: admin only in v1, like `create`.
+    audit::require_admin(&context)?;
     let new_id = request
         .new_id
         .as_deref()
@@ -406,11 +455,21 @@ pub async fn clone(
     ensure_lan_network(&state, &clone).await?;
 
     let template = clone_template(&state, &source)?;
+    // A clone of a restricted instance inherits its destination policy: a
+    // security setting must never loosen silently when an agent is duplicated.
+    let source_policy = egress_policy::load(&state.db, &source.id).map_err(ApiError::from)?;
     let inherited: BTreeMap<String, String> = source_env
         .iter()
         .filter(|entry| !entry.secret)
         .map(|entry| (entry.key.clone(), entry.value.clone()))
         .collect();
+    checks::validate_values(
+        template.meta.env.as_deref().unwrap_or_default(),
+        inherited
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(env_format_error)?;
     let values = render::build_secrets(
         &clone,
         gate_token.as_deref(),
@@ -423,11 +482,29 @@ pub async fn clone(
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
     let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     crate::api::push_provider_key(&mut env_keys, &clone);
-    let rendered = render::render_instance(&state.cfg, &clone, &template, &env_keys)
-        .map_err(ApiError::from)?;
+    let rendered = render::render_instance_with_project_and_policy(
+        &state.cfg,
+        &clone,
+        &template,
+        None,
+        &env_keys,
+        source_policy.as_ref(),
+    )
+    .map_err(ApiError::from)?;
 
     // From here on the clone exists: any failure rolls it back completely.
     state.db.insert_instance(&clone).map_err(ApiError::from)?;
+    if let Some(policy) = &source_policy {
+        let cloned = egress_policy::EgressPolicy {
+            instance_id: new_id.clone(),
+            updated_at: now_iso(),
+            ..policy.clone()
+        };
+        if let Err(err) = egress_policy::upsert(&state.db, &cloned) {
+            rollback_clone(&state, &new_id);
+            return Err(ApiError::from(err));
+        }
+    }
     if let Err(err) = write_clone(&state, &source.id, &clone, &entries, &rendered, copy_data).await
     {
         rollback_clone(&state, &new_id);
@@ -519,6 +596,8 @@ pub async fn import(
     Query(query): Query<ImportQuery>,
     request: Request,
 ) -> Result<(StatusCode, Json<InstanceDetail>), ApiError> {
+    // An import creates a new fleet member: admin only in v1.
+    audit::require_admin(&context)?;
     let id = query.id.as_deref().unwrap_or_default().trim().to_string();
     validate_instance_id(&id).map_err(|message| ApiError::bad_request("invalid_id", message))?;
     let start = query.start.unwrap_or(false);
@@ -779,14 +858,27 @@ pub async fn patch(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<PatchInstanceRequest>,
+    ApiJson(request): ApiJson<PatchInstanceRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
     let channel_token = apply_patch(&state, &mut spec, &request)?;
+    let suggestions = checks::template_info(&state.cfg, &spec).env;
+    let supplied = request
+        .env
+        .clone()
+        .map(EnvInput::into_vars)
+        .unwrap_or_default();
+    checks::validate_values(&suggestions, supplied_env_values(Some(&supplied)))
+        .map_err(env_format_error)?;
     let gate_token = normalize_token(request.gate_token.as_deref(), "invalid_gate_token")?;
+    // A PATCH that may rewrite the environment gets a restore point first:
+    // an applied env is exactly what an operator wants to roll back.
+    if request.env.is_some() || gate_token.is_some() || channel_token.is_some() {
+        crate::snapshots::auto_before(&state, &id, "patch").await;
+    }
     enforce_caps(&state, Some(&id), &spec)?;
     check_egress_policy(&state, &spec).await?;
     ensure_lan_network(&state, &spec).await?;
@@ -794,7 +886,8 @@ pub async fn patch(
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     let mut values = env_values_of(&existing);
     let mut flags = env_flags_of(&existing);
-    apply_env_merge(&mut values, &mut flags, request.env.as_deref())?;
+    let env_vars = request.env.clone().map(EnvInput::into_vars);
+    apply_env_merge(&mut values, &mut flags, env_vars.as_deref())?;
     let values = render::merge_secrets(
         values,
         &spec,
@@ -834,8 +927,10 @@ pub async fn patch(
 /// Body of `PUT /api/instances/{id}/env`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PutEnvRequest {
+    /// Canonical list (`[{key,value,secret}]`) or deprecated v0.4.0 map
+    /// (`{"KEY": "value"}`, every entry stored as a secret).
     #[serde(default)]
-    pub env: Option<Vec<EnvVarInput>>,
+    pub env: Option<EnvInput>,
 }
 
 /// Replace the whole environment of an instance.
@@ -848,9 +943,9 @@ pub async fn put_env(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
-    Json(request): Json<PutEnvRequest>,
+    ApiJson(request): ApiJson<PutEnvRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
-    let vars = request.env.ok_or_else(|| {
+    let vars = request.env.map(EnvInput::into_vars).ok_or_else(|| {
         ApiError::bad_request("invalid_env", "env is required: send {\"env\": [{...}]}")
     })?;
 
@@ -858,7 +953,12 @@ pub async fn put_env(
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
+    // A full environment replacement is a risky operation: snapshot first.
+    crate::snapshots::auto_before(&state, &id, "env").await;
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let suggestions = checks::template_info(&state.cfg, &spec).env;
+    checks::validate_values(&suggestions, supplied_env_values(Some(&vars)))
+        .map_err(env_format_error)?;
     let entries = resolve_full_env(&existing, &vars)?;
 
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
@@ -889,6 +989,8 @@ pub async fn delete_env(
     let _guard = lock.lock().await;
 
     let mut spec = load(&state, &id)?;
+    // Removing a variable rewrites the environment: snapshot before it.
+    crate::snapshots::auto_before(&state, &id, "env-delete").await;
     let existing = envs::load(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
     if !existing.iter().any(|entry| entry.key == key) {
         return Err(ApiError::not_found(format!(
@@ -1073,10 +1175,28 @@ pub async fn delete(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
 ) -> Result<StatusCode, ApiError> {
+    // Deleting an instance is destructive: respect the maintenance windows
+    // (issue #39) before stopping or removing anything.
+    crate::maintenance::enforce(&state)?;
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
 
     let spec = load(&state, &id)?;
+    // Destruction is an owner decision: `operator` may write, not delete.
+    if !(context.role == crate::auth::Role::Admin && context.scope.is_none()) {
+        let acl = crate::authz::entries(
+            state
+                .db
+                .acl_for_subject(&context.subject)
+                .map_err(ApiError::from)?,
+        );
+        if !crate::authz::is_owner(&context, &acl, &spec.id) {
+            return Err(ApiError::forbidden(
+                "forbidden",
+                "only an admin or an owner may delete an instance",
+            ));
+        }
+    }
     let purge = query.purge();
     if let Err(err) = state.driver.down(&spec).await {
         let detail = err.detail.clone();
@@ -1162,6 +1282,35 @@ async fn lifecycle(
         Lifecycle::Restart => "instance.restart",
     };
     audit::record(&state, &context, audit_action, &id, None);
+
+    // Tell the notifiers that the operator changed the state of an agent. A
+    // restart is intentional and stays silent; a start/stop is the signal an
+    // operator subscribes to. Fire-and-forget: a slow webhook must not delay
+    // the HTTP response.
+    let event = match operation {
+        Lifecycle::Start => Some(crate::notify::Event::InstanceUp),
+        Lifecycle::Stop => Some(crate::notify::Event::InstanceDown),
+        Lifecycle::Restart => None,
+    };
+    if let Some(event) = event {
+        crate::notify::spawn_emit(
+            state.clone(),
+            event,
+            crate::notify::Payload::instance(&spec).with_state(status.as_str()),
+        );
+    }
+    let webhook_event = match operation {
+        Lifecycle::Start | Lifecycle::Restart => Some(crate::webhooks::Event::InstanceStarted),
+        Lifecycle::Stop => Some(crate::webhooks::Event::InstanceStopped),
+    };
+    if let Some(event) = webhook_event {
+        crate::webhooks::emit(
+            &state,
+            event,
+            serde_json::json!({ "id": spec.id, "status": status.as_str(), "action": action }),
+        );
+    }
+
     Ok(Json(StatusResponse {
         status: status.as_str().to_string(),
     }))
@@ -1172,7 +1321,7 @@ async fn lifecycle(
 /// Instances adopted from disk have the template `custom`: their config was
 /// written by hand (or by an older control plane), so the on-disk file is used
 /// as the template instead of a built-in.
-fn render_for_update(
+pub(crate) fn render_for_update(
     state: &AppState,
     spec: &InstanceSpec,
     env_keys: &[String],
@@ -1183,13 +1332,15 @@ fn render_for_update(
     let mut spec = spec.clone();
     crate::api::hydrate_previous_image(state, &mut spec);
     let spec = &spec;
+    let policy = egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
     match render::load_template(&state.cfg, &spec.template) {
-        Ok(template) => render::render_instance_with_project(
+        Ok(template) => render::render_instance_with_project_and_policy(
             &state.cfg,
             spec,
             &template,
             project.as_deref(),
             env_keys,
+            policy.as_ref(),
         )
         .map_err(ApiError::from),
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
@@ -1201,11 +1352,12 @@ fn render_for_update(
                 ))
             })?;
             Ok(render::RenderedInstance {
-                compose_yaml: render::render_compose_with_project(
+                compose_yaml: render::render_compose_with_project_and_policy(
                     &state.cfg,
                     spec,
                     project.as_deref(),
                     env_keys,
+                    policy.as_ref(),
                 )
                 .map_err(ApiError::from)?,
                 config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
@@ -1276,7 +1428,10 @@ pub(crate) fn record_health(state: &AppState, spec: &mut InstanceSpec, health: H
 /// request is refused with `409 egress_not_enforced`.
 ///
 /// Lifecycle calls (start/stop/restart) never go through this check.
-async fn check_egress_policy(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+pub(crate) async fn check_egress_policy(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
     if spec.allow_lan || state.cfg.egress == EgressMode::Off {
         return Ok(());
     }
@@ -1313,7 +1468,10 @@ fn egress_conflict(detail: String, marker_path: &std::path::Path) -> ApiError {
 }
 
 /// Create the unrestricted LAN network before an `allow_lan` instance joins it.
-async fn ensure_lan_network(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
+pub(crate) async fn ensure_lan_network(
+    state: &AppState,
+    spec: &InstanceSpec,
+) -> Result<(), ApiError> {
     if !spec.allow_lan {
         return Ok(());
     }
@@ -1330,7 +1488,7 @@ async fn ensure_lan_network(state: &AppState, spec: &InstanceSpec) -> Result<(),
 ///
 /// `replacing` is the instance being patched: its stored row is excluded from
 /// the sum so an unchanged or shrinking value never trips the cap.
-fn enforce_caps(
+pub(crate) fn enforce_caps(
     state: &AppState,
     replacing: Option<&str>,
     spec: &InstanceSpec,
@@ -1353,38 +1511,64 @@ fn enforce_caps(
     // Float sums of decimal quotas are not exact; 1e-9 absorbs the noise.
     const EPSILON: f64 = 1e-9;
     if cfg.max_total_cpu > 0.0 && used_cpu + spec.cpu_limit > cfg.max_total_cpu + EPSILON {
-        return Err(ApiError::conflict(
-            "cpu_cap_exceeded",
-            format!(
-                "requested cpu_limit {} would bring the fleet to {} CPUs, above the configured cap of {}",
-                spec.cpu_limit,
-                used_cpu + spec.cpu_limit,
-                cfg.max_total_cpu
-            ),
-        )
-        .with_details(serde_json::json!({
-            "used": used_cpu,
-            "requested": spec.cpu_limit,
-            "cap": cfg.max_total_cpu,
-        })));
+        return Err(refuse_quota(
+            state,
+            spec,
+            ApiError::conflict(
+                "cpu_cap_exceeded",
+                format!(
+                    "requested cpu_limit {} would bring the fleet to {} CPUs, above the configured cap of {}",
+                    spec.cpu_limit,
+                    used_cpu + spec.cpu_limit,
+                    cfg.max_total_cpu
+                ),
+            )
+            .with_details(serde_json::json!({
+                "used": used_cpu,
+                "requested": spec.cpu_limit,
+                "cap": cfg.max_total_cpu,
+            })),
+        ));
     }
     if cfg.max_total_mem_mb > 0 && used_mem + u64::from(spec.mem_limit_mb) > cfg.max_total_mem_mb {
-        return Err(ApiError::conflict(
-            "mem_cap_exceeded",
-            format!(
-                "requested mem_limit_mb {} would bring the fleet to {} MB, above the configured cap of {} MB",
-                spec.mem_limit_mb,
-                used_mem + u64::from(spec.mem_limit_mb),
-                cfg.max_total_mem_mb
-            ),
-        )
-        .with_details(serde_json::json!({
-            "used": used_mem,
-            "requested": spec.mem_limit_mb,
-            "cap": cfg.max_total_mem_mb,
-        })));
+        return Err(refuse_quota(
+            state,
+            spec,
+            ApiError::conflict(
+                "mem_cap_exceeded",
+                format!(
+                    "requested mem_limit_mb {} would bring the fleet to {} MB, above the configured cap of {} MB",
+                    spec.mem_limit_mb,
+                    used_mem + u64::from(spec.mem_limit_mb),
+                    cfg.max_total_mem_mb
+                ),
+            )
+            .with_details(serde_json::json!({
+                "used": used_mem,
+                "requested": spec.mem_limit_mb,
+                "cap": cfg.max_total_mem_mb,
+            })),
+        ));
     }
     Ok(())
+}
+
+/// Emit `quota.exceeded` for the refused instance, then return the same error.
+///
+/// Fire-and-forget: the API keeps its `409` without waiting for the notifiers.
+fn refuse_quota(state: &AppState, spec: &InstanceSpec, error: ApiError) -> ApiError {
+    crate::notify::spawn_emit(
+        state.clone(),
+        crate::notify::Event::QuotaExceeded,
+        crate::notify::Payload {
+            instance_id: Some(spec.id.clone()),
+            instance_name: Some(spec.name.clone()),
+            state: None,
+            error: Some(error.message.clone()),
+            details: Some(error.code.to_string()),
+        },
+    );
+    error
 }
 
 /// `docker compose ps` reports `unknown` when no container exists; keep a
@@ -1397,7 +1581,11 @@ fn effective_status(cached: Status, observed: Status) -> Status {
     }
 }
 
-fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
+fn to_summary(
+    spec: &InstanceSpec,
+    health: Health,
+    role: Option<crate::authz::InstanceRole>,
+) -> InstanceSummary {
     InstanceSummary {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -1413,6 +1601,7 @@ fn to_summary(spec: &InstanceSpec, health: Health) -> InstanceSummary {
         shares: spec.shares.iter().map(|share| share.name.clone()).collect(),
         last_error: spec.last_error.clone(),
         created_at: spec.created_at.clone(),
+        role: role.map(|role| role.as_str().to_string()),
     }
 }
 
@@ -1434,6 +1623,15 @@ fn to_detail(
     if crate::secrets::has_plaintext_file(&state.cfg, &spec.id) {
         warnings.push(crate::secrets::WARNING_LEGACY.to_string());
     }
+    // Template allowlists (issue #27): appended after the egress/LAN and
+    // plaintext-secrets warnings, never instead of them.
+    let template = checks::template_info(&state.cfg, spec);
+    warnings.extend(checks::detail_warnings(
+        &template,
+        spec.channel,
+        health,
+        &env,
+    ));
     InstanceDetail {
         id: spec.id.clone(),
         name: spec.name.clone(),
@@ -1481,6 +1679,11 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         .iter()
         .map(|entry| (entry.key.as_str(), entry.secret))
         .collect();
+    let env_vars = request
+        .env
+        .clone()
+        .map(EnvInput::into_vars)
+        .unwrap_or_default();
 
     let model = match request.model.as_deref() {
         Some(value) => {
@@ -1537,13 +1740,7 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
 
     // Every `required` entry of the template schema must be supplied by the
     // request itself (or by one of the token fields).
-    let mut provided: BTreeSet<&str> = request
-        .env
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|var| var.key.as_str())
-        .collect();
+    let mut provided: BTreeSet<&str> = env_vars.iter().map(|var| var.key.as_str()).collect();
     if request
         .gate_token
         .as_deref()
@@ -1561,26 +1758,33 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             provided.insert(env);
         }
     }
-    let missing: Vec<serde_json::Value> = schema
-        .iter()
-        .filter(|entry| entry.required && !provided.contains(entry.key.as_str()))
-        .map(|entry| serde_json::json!({ "key": entry.key, "field": "env" }))
-        .collect();
-    if !missing.is_empty() {
-        let keys: Vec<&str> = schema
+    // Built-ins keep the #27 behaviour: a missing allowlist is a warning, not
+    // a creation error. Only the `required` keys declared by a custom layer of
+    // the chain are enforced.
+    {
+        let missing: Vec<serde_json::Value> = template
+            .enforced_required
             .iter()
-            .filter(|entry| entry.required && !provided.contains(entry.key.as_str()))
-            .map(|entry| entry.key.as_str())
+            .filter(|key| !provided.contains(key.as_str()))
+            .map(|key| serde_json::json!({ "key": key, "field": "env" }))
             .collect();
-        return Err(ApiError::bad_request(
-            "missing_required_env",
-            format!(
-                "template \"{}\" requires environment variable(s): {}",
-                template.id,
-                keys.join(", ")
-            ),
-        )
-        .with_details(serde_json::json!(missing)));
+        if !missing.is_empty() {
+            let keys: Vec<&str> = template
+                .enforced_required
+                .iter()
+                .filter(|key| !provided.contains(key.as_str()))
+                .map(|key| key.as_str())
+                .collect();
+            return Err(ApiError::bad_request(
+                "missing_required_env",
+                format!(
+                    "template \"{}\" requires environment variable(s): {}",
+                    template.id,
+                    keys.join(", ")
+                ),
+            )
+            .with_details(serde_json::json!(missing)));
+        }
     }
 
     let shares = match &request.shares {
@@ -1628,29 +1832,30 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
         .unwrap_or_default();
     validate_notes(&notes).map_err(|message| ApiError::bad_request("invalid_notes", message))?;
 
-    let env: Vec<EnvWrite> = validate_env_inputs(
-        request.env.as_deref().unwrap_or_default(),
-        true,
-        true,
-        Some(&schema),
-    )?
-    .into_iter()
-    .map(|var| {
-        // The template schema decides the storage shape unless the request
-        // says otherwise.
-        let secret = var.secret.unwrap_or_else(|| {
-            schema_secret
-                .get(var.key.as_str())
-                .copied()
-                .unwrap_or(false)
-        });
-        EnvWrite {
-            key: var.key,
-            value: var.value.unwrap_or_default(),
-            secret,
-        }
-    })
-    .collect();
+    let env: Vec<EnvWrite> = validate_env_inputs(&env_vars, true, true, Some(&schema))?
+        .into_iter()
+        .map(|var| {
+            // The template schema decides the storage shape unless the request
+            // says otherwise.
+            let secret = var.secret.unwrap_or_else(|| {
+                schema_secret
+                    .get(var.key.as_str())
+                    .copied()
+                    .unwrap_or(false)
+            });
+            EnvWrite {
+                key: var.key,
+                value: var.value.unwrap_or_default(),
+                secret,
+            }
+        })
+        .collect();
+    checks::validate_values(
+        &schema,
+        env.iter()
+            .map(|entry| (entry.key.as_str(), entry.value.as_str())),
+    )
+    .map_err(env_format_error)?;
     let gate_token = request
         .gate_token
         .as_deref()
@@ -1679,6 +1884,10 @@ fn prepare_create(state: &AppState, request: &CreateInstanceRequest) -> Result<P
             image: state.cfg.image.clone(),
             previous_image: None,
             allow_lan,
+            heal: HealPolicy::Off,
+            unhealthy_after: DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: DEFAULT_HEAL_BACKOFF_S,
             notes,
             status: Status::Created,
             last_error: None,
@@ -1906,7 +2115,7 @@ fn validate_env_inputs(
             ));
         }
         match &var.value {
-            Some(value) => validate_env_value(value)
+            Some(value) => validate_env_raw_value(value)
                 .map_err(|message| ApiError::bad_request("invalid_env", message))?,
             None if require_value => {
                 return Err(ApiError::bad_request(
@@ -2062,6 +2271,28 @@ fn env_entries(
         .collect()
 }
 
+/// Values a request actually supplies, for template format validation.
+///
+/// A `value: null` entry deletes a key (PATCH) or keeps a stored secret (PUT):
+/// it carries nothing to validate.
+fn supplied_env_values<'a>(
+    vars: Option<&'a [EnvVarInput]>,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    vars.unwrap_or_default()
+        .iter()
+        .filter_map(|var| var.value.as_deref().map(|value| (var.key.as_str(), value)))
+}
+
+/// `400 invalid_env_format` with the key, the expected format and the value.
+fn env_format_error(err: checks::EnvFormatError) -> ApiError {
+    let message = err.message();
+    ApiError::bad_request("invalid_env_format", message).with_details(serde_json::json!({
+        "key": err.key,
+        "expected": err.expected,
+        "received": err.received,
+    }))
+}
+
 /// Keys supplied by the gate/channel tokens of a request: always secret, even
 /// when the request marks them as plain.
 fn token_keys(spec: &InstanceSpec, gate: bool, channel: bool) -> Vec<&str> {
@@ -2147,6 +2378,8 @@ fn clone_template(state: &AppState, source: &InstanceSpec) -> Result<TemplateSou
                 soul_md,
                 meta: TemplateMeta::default(),
                 defaults: crate::models::TemplateDefaults::default(),
+                read_only: false,
+                enforced_required: Vec::new(),
             })
         }
         Err(err) => Err(ApiError::from(err)),

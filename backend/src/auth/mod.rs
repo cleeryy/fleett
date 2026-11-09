@@ -23,6 +23,11 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+/// Upper bound of the `User-Agent` stored in the audit log. Long enough to
+/// identify a browser or client, short enough that a hostile header cannot
+/// bloat a row.
+pub const MAX_USER_AGENT_CHARS: usize = 512;
+
 /// `bytes` random bytes as lowercase hex (2 chars per byte).
 pub fn random_hex(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
@@ -88,6 +93,92 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// One operation a scoped token may perform on its instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Read,
+    Write,
+    Exec,
+}
+
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Exec => "exec",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "exec" => Some(Self::Exec),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Restriction attached to a named bearer token (issue #37).
+///
+/// `instances` is the set of instance ids the token may address; `actions` is
+/// the set of operations it may perform. A token without a scope keeps the
+/// legacy behaviour: its global [`Role`] applies to the whole fleet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenScope {
+    #[serde(default)]
+    pub instances: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+}
+
+impl TokenScope {
+    /// Decode the JSON text stored in `api_tokens.scope`.
+    ///
+    /// `None` (or a blank value) means "no scope" and the legacy global role
+    /// applies. A malformed value yields an empty scope, which denies every
+    /// instance: a corrupted row must never widen access.
+    pub fn parse_stored(raw: Option<&str>) -> Option<Self> {
+        let text = raw?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        match serde_json::from_str(text) {
+            Ok(scope) => Some(scope),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "api_tokens.scope is not valid JSON: the token is restricted to nothing"
+                );
+                Some(Self::default())
+            }
+        }
+    }
+
+    /// Serialize to the JSON text stored in `api_tokens.scope`.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("a token scope always serializes")
+    }
+
+    /// Whether the scope lists `instance`.
+    pub fn allows_instance(&self, instance: &str) -> bool {
+        self.instances.iter().any(|id| id == instance)
+    }
+
+    /// Whether the scope includes `action`.
+    pub fn allows_action(&self, action: Action) -> bool {
+        self.actions.contains(&action)
+    }
+}
+
 /// Credential that authenticated the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
@@ -110,12 +201,20 @@ pub struct AuthContext {
     /// Human-readable actor: the token name for bearers, the email (or `sub`)
     /// for sessions.
     pub actor: String,
+    /// Stable key matched against `instance_acl.subject`: the email (or the
+    /// OIDC `sub`) for sessions, the token name for bearer tokens.
+    pub subject: String,
     pub role: Role,
     pub method: AuthMethod,
     /// Profile carried by a session, absent for bearer tokens.
     pub user: Option<SessionUser>,
+    /// Restriction of a named bearer token; `None` for sessions and for tokens
+    /// created before scopes existed (legacy global behaviour).
+    pub scope: Option<TokenScope>,
     /// Client address, best effort (`X-Forwarded-For`, then the peer).
     pub ip: Option<String>,
+    /// Client `User-Agent`, bounded by the middleware before it is stored.
+    pub user_agent: Option<String>,
 }
 
 /// Profile of the signed-in user.
@@ -170,5 +269,42 @@ mod tests {
         );
         assert_eq!(Role::from_groups(&groups(&["other"]), admin, viewer), None);
         assert_eq!(Role::from_groups(&[], admin, viewer), None);
+    }
+
+    #[test]
+    fn actions_round_trip() {
+        assert_eq!(Action::parse("READ"), Some(Action::Read));
+        assert_eq!(Action::parse("write"), Some(Action::Write));
+        assert_eq!(Action::parse("exec"), Some(Action::Exec));
+        assert_eq!(Action::parse("root"), None);
+        assert_eq!(Action::Read.as_str(), "read");
+        assert_eq!(Action::Exec.to_string(), "exec");
+    }
+
+    #[test]
+    fn scopes_round_trip_through_the_stored_json() {
+        let scope = TokenScope {
+            instances: vec!["probe".into(), "tchouniz".into()],
+            actions: vec![Action::Read, Action::Write],
+        };
+        let stored = scope.to_json();
+        assert_eq!(TokenScope::parse_stored(Some(&stored)), Some(scope.clone()));
+        assert!(scope.allows_instance("probe"));
+        assert!(!scope.allows_instance("alice"));
+        assert!(scope.allows_action(Action::Write));
+        assert!(!scope.allows_action(Action::Exec));
+    }
+
+    #[test]
+    fn legacy_and_malformed_scopes_are_handled_safely() {
+        assert_eq!(TokenScope::parse_stored(None), None);
+        assert_eq!(TokenScope::parse_stored(Some("  ")), None);
+        // A corrupted row must never widen access: it parses to an empty scope.
+        let malformed = TokenScope::parse_stored(Some("{\"instances\":")).expect("scope");
+        assert!(malformed.instances.is_empty());
+        assert!(malformed.actions.is_empty());
+        // Unknown actions are a parse error, hence also "deny everything".
+        let unknown = TokenScope::parse_stored(Some("{\"actions\":[\"root\"]}")).expect("scope");
+        assert!(unknown.actions.is_empty());
     }
 }

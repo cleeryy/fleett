@@ -7,7 +7,8 @@
 //! being recreated.
 
 use super::{
-    Driver, DriverError, DriverFuture, ImageRecord, InspectInfo, LogsOptions, PsResult, UsageSample,
+    Driver, DriverError, DriverFuture, ExecResult, ImageRecord, InspectInfo, LogsOptions, PsResult,
+    UsageSample,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -463,6 +464,46 @@ impl Driver for ComposeDriver {
         })
     }
 
+    fn exec<'a>(
+        &'a self,
+        spec: &'a InstanceSpec,
+        argv: &'a [String],
+        timeout_s: u64,
+    ) -> DriverFuture<'a, Result<ExecResult, DriverError>> {
+        Box::pin(async move {
+            // `-T` disables the TTY, so the output is plain bytes and the call
+            // never hangs waiting for a terminal. The service name is always
+            // `agent` (see `render::render_compose`).
+            let mut command = self.command(&spec.id)?;
+            command.args(["exec", "-T", "agent"]);
+            command.args(argv);
+            command.stdin(Stdio::null()).kill_on_drop(true);
+            let timeout = Duration::from_secs(timeout_s.max(1));
+            match tokio::time::timeout(timeout, command.output()).await {
+                Err(_) => Ok(ExecResult {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: format!("timed out after {}s", timeout.as_secs()),
+                    timed_out: true,
+                    duration_ms: 0,
+                    truncated: false,
+                }),
+                Ok(Err(err)) => Err(DriverError::new(
+                    "exec",
+                    format!("could not run docker: {err}"),
+                )),
+                Ok(Ok(output)) => Ok(ExecResult {
+                    exit_code: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    timed_out: false,
+                    duration_ms: 0,
+                    truncated: false,
+                }),
+            }
+        })
+    }
+
     fn ensure_image<'a>(&'a self, image: &'a str) -> DriverFuture<'a, Result<(), DriverError>> {
         Box::pin(async move {
             // `docker image inspect` exits non-zero when the tag is absent, so
@@ -725,6 +766,14 @@ fn parse_inspect(stdout: &str) -> Option<InspectInfo> {
             .find(|(key, _)| key.eq_ignore_ascii_case("oomkilled"))
             .and_then(|(_, value)| value.as_bool())
             .unwrap_or(false),
+        // `RestartCount` is a sibling of `State` in `docker inspect`, not a
+        // member of it.
+        restart_count: object
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("restartcount"))
+            .and_then(|(_, value)| value.as_u64())
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .unwrap_or(0),
         error: text(&["error"]).filter(|error| !error.trim().is_empty()),
         started_at,
     })
@@ -1119,6 +1168,7 @@ mod tests {
         let stdout = r#"[{
             "Id": "abc",
             "Name": "/fleett-alice",
+            "RestartCount": 4,
             "State": {
                 "Status": "running",
                 "Running": true,
@@ -1133,6 +1183,7 @@ mod tests {
         assert_eq!(info.state, "running");
         assert_eq!(info.exit_code, Some(0));
         assert!(!info.oom_killed);
+        assert_eq!(info.restart_count, 4);
         assert_eq!(info.error, None);
         assert_eq!(
             info.started_at.as_deref(),
@@ -1251,6 +1302,10 @@ mod tests {
             image: "hermes-agent:0.22.2-local".to_string(),
             previous_image: None,
             allow_lan: false,
+            heal: crate::models::HealPolicy::Off,
+            unhealthy_after: crate::models::DEFAULT_UNHEALTHY_AFTER,
+            max_restarts: crate::models::DEFAULT_MAX_RESTARTS,
+            heal_backoff_s: crate::models::DEFAULT_HEAL_BACKOFF_S,
             notes: String::new(),
             status: Status::Created,
             last_error: None,

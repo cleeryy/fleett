@@ -10,6 +10,7 @@ use fleett::driver::compose::ComposeDriver;
 use fleett::driver::mock::MockDriver;
 use fleett::driver::Driver;
 use fleett::egress;
+use fleett::mcp;
 use fleett::migrate;
 use fleett::secrets;
 use std::path::PathBuf;
@@ -168,6 +169,32 @@ enum Commands {
     },
     /// Show the CPU, memory and disk usage of the fleet (client mode).
     Usage,
+    /// Token usage and cost of the fleet (client mode). See docs/COST.md.
+    Cost {
+        /// Inclusive lower bound (`YYYY-MM-DD` or RFC 3339); default: first
+        /// day of the month.
+        #[arg(long)]
+        from: Option<String>,
+        /// Upper bound (`YYYY-MM-DD` includes the whole day); default: now.
+        #[arg(long)]
+        to: Option<String>,
+        /// `instance` (default), `model` or `day`.
+        #[arg(long, default_value = "instance")]
+        group_by: String,
+    },
+    /// Show or change the per-model token prices (client mode).
+    Pricing {
+        #[command(subcommand)]
+        action: Option<PricingCommands>,
+    },
+    /// Show or set the monthly budget of one instance (client mode).
+    Budget {
+        /// Instance id.
+        id: String,
+        /// Monthly ceiling in USD; omit to only show the status.
+        #[arg(long)]
+        set: Option<f64>,
+    },
     /// List the container images present on the host and their instances
     /// (client mode).
     Images,
@@ -189,6 +216,53 @@ enum Commands {
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
+    /// List the incidents recorded by the watchdog (client mode).
+    Incidents {
+        /// `open` or `closed`.
+        #[arg(long)]
+        status: Option<String>,
+        /// Only the incidents of this instance.
+        #[arg(long)]
+        instance: Option<String>,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Change the self-healing policy of an instance (client mode).
+    ///
+    /// See docs/WATCHDOG.md.
+    Heal {
+        /// Instance id.
+        id: String,
+        /// `off` (observe only), `restart` or `recreate`.
+        #[arg(long)]
+        policy: String,
+        /// Consecutive unhealthy samples before the watchdog acts.
+        #[arg(long)]
+        unhealthy_after: Option<u32>,
+        /// Heal attempts allowed before the watchdog gives up.
+        #[arg(long)]
+        max_restarts: Option<u32>,
+        /// Base delay between two heal attempts, in seconds.
+        #[arg(long)]
+        backoff: Option<u64>,
+    },
+    /// Manage incidents (client mode).
+    Incident {
+        #[command(subcommand)]
+        action: IncidentCommands,
+    },
+    /// Expose the fleet as an MCP server for an orchestrating agent.
+    ///
+    /// Speaks JSON-RPC 2.0 over stdin/stdout by default, or Streamable HTTP
+    /// (`POST /mcp`) with `--http`. Every tool is a call to the HTTP API with
+    /// the token of `~/.config/fleett/config.toml`. See docs/MCP.md.
+    Mcp {
+        /// Serve Streamable HTTP on this address (e.g. 127.0.0.1:8091) instead
+        /// of stdio. SSE streaming is not implemented.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+    },
     /// Send a message to another instance over the fleet bus (client mode).
     Say {
         /// Recipient instance id.
@@ -235,6 +309,95 @@ enum Commands {
     Template {
         #[command(subcommand)]
         action: TemplateCommands,
+    },
+    /// Read and write the shared fleet memory (client mode).
+    Memory {
+        #[command(subcommand)]
+        action: MemoryCommands,
+    },
+    /// Read or change the per-instance access list (client mode).
+    Acl {
+        #[command(subcommand)]
+        action: AclCommands,
+    },
+    /// List the cron schedules of an instance (client mode).
+    Schedules {
+        /// Instance id.
+        id: String,
+    },
+    /// Create, delete or trigger a cron schedule (client mode).
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleCommands,
+    },
+    /// Show the run history of an instance (client mode).
+    Runs {
+        /// Instance id.
+        id: String,
+        /// Maximum rows (1..=500).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCommands {
+    /// Print the access list of one instance.
+    Get { id: String },
+    /// Grant or update one subject.
+    Set {
+        id: String,
+        subject: String,
+        /// `owner`, `operator` or `viewer`.
+        role: String,
+    },
+    /// Remove one subject.
+    Rm { id: String, subject: String },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// Create or update one entry.
+    Set {
+        /// `global`, `shared`, `instance:<id>` or `project:<name>`.
+        namespace: String,
+        key: String,
+        value: String,
+        /// Tag, repeatable.
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Expire after N seconds.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Read one entry by namespace and key.
+    Get { namespace: String, key: String },
+    /// Browse entries.
+    List {
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Full text search.
+    Search {
+        query: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Show every version of one entry.
+    History { id: i64 },
+    /// Restore an old version as a new one.
+    Restore { id: i64, version: u32 },
+    /// Soft-delete one entry.
+    Delete { id: i64 },
+    /// Copy an entry into another namespace (default global).
+    Promote {
+        id: i64,
+        #[arg(long, default_value = "global")]
+        namespace: String,
     },
 }
 
@@ -312,6 +475,61 @@ enum TemplateCommands {
 }
 
 #[derive(Subcommand, Clone)]
+enum ScheduleCommands {
+    /// Create a schedule for an instance.
+    Add {
+        /// Instance id.
+        id: String,
+        /// Operator-facing name, unique per instance.
+        #[arg(long)]
+        name: String,
+        /// Five-field cron expression, evaluated in UTC (`*/5 * * * *`).
+        #[arg(long)]
+        cron: String,
+        /// Prompt sent to the gateway on every run.
+        #[arg(long)]
+        prompt: String,
+        /// Enable the schedule (the default).
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Create the schedule disabled.
+        #[arg(long, conflicts_with = "enabled")]
+        disabled: bool,
+        /// `skip` (default) or `queue` when the previous run is still going.
+        #[arg(long)]
+        overlap: Option<String>,
+        /// Execution budget in seconds (1..=3600, default 300).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Timezone label (stored, evaluated in UTC for now).
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Replay one missed occurrence at startup.
+        #[arg(long)]
+        catchup: bool,
+    },
+    /// Delete a schedule and its run history.
+    Rm {
+        /// Schedule id.
+        schedule_id: String,
+    },
+    /// Trigger a schedule immediately and print the run.
+    Run {
+        /// Schedule id.
+        schedule_id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum IncidentCommands {
+    /// Close one incident by hand (`fleett incident close <id>`).
+    Close {
+        /// Incident id.
+        id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum BackupCommands {
     /// List the archives of the backup directory, newest first.
     List {
@@ -329,6 +547,29 @@ enum BackupCommands {
         /// Accept a non-empty root and overwrite its files.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum PricingCommands {
+    /// List the latest price of every model.
+    List,
+    /// Set the price of one model (a new effective date adds a version).
+    Set {
+        /// Model name, as written by the gateway.
+        model: String,
+        /// Input price, per million tokens.
+        #[arg(long)]
+        input: f64,
+        /// Output price, per million tokens.
+        #[arg(long)]
+        output: f64,
+        /// Three-letter currency code (default USD).
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        /// First day the price applies to (`YYYY-MM-DD`, default today).
+        #[arg(long)]
+        effective_from: Option<String>,
     },
 }
 
@@ -487,6 +728,35 @@ async fn main() -> anyhow::Result<()> {
         Commands::Restart { id } => cli::run(cli::Command::Restart(id), json).await,
         Commands::Delete { id, purge } => cli::run(cli::Command::Delete { id, purge }, json).await,
         Commands::Usage => cli::run(cli::Command::Usage, json).await,
+        Commands::Cost { from, to, group_by } => {
+            cli::run(
+                cli::Command::Cost(cli::CostArgs { from, to, group_by }),
+                json,
+            )
+            .await
+        }
+        Commands::Pricing { action } => {
+            let action = match action.unwrap_or(PricingCommands::List) {
+                PricingCommands::List => cli::PricingAction::List,
+                PricingCommands::Set {
+                    model,
+                    input,
+                    output,
+                    currency,
+                    effective_from,
+                } => cli::PricingAction::Set(cli::PricingArgs {
+                    model,
+                    input,
+                    output,
+                    currency,
+                    effective_from,
+                }),
+            };
+            cli::run(cli::Command::Pricing(action), json).await
+        }
+        Commands::Budget { id, set } => {
+            cli::run(cli::Command::Budget(cli::BudgetArgs { id, set }), json).await
+        }
         Commands::Images => cli::run(cli::Command::Images, json).await,
         Commands::Upgrade {
             image,
@@ -506,6 +776,50 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+        Commands::Incidents {
+            status,
+            instance,
+            limit,
+        } => {
+            cli::run(
+                cli::Command::Incidents(cli::IncidentsArgs {
+                    status,
+                    instance,
+                    limit,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Heal {
+            id,
+            policy,
+            unhealthy_after,
+            max_restarts,
+            backoff,
+        } => {
+            cli::run(
+                cli::Command::Heal(cli::HealArgs {
+                    id,
+                    policy,
+                    unhealthy_after,
+                    max_restarts,
+                    backoff_s: backoff,
+                }),
+                json,
+            )
+            .await
+        }
+        Commands::Incident { action } => match action {
+            IncidentCommands::Close { id } => cli::run(cli::Command::IncidentClose(id), json).await,
+        },
+        Commands::Mcp { http } => {
+            match http {
+                Some(addr) => mcp::run_http(&addr).await?,
+                None => mcp::run_stdio().await?,
+            }
+            0
+        }
         Commands::Say {
             to,
             body,
@@ -588,6 +902,94 @@ async fn main() -> anyhow::Result<()> {
             };
             cli::run(cli::Command::Template(command), json).await
         }
+        Commands::Acl { action } => {
+            let command = match action {
+                AclCommands::Get { id } => cli::Command::AclGet(id),
+                AclCommands::Set { id, subject, role } => {
+                    cli::Command::AclSet { id, subject, role }
+                }
+                AclCommands::Rm { id, subject } => cli::Command::AclRm { id, subject },
+            };
+            cli::run(command, json).await
+        }
+        Commands::Memory { action } => {
+            let command = match action {
+                MemoryCommands::Set {
+                    namespace,
+                    key,
+                    value,
+                    tag,
+                    ttl,
+                } => cli::MemoryCommand::Set {
+                    namespace,
+                    key,
+                    value,
+                    tags: tag,
+                    ttl_s: ttl,
+                },
+                MemoryCommands::Get { namespace, key } => {
+                    cli::MemoryCommand::Get { namespace, key }
+                }
+                MemoryCommands::List { namespace, limit } => {
+                    cli::MemoryCommand::List { namespace, limit }
+                }
+                MemoryCommands::Search {
+                    query,
+                    namespace,
+                    limit,
+                } => cli::MemoryCommand::Search {
+                    query,
+                    namespace,
+                    limit,
+                },
+                MemoryCommands::History { id } => cli::MemoryCommand::History { id },
+                MemoryCommands::Restore { id, version } => {
+                    cli::MemoryCommand::Restore { id, version }
+                }
+                MemoryCommands::Delete { id } => cli::MemoryCommand::Delete { id },
+                MemoryCommands::Promote { id, namespace } => {
+                    cli::MemoryCommand::Promote { id, namespace }
+                }
+            };
+            cli::run(cli::Command::Memory(command), json).await
+        }
+        Commands::Schedules { id } => cli::run(cli::Command::Schedules { id }, json).await,
+        Commands::Schedule { action } => {
+            let command = match action {
+                ScheduleCommands::Add {
+                    id,
+                    name,
+                    cron,
+                    prompt,
+                    enabled,
+                    disabled,
+                    overlap,
+                    timeout,
+                    timezone,
+                    catchup,
+                } => cli::Command::ScheduleAdd(cli::ScheduleAddArgs {
+                    id,
+                    name,
+                    cron,
+                    prompt,
+                    enabled: if enabled {
+                        Some(true)
+                    } else if disabled {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                    overlap,
+                    timeout_s: timeout,
+                    timezone,
+                    catchup,
+                }),
+                ScheduleCommands::Rm { schedule_id } => cli::Command::ScheduleRm { schedule_id },
+                ScheduleCommands::Run { schedule_id } => cli::Command::ScheduleRun { schedule_id },
+            };
+            cli::run(command, json).await
+        }
+        Commands::Runs { id, limit } => cli::run(cli::Command::Runs { id, limit }, json).await,
     };
 
     if code != 0 {
@@ -661,8 +1063,59 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
     let state = AppState::bootstrap_with_db(cfg.clone(), driver, db)?;
     let app = api::router(state.clone());
 
+    // A `running` row belongs to a process that died; catchup=false schedules
+    // whose slot is long past are moved to their next future occurrence here.
+    match fleett::scheduler::recover(&state.db) {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(count, "recovered stale scheduled runs"),
+        Err(err) => tracing::warn!(%err, "could not recover scheduled runs"),
+    }
+    spawn_scheduler(state.clone());
+    if cfg.watchdog_interval_s > 0 {
+        tokio::spawn(fleett::watchdog::run(state.clone()));
+    } else {
+        tracing::info!("watchdog disabled (FLEETT_WATCHDOG_INTERVAL_S=0)");
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(fleett::logstore::run(state));
+    }
+    if cfg.cost_scan_interval_s > 0 {
+        fleett::cost::spawn_scanner(
+            state.clone(),
+            std::time::Duration::from_secs(cfg.cost_scan_interval_s),
+        );
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(fleett::maintenance::TICK_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                fleett::maintenance::tick_scheduled(&state).await;
+            }
+        });
+    }
+
     if let Some(bind) = cfg.metrics.bind {
         spawn_metrics_listener(state.clone(), bind).await?;
+    }
+
+    // Token accounting (issue #35): one scan at startup, then every
+    // `FLEETT_COST_SCAN_INTERVAL_S` seconds. `0` disables the scanner; the
+    // ingest endpoint stays available either way.
+    {
+        let state = state.clone();
+        tokio::spawn(fleett::logstore::run(state));
+    }
+    if cfg.cost_scan_interval_s > 0 {
+        fleett::cost::spawn_scanner(
+            state.clone(),
+            std::time::Duration::from_secs(cfg.cost_scan_interval_s),
+        );
+    } else {
+        tracing::info!("cost scanner disabled (FLEETT_COST_SCAN_INTERVAL_S=0)");
     }
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
@@ -676,12 +1129,32 @@ async fn serve(cfg: Config) -> anyhow::Result<()> {
         "fleett listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("control plane stopped; agents keep running");
     Ok(())
+}
+
+/// Start the cron loop (`scheduler::tick` every 15 s).
+///
+/// Only `serve` calls this: the test suite builds [`AppState`] directly and
+/// never runs a background loop.
+fn spawn_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            fleett::scheduler::TICK_INTERVAL_S,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            fleett::scheduler::tick(&state).await;
+        }
+    });
 }
 
 /// Start the dedicated Prometheus listener (`FLEETT_METRICS_BIND`).

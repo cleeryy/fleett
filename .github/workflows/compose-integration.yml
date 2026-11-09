@@ -143,8 +143,22 @@ jobs:
           set -euo pipefail
           auth="Authorization: Bearer $FLEETT_TOKEN"
 
-          curl -fsS -X POST "$FLEETT_URL/api/instances/$INSTANCE_ID/stop" -H "$auth" -o /dev/null
-          curl -fsS -X DELETE "$FLEETT_URL/api/instances/$INSTANCE_ID?purge=true" -H "$auth" -o /dev/null
+          stop_code=$(curl -sS -X POST "$FLEETT_URL/api/instances/$INSTANCE_ID/stop" -H "$auth" \
+            -o "$RUNNER_TEMP/stop.json" -w '%{http_code}')
+          if [ "$stop_code" != 200 ]; then
+            echo "::error::POST stop answered HTTP $stop_code"
+            cat "$RUNNER_TEMP/stop.json" || true
+            tail -80 "$RUNNER_TEMP/fleett-serve.log" || true
+            exit 1
+          fi
+          delete_code=$(curl -sS -X DELETE "$FLEETT_URL/api/instances/$INSTANCE_ID?purge=true" -H "$auth" \
+            -o "$RUNNER_TEMP/delete.json" -w '%{http_code}')
+          if [ "$delete_code" != 204 ]; then
+            echo "::error::DELETE answered HTTP $delete_code"
+            cat "$RUNNER_TEMP/delete.json" || true
+            tail -120 "$RUNNER_TEMP/fleett-serve.log" || true
+            exit 1
+          fi
 
           if curl -fsS "$FLEETT_URL/api/instances/$INSTANCE_ID" -H "$auth" -o /dev/null; then
             echo "::error::the instance still answers after DELETE"

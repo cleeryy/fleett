@@ -1,11 +1,13 @@
 import { useState, type ReactNode } from "react";
 import {
   Boxes,
+  Brain,
   FolderTree,
   KeyRound,
   LayoutTemplate,
   LogOut,
   Menu,
+  MessagesSquare,
   Moon,
   Plug,
   ScrollText,
@@ -43,6 +45,8 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { key: "instances", label: "Instances", href: "#/instances", icon: Boxes },
+  { key: "messages", label: "Messages", href: "#/messages", icon: MessagesSquare, adminOnly: true },
+  { key: "memory", label: "Memory", href: "#/memory", icon: Brain },
   { key: "providers", label: "Providers", href: "#/providers", icon: Plug },
   { key: "shares", label: "Shares", href: "#/shares", icon: FolderTree },
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
@@ -56,6 +60,8 @@ function activeKey(path: string): string {
   if (path.startsWith("/templates")) return "templates";
   if (path.startsWith("/tokens")) return "tokens";
   if (path.startsWith("/audit")) return "audit";
+  if (path.startsWith("/messages")) return "messages";
+  if (path.startsWith("/memory")) return "memory";
   return "instances";
 }
 

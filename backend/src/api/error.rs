@@ -149,6 +149,26 @@ impl From<crate::envs::EnvError> for ApiError {
     }
 }
 
+impl From<crate::cost::CostError> for ApiError {
+    fn from(err: crate::cost::CostError) -> Self {
+        match err {
+            crate::cost::CostError::InvalidRange(message) => {
+                ApiError::bad_request("invalid_range", message)
+            }
+            crate::cost::CostError::InvalidPricing(message) => {
+                ApiError::bad_request("invalid_pricing", message)
+            }
+            crate::cost::CostError::InvalidBudget(message) => {
+                ApiError::bad_request("invalid_budget", message)
+            }
+            crate::cost::CostError::InvalidIngest(message) => {
+                ApiError::bad_request("invalid_ingest", message)
+            }
+            crate::cost::CostError::Db(err) => ApiError::from(err),
+        }
+    }
+}
+
 /// Truncate on a character boundary (compose stderr may contain UTF-8).
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {

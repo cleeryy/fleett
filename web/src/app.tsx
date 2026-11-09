@@ -17,6 +17,8 @@ import { FleetPage } from "@/pages/fleet";
 import { InstanceDetailPage } from "@/pages/instance-detail";
 import { NewInstancePage } from "@/pages/instance-new";
 import { LoginPage } from "@/pages/login";
+import { MemoryPage } from "@/pages/memory";
+import { MessagesPage } from "@/pages/messages";
 import { ProviderDetailPage } from "@/pages/provider-detail";
 import { ProvidersPage } from "@/pages/providers";
 import { SharesPage } from "@/pages/shares";
@@ -40,6 +42,8 @@ function titleFor(path: string): string {
   if (path === "/templates") return "Templates";
   if (path === "/tokens") return "Tokens";
   if (path === "/audit") return "Audit log";
+  if (path === "/messages") return "Messages";
+  if (path === "/memory") return "Memory";
   if (path === "/login") return "Sign in";
   return "Not found";
 }
@@ -293,6 +297,19 @@ export default function App() {
         message="The audit trail is readable by admins only."
       />
     );
+  } else if (path === "/messages") {
+    crumbs = [{ label: "Messages" }];
+    screen = admin ? (
+      <MessagesPage />
+    ) : (
+      <RestrictedScreen
+        title="Messages"
+        message="The global bus view is readable by admins. Open an instance to read its own inbox and outbox."
+      />
+    );
+  } else if (path === "/memory") {
+    crumbs = [{ label: "Memory" }];
+    screen = <MemoryPage />;
   } else {
     crumbs = [{ label: "Not found" }];
     screen = (

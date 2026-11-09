@@ -8,7 +8,7 @@ use axum::Router;
 use fleett::api::{self, AppState};
 use fleett::config::{Config, EgressMode};
 use fleett::driver::mock::MockDriver;
-use fleett::driver::InspectInfo;
+use fleett::driver::{ExecOutput, InspectInfo};
 use fleett::models::{Health, Status};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -322,6 +322,40 @@ async fn lists_builtin_templates() {
         guest_env,
         ["TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"]
     );
+
+    // Every suggestion carries an example and a format, and the allowlists
+    // that gate the gateway are marked required (#27).
+    let telegram = guest["env"]
+        .as_array()
+        .expect("guest env")
+        .iter()
+        .find(|entry| entry["key"] == "TELEGRAM_ALLOWED_USERS")
+        .expect("Telegram allowlist");
+    assert_eq!(telegram["example"], "123456789");
+    assert_eq!(telegram["format"], "csv-of-ids");
+    assert_eq!(telegram["required"], true);
+
+    let users = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_USERS")
+        .expect("Discord allowlist");
+    assert_eq!(users["example"], "274575374111866880");
+    assert_eq!(users["format"], "csv-of-ids");
+    assert_eq!(users["required"], true);
+    let channel_ids = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOWED_CHANNELS")
+        .expect("Discord channel allowlist");
+    assert_eq!(channel_ids["format"], "csv-of-ids");
+    assert_eq!(channel_ids["required"], false);
+    let allow_all = discord_env
+        .iter()
+        .find(|entry| entry["key"] == "DISCORD_ALLOW_ALL_USERS")
+        .expect("Discord allow-all flag");
+    assert_eq!(allow_all["example"], "false");
+    assert_eq!(allow_all["format"], "bool");
+    assert_eq!(allow_all["required"], false);
+
     assert_eq!(
         templates
             .iter()
@@ -329,6 +363,253 @@ async fn lists_builtin_templates() {
             .expect("solo template")["env"],
         json!([])
     );
+}
+
+// ---------------------------------------------------------------------------
+// Template allowlist checks (issue #27)
+// ---------------------------------------------------------------------------
+
+async fn create_guest_discord(harness: &Harness, id: &str) -> Value {
+    let body = json!({
+        "id": id,
+        "name": format!("Agent {id}"),
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "api_key_env": "HERMES_GATE_PROFILE_TOKEN",
+        "channel": {"type": "discord", "token": "discord-token"},
+        "shares": [],
+        "mem_limit_mb": 1024,
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {response}");
+    parse(&response)
+}
+
+fn warning_codes(body: &Value) -> Vec<String> {
+    body["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(|warning| warning["code"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_guest_discord_instance_without_an_allowlist_warns_in_the_detail_and_check() {
+    let harness = Harness::new();
+    // LAN access adds its own warning: env warnings must append to it.
+    let body = json!({
+        "id": "alice",
+        "name": "Alice",
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "discord", "token": "discord-token"},
+        "allow_lan": true,
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let detail = parse(&response);
+    let messages: Vec<&str> = detail["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|warning| warning.contains("fleett-lan")),
+        "the egress warning must not be dropped: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|warning| warning.contains("DISCORD_ALLOWED_USERS")),
+        "{messages:?}"
+    );
+
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice/check", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let check = parse(&response);
+    assert_eq!(check["ok"], false);
+    assert_eq!(check["template"], "guest-discord");
+    let codes = warning_codes(&check);
+    assert!(
+        codes.contains(&"allowlist_missing".to_string()),
+        "{codes:?}"
+    );
+    assert!(
+        codes.contains(&"gateway_may_refuse".to_string()),
+        "{codes:?}"
+    );
+    let warning = check["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|warning| warning["code"] == "allowlist_missing")
+        .expect("allowlist warning");
+    assert_eq!(warning["key"], "DISCORD_ALLOWED_USERS");
+    assert_eq!(warning["field"], "env.DISCORD_ALLOWED_USERS");
+    assert!(warning["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("DISCORD_ALLOWED_USERS")));
+
+    // Setting the allowlist (and keeping the stored token) clears the warning.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "274575374111866880", "secret": false},
+                {"key": "DISCORD_BOT_TOKEN", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let detail = parse(&response);
+    assert!(
+        !detail["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|warning| warning.contains("DISCORD_ALLOWED_USERS")),
+        "{detail}"
+    );
+
+    let (status, response) = harness
+        .request(Method::GET, "/api/instances/alice/check", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let check = parse(&response);
+    assert_eq!(check["ok"], true, "{check}");
+    assert_eq!(check["warnings"], json!([]));
+}
+
+#[tokio::test]
+async fn template_formats_are_enforced_on_create_patch_and_put() {
+    let harness = Harness::new();
+
+    // Create.
+    let body = json!({
+        "id": "alice",
+        "template": "guest-discord",
+        "model": MODEL,
+        "base_url": BASE_URL,
+        "channel": {"type": "discord", "token": "discord-token"},
+        "env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice", "secret": false}],
+    });
+    let (status, response) = harness
+        .request(Method::POST, "/api/instances", Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    let error = parse(&response)["error"].clone();
+    assert_eq!(error["code"], "invalid_env_format");
+    assert_eq!(error["details"]["key"], "DISCORD_ALLOWED_USERS");
+    assert_eq!(error["details"]["expected"], "csv-of-ids");
+    assert_eq!(error["details"]["received"], "alice");
+    assert!(!harness.instance_dir("alice").exists());
+
+    // A valid value (spaces around ids are allowed) is accepted, and unknown
+    // keys are not rejected.
+    let detail = create_guest_discord(&harness, "alice").await;
+    assert_eq!(detail["id"], "alice");
+    let (status, response) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"env": [{"key": "UNKNOWN_KEY", "value": "anything"}]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // PATCH and PUT refuse the same invalid value.
+    for (method, body) in [
+        (
+            Method::PATCH,
+            json!({"env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice"}]}),
+        ),
+        (
+            Method::PUT,
+            json!({"env": [{"key": "DISCORD_ALLOWED_USERS", "value": "alice", "secret": false}]}),
+        ),
+    ] {
+        let uri = if method == Method::PATCH {
+            "/api/instances/alice"
+        } else {
+            "/api/instances/alice/env"
+        };
+        let (status, response) = harness.request(method, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(
+            parse(&response)["error"]["code"],
+            "invalid_env_format",
+            "{response}"
+        );
+    }
+
+    // PUT accepts a valid CSV, including spaces.
+    let (status, response) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/env",
+            Some(json!({"env": [
+                {"key": "DISCORD_ALLOWED_USERS", "value": "274575374111866880, 123", "secret": false},
+                {"key": "DISCORD_ALLOW_ALL_USERS", "value": "no", "secret": false},
+                {"key": "DISCORD_BOT_TOKEN", "secret": true}
+            ]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+}
+
+#[tokio::test]
+async fn a_clone_validates_the_values_it_inherits_from_its_template() {
+    let harness = Harness::new();
+    let _source = create_guest_discord(&harness, "source").await;
+
+    // A value can predate the validation (written by an older release): the
+    // clone still refuses to carry it.
+    let entries = vec![
+        fleett::envs::EnvWrite {
+            key: "DISCORD_ALLOWED_USERS".to_string(),
+            value: "not-an-id".to_string(),
+            secret: false,
+        },
+        fleett::envs::EnvWrite {
+            key: "DISCORD_BOT_TOKEN".to_string(),
+            value: "discord-token".to_string(),
+            secret: true,
+        },
+    ];
+    fleett::envs::replace(&harness.state.cfg, &harness.state.db, "source", &entries)
+        .expect("legacy environment");
+
+    let (status, response) = harness
+        .request(
+            Method::POST,
+            "/api/instances/source/clone",
+            Some(json!({
+                "new_id": "copy",
+                "channel_token": "new-token",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        parse(&response)["error"]["code"],
+        "invalid_env_format",
+        "{response}"
+    );
+    assert!(!harness.instance_dir("copy").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,6 +2329,474 @@ async fn lifecycle_is_never_blocked_by_the_egress_policy() {
 }
 
 // ---------------------------------------------------------------------------
+// Egress destination policy (issue #41)
+// ---------------------------------------------------------------------------
+
+async fn egress_policy(harness: &Harness, id: &str) -> Value {
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/instances/{id}/egress"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)
+}
+
+#[tokio::test]
+async fn egress_policy_reports_the_legacy_modes() {
+    let harness = Harness::new();
+    let detail = create_instance(&harness, "alice").await;
+    assert_eq!(detail["allow_lan"], false);
+
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "disabled");
+    assert_eq!(policy["mode"], "allow");
+    assert_eq!(policy["fqdns"], json!([]));
+    assert!(policy.get("proxy").is_none());
+    assert!(policy.get("updated_at").is_none());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], false);
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("FLEETT_EGRESS=off")),
+        "{result}"
+    );
+
+    // `allow_lan: true` is projected as an allow-all policy.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "allow_lan");
+    assert_eq!(policy["mode"], "allow");
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], true);
+    assert_eq!(parse(&body)["enforced"], false);
+
+    // The restricted legacy mode denies the RFC 1918 ranges once the host
+    // firewall marker is in place.
+    let harness = Harness::with_config(|cfg| cfg.egress = EgressMode::Restrict);
+    harness.mock.force_network_subnet(Some("172.18.0.0/16"));
+    harness.write_egress_marker("172.18.0.0/16");
+    create_instance(&harness, "alice").await;
+    let policy = egress_policy(&harness, "alice").await;
+    assert_eq!(policy["source"], "legacy");
+    assert_eq!(policy["mode"], "allow");
+    assert_eq!(
+        policy["cidrs"],
+        json!(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], false);
+    assert_eq!(parse(&body)["enforced"], true);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], true);
+}
+
+#[tokio::test]
+async fn egress_policy_renders_the_proxy_and_survives_a_patch() {
+    let harness = Harness::with_config(|cfg| cfg.egress_proxy = "http://127.0.0.1:9".to_string());
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({
+                "mode": "deny",
+                "fqdns": ["API.GitHub.com"],
+                "cidrs": [],
+                "ports": [443]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = parse(&body);
+    assert_eq!(policy["source"], "explicit");
+    assert_eq!(policy["mode"], "deny");
+    assert_eq!(policy["fqdns"], json!(["api.github.com"]));
+    assert_eq!(policy["ports"], json!([443]));
+    assert!(policy["updated_at"].is_string());
+    assert!(policy["proxy_acl"]
+        .as_str()
+        .is_some_and(|acl| acl.contains("http_access allow fleett_alice_domains")));
+
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    let environment = &compose["services"]["agent"]["environment"];
+    assert_eq!(
+        environment["HTTP_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+    assert_eq!(
+        environment["HTTPS_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+    assert!(environment["NO_PROXY"]
+        .as_str()
+        .is_some_and(|value| value.contains("fleett")));
+
+    // The decision follows the policy; enforcement is reported separately.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], false);
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("unreachable")),
+        "{result}"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["allowed"], false);
+
+    // A PATCH that does not touch egress keeps the proxy variables.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"name": "Alice Renamed"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert_eq!(
+        compose["services"]["agent"]["environment"]["HTTP_PROXY"].as_str(),
+        Some("http://127.0.0.1:9")
+    );
+
+    // Deleting the policy returns to the legacy shape and drops the variables.
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/egress", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["source"], "disabled");
+    let compose = read_yaml(&harness.instance_dir("alice").join("compose.yaml"));
+    assert!(compose["services"]["agent"]["environment"]
+        .get("HTTP_PROXY")
+        .is_none());
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=50", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit = parse(&body);
+    let actions: Vec<&str> = audit
+        .as_array()
+        .expect("audit entries")
+        .iter()
+        .filter_map(|entry| entry["action"].as_str())
+        .collect();
+    assert!(actions.contains(&"egress.policy.update"), "{actions:?}");
+    assert!(actions.contains(&"egress.policy.delete"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn egress_policy_reports_a_reachable_proxy_and_the_allow_lan_bypass() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let address = listener.local_addr().expect("address");
+    let harness = Harness::with_config(|cfg| {
+        cfg.egress_proxy = format!("http://{address}");
+    });
+    create_instance(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"], "ports": [443]})),
+        )
+        .await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = parse(&body);
+    assert_eq!(result["allowed"], true);
+    assert_eq!(result["enforced"], true, "{result}");
+    assert!(
+        result["enforcement"]
+            .as_str()
+            .is_some_and(|value| value.contains("socket only")),
+        "{result}"
+    );
+
+    // allow_lan opens a direct path around the proxy: the policy is reported
+    // as not enforced even when the proxy answers.
+    harness
+        .request(
+            Method::PATCH,
+            "/api/instances/alice",
+            Some(json!({"allow_lan": true})),
+        )
+        .await;
+    let policy = egress_policy(&harness, "alice").await;
+    assert!(
+        policy["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|value| value.contains("bypass"))),
+        "{policy}"
+    );
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/egress/test",
+            Some(json!({"host": "api.github.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["enforced"], false);
+    drop(listener);
+}
+
+#[tokio::test]
+async fn egress_policy_validates_input_and_requires_authentication() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, _) = harness
+        .request_as(Method::GET, "/api/instances/alice/egress", None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = harness
+        .request(Method::GET, "/api/instances/ghost/egress", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for body in [
+        json!({"mode": "deny", "fqdns": ["https://api.github.com"]}),
+        json!({"mode": "deny", "fqdns": ["api.github.com:443"]}),
+        json!({"mode": "maybe", "fqdns": ["api.github.com"]}),
+        json!({"mode": "deny", "cidrs": ["10.0.0.0/33"]}),
+        json!({"mode": "deny", "ports": [0]}),
+    ] {
+        let (status, response) = harness
+            .request(
+                Method::PUT,
+                "/api/instances/alice/egress",
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(parse(&response)["error"]["code"], "invalid_egress_policy");
+    }
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"]})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn egress_blocks_are_ingested_listed_and_cleared() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({
+                "instance": "alice",
+                "host": "10.1.20.1",
+                "port": 443,
+                "reason": "destination denied by policy"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let block = parse(&body);
+    assert_eq!(block["instance_id"], "alice");
+    assert_eq!(block["host"], "10.1.20.1");
+    assert_eq!(block["port"], 443);
+    assert_eq!(block["reason"], "destination denied by policy");
+    assert!(block["at"].is_string());
+    assert!(block["id"].as_i64().is_some_and(|id| id > 0));
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "ghost", "host": "example.com", "port": 443})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    for body in [
+        json!({"instance": "alice", "host": "", "port": 443}),
+        json!({"instance": "alice", "host": "https://example.com", "port": 443}),
+        json!({"instance": "alice", "host": "example.com", "port": 0}),
+    ] {
+        let (status, response) = harness
+            .request(Method::POST, "/api/egress/blocks", Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/egress/blocks", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "example.com", "port": 443})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, _) = harness
+        .request_as(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "example.com", "port": 443})),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["removed"], 1);
+    let (_, body) = harness
+        .request(Method::GET, "/api/instances/alice/egress/blocks", None)
+        .await;
+    assert_eq!(parse(&body), json!([]));
+}
+
+#[tokio::test]
+async fn deleting_an_instance_removes_its_policy_and_blocks() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness
+        .request(
+            Method::PUT,
+            "/api/instances/alice/egress",
+            Some(json!({"mode": "deny", "fqdns": ["api.github.com"]})),
+        )
+        .await;
+    harness
+        .request(
+            Method::POST,
+            "/api/egress/blocks",
+            Some(json!({"instance": "alice", "host": "10.1.20.1", "port": 443})),
+        )
+        .await;
+
+    let (status, body) = harness
+        .request(Method::DELETE, "/api/instances/alice", None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/egress/blocks", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body), json!([]));
+}
+
+// ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
 
@@ -2661,6 +3410,7 @@ async fn the_detail_reports_the_docker_inspect_failure() {
             state: "exited".to_string(),
             exit_code: Some(137),
             oom_killed: true,
+            restart_count: 0,
             error: Some("task: non-zero exit (137)".to_string()),
             started_at: None,
         },
@@ -3878,6 +4628,310 @@ async fn file_mutations_are_audited() {
 }
 
 // ---------------------------------------------------------------------------
+// Exec (#36)
+// ---------------------------------------------------------------------------
+
+async fn audit_entries(harness: &Harness, action: &str) -> Vec<Value> {
+    let (status, body) = harness
+        .request(Method::GET, "/api/audit?limit=50", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)
+        .as_array()
+        .expect("audit array")
+        .iter()
+        .filter(|entry| entry["action"] == action)
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn exec_runs_an_allowlisted_command_and_audits_it() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["ls", "/opt/data"], "timeout_s": 5})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let exec = parse(&body);
+    assert_eq!(exec["exit_code"], 0);
+    assert!(
+        exec["stdout"]
+            .as_str()
+            .is_some_and(|text| text.contains("ls /opt/data")),
+        "{body}"
+    );
+    assert_eq!(exec["stderr"], "");
+    assert_eq!(exec["timed_out"], false);
+    assert_eq!(exec["truncated"], false);
+    assert!(exec["duration_ms"].as_u64().is_some());
+
+    let calls = harness.mock.exec_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].instance, "alice");
+    assert_eq!(calls[0].argv, vec!["ls", "/opt/data"]);
+    assert_eq!(calls[0].timeout_s, 5);
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["target"], "alice");
+    assert_eq!(entry["details"]["result"], "ok");
+    assert_eq!(entry["details"]["argv"], json!(["ls", "/opt/data"]));
+    assert_eq!(entry["details"]["exit_code"], 0);
+    assert_eq!(entry["details"]["truncated"], false);
+    assert_eq!(entry["details"]["wildcard"], false);
+}
+
+#[tokio::test]
+async fn exec_refuses_rm_and_audits_the_refusal() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["rm", "-rf", "/"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "exec_refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("denylist")),
+        "{body}"
+    );
+    assert_eq!(error["details"]["reason"], "denied_command");
+    assert_eq!(error["details"]["argv"], json!(["rm", "-rf", "/"]));
+    let allowlist = error["details"]["allowlist"]
+        .as_array()
+        .expect("allowlist array");
+    assert!(allowlist.iter().any(|value| value == "ls"), "{body}");
+    assert!(
+        error["details"]["denylist"]
+            .as_array()
+            .expect("denylist array")
+            .iter()
+            .any(|value| value == "rm"),
+        "{body}"
+    );
+    assert!(
+        harness.mock.exec_calls().is_empty(),
+        "a refused command never reaches the driver"
+    );
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["details"]["result"], "refused");
+    assert_eq!(entries[0]["details"]["reason"], "denied_command");
+}
+
+#[tokio::test]
+async fn exec_reports_a_timeout_with_a_null_exit_code() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_exec_result(
+        "alice",
+        ExecOutput {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            duration_ms: 1000,
+            truncated: false,
+        },
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["cat", "/dev/zero"], "timeout_s": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let exec = parse(&body);
+    assert_eq!(exec["timed_out"], true);
+    assert_eq!(exec["exit_code"], Value::Null);
+    assert_eq!(exec["stdout"], "");
+
+    let entries = audit_entries(&harness, "instance.exec").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["details"]["result"], "timeout");
+}
+
+#[tokio::test]
+async fn exec_reports_a_truncated_stream() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.set_exec_result(
+        "alice",
+        ExecOutput {
+            exit_code: Some(0),
+            stdout: format!("data{}", fleett::exec::TRUNCATION_MARKER),
+            stderr: String::new(),
+            timed_out: false,
+            duration_ms: 3,
+            truncated: true,
+        },
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"cmd": "cat /dev/zero"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["truncated"], true);
+    assert_eq!(
+        audit_entries(&harness, "instance.exec").await[0]["details"]["truncated"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn exec_rejects_malformed_requests_before_touching_the_driver() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    for (body, code) in [
+        (json!({"cmd": "ls", "argv": ["ls"]}), "invalid_exec"),
+        (json!({}), "invalid_exec"),
+        (json!({"cmd": "ls; rm -rf /"}), "invalid_exec"),
+        (json!({"argv": ["ls"], "timeout_s": 0}), "invalid_timeout"),
+        (json!({"argv": ["ls"], "timeout_s": 301}), "invalid_timeout"),
+    ] {
+        let (status, response) = harness
+            .request(
+                Method::POST,
+                "/api/instances/alice/exec",
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(parse(&response)["error"]["code"], code, "{body}");
+    }
+    assert!(harness.mock.exec_calls().is_empty());
+
+    let (status, _) = harness
+        .request(
+            Method::POST,
+            "/api/instances/ghost/exec",
+            Some(json!({"argv": ["ls"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn exec_policy_lists_the_effective_lists_and_is_admin_only() {
+    let harness = Harness::new();
+    let (status, body) = harness.request(Method::GET, "/api/exec/policy", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let policy = parse(&body);
+    assert_eq!(policy["source"], "default");
+    assert_eq!(policy["wildcard"], false);
+    assert!(policy["allowlist"]
+        .as_array()
+        .expect("allowlist")
+        .iter()
+        .any(|value| value == "ls"));
+    assert!(policy["denylist"]
+        .as_array()
+        .expect("denylist")
+        .iter()
+        .any(|value| value == "rm"));
+    assert_eq!(policy["max_output_bytes"], 256 * 1024);
+    assert_eq!(policy["timeout_s"]["default"], 30);
+
+    // A viewer may run nothing and read no policy.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "read-only", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"].as_str().expect("token").to_string();
+    let (status, _, body) = harness
+        .send(Method::GET, "/api/exec/policy", None, Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, body) = harness
+        .send(
+            Method::POST,
+            "/api/instances/alice/exec",
+            Some(json!({"argv": ["ls"]})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // The SSE route is a GET, so the method policy alone would let a viewer
+    // through: the handler itself must require admin.
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=ls",
+            None,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn exec_stream_is_a_one_shot_sse() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, headers, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=ls%20%2Fopt%2Fdata&timeout_s=5",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(body.contains("event: stdout"), "{body}");
+    assert!(
+        body.contains("\"line\":\"[mock] exec in alice: ls /opt/data\""),
+        "{body}"
+    );
+    assert!(body.contains("event: exit"), "{body}");
+    assert!(body.contains("\"exit_code\":0"), "{body}");
+
+    // A refusal is a JSON 403 before any SSE byte is sent.
+    let (status, _, body) = harness
+        .send(
+            Method::GET,
+            "/api/instances/alice/exec/stream?cmd=rm%20-rf%20%2F",
+            None,
+            Some(TOKEN),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "exec_refused");
+}
+
+// ---------------------------------------------------------------------------
 // Agent-to-agent bus (#28)
 // ---------------------------------------------------------------------------
 
@@ -3957,6 +5011,410 @@ async fn a_message_loop_is_stopped_by_hops() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(parse(&body)["error"]["code"], "message_loop");
+}
+
+// ---------------------------------------------------------------------------
+// Cron schedules (issue #30)
+// ---------------------------------------------------------------------------
+
+fn schedule_body(name: &str, cron: &str, prompt: &str) -> Value {
+    json!({
+        "name": name,
+        "cron": cron,
+        "prompt": prompt,
+    })
+}
+
+async fn create_schedule(harness: &Harness, id: &str, body: Value) -> Value {
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            &format!("/api/instances/{id}/schedules"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {text}");
+    parse(&text)
+}
+
+fn force_schedule_due(harness: &Harness, schedule_id: &str) {
+    harness
+        .state
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules SET next_run_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![schedule_id],
+            )
+        })
+        .expect("force due");
+}
+
+#[tokio::test]
+async fn schedules_can_be_created_listed_and_run() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "summarize the incidents"),
+    )
+    .await;
+    assert_eq!(schedule["instance_id"], "alice");
+    assert_eq!(schedule["name"], "every-five");
+    assert_eq!(schedule["cron"], "*/5 * * * *");
+    assert_eq!(schedule["enabled"], true);
+    assert_eq!(schedule["overlap"], "skip");
+    assert_eq!(schedule["timeout"], 300);
+    assert!(schedule["next_run_at"].is_string());
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    // Disabling clears the next occurrence without touching the schedule.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{schedule_id}"),
+            Some(json!({"enabled": false, "timeout": 45, "overlap": "queue"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let patched = parse(&body);
+    assert_eq!(patched["enabled"], false);
+    assert_eq!(patched["timeout"], 45);
+    assert_eq!(patched["overlap"], "queue");
+    assert!(patched["next_run_at"].is_null());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "ok");
+    assert_eq!(run["exit_code"], 0);
+    assert!(
+        run["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("summarize the incidents"),
+        "{run}"
+    );
+    assert!(run["duration_ms"].is_number());
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs?limit=10", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["schedule_id"], schedule_id);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = parse(&body);
+    assert_eq!(view.as_array().expect("array").len(), 1);
+    assert_eq!(view[0]["runs_total"], 1);
+    assert_eq!(view[0]["runs_failed"], 0);
+    assert_eq!(view[0]["failure_rate"], 0.0);
+    assert_eq!(view[0]["last_run"]["status"], "ok");
+
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_failing_run_is_visible_with_its_exit_code() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.force_exec(
+        "alice",
+        fleett::driver::ExecResult {
+            exit_code: Some(3),
+            stdout: String::new(),
+            stderr: "gateway: provider timeout".to_string(),
+            timed_out: false,
+            duration_ms: 0,
+            truncated: false,
+        },
+    );
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "probe"),
+    )
+    .await;
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "error");
+    assert_eq!(run["exit_code"], 3);
+    assert!(run["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("provider timeout"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body)[0]["exit_code"], 3);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = parse(&body);
+    assert_eq!(view[0]["runs_failed"], 1);
+    assert_eq!(view[0]["failure_rate"], 1.0);
+}
+
+#[tokio::test]
+async fn schedule_input_is_validated() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    for (body, code) in [
+        (schedule_body("bad", "not a cron", "p"), "invalid_cron"),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 0}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 3601}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "overlap": "parallel"}),
+            "invalid_overlap",
+        ),
+    ] {
+        let (status, text) = harness
+            .request(Method::POST, "/api/instances/alice/schedules", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(parse(&text)["error"]["code"], code);
+    }
+
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/ghost/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "unknown_instance");
+
+    create_schedule(&harness, "alice", schedule_body("daily", "0 9 * * *", "p")).await;
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("daily", "0 10 * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "schedule_exists");
+
+    let (status, text) = harness
+        .request(Method::POST, "/api/schedules/ghost/run", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+}
+
+#[tokio::test]
+async fn the_tick_runs_due_schedules_but_never_a_disabled_one() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+    let alice = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("five", "*/5 * * * *", "alice prompt"),
+    )
+    .await;
+    let bob = create_schedule(
+        &harness,
+        "bob",
+        schedule_body("five", "*/5 * * * *", "bob prompt"),
+    )
+    .await;
+    let bob_id = bob["id"].as_str().expect("id").to_string();
+    let (status, _) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{bob_id}"),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    force_schedule_due(&harness, alice["id"].as_str().expect("id"));
+    force_schedule_due(&harness, &bob_id);
+
+    fleett::scheduler::tick(&harness.state).await;
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["status"], "ok");
+    assert!(runs[0]["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("alice prompt"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/bob/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    assert!(harness
+        .mock
+        .exec_calls()
+        .iter()
+        .all(|call| call.instance == "alice"));
+}
+
+#[tokio::test]
+async fn schedule_endpoints_require_authentication() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request_as(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/ghost/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "unknown_instance");
+}
+
+// ---------------------------------------------------------------------------
+// Shared memory (#29)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn memory_is_written_searched_and_rolled_back() {
+    let harness = Harness::new();
+    create_instance(&harness, "probe").await;
+    create_instance(&harness, "tchouniz").await;
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/memory",
+            Some(json!({
+                "namespace": "instance:probe",
+                "key": "runbook",
+                "value": "restart the gateway after an upgrade",
+                "tags": ["ops"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = parse(&body)["entry"].clone();
+    let id = first["id"].as_i64().expect("id");
+    assert_eq!(first["version"], 1);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/memory/search?q=gateway", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/memory",
+            Some(json!({
+                "namespace": "instance:probe",
+                "key": "runbook",
+                "value": "drain first",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["entry"]["version"], 2);
+
+    let (status, body) = harness
+        .request(Method::GET, &format!("/api/memory/{id}/history"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("array").len(), 2);
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/memory/{id}/rollback"),
+            Some(json!({ "version": 1 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse(&body)["value"],
+        "restart the gateway after an upgrade"
+    );
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/memory/{id}/promote"),
+            Some(json!({ "namespace": "global" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["namespace"], "global");
+
+    let (status, _) = harness
+        .request(Method::DELETE, &format!("/api/memory/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 // ---------------------------------------------------------------------------
