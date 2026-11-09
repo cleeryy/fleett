@@ -28,7 +28,7 @@ use crate::render::{self, RenderError, TemplateSource};
 use crate::store;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use http_body_util::BodyExt;
@@ -996,6 +996,7 @@ pub async fn patch(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
+    headers: HeaderMap,
     ApiJson(request): ApiJson<PatchInstanceRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let lock = state.locks.for_id(&id);
@@ -1055,7 +1056,13 @@ pub async fn patch(
         Err(_) => (Status::Running, Health::Unknown, None),
     };
     record_health(&state, &mut spec, health);
-    audit::record(&state, &context, "instance.patch", &spec.id, None);
+    audit::record(
+        &state,
+        &context,
+        "instance.patch",
+        &spec.id,
+        audit::with_assistant_tag(None, &headers),
+    );
     let warnings = egress::warnings(&state.cfg, spec.allow_lan);
     Ok(Json(to_detail(
         &state, &spec, status, health, container, warnings,
@@ -1081,6 +1088,7 @@ pub async fn put_env(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
+    headers: HeaderMap,
     ApiJson(request): ApiJson<PutEnvRequest>,
 ) -> Result<Json<InstanceDetail>, ApiError> {
     let vars = request.env.map(EnvInput::into_vars).ok_or_else(|| {
@@ -1109,10 +1117,13 @@ pub async fn put_env(
         &context,
         "instance.env.update",
         &spec.id,
-        Some(serde_json::json!({
-            "keys": entries.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
-            "secrets": entries.iter().filter(|entry| entry.secret).count(),
-        })),
+        audit::with_assistant_tag(
+            Some(serde_json::json!({
+                "keys": entries.iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+                "secrets": entries.iter().filter(|entry| entry.secret).count(),
+            })),
+            &headers,
+        ),
     );
     detail_after_apply(&state, &spec).await
 }
@@ -1122,6 +1133,7 @@ pub async fn delete_env(
     Path((id, key)): Path<(String, String)>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
@@ -1154,7 +1166,7 @@ pub async fn delete_env(
         &context,
         "instance.env.delete",
         &spec.id,
-        Some(serde_json::json!({ "key": key })),
+        audit::with_assistant_tag(Some(serde_json::json!({ "key": key })), &headers),
     );
     up_and_record(&state, &mut spec).await?;
     Ok(StatusCode::NO_CONTENT)

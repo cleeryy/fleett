@@ -1154,6 +1154,113 @@ export interface ExecResult {
   truncated: boolean;
 }
 
+/* --------------------------------------------------------------------------
+ * Integrated assistant (issue #56)
+ * -------------------------------------------------------------------------- */
+
+/** `GET /api/assistant/config`. `enabled: false` hides the panel entirely. */
+export interface AssistantConfig {
+  enabled: boolean;
+  /** Provider the assistant borrows; `null` until an operator selects one. */
+  provider: AssistantProvider | null;
+  model: string;
+  budget_tokens: number;
+  used_tokens: number;
+}
+
+export interface AssistantProvider {
+  id: string;
+  name: string;
+}
+
+/** The quick tasks offered above the composer. */
+export type AssistantTask =
+  | "write_skill"
+  | "draft_soul"
+  | "env_allowlist"
+  | "explain_error"
+  | "config_yaml";
+
+/**
+ * What the operator is looking at. Every field is optional except `page`;
+ * the controller redacts the bundle again before it reaches the model.
+ */
+export interface AssistantContext {
+  page: string;
+  instance?: string;
+  /** Virtual path of the file open in the editor. */
+  path?: string;
+  /** Text selected in the page or the editor. */
+  selection?: string;
+  /** Editor buffer, already capped by the console. */
+  file_content?: string;
+  /** Human-readable shape of the object being edited. */
+  schema?: string;
+}
+
+export type AssistantRole = "user" | "assistant";
+
+export interface AssistantTurnInput {
+  role: AssistantRole;
+  content: string;
+}
+
+export interface AssistantChatInput {
+  session_id: string;
+  context: AssistantContext;
+  messages: AssistantTurnInput[];
+  task?: AssistantTask;
+}
+
+/** `file` writes a file, `env` merges variables, `yaml` is copy-only. */
+export type AssistantProposalKind = "file" | "env" | "yaml";
+
+/** One variable of an `env` proposal. A credential is proposed without a value. */
+export interface AssistantEnvVar {
+  key: string;
+  /** Plausible value for a plain variable; absent for a secret. */
+  value?: string;
+  /** The value has to be stored encrypted and filled in by the operator. */
+  secret?: boolean;
+}
+
+export interface AssistantProposal {
+  kind: AssistantProposalKind;
+  /** Target file, rooted at the instance home; absent for copy-only YAML. */
+  path?: string;
+  /** Full content of the file, or the YAML block. */
+  content?: string;
+  env?: AssistantEnvVar[];
+}
+
+export interface AssistantUsage {
+  prompt: number;
+  completion: number;
+  total: number;
+}
+
+/** What the controller put in the prompt, and what it left on the host. */
+export interface AssistantRedaction {
+  sent: string[];
+  omitted: string[];
+  /** Known secret shapes replaced by `[REDACTED]` before the request. */
+  redacted?: number;
+}
+
+/** `POST /api/assistant/chat`. */
+export interface AssistantReply {
+  message: string;
+  proposal?: AssistantProposal;
+  usage: AssistantUsage;
+  redaction: AssistantRedaction;
+}
+
+/** Mutations that can be traced back to the assistant in the audit log. */
+export interface MutationOptions {
+  /** Adds `X-Fleett-Assistant: 1`; the controller records "via assistant". */
+  viaAssistant?: boolean;
+}
+
 export interface FleetApi {
   health(): Promise<Health>;
   /** Public: which login methods the controller advertises. */
@@ -1175,19 +1282,27 @@ export interface FleetApi {
   listInstances(): Promise<InstanceSummary[]>;
   getInstance(id: string): Promise<InstanceDetail>;
   /** Replaces the whole environment and applies it: rewrites compose and runs `up -d`. */
-  putInstanceEnv(id: string, env: EnvInput[]): Promise<InstanceDetail>;
+  putInstanceEnv(id: string, env: EnvInput[], options?: MutationOptions): Promise<InstanceDetail>;
   /** Removes one variable and applies it. */
   deleteInstanceEnv(id: string, key: string): Promise<void>;
   createInstance(input: CreateInstanceInput): Promise<InstanceDetail>;
   cloneInstance(id: string, input: CloneInstanceInput): Promise<InstanceDetail>;
-  patchInstance(id: string, input: PatchInstanceInput): Promise<InstanceDetail>;
+  patchInstance(
+    id: string,
+    input: PatchInstanceInput,
+    options?: MutationOptions,
+  ): Promise<InstanceDetail>;
   action(id: string, action: "start" | "stop" | "restart"): Promise<LifecycleResult>;
   deleteInstance(id: string, purge: boolean): Promise<void>;
   logs(id: string, tail: number): Promise<string>;
   listFiles(id: string, path: string): Promise<FileEntry[]>;
   readFile(id: string, path: string): Promise<FileContent>;
   /** Compare-and-swap write; `restart` restarts, `force` sends `If-Match: *`. */
-  writeFile(id: string, input: WriteFileInput): Promise<WriteFileResult>;
+  writeFile(
+    id: string,
+    input: WriteFileInput,
+    options?: MutationOptions,
+  ): Promise<WriteFileResult>;
   deleteFile(id: string, path: string): Promise<void>;
   mkdir(id: string, path: string): Promise<MkdirResult>;
   gitLog(id: string, options?: GitLogOptions): Promise<GitLog>;
@@ -1295,4 +1410,9 @@ export interface FleetApi {
   putEgress(id: string, input: EgressPolicyInput): Promise<EgressPolicyView>;
   testEgress(id: string, host: string, port: number): Promise<EgressTestResult>;
   exec(id: string, input: ExecInput): Promise<ExecResult>;
+
+  /* Assistant */
+  /** 404 hides the panel (`FLEETT_ASSISTANT=off`). */
+  assistantConfig(): Promise<AssistantConfig>;
+  assistantChat(input: AssistantChatInput): Promise<AssistantReply>;
 }

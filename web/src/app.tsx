@@ -5,6 +5,7 @@ import { api, FALLBACK_AUTH_CONFIG } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
 import type { AuthConfig, Health, Identity } from "@/api/types";
 import { AppShell, type Crumb } from "@/components/app-shell";
+import { AssistantPanel } from "@/components/assistant";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { EmptyState } from "@/components/empty-state";
@@ -393,8 +394,10 @@ export default function App() {
         >
           {screen}
         </AppShell>
+        <AssistantPanel />
       </SessionContext.Provider>
-      <Toaster theme={theme} position="bottom-right" />
+      {/* Lifted so toasts clear the floating assistant button. */}
+      <Toaster theme={theme} position="bottom-right" offset={{ bottom: 88 }} />
     </>
   );
 }

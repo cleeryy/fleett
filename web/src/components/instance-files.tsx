@@ -40,6 +40,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { diffLines } from "@/lib/diff";
+import {
+  ASSISTANT_APPLIED_EVENT,
+  fileSchemaHint,
+  useAssistantScope,
+  type AssistantAppliedDetail,
+} from "@/lib/assistant";
 import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
 import { setRouteGuard } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
@@ -71,6 +77,9 @@ type DialogKind = "new-file" | "new-folder" | "delete" | "force" | "reload" | nu
 function baseName(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
+
+const FILES_SCHEMA =
+  "Data directory of the instance: SOUL.md, SKILL.md, config.yaml (rendered), skills/ and logs/. Only markdown, YAML, JSON, text and script files are writable.";
 
 function parentPath(path: string): string {
   if (path === "/") return "/";
@@ -147,6 +156,7 @@ export function InstanceFiles({
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [saving, setSaving] = useState<"save" | "restart" | null>(null);
   const [preview, setPreview] = useState(false);
+  const [selection, setSelection] = useState("");
 
   const [dialog, setDialog] = useState<DialogKind>(null);
   const [name, setName] = useState("");
@@ -161,6 +171,53 @@ export function InstanceFiles({
 
   const dirty = open ? (open.isNew ? true : draft !== open.content) : false;
   const entries = listing.data ?? [];
+
+  // The assistant sees the open buffer, its ETag and the current selection so a
+  // proposal can be diffed and applied with compare-and-swap. Refs keep the
+  // apply listener reading the live values without re-subscribing per keystroke.
+  const openRef = useRef(open);
+  openRef.current = open;
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+  const loadFileRef = useRef(loadFile);
+  loadFileRef.current = loadFile;
+
+  useAssistantScope(
+    active
+      ? {
+          page: "Files",
+          instance: id,
+          path: open?.path,
+          fileContent: open ? draft : undefined,
+          etag: open?.etag ?? undefined,
+          selection: selection || undefined,
+          schema: open ? fileSchemaHint(open.path, open.rendered) : FILES_SCHEMA,
+        }
+      : null,
+  );
+
+  useEffect(() => {
+    setSelection("");
+  }, [open?.path]);
+
+  // An applied proposal went through PUT /files/content: refresh the listing
+  // and, when the same file is open and clean, reload its buffer.
+  useEffect(() => {
+    function onApplied(event: Event) {
+      const applied = (event as CustomEvent<AssistantAppliedDetail>).detail;
+      if (!applied || applied.instance !== id || applied.kind !== "file") return;
+      listing.reload();
+      const current = openRef.current;
+      if (!applied.path || current?.path !== applied.path) return;
+      if (dirtyRef.current) {
+        toast.info(`${current.name} changed on disk. Your unsaved buffer was kept.`);
+        return;
+      }
+      void loadFileRef.current(applied.path);
+    }
+    window.addEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
+    return () => window.removeEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
+  }, [id, listing.reload]);
 
   useEffect(() => {
     setCwd("/");
@@ -777,6 +834,12 @@ export function InstanceFiles({
                     aria-describedby="editor-hint"
                     className="h-full min-w-0 flex-1 resize-none bg-transparent px-3 py-3 font-mono text-xs leading-5 outline-none"
                     onChange={(event) => setDraft(event.target.value)}
+                    onSelect={(event) => {
+                      const field = event.currentTarget;
+                      const start = field.selectionStart;
+                      const end = field.selectionEnd;
+                      setSelection(end > start ? field.value.slice(start, end) : "");
+                    }}
                     onScroll={() => {
                       if (gutterRef.current && textareaRef.current) {
                         gutterRef.current.scrollTop = textareaRef.current.scrollTop;

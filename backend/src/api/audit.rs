@@ -13,7 +13,7 @@ use crate::db::{AuditFilter, AuditRecord, NewAuditRecord};
 use crate::models::now_iso;
 use axum::body::Body;
 use axum::extract::{Extension, Query, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::Json;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -132,6 +132,43 @@ pub fn record_result(
             details: details.map(|value| value.to_string()),
         },
     );
+}
+
+/// Header the console sets when it applies a proposal drafted by the assistant.
+///
+/// The write still goes through its regular route (ETag, backup, git commit):
+/// only the audit row gains a `via: "assistant"` detail, so an operator can
+/// tell an applied draft from a hand edit.
+pub const ASSISTANT_HEADER: &str = "x-fleett-assistant";
+
+/// Whether the request carries the assistant marker.
+pub fn applied_by_assistant(headers: &HeaderMap) -> bool {
+    headers
+        .get(ASSISTANT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Add `via: "assistant"` to an audit detail when the header is present.
+pub fn with_assistant_tag(details: Option<Value>, headers: &HeaderMap) -> Option<Value> {
+    if !applied_by_assistant(headers) {
+        return details;
+    }
+    let mut object = match details {
+        Some(Value::Object(object)) => object,
+        Some(other) => {
+            let mut object = serde_json::Map::new();
+            object.insert("details".to_string(), other);
+            object
+        }
+        None => serde_json::Map::new(),
+    };
+    object.insert("via".to_string(), Value::String("assistant".to_string()));
+    Some(Value::Object(object))
 }
 
 /// Append a fully-built row (login and logout have no [`AuthContext`] yet).

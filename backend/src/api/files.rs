@@ -136,19 +136,23 @@ pub async fn write(
     .map_err(map_error)?;
 
     // The write already happened: audit it before a restart can fail, so the
-    // trail never loses a mutation.
+    // trail never loses a mutation. A proposal applied from the assistant
+    // panel is tagged `via: "assistant"` instead of getting another action.
     crate::history::record_ui_write(&state.cfg, &id, &context, &outcome.path);
     audit::record(
         &state,
         &context,
         "instance.file.write",
         &spec.id,
-        Some(json!({
-            "path": outcome.path,
-            "size": outcome.size,
-            "backup": outcome.backup,
-            "restart": restart,
-        })),
+        audit::with_assistant_tag(
+            Some(json!({
+                "path": outcome.path,
+                "size": outcome.size,
+                "backup": outcome.backup,
+                "restart": restart,
+            })),
+            &headers,
+        ),
     );
 
     let mut restarted = false;
@@ -192,6 +196,7 @@ pub async fn delete_file(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
     Query(query): Query<PathQuery>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let lock = state.locks.for_id(&id);
     let _guard = lock.lock().await;
@@ -204,7 +209,7 @@ pub async fn delete_file(
         &context,
         "instance.file.delete",
         &spec.id,
-        Some(json!({ "path": path })),
+        audit::with_assistant_tag(Some(json!({ "path": path })), &headers),
     );
     Ok(StatusCode::NO_CONTENT)
 }

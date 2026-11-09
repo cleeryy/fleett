@@ -1,6 +1,7 @@
 //! HTTP layer.
 
 pub mod acl;
+pub mod assistant;
 pub mod audit;
 pub mod auth;
 pub mod bus;
@@ -88,6 +89,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Last disk-quota level of every instance (one event per crossing).
     pub quota: Arc<crate::quota::QuotaMonitor>,
+    /// In-memory token counters of the integrated assistant, one per session.
+    pub assistant: Arc<crate::assistant::Sessions>,
     pub started_at: Instant,
 }
 
@@ -151,6 +154,7 @@ impl AppState {
                 .build()
                 .unwrap_or_default(),
             quota: Arc::new(crate::quota::QuotaMonitor::new()),
+            assistant: Arc::new(crate::assistant::Sessions::default()),
             started_at: Instant::now(),
         })
     }
@@ -412,7 +416,19 @@ fn api_routes(state: AppState) -> Router<AppState> {
         .route("/shares", get(shares::list).post(shares::create))
         .route("/shares/{name}", delete(shares::delete))
         .route("/shares/{name}/attach", post(shares::attach))
-        .route("/shares/{name}/detach", post(shares::detach))
+        .route("/shares/{name}/detach", post(shares::detach));
+
+    // `FLEETT_ASSISTANT=off` removes the routes entirely: they then answer the
+    // generic 404 and the console hides the panel.
+    let protected = if state.cfg.assistant_enabled {
+        protected
+            .route("/assistant/config", get(assistant::config))
+            .route("/assistant/chat", post(assistant::chat))
+    } else {
+        protected
+    };
+
+    let protected = protected
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::authz::require_instance_access,

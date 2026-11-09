@@ -473,6 +473,18 @@ pub struct Config {
     pub audit_hmac_key: Option<crate::audit::AuditKey>,
     /// Rows older than this are pruned (`FLEETT_AUDIT_RETENTION`, default 90d).
     pub audit_retention: chrono::Duration,
+    /// Integrated assistant (issue #56): `FLEETT_ASSISTANT=off` removes the two
+    /// `/api/assistant/*` routes and hides the console panel.
+    pub assistant_enabled: bool,
+    /// Provider id that answers the assistant (`FLEETT_ASSISTANT_PROVIDER`);
+    /// `None` makes the chat endpoint answer `409 assistant_not_configured`.
+    pub assistant_provider: Option<String>,
+    /// Model sent to the provider (`FLEETT_ASSISTANT_MODEL`, default
+    /// `deepseek-v4.1-flash`).
+    pub assistant_model: String,
+    /// Per-session token budget (`FLEETT_ASSISTANT_BUDGET_TOKENS`, default
+    /// 50 000; `0` disables the limit).
+    pub assistant_budget_tokens: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -784,6 +796,34 @@ impl Config {
             })?,
         };
 
+        // `FLEETT_ASSISTANT=off` removes the assistant routes entirely; the
+        // explicit `on` (or an unset variable) keeps the feature on.
+        let assistant_enabled = match get("ASSISTANT") {
+            None => true,
+            Some(value) => match value.to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" | "yes" => true,
+                "off" | "false" | "0" | "no" => false,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        var: "FLEETT_ASSISTANT",
+                        value,
+                        detail: "expected \"on\" or \"off\"".to_string(),
+                    })
+                }
+            },
+        };
+        let assistant_provider = get("ASSISTANT_PROVIDER");
+        let assistant_model =
+            get("ASSISTANT_MODEL").unwrap_or_else(|| crate::assistant::DEFAULT_MODEL.to_string());
+        let assistant_budget_tokens = match get("ASSISTANT_BUDGET_TOKENS") {
+            None => crate::assistant::DEFAULT_BUDGET_TOKENS,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_ASSISTANT_BUDGET_TOKENS",
+                value: value.clone(),
+                detail: format!("{err} (0 disables the budget)"),
+            })?,
+        };
+
         Ok(Self {
             root,
             bind,
@@ -817,6 +857,10 @@ impl Config {
             security,
             audit_hmac_key,
             audit_retention,
+            assistant_enabled,
+            assistant_provider,
+            assistant_model,
+            assistant_budget_tokens,
         })
     }
 
@@ -880,6 +924,10 @@ impl Config {
             audit_hmac_key: None,
             audit_retention: crate::audit::parse_retention(crate::audit::DEFAULT_RETENTION)
                 .expect("valid default"),
+            assistant_enabled: true,
+            assistant_provider: None,
+            assistant_model: crate::assistant::DEFAULT_MODEL.to_string(),
+            assistant_budget_tokens: crate::assistant::DEFAULT_BUDGET_TOKENS,
         }
     }
 
@@ -1500,6 +1548,61 @@ FLEETT_NETWORK='fleett-net'
         assert_eq!(cfg.bind.port(), 9999);
         assert_eq!(cfg.network, DEFAULT_NETWORK);
         assert_eq!(cfg.driver, DriverKind::Mock);
+    }
+
+    #[test]
+    fn assistant_settings_are_resolved_with_defaults_and_off_switches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_string_lossy().to_string();
+        let load = |vars: Vec<(&'static str, &'static str)>| {
+            let root = root.clone();
+            Config::from_process_env(move |key| {
+                if key == "FLEETT_ROOT" {
+                    return Some(root.clone());
+                }
+                if key == "FLEETT_TOKEN" {
+                    return Some("token".to_string());
+                }
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+
+        // Defaults: the assistant is on, with no provider and a 50 000 budget.
+        let cfg = load(vec![]).expect("defaults");
+        assert!(cfg.assistant_enabled);
+        assert_eq!(cfg.assistant_provider, None);
+        assert_eq!(cfg.assistant_model, crate::assistant::DEFAULT_MODEL);
+        assert_eq!(
+            cfg.assistant_budget_tokens,
+            crate::assistant::DEFAULT_BUDGET_TOKENS
+        );
+
+        // `off` removes the feature; `on` keeps it.
+        assert!(
+            !load(vec![("FLEETT_ASSISTANT", "off")])
+                .expect("off")
+                .assistant_enabled
+        );
+        assert!(
+            load(vec![("FLEETT_ASSISTANT", "on")])
+                .expect("on")
+                .assistant_enabled
+        );
+        assert!(load(vec![("FLEETT_ASSISTANT", "maybe")]).is_err());
+
+        // The provider, model and budget come from the environment.
+        let cfg = load(vec![
+            ("FLEETT_ASSISTANT_PROVIDER", "abc"),
+            ("FLEETT_ASSISTANT_MODEL", "model-x"),
+            ("FLEETT_ASSISTANT_BUDGET_TOKENS", "0"),
+        ])
+        .expect("explicit values");
+        assert_eq!(cfg.assistant_provider.as_deref(), Some("abc"));
+        assert_eq!(cfg.assistant_model, "model-x");
+        assert_eq!(cfg.assistant_budget_tokens, 0);
+        assert!(load(vec![("FLEETT_ASSISTANT_BUDGET_TOKENS", "many")]).is_err());
     }
 
     #[test]

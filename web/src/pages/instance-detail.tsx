@@ -60,6 +60,12 @@ import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { SharePicker } from "@/components/share-picker";
 import { StatusBadge } from "@/components/status-badge";
+import {
+  ASSISTANT_APPLIED_EVENT,
+  instanceTabSchema,
+  useAssistantScope,
+  type AssistantAppliedDetail,
+} from "@/lib/assistant";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
 import { navigate, hrefFor } from "@/lib/router";
@@ -865,6 +871,23 @@ function LogsTab({ id }: { id: string }) {
   );
 }
 
+const TAB_PAGES: Record<string, string> = {
+  overview: "Overview",
+  configuration: "Configuration",
+  schedules: "Schedules",
+  incidents: "Incidents",
+  snapshots: "Snapshots",
+  files: "Files",
+  messages: "Messages",
+  memory: "Memory",
+  history: "History",
+  logs: "Logs",
+  access: "Access",
+  egress: "Egress",
+  terminal: "Terminal",
+  compose: "Compose",
+};
+
 function DetailSkeleton() {
   return (
     <div className="space-y-6">
@@ -897,6 +920,27 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
   const providers = useResource(() => api.listProviders(), []);
   const templatesResource = useResource(() => api.listTemplates(), []);
+
+  // The assistant sees the tab, the instance and its last error. The Files tab
+  // refines this with the open path and buffer.
+  useAssistantScope({
+    page: TAB_PAGES[tab] ?? "Instance",
+    instance: id,
+    schema: instanceTabSchema(tab),
+    errorText: detail.data?.last_error ?? undefined,
+  });
+
+  // An environment applied from the assistant is a normal PATCH: refresh so the
+  // Configuration tab and the warnings show the new state.
+  useEffect(() => {
+    function onApplied(event: Event) {
+      const applied = (event as CustomEvent<AssistantAppliedDetail>).detail;
+      if (!applied || applied.instance !== id || applied.kind !== "env") return;
+      setNonce((value) => value + 1);
+    }
+    window.addEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
+    return () => window.removeEventListener(ASSISTANT_APPLIED_EVENT, onApplied);
+  }, [id]);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);

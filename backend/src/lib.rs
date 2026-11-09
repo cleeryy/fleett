@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod archive;
+pub mod assistant;
 pub mod audit;
 pub mod auth;
 pub mod authz;

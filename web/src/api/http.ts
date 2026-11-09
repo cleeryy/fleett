@@ -4,6 +4,9 @@ import { tokenStore } from "@/lib/token";
 import type {
   AckMessageResult,
   AclItemInput,
+  AssistantChatInput,
+  AssistantConfig,
+  AssistantReply,
   AuditEntry,
   AuthConfig,
   BudgetInput,
@@ -58,6 +61,7 @@ import type {
   MemoryVersion,
   Message,
   MkdirResult,
+  MutationOptions,
   PatchInstanceInput,
   PatchPipelineInput,
   PatchProviderInput,
@@ -122,6 +126,14 @@ function queryString(params: Record<string, string | number | undefined>): strin
 function authUrl(loginUrl: string): string {
   if (isAbsoluteUrl(loginUrl)) return loginUrl;
   return `${BASE}${loginUrl.startsWith("/") ? loginUrl : `/${loginUrl}`}`;
+}
+
+/**
+ * Writes initiated by the assistant carry a marker so the controller records
+ * "via assistant" in the audit log and keeps the usual backup and git trail.
+ */
+function assistantHeaders(options?: MutationOptions): Record<string, string> {
+  return options?.viaAssistant ? { "X-Fleett-Assistant": "1" } : {};
 }
 
 async function request<T>(path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<T> {
@@ -256,9 +268,10 @@ export const httpApi: FleetApi = {
 
   getInstance: (id) => request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}`),
 
-  putInstanceEnv: (id: string, env: EnvInput[]) =>
+  putInstanceEnv: (id: string, env: EnvInput[], options?: MutationOptions) =>
     request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}/env`, {
       method: "PUT",
+      headers: assistantHeaders(options),
       body: JSON.stringify({ env }),
     }),
 
@@ -276,9 +289,10 @@ export const httpApi: FleetApi = {
       body: JSON.stringify(input),
     }),
 
-  patchInstance: (id, input: PatchInstanceInput) =>
+  patchInstance: (id, input: PatchInstanceInput, options?: MutationOptions) =>
     request<InstanceDetail>(`/api/instances/${encodeURIComponent(id)}`, {
       method: "PATCH",
+      headers: assistantHeaders(options),
       body: JSON.stringify(input),
     }),
 
@@ -300,9 +314,9 @@ export const httpApi: FleetApi = {
       `/api/instances/${encodeURIComponent(id)}/files/content?path=${encodeURIComponent(path)}`,
     ),
 
-  writeFile: (id, input: WriteFileInput) => {
+  writeFile: (id, input: WriteFileInput, options?: MutationOptions) => {
     const query = input.restart ? "?restart=true" : "";
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = assistantHeaders(options);
     if (input.force) {
       // `*` means "the file must exist, any version": the documented override.
       headers["If-Match"] = "*";
@@ -707,6 +721,17 @@ export const httpApi: FleetApi = {
 
   exec: (id, input: ExecInput) =>
     request<ExecResult>(`/api/instances/${encodeURIComponent(id)}/exec`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /* Assistant */
+
+  assistantConfig: () =>
+    request<AssistantConfig>("/api/assistant/config", {}, { signalUnauthorized: false }),
+
+  assistantChat: (input: AssistantChatInput) =>
+    request<AssistantReply>("/api/assistant/chat", {
       method: "POST",
       body: JSON.stringify(input),
     }),
