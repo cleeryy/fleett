@@ -213,14 +213,15 @@ fn parse_api_error(status: u16, text: &str) -> CliError {
 // HTTP client
 // ---------------------------------------------------------------------------
 
-struct Client {
+#[derive(Clone)]
+pub(crate) struct Client {
     base: String,
     token: Option<String>,
     http: reqwest::Client,
 }
 
 impl Client {
-    fn new(cfg: &ClientConfig) -> Result<Self, CliError> {
+    pub(crate) fn new(cfg: &ClientConfig) -> Result<Self, CliError> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -243,7 +244,7 @@ impl Client {
         serde_json::from_value(value).map_err(|err| CliError::Decode(err.to_string()))
     }
 
-    async fn value(
+    pub(crate) async fn value(
         &self,
         method: Method,
         path: &str,
@@ -258,7 +259,7 @@ impl Client {
         serde_json::from_str(trimmed).map_err(|err| CliError::Decode(format!("{err}: {trimmed}")))
     }
 
-    async fn text(
+    pub(crate) async fn text(
         &self,
         method: Method,
         path: &str,
@@ -1660,7 +1661,7 @@ fn caps_line(caps: &UsageCaps) -> String {
 }
 
 /// Percent-encode one path segment (instance ids are already safe).
-fn encode_path_segment(value: &str) -> String {
+pub(crate) fn encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

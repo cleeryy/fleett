@@ -10,6 +10,7 @@ use fleett::driver::compose::ComposeDriver;
 use fleett::driver::mock::MockDriver;
 use fleett::driver::Driver;
 use fleett::egress;
+use fleett::mcp;
 use fleett::migrate;
 use fleett::secrets;
 use std::path::PathBuf;
@@ -189,6 +190,17 @@ enum Commands {
     },
     /// Check the API, authentication, Docker, secrets and egress (client mode).
     Doctor,
+    /// Expose the fleet as an MCP server for an orchestrating agent.
+    ///
+    /// Speaks JSON-RPC 2.0 over stdin/stdout by default, or Streamable HTTP
+    /// (`POST /mcp`) with `--http`. Every tool is a call to the HTTP API with
+    /// the token of `~/.config/fleett/config.toml`. See docs/MCP.md.
+    Mcp {
+        /// Serve Streamable HTTP on this address (e.g. 127.0.0.1:8091) instead
+        /// of stdio. SSE streaming is not implemented.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+    },
     /// Send a message to another instance over the fleet bus (client mode).
     Say {
         /// Recipient instance id.
@@ -477,6 +489,13 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Doctor => cli::run(cli::Command::Doctor, json).await,
+        Commands::Mcp { http } => {
+            match http {
+                Some(addr) => mcp::run_http(&addr).await?,
+                None => mcp::run_stdio().await?,
+            }
+            0
+        }
         Commands::Say {
             to,
             body,

@@ -65,6 +65,7 @@ fleett memory restore <id> <version>
 fleett memory delete <id>
 fleett memory promote <id> [--namespace global]
 fleett doctor
+fleett mcp [--http ADDR]
 ```
 
 Every command accepts the global `--json` flag (before or after the subcommand). Human
@@ -223,6 +224,26 @@ Prints a checklist and exits non-zero when a check fails:
 fleett doctor
 fleett --json doctor
 ```
+
+### `mcp`
+
+Runs a Model Context Protocol server that exposes the fleet as nineteen strict tools
+(`list_instances`, `get_instance`, `create_instance`, `start/stop/restart/delete_instance`,
+`logs`, `env_set/env_unset`, `read_file/write_file`, `git_log/git_status/git_revert`,
+`list_providers`, `test_provider`, `usage`, `run_pipeline`). Every tool is an HTTP API call
+made with the same URL and token as the other client commands, so the API keeps enforcing the
+token role and auditing every mutation; the server adds no privilege. See
+[docs/MCP.md](MCP.md) for the full catalog, the Hermes configuration and the HTTP mode.
+
+```bash
+fleett mcp                              # stdio: one JSON-RPC message per line
+fleett mcp --http 127.0.0.1:8091        # Streamable HTTP: POST /mcp
+```
+
+Stdout only carries JSON-RPC responses (diagnostics go to stderr). The global `--json` flag
+is ignored: tool results are MCP `content` + `structuredContent`, and execution errors are
+`isError` results carrying the API code. A token without the required role is refused by the
+API and the refusal is returned as-is (for example `code: "forbidden", status: 403`).
 
 ## Output and exit codes
 

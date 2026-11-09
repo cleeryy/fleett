@@ -410,3 +410,20 @@ file, pulls nothing and audits nothing.
 The compose file is the source of truth: the database `image` column is resynchronised from
 `services.agent.image` at startup, so a hand edit or a restore is picked up. See
 `docs/UPGRADE.md` for the operator procedure.
+
+## MCP server (client-side)
+
+This document describes the control plane routes; `fleett mcp` adds **no API route**. It is a
+client of the routes above: every MCP tool is one authenticated API call made with the token
+of `~/.config/fleett/config.toml` (`FLEETT_URL` / `FLEETT_TOKEN`), so the role check, the audit
+entry of a mutation and the error envelope are exactly the ones documented here. A
+`403 forbidden` from the API is returned to the MCP client as a tool error carrying the API
+message.
+
+`fleett mcp --http <addr>` is a separate, optional listener that serves JSON-RPC on
+`POST /mcp`; it is not part of the control plane router and is not proxied by `/api`. It has
+no authentication of its own: it acts with the token of its own process, so bind it to
+loopback (or front it with an authenticating proxy). SSE streaming is not implemented.
+
+See [docs/MCP.md](docs/MCP.md) for the tool catalog, the Hermes configuration and the
+limitations.
