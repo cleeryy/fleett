@@ -474,6 +474,141 @@ export interface RevertResult {
   status: string;
 }
 
+/* --------------------------------------------------------------------------
+ * Agent-to-agent messages (docs/BUS.md)
+ * -------------------------------------------------------------------------- */
+
+/** `ask` expects a `result`; `tell` is one-way. */
+export type MessageKind = "ask" | "tell" | "result";
+/** `delivered` is stamped when the recipient fetches its inbox; `read` when it acks. */
+export type MessageStatus = "queued" | "delivered" | "read";
+/** Which side of an instance mailbox to read. */
+export type MessageBox = "inbox" | "outbox" | "all";
+
+/** One row of the persistent bus. */
+export interface Message {
+  id: string;
+  from: string;
+  to: string;
+  kind: MessageKind;
+  body: string;
+  /** Ties a question to its answer and powers loop detection. */
+  correlation_id?: string | null;
+  hops: number;
+  status: MessageStatus;
+  created_at: string;
+  expires_at: string;
+  delivered_at?: string | null;
+  read_at?: string | null;
+}
+
+export interface ListMessagesParams {
+  /** Either side of the conversation. */
+  instance?: string;
+  from?: string;
+  to?: string;
+  kind?: MessageKind;
+  limit?: number;
+}
+
+export interface InstanceMessagesParams {
+  view?: MessageBox;
+  status?: MessageStatus;
+  limit?: number;
+}
+
+export interface SendMessageInput {
+  to: string;
+  /** Admin only: send on behalf of another instance. Defaults to the path id. */
+  from?: string;
+  /** Defaults to `tell`. */
+  kind?: MessageKind;
+  body: string;
+  correlation_id?: string;
+  /** 30 s … 30 days. Defaults to 24 h. */
+  ttl_s?: number;
+}
+
+/** `POST /api/instances/{id}/messages/{message_id}/ack`. */
+export interface AckMessageResult {
+  message: Message;
+}
+
+/* --------------------------------------------------------------------------
+ * Shared fleet memory (docs/MEMORY.md)
+ * -------------------------------------------------------------------------- */
+
+/** `global`, `shared`, `instance:<id>` or `project:<name>`. */
+export type MemoryNamespace = string;
+export type MemoryAction = "create" | "update" | "delete" | "rollback";
+
+export interface MemoryEntry {
+  id: number;
+  namespace: MemoryNamespace;
+  key: string;
+  /** Plaintext by design: knowledge, never a credential. */
+  value: string;
+  tags: string[];
+  /** Instance id, actor or admin that wrote the current version. */
+  owner: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  /** Absent when the entry never expires. */
+  expires_at?: string | null;
+}
+
+/** One append-only row of an entry history. */
+export interface MemoryVersion {
+  version: number;
+  value: string;
+  tags: string[];
+  owner: string;
+  action: MemoryAction | string;
+  at: string;
+}
+
+/** `POST /api/memory`: created is false when `(namespace, key)` already existed. */
+export interface WriteMemoryResult {
+  entry: MemoryEntry;
+  created: boolean;
+}
+
+export interface ListMemoryParams {
+  namespace?: string;
+  tag?: string;
+  limit?: number;
+}
+
+export interface SearchMemoryParams {
+  q: string;
+  namespace?: string;
+  /** Every tag is required (AND). */
+  tags?: string[];
+  limit?: number;
+}
+
+export interface CreateMemoryInput {
+  namespace: string;
+  key: string;
+  value: string;
+  tags?: string[];
+  /** 60 s … 1 year; omitted means no expiry. */
+  ttl_s?: number;
+}
+
+export interface UpdateMemoryInput {
+  value: string;
+  tags?: string[];
+  /** Omitted keeps the stored expiry. */
+  ttl_s?: number;
+}
+
+/** `DELETE /api/memory/expired` and `/api/messages/expired`. */
+export interface PurgeResult {
+  removed: number;
+}
+
 export interface FleetApi {
   health(): Promise<Health>;
   /** Public: which login methods the controller advertises. */
@@ -523,4 +658,27 @@ export interface FleetApi {
   createToken(input: CreateTokenInput): Promise<CreatedToken>;
   revokeToken(id: string): Promise<void>;
   listAudit(limit: number): Promise<AuditEntry[]>;
+  /** Admin view of the whole bus, both directions. */
+  listMessages(params?: ListMessagesParams): Promise<Message[]>;
+  /** One instance mailbox; reading the inbox stamps `delivered_at`. */
+  instanceMessages(id: string, params?: InstanceMessagesParams): Promise<Message[]>;
+  /** The path id is the sender unless an admin overrides `from`. */
+  sendMessage(id: string, input: SendMessageInput): Promise<Message>;
+  /** Only the recipient can ack; stamps `read_at`. */
+  ackMessage(id: string, messageId: string): Promise<AckMessageResult>;
+  listMemory(params?: ListMemoryParams): Promise<MemoryEntry[]>;
+  /** Full-text search; tags are ANDed. */
+  searchMemory(params: SearchMemoryParams): Promise<MemoryEntry[]>;
+  getMemoryByKey(namespace: string, key: string): Promise<MemoryEntry>;
+  /** Upsert keyed by `(namespace, key)`. */
+  createOrUpdateMemory(input: CreateMemoryInput): Promise<WriteMemoryResult>;
+  updateMemory(id: number, input: UpdateMemoryInput): Promise<MemoryEntry>;
+  /** Soft delete: the entry disappears from reads, its history stays restorable. */
+  deleteMemory(id: number): Promise<void>;
+  memoryHistory(id: number): Promise<MemoryVersion[]>;
+  /** Restores an old value as a new version. */
+  rollbackMemory(id: number, version: number): Promise<MemoryEntry>;
+  /** Copies the entry into another namespace; the source stays readable. */
+  promoteMemory(id: number, namespace: string): Promise<MemoryEntry>;
+  purgeExpiredMemory(): Promise<PurgeResult>;
 }

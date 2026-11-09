@@ -1,5 +1,6 @@
 import { ApiError } from "./errors";
 import type {
+  AckMessageResult,
   AuditEntry,
   AuthConfig,
   AuthMode,
@@ -7,6 +8,7 @@ import type {
   CloneInstanceInput,
   CommitInfo,
   CreateInstanceInput,
+  CreateMemoryInput,
   CreateProviderInput,
   CreateTokenInput,
   CreatedToken,
@@ -22,9 +24,18 @@ import type {
   Health,
   Identity,
   InstanceDetail,
+  InstanceMessagesParams,
   InstanceStatus,
   InstanceSummary,
   LifecycleResult,
+  ListMemoryParams,
+  ListMessagesParams,
+  MemoryEntry,
+  MemoryVersion,
+  Message,
+  MessageKind,
+  MessageBox,
+  MessageStatus,
   MkdirResult,
   PatchInstanceInput,
   PatchProviderInput,
@@ -33,15 +44,20 @@ import type {
   ProviderRotateResult,
   ProviderSummary,
   ProviderTestResult,
+  PurgeResult,
   RevertInput,
   RevertResult,
   Role,
+  SearchMemoryParams,
+  SendMessageInput,
   Share,
   ShareMode,
   Template,
   TokenInfo,
+  UpdateMemoryInput,
   WriteFileInput,
   WriteFileResult,
+  WriteMemoryResult,
 } from "./types";
 import { toPatch } from "@/lib/diff";
 import { tokenStore } from "@/lib/token";
@@ -196,6 +212,13 @@ let templates: Template[] = [];
 let tokens: TokenInfo[] = [];
 let audit: AuditEntry[] = [];
 let providerStore: StoredProvider[] = [];
+let busMessages: Message[] = [];
+let memoryStore: MemoryEntry[] = [];
+/** Soft-deleted entries stay addressable by history and rollback. */
+const deletedMemory = new Set<number>();
+/** Append-only history, keyed by memory entry id, newest version first. */
+const memoryHistory = new Map<number, MemoryVersion[]>();
+let memorySequence = 1;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -1202,6 +1225,519 @@ function cloneInstanceData(sourceId: string, targetId: string): void {
   recordCommit(targetId, copy, { name: "fleett", email: "fleett@localhost" }, "sync");
 }
 
+// ---------------------------------------------------------------------------
+// message bus and shared memory (issues #28, #29)
+
+const MESSAGE_BODY_MAX = 16 * 1024;
+const MESSAGE_TTL_MIN = 30;
+const MESSAGE_TTL_MAX = 30 * 24 * 3600;
+const MESSAGE_DEFAULT_TTL = 24 * 3600;
+const MESSAGE_MAX_HOPS = 8;
+
+const MEMORY_VALUE_MAX = 64 * 1024;
+const MEMORY_KEY_MAX = 128;
+const MEMORY_TAGS_MAX = 16;
+const MEMORY_TAG_MAX = 32;
+const MEMORY_TTL_MIN = 60;
+const MEMORY_TTL_MAX = 365 * 24 * 3600;
+
+function pageLimit(limit: number | undefined, fallback: number): number {
+  const value = limit === undefined || !Number.isFinite(limit) ? fallback : Math.floor(limit);
+  return Math.min(Math.max(value, 1), 500);
+}
+
+function parseKind(value: string | undefined, fallback: MessageKind = "tell"): MessageKind {
+  if (value === undefined || value === "") return fallback;
+  if (value === "ask" || value === "tell" || value === "result") return value;
+  fail(400, "invalid_kind", "kind must be ask, tell or result");
+}
+
+function parseStatus(value: string | undefined): MessageStatus | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value === "queued" || value === "delivered" || value === "read") return value;
+  fail(400, "invalid_status", "status must be queued, delivered or read");
+}
+
+function parseBox(value: string | undefined): MessageBox {
+  if (value === undefined || value === "") return "inbox";
+  if (value === "inbox" || value === "outbox" || value === "all") return value;
+  fail(400, "invalid_view", "view must be inbox, outbox or all");
+}
+
+function messageBody(raw: string): string {
+  const body = raw.trim();
+  if (!body) fail(400, "empty_body", "message body must not be empty");
+  if (byteLength(body) > MESSAGE_BODY_MAX) {
+    fail(400, "body_too_large", "message body exceeds 16384 bytes");
+  }
+  return body;
+}
+
+function messageTtl(ttl: number | undefined): number {
+  if (ttl === undefined) return MESSAGE_DEFAULT_TTL;
+  if (!Number.isInteger(ttl) || ttl < MESSAGE_TTL_MIN || ttl > MESSAGE_TTL_MAX) {
+    fail(400, "invalid_ttl", "ttl_s must be between 30 and 2592000 seconds");
+  }
+  return ttl;
+}
+
+function messageCorrelation(value: string | undefined): string | undefined {
+  const correlation = value?.trim();
+  return correlation ? correlation : undefined;
+}
+
+/** Expired rows are invisible to every read until a purge removes them. */
+function liveMessages(): Message[] {
+  return busMessages.filter((message) => Date.parse(message.expires_at) > Date.now());
+}
+
+function newestFirst(left: Message, right: Message): number {
+  return Date.parse(right.created_at) - Date.parse(left.created_at) || right.id.localeCompare(left.id);
+}
+
+function assertMemoryNamespace(namespace: string): string {
+  const value = namespace.trim();
+  const ok =
+    value === "global" ||
+    value === "shared" ||
+    /^instance:[a-z0-9][a-z0-9-]{1,31}$/.test(value) ||
+    /^project:[A-Za-z0-9-]+$/.test(value);
+  if (!ok) {
+    fail(
+      400,
+      "invalid_namespace",
+      "namespace must be global, shared, instance:<id> or project:<name>",
+    );
+  }
+  return value;
+}
+
+function assertMemoryKey(key: string): string {
+  const value = key.trim();
+  if (!value || byteLength(value) > MEMORY_KEY_MAX) {
+    fail(400, "invalid_key", "a key is 1 to 128 characters long");
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    fail(400, "invalid_key", "a key must not contain control characters");
+  }
+  return value;
+}
+
+function memoryValue(value: string): string {
+  if (byteLength(value) > MEMORY_VALUE_MAX) {
+    fail(400, "value_too_large", "value exceeds 65536 bytes");
+  }
+  return value;
+}
+
+function memoryTags(raw: string[] | undefined): string[] {
+  const tags: string[] = [];
+  for (const candidate of raw ?? []) {
+    const tag = candidate.trim().toLowerCase();
+    if (!tag) continue;
+    if (byteLength(tag) > MEMORY_TAG_MAX || !/^[a-z0-9._:-]+$/.test(tag)) {
+      fail(400, "invalid_tag", `invalid tag: ${tag}`);
+    }
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  if (tags.length > MEMORY_TAGS_MAX) {
+    fail(400, "invalid_tag", "at most 16 tags are accepted");
+  }
+  return tags;
+}
+
+function memoryTtl(ttl: number | undefined): string | undefined {
+  if (ttl === undefined) return undefined;
+  if (!Number.isInteger(ttl) || ttl < MEMORY_TTL_MIN || ttl > MEMORY_TTL_MAX) {
+    fail(400, "invalid_ttl", "ttl_s must be between 60 and 31536000 seconds");
+  }
+  return iso(Date.now() + ttl * 1000);
+}
+
+function isDeletedMemory(id: number): boolean {
+  return deletedMemory.has(id);
+}
+
+function isExpiredMemory(entry: MemoryEntry): boolean {
+  return entry.expires_at !== undefined && entry.expires_at !== null
+    ? Date.parse(entry.expires_at) <= Date.now()
+    : false;
+}
+
+function isLiveMemory(entry: MemoryEntry): boolean {
+  return !isDeletedMemory(entry.id) && !isExpiredMemory(entry);
+}
+
+function findMemory(id: number): MemoryEntry {
+  const entry = memoryStore.find((candidate) => candidate.id === id);
+  if (!entry) fail(404, "not_found", `unknown memory entry ${id}`);
+  return entry;
+}
+
+function findLiveMemory(id: number): MemoryEntry {
+  const entry = findMemory(id);
+  if (!isLiveMemory(entry)) fail(404, "not_found", `unknown memory entry ${id}`);
+  return entry;
+}
+
+function recordMemoryVersion(entry: MemoryEntry, action: string, at: string): void {
+  const versions = memoryHistory.get(entry.id) ?? [];
+  versions.unshift({
+    version: entry.version,
+    value: entry.value,
+    tags: [...entry.tags],
+    owner: entry.owner,
+    action,
+    at,
+  });
+  memoryHistory.set(entry.id, versions);
+}
+
+function copyMemory(entry: MemoryEntry): MemoryEntry {
+  return { ...entry, tags: [...entry.tags] };
+}
+
+/** Upsert keyed by `(namespace, key)`, reviving a soft-deleted or expired row. */
+function upsertMemory(
+  namespace: string,
+  key: string,
+  value: string,
+  tags: string[],
+  owner: string,
+  expiresAt: string | undefined,
+): { entry: MemoryEntry; created: boolean } {
+  const at = nowIso();
+  const existing = memoryStore.find(
+    (candidate) => candidate.namespace === namespace && candidate.key === key,
+  );
+  if (existing) {
+    existing.value = value;
+    existing.tags = tags;
+    existing.owner = owner;
+    existing.version = Math.max(existing.version + 1, 1);
+    existing.updated_at = at;
+    if (expiresAt !== undefined) existing.expires_at = expiresAt;
+    deletedMemory.delete(existing.id);
+    recordMemoryVersion(existing, "update", at);
+    return { entry: existing, created: false };
+  }
+  const entry: MemoryEntry = {
+    id: memorySequence++,
+    namespace,
+    key,
+    value,
+    tags,
+    owner,
+    version: 1,
+    created_at: at,
+    updated_at: at,
+    expires_at: expiresAt,
+  };
+  memoryStore.push(entry);
+  recordMemoryVersion(entry, "create", at);
+  return { entry, created: true };
+}
+
+/** The two examples the console ships with, wired through the same validators. */
+function seedBusAndMemory(): void {
+  const minutesAgo = (minutes: number) => SEEDED_AT - minutes * 60_000;
+
+  function seededMessage(input: {
+    id: string;
+    from: string;
+    to: string;
+    kind: MessageKind;
+    body: string;
+    correlation?: string;
+    hops: number;
+    status: MessageStatus;
+    age_min: number;
+    ttl_h: number;
+    delivered_min?: number;
+    read_min?: number;
+  }): Message {
+    const created = minutesAgo(input.age_min);
+    return {
+      id: input.id,
+      from: input.from,
+      to: input.to,
+      kind: input.kind,
+      body: input.body,
+      correlation_id: input.correlation,
+      hops: input.hops,
+      status: input.status,
+      created_at: iso(created),
+      expires_at: iso(created + input.ttl_h * HOUR),
+      delivered_at:
+        input.delivered_min === undefined ? undefined : iso(minutesAgo(input.delivered_min)),
+      read_at: input.read_min === undefined ? undefined : iso(minutesAgo(input.read_min)),
+    };
+  }
+
+  busMessages = [
+    seededMessage({
+      id: "7f41c9a2-3d6e-4b18-9f0c-2a5e7d8b1c40",
+      from: "ops",
+      to: "alice",
+      kind: "ask",
+      body:
+        "The nightly rclone mirror of the media share reported a size mismatch this morning. " +
+        "Can you confirm the 06:00 backup finished on your side before I re-run the sync?",
+      correlation: "backup-media-42",
+      hops: 0,
+      status: "read",
+      age_min: 186,
+      ttl_h: 21,
+      delivered_min: 184,
+      read_min: 181,
+    }),
+    seededMessage({
+      id: "0c9d4e17-8b2a-4c65-a1f3-6d90e2b74f58",
+      from: "alice",
+      to: "ops",
+      kind: "result",
+      body:
+        "Confirmed. The 06:00 run completed in 11 minutes. The mismatch came from two deleted photos " +
+        "that were still in the mirror index; it is consistent again. No need to re-run.",
+      correlation: "backup-media-42",
+      hops: 1,
+      status: "queued",
+      age_min: 172,
+      ttl_h: 22,
+    }),
+    seededMessage({
+      id: "b83e6f52-1a47-4d09-8c3b-5f2e9a0d6c71",
+      from: "ops",
+      to: "margaret",
+      kind: "tell",
+      body:
+        "Heads-up: the weekly PBS verify job moved to 03:30 on Sunday. Nothing to do on your side; " +
+        "the media share is read-only and stays untouched.",
+      hops: 0,
+      status: "delivered",
+      age_min: 92,
+      ttl_h: 20,
+      delivered_min: 90,
+    }),
+    seededMessage({
+      id: "d2a7c410-5e93-4b68-9f17-3c8b6e0a2d95",
+      from: "workshop",
+      to: "school",
+      kind: "tell",
+      body:
+        "The sandbox template now ships with the note skill enabled. Start the instance once and " +
+        "the gateway picks up the new config.",
+      hops: 0,
+      status: "queued",
+      age_min: 47,
+      ttl_h: 23,
+    }),
+    seededMessage({
+      id: "3e59b8d6-72c4-4a1f-b0d5-8e6f2c9a4b13",
+      from: "alice",
+      to: "margaret",
+      kind: "ask",
+      body:
+        "For the family archive: do you want me to keep the camera originals under media/original, " +
+        "or only the resized copies? Originals are about 40 GB.",
+      correlation: "photos-7",
+      hops: 0,
+      status: "read",
+      age_min: 1_460,
+      ttl_h: 168,
+      delivered_min: 1_455,
+      read_min: 1_440,
+    }),
+    seededMessage({
+      id: "9a02f6c8-6d31-4c7e-8b54-1f7a3e0c9d28",
+      from: "margaret",
+      to: "alice",
+      kind: "result",
+      body:
+        "Keep the originals. Disk is cheap and I never want to lose the negatives; the resized copies " +
+        "are only for the phone album.",
+      correlation: "photos-7",
+      hops: 1,
+      status: "read",
+      age_min: 1_438,
+      ttl_h: 168,
+      delivered_min: 1_436,
+      read_min: 1_430,
+    }),
+  ];
+
+  memoryStore = [];
+  memoryHistory.clear();
+  deletedMemory.clear();
+  memorySequence = 1;
+
+  function seededMemory(input: {
+    namespace: string;
+    key: string;
+    owner: string;
+    expires_in_min?: number;
+    versions: Array<{
+      age_min: number;
+      value: string;
+      tags: string[];
+      owner?: string;
+      action?: string;
+    }>;
+  }): MemoryEntry {
+    const id = memorySequence++;
+    const newest = input.versions[input.versions.length - 1];
+    const oldest = input.versions[0];
+    const entry: MemoryEntry = {
+      id,
+      namespace: input.namespace,
+      key: input.key,
+      value: newest.value,
+      tags: [...newest.tags],
+      owner: newest.owner ?? input.owner,
+      version: input.versions.length,
+      created_at: iso(minutesAgo(oldest.age_min)),
+      updated_at: iso(minutesAgo(newest.age_min)),
+      expires_at:
+        input.expires_in_min === undefined
+          ? undefined
+          : iso(SEEDED_AT + input.expires_in_min * 60_000),
+    };
+    memoryStore.push(entry);
+    memoryHistory.set(
+      id,
+      input.versions
+        .map((version, index) => ({
+          version: index + 1,
+          value: version.value,
+          tags: [...version.tags],
+          owner: version.owner ?? input.owner,
+          action: version.action ?? (index === 0 ? "create" : "update"),
+          at: iso(minutesAgo(version.age_min)),
+        }))
+        .reverse(),
+    );
+    return entry;
+  }
+
+  seededMemory({
+    namespace: "global",
+    key: "fleet-contract",
+    owner: "cleeryy@example.com",
+    versions: [
+      {
+        age_min: 18 * 24 * 60,
+        value:
+          "Agents share findings through the `findings` share. Announce a deploy in #ops before " +
+          "restarting more than one instance.",
+        tags: ["contract", "ops"],
+      },
+      {
+        age_min: 3 * 24 * 60,
+        value:
+          "Agents poll their inbox through GET /api/instances/<id>/messages and ack handled " +
+          "messages. Never send more than 16 KiB; put files in a share. Findings belong in the " +
+          "`findings` share, durable lessons in shared memory.",
+        tags: ["bus", "contract"],
+      },
+    ],
+  });
+
+  seededMemory({
+    namespace: "shared",
+    key: "backup-runbook",
+    owner: "ops",
+    versions: [
+      {
+        age_min: 20 * 24 * 60,
+        value: "PBS runs at 02:00. Check the dashboard when a job is missing.",
+        tags: ["backup"],
+      },
+      {
+        age_min: 6 * 24 * 60,
+        value:
+          "PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily " +
+          "copies; the verify job runs on Sunday at 03:30.",
+        tags: ["backup", "ops"],
+      },
+      {
+        age_min: 1 * 24 * 60,
+        value:
+          "PBS runs at 02:00, the offsite rclone mirror at 06:00. The mirror keeps seven daily " +
+          "copies; the verify job runs on Sunday at 03:30. When a run is missing, start with " +
+          "`journalctl -u pbs` and check `flock` holders before re-running by hand.",
+        tags: ["backup", "ops", "runbook"],
+      },
+    ],
+  });
+
+  seededMemory({
+    namespace: "instance:ops",
+    key: "gateway-upgrade",
+    owner: "ops",
+    versions: [
+      {
+        age_min: 4 * 24 * 60,
+        value:
+          "Restart the gateway after an image upgrade: `docker compose restart hermes`. The " +
+          "healthcheck probes /opt/data/gateway.sock with the identify verb and reports unhealthy " +
+          "until the socket answers.",
+        tags: ["upgrade", "runbook"],
+      },
+    ],
+  });
+
+  seededMemory({
+    namespace: "instance:alice",
+    key: "telegram-allowlist",
+    owner: "alice",
+    versions: [
+      {
+        age_min: 9 * 24 * 60,
+        value: "The Telegram allowlist contains user 81459823.",
+        tags: ["telegram"],
+      },
+      {
+        age_min: 2 * 24 * 60,
+        value:
+          "Only the Telegram user 81459823 may talk to this agent. Add new users through the " +
+          "console, never by editing config.yaml: a hand edit is overwritten on the next PATCH.",
+        tags: ["telegram", "allowlist"],
+      },
+    ],
+  });
+
+  seededMemory({
+    namespace: "project:tchounis",
+    key: "course-sources",
+    owner: "cleeryy@example.com",
+    versions: [
+      {
+        age_min: 30 * 24 * 60,
+        value:
+          "PDF sources live outside git on hermesagent:/home/hermes/tchouni-sources. Never commit " +
+          "them: they are large and the Docker image must stay small. Medical content comes from " +
+          "the course, VIDAL, RCP ANSM or WHO only.",
+        tags: ["medical", "tchounis", "sources"],
+      },
+    ],
+  });
+
+  // One expired row so the purge action removes something in the demo.
+  seededMemory({
+    namespace: "shared",
+    key: "deploy-42",
+    owner: "workshop",
+    expires_in_min: -1_440,
+    versions: [
+      {
+        age_min: 3 * 24 * 60,
+        value: "Deploy 42: restart ops first, then alice. Watch the gateway socket for two minutes.",
+        tags: ["deploy", "temporary"],
+      },
+    ],
+  });
+}
+
 export function resetMock(): void {
   const telegramEnv = [
     {
@@ -1481,6 +2017,8 @@ export function resetMock(): void {
       target: "alice",
     },
   ];
+
+  seedBusAndMemory();
 
   filesystems.clear();
   repositories.clear();
@@ -2686,5 +3224,277 @@ export const mockApi: FleetApi = {
     await delay(160);
     const count = Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), 1000) : 200;
     return audit.slice(0, count).map((entry) => ({ ...entry }));
+  },
+
+  async listMessages(params: ListMessagesParams = {}): Promise<Message[]> {
+    requireAdmin();
+    await delay(150);
+    const kind = params.kind ? parseKind(params.kind) : undefined;
+    return liveMessages()
+      .filter(
+        (message) =>
+          (!params.instance || message.from === params.instance || message.to === params.instance) &&
+          (!params.from || message.from === params.from) &&
+          (!params.to || message.to === params.to) &&
+          (!kind || message.kind === kind),
+      )
+      .sort(newestFirst)
+      .slice(0, pageLimit(params.limit, 100))
+      .map((message) => ({ ...message }));
+  },
+
+  async instanceMessages(
+    id: string,
+    params: InstanceMessagesParams = {},
+  ): Promise<Message[]> {
+    requireAuth();
+    await delay(130);
+    findRow(id);
+    const view = parseBox(params.view);
+    const status = parseStatus(params.status);
+    const selected = liveMessages()
+      .filter((message) =>
+        view === "inbox"
+          ? message.to === id
+          : view === "outbox"
+            ? message.from === id
+            : message.to === id || message.from === id,
+      )
+      .filter((message) => !status || message.status === status)
+      .sort(newestFirst)
+      .slice(0, pageLimit(params.limit, 100));
+
+    // Reading the inbox stamps delivered_at, exactly like the controller.
+    if (view !== "outbox") {
+      const at = nowIso();
+      for (const message of selected) {
+        if (message.to === id && message.status === "queued") {
+          message.status = "delivered";
+          message.delivered_at = at;
+        }
+      }
+    }
+    return selected.map((message) => ({ ...message }));
+  },
+
+  async sendMessage(id: string, input: SendMessageInput): Promise<Message> {
+    const identity = requireWrite();
+    await delay(240);
+    findRow(id);
+    const from = input.from?.trim() || id;
+    if (from !== id && identity.role !== "admin") {
+      fail(403, "forbidden", "only an admin may send a message on behalf of another instance");
+    }
+    findRow(from);
+
+    const to = input.to.trim();
+    if (!to) fail(400, "unknown_instance", "recipient is required");
+    findRow(to);
+    if (from === to) fail(400, "self_message", "an instance cannot message itself");
+
+    const body = messageBody(input.body);
+    const kind = parseKind(input.kind);
+    const correlation = messageCorrelation(input.correlation_id);
+    const hops = correlation
+      ? busMessages
+          .filter((message) => message.correlation_id === correlation)
+          .reduce((max, message) => Math.max(max, message.hops), -1) + 1
+      : 0;
+    if (hops >= MESSAGE_MAX_HOPS) {
+      fail(
+        409,
+        "message_loop",
+        `message stopped after ${hops} hops (max ${MESSAGE_MAX_HOPS})`,
+        { hops, max_hops: MESSAGE_MAX_HOPS },
+      );
+    }
+
+    const createdAt = nowIso();
+    const message: Message = {
+      id: crypto.randomUUID(),
+      from,
+      to,
+      kind,
+      body,
+      correlation_id: correlation,
+      hops,
+      status: "queued",
+      created_at: createdAt,
+      expires_at: iso(Date.parse(createdAt) + messageTtl(input.ttl_s) * 1000),
+    };
+    busMessages.push(message);
+    return { ...message };
+  },
+
+  async ackMessage(id: string, messageId: string): Promise<AckMessageResult> {
+    requireWrite();
+    await delay(160);
+    const message = busMessages.find(
+      (candidate) => candidate.id === messageId && candidate.to === id,
+    );
+    if (!message) fail(404, "not_found", `unknown message "${messageId}"`);
+    message.status = "read";
+    message.read_at = nowIso();
+    return { message: { ...message } };
+  },
+
+  async listMemory(params: ListMemoryParams = {}): Promise<MemoryEntry[]> {
+    requireAuth();
+    await delay(160);
+    const tag = params.tag?.trim().toLowerCase();
+    return memoryStore
+      .filter((entry) => isLiveMemory(entry))
+      .filter((entry) => !params.namespace || entry.namespace === params.namespace)
+      .filter((entry) => !tag || entry.tags.includes(tag))
+      .sort(
+        (left, right) =>
+          Date.parse(right.updated_at) - Date.parse(left.updated_at) || right.id - left.id,
+      )
+      .slice(0, pageLimit(params.limit, 50))
+      .map(copyMemory);
+  },
+
+  async searchMemory(params: SearchMemoryParams): Promise<MemoryEntry[]> {
+    requireAuth();
+    await delay(200);
+    const terms = params.q
+      .toLowerCase()
+      .split(/\s+/)
+      .map((term) => term.replace(/[^\p{L}\p{N}_.-]/gu, ""))
+      .filter(Boolean);
+    if (terms.length === 0) fail(400, "empty_query", "q must contain at least one word");
+    const tags = memoryTags(params.tags);
+    return memoryStore
+      .filter((entry) => isLiveMemory(entry))
+      .filter((entry) => !params.namespace || entry.namespace === params.namespace)
+      .filter((entry) => tags.every((tag) => entry.tags.includes(tag)))
+      .filter((entry) => {
+        const haystack = [entry.namespace, entry.key, entry.value, ...entry.tags]
+          .join(" ")
+          .toLowerCase();
+        return terms.every((term) => haystack.includes(term));
+      })
+      .sort(
+        (left, right) =>
+          Date.parse(right.updated_at) - Date.parse(left.updated_at) || right.id - left.id,
+      )
+      .slice(0, pageLimit(params.limit, 50))
+      .map(copyMemory);
+  },
+
+  async getMemoryByKey(namespace: string, key: string): Promise<MemoryEntry> {
+    requireAuth();
+    await delay(120);
+    const entry = memoryStore.find(
+      (candidate) =>
+        candidate.namespace === namespace.trim() && candidate.key === key.trim(),
+    );
+    if (!entry || !isLiveMemory(entry)) {
+      fail(404, "not_found", `no memory entry ${namespace}/${key}`);
+    }
+    return copyMemory(entry);
+  },
+
+  async createOrUpdateMemory(input: CreateMemoryInput): Promise<WriteMemoryResult> {
+    const identity = requireWrite();
+    await delay(240);
+    const namespace = assertMemoryNamespace(input.namespace);
+    const key = assertMemoryKey(input.key);
+    const value = memoryValue(input.value);
+    const tags = memoryTags(input.tags);
+    const expiresAt = memoryTtl(input.ttl_s);
+    const { entry, created } = upsertMemory(
+      namespace,
+      key,
+      value,
+      tags,
+      identity.actor,
+      expiresAt,
+    );
+    return { entry: copyMemory(entry), created };
+  },
+
+  async updateMemory(id: number, input: UpdateMemoryInput): Promise<MemoryEntry> {
+    const identity = requireWrite();
+    await delay(220);
+    const entry = findLiveMemory(id);
+    const value = memoryValue(input.value);
+    const tags = input.tags === undefined ? entry.tags : memoryTags(input.tags);
+    const expiresAt = memoryTtl(input.ttl_s);
+    entry.value = value;
+    entry.tags = tags;
+    entry.owner = identity.actor;
+    entry.version += 1;
+    entry.updated_at = nowIso();
+    if (expiresAt !== undefined) entry.expires_at = expiresAt;
+    recordMemoryVersion(entry, "update", entry.updated_at);
+    return copyMemory(entry);
+  },
+
+  async deleteMemory(id: number): Promise<void> {
+    const identity = requireWrite();
+    await delay(200);
+    const entry = findLiveMemory(id);
+    const at = nowIso();
+    entry.owner = identity.actor;
+    entry.updated_at = at;
+    deletedMemory.add(id);
+    recordMemoryVersion(entry, "delete", at);
+  },
+
+  async memoryHistory(id: number): Promise<MemoryVersion[]> {
+    requireAuth();
+    await delay(140);
+    const versions = memoryHistory.get(id);
+    if (!versions) fail(404, "not_found", `unknown memory entry ${id}`);
+    return versions.map((version) => ({ ...version, tags: [...version.tags] }));
+  },
+
+  async rollbackMemory(id: number, version: number): Promise<MemoryEntry> {
+    const identity = requireWrite();
+    await delay(220);
+    const entry = findMemory(id);
+    const target = memoryHistory
+      .get(id)
+      ?.find((candidate) => candidate.version === version);
+    if (!target) fail(404, "not_found", `version ${version} does not exist for this entry`);
+    const at = nowIso();
+    entry.value = target.value;
+    entry.tags = [...target.tags];
+    entry.owner = identity.actor;
+    entry.version += 1;
+    entry.updated_at = at;
+    entry.expires_at = undefined;
+    deletedMemory.delete(id);
+    recordMemoryVersion(entry, "rollback", at);
+    return copyMemory(entry);
+  },
+
+  async promoteMemory(id: number, namespace: string): Promise<MemoryEntry> {
+    const identity = requireWrite();
+    await delay(220);
+    const entry = findLiveMemory(id);
+    const target = assertMemoryNamespace(namespace);
+    const { entry: promoted } = upsertMemory(
+      target,
+      entry.key,
+      entry.value,
+      [...entry.tags],
+      identity.actor,
+      undefined,
+    );
+    return copyMemory(promoted);
+  },
+
+  async purgeExpiredMemory(): Promise<PurgeResult> {
+    requireAdmin();
+    await delay(200);
+    const expired = memoryStore.filter((entry) => isExpiredMemory(entry));
+    for (const entry of expired) {
+      memoryHistory.delete(entry.id);
+      deletedMemory.delete(entry.id);
+    }
+    memoryStore = memoryStore.filter((entry) => !isExpiredMemory(entry));
+    return { removed: expired.length };
   },
 };
