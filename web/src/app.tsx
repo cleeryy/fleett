@@ -17,6 +17,8 @@ import { FleetPage } from "@/pages/fleet";
 import { InstanceDetailPage } from "@/pages/instance-detail";
 import { NewInstancePage } from "@/pages/instance-new";
 import { LoginPage } from "@/pages/login";
+import { ProviderDetailPage } from "@/pages/provider-detail";
+import { ProvidersPage } from "@/pages/providers";
 import { SharesPage } from "@/pages/shares";
 import { TemplatesPage } from "@/pages/templates";
 import { TokensPage } from "@/pages/tokens";
@@ -32,6 +34,8 @@ function titleFor(path: string): string {
   if (path === "/instances") return "Instances";
   if (path === "/instances/new") return "New instance";
   if (path.startsWith("/instances/")) return decodeURIComponent(path.slice("/instances/".length));
+  if (path === "/providers") return "Providers";
+  if (path.startsWith("/providers/")) return "Provider details";
   if (path === "/shares") return "Shares";
   if (path === "/templates") return "Templates";
   if (path === "/tokens") return "Tokens";
@@ -237,6 +241,7 @@ export default function App() {
   let screen: ReactNode = null;
 
   const detailMatch = /^\/instances\/([^/]+)$/.exec(path);
+  const providerMatch = /^\/providers\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
     crumbs = [{ label: "Instances" }];
@@ -255,6 +260,13 @@ export default function App() {
     const id = decodeURIComponent(detailMatch[1]);
     crumbs = [{ label: "Instances", href: "#/instances" }, { label: id, mono: true }];
     screen = <InstanceDetailPage key={id} id={id} />;
+  } else if (path === "/providers") {
+    crumbs = [{ label: "Providers" }];
+    screen = <ProvidersPage />;
+  } else if (providerMatch) {
+    const id = decodeURIComponent(providerMatch[1]);
+    crumbs = [{ label: "Providers", href: "#/providers" }, { label: "Provider details" }];
+    screen = <ProviderDetailPage key={id} id={id} />;
   } else if (path === "/shares") {
     crumbs = [{ label: "Shares" }];
     screen = <SharesPage />;

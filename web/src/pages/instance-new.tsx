@@ -23,10 +23,11 @@ import { Textarea } from "@/components/ui/textarea";
 import { EnvironmentRows } from "@/components/env-rows";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
+import { ProviderSelect } from "@/components/provider-select";
 import { SharePicker } from "@/components/share-picker";
 import { envPayload, validateEnvRows, type EnvRow } from "@/lib/env";
 import { isHttpUrl, isValidSlug } from "@/lib/validation";
-import { navigate, setRouteGuard, useRoute } from "@/lib/router";
+import { navigate, setRouteGuard, hrefFor, useRoute } from "@/lib/router";
 import { useResource } from "@/lib/use-resource";
 import { cn } from "@/lib/utils";
 
@@ -45,6 +46,7 @@ interface Draft {
   idTouched: boolean;
   template: string;
   model: string;
+  provider: string;
   baseUrl: string;
   apiKeyEnv: string;
   providerToken: string;
@@ -64,6 +66,7 @@ const DEFAULT_DRAFT: Draft = {
   idTouched: false,
   template: "",
   model: "",
+  provider: "",
   baseUrl: "https://opencode.ai/inference/go/openai/v1",
   apiKeyEnv: "HERMES_GATE_PROFILE_TOKEN",
   providerToken: "",
@@ -164,6 +167,7 @@ export function NewInstancePage() {
   const route = useRoute();
   const templates = useResource(() => api.listTemplates(), []);
   const shares = useResource(() => api.listShares(), []);
+  const providers = useResource(() => api.listProviders(), []);
 
   const [draft, setDraft] = useState<Draft>(DEFAULT_DRAFT);
   const [step, setStep] = useState(0);
@@ -270,6 +274,19 @@ export function NewInstancePage() {
     setDraft((current) => ({ ...current, channel: value, channelTouched: true }));
   }
 
+  function selectProvider(id: string) {
+    const provider = (providers.data ?? []).find((candidate) => candidate.id === id) ?? null;
+    setDraft((current) => ({
+      ...current,
+      provider: id,
+      // The provider supplies the secret: drop any per-instance token typed
+      // before. Switching back to none keeps the fields and restores the token.
+      providerToken: id ? "" : current.providerToken,
+      baseUrl: provider ? provider.base_url : current.baseUrl,
+      apiKeyEnv: provider ? provider.api_key_env : current.apiKeyEnv,
+    }));
+  }
+
   async function create() {
     for (let index = 0; index < LAST_STEP; index += 1) {
       const stepErrors = validate(draft, index);
@@ -293,7 +310,8 @@ export function NewInstancePage() {
         model: draft.model.trim(),
         base_url: draft.baseUrl.trim(),
         api_key_env: draft.apiKeyEnv.trim(),
-        gate_token: draft.providerToken.trim() || undefined,
+        provider: draft.provider || undefined,
+        gate_token: draft.provider ? undefined : draft.providerToken.trim() || undefined,
         channel: draft.channel === "none" ? { type: "none" } : { type: draft.channel, token: draft.token },
         shares: draft.shares,
         mem_limit_mb: Number(draft.memLimit),
@@ -321,7 +339,11 @@ export function NewInstancePage() {
           setAttempted(null);
           const secretEnv = draft.env.some((row) => row.secret);
           const egress = error.code === "egress_not_enforced";
-          const field = egress ? "wizard-allow-lan" : secretEnv ? null : "provider-token";
+          const field = egress
+            ? "wizard-allow-lan"
+            : secretEnv || draft.provider
+              ? null
+              : "provider-token";
           const marker = egress
             ? "[data-egress-alert]"
             : secretEnv
@@ -354,11 +376,15 @@ export function NewInstancePage() {
   const egressError = submitError?.code === "egress_not_enforced" ? submitError : null;
   const secretsError = submitError?.code === "secrets_key_missing" ? submitError : null;
   const selectedTemplate = templateList.find((template) => template.id === draft.template);
+  const providerList = providers.data ?? [];
+  const selectedProvider = providerList.find((provider) => provider.id === draft.provider) ?? null;
   const envSuggestions = (selectedTemplate?.env ?? []).filter(
     (suggestion) => !draft.env.some((row) => row.key.trim() === suggestion.key),
   );
   const envErrors = showErrors && step === 2 ? validateEnvRows(draft.env, "create").rows : {};
   const envHasSecrets = draft.env.some((row) => row.secret);
+  const secretsErrorShownInline =
+    secretsError !== null && step === 2 && (!draft.provider || envHasSecrets);
 
   return (
     <>
@@ -405,7 +431,7 @@ export function NewInstancePage() {
         </nav>
 
         <div className="min-w-0 max-w-2xl space-y-6">
-          {submitError && !(egressError && step === 2) && !(secretsError && step === 2) ? (
+          {submitError && !(egressError && step === 2) && !secretsErrorShownInline ? (
             <ErrorAlert error={submitError} />
           ) : null}
 
@@ -542,6 +568,36 @@ export function NewInstancePage() {
             {step === 2 ? (
               <div className="space-y-5">
                 <div className="space-y-2">
+                  <Label htmlFor="wizard-provider">
+                    Provider <span className="font-normal text-muted-foreground">(optional)</span>
+                  </Label>
+                  <ProviderSelect
+                    id="wizard-provider"
+                    value={draft.provider}
+                    onChange={selectProvider}
+                    providers={providerList}
+                    loading={providers.loading && !providers.data}
+                    describedBy="wizard-provider-help"
+                  />
+                  <p id="wizard-provider-help" className="text-xs text-muted-foreground">
+                    Share one API credential and inherit its base URL and variable name. The model stays
+                    per instance.
+                  </p>
+                  {providers.error ? (
+                    <p className="text-xs text-destructive">
+                      Providers could not be loaded: {providers.error.message}{" "}
+                      <button
+                        type="button"
+                        className="underline underline-offset-4"
+                        onClick={providers.reload}
+                      >
+                        Retry
+                      </button>
+                    </p>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
                   <Label htmlFor="model">Model</Label>
                   <Input
                     id="model"
@@ -593,35 +649,54 @@ export function NewInstancePage() {
                   <FieldError id="api-key-env-error" message={showErrors ? errors.apiKeyEnv : undefined} />
                 </div>
 
-                <div className="space-y-2">
-                  <Label htmlFor="provider-token">
-                    Provider token{" "}
-                    <span className="font-normal text-muted-foreground">(optional, recommended)</span>
-                  </Label>
-                  <Input
-                    id="provider-token"
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="font-mono"
-                    value={draft.providerToken}
-                    aria-describedby="provider-token-help"
-                    onChange={(event) => {
-                      update("providerToken", event.target.value);
-                      if (secretsError) setSubmitError(null);
-                    }}
-                  />
-                  <p id="provider-token-help" className="text-xs text-muted-foreground">
-                    Encrypted at rest and never returned by the API. The host needs its secrets key
-                    (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
-                    cannot call the model.
-                  </p>
-                  {secretsError && !envHasSecrets ? (
-                    <div data-secrets-alert>
-                      <ErrorAlert error={secretsError} />
-                    </div>
-                  ) : null}
-                </div>
+                {selectedProvider ? (
+                  <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
+                    <p className="text-sm">
+                      Credential supplied by provider{" "}
+                      <a
+                        href={hrefFor(`/providers/${selectedProvider.id}`)}
+                        className="font-mono underline-offset-4 hover:underline"
+                      >
+                        {selectedProvider.name}
+                      </a>
+                      .
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      No per-instance token is stored. Base URL and API key env were filled from the
+                      provider and stay editable; an explicit value wins.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label htmlFor="provider-token">
+                      Provider token{" "}
+                      <span className="font-normal text-muted-foreground">(optional, recommended)</span>
+                    </Label>
+                    <Input
+                      id="provider-token"
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="font-mono"
+                      value={draft.providerToken}
+                      aria-describedby="provider-token-help"
+                      onChange={(event) => {
+                        update("providerToken", event.target.value);
+                        if (secretsError) setSubmitError(null);
+                      }}
+                    />
+                    <p id="provider-token-help" className="text-xs text-muted-foreground">
+                      Encrypted at rest and never returned by the API. The host needs its secrets key
+                      (<span className="font-mono">sudo fleett secrets init</span>). Without it the agent
+                      cannot call the model.
+                    </p>
+                    {secretsError && !envHasSecrets ? (
+                      <div data-secrets-alert>
+                        <ErrorAlert error={secretsError} />
+                      </div>
+                    ) : null}
+                  </div>
+                )}
 
                 <div className="space-y-2">
                   <Label htmlFor="mem-limit">Memory limit (MB)</Label>
@@ -777,8 +852,34 @@ export function NewInstancePage() {
                   />
                   <ReviewRow label="API key env" value={<span className="font-mono">{draft.apiKeyEnv}</span>} />
                   <ReviewRow
+                    label="Provider"
+                    value={
+                      selectedProvider ? (
+                        <span className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={hrefFor(`/providers/${selectedProvider.id}`)}
+                            className="font-mono underline-offset-4 hover:underline"
+                          >
+                            {selectedProvider.name}
+                          </a>
+                          <Badge variant="outline" className="font-mono text-xs font-normal">
+                            {selectedProvider.kind}
+                          </Badge>
+                        </span>
+                      ) : (
+                        "None"
+                      )
+                    }
+                  />
+                  <ReviewRow
                     label="Provider token"
-                    value={draft.providerToken.trim() ? "•••••••• set" : "Not set"}
+                    value={
+                      selectedProvider
+                        ? `Supplied by provider ${selectedProvider.name}`
+                        : draft.providerToken.trim()
+                          ? "•••••••• set"
+                          : "Not set"
+                    }
                   />
                   <ReviewRow
                     label="Environment"

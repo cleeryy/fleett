@@ -91,6 +91,86 @@ export interface Template {
   env: EnvSuggestion[];
 }
 
+/* --------------------------------------------------------------------------
+ * Providers (docs/PROVIDERS.md)
+ * -------------------------------------------------------------------------- */
+
+/** Metadata of one reusable API credential. The secret is never returned. */
+export interface ProviderSummary {
+  id: string;
+  /** Lowercase slug, unique across the fleet. */
+  name: string;
+  /** `openai-compatible`, `anthropic` or `google`; metadata for the console. */
+  kind: string;
+  base_url: string;
+  /** Container variable the secret is injected under. */
+  api_key_env: string;
+  /** Instances whose `provider` is this id. */
+  instances_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One instance attached to a provider. */
+export interface ProviderInstanceRef {
+  id: string;
+  name: string;
+}
+
+/** `GET /api/providers/{id}`: the summary plus the instances that use it. */
+export interface ProviderDetail extends ProviderSummary {
+  instances: ProviderInstanceRef[];
+}
+
+/** Outcome of one instance in a rotation report. */
+export interface ProviderRestart {
+  id: string;
+  /** `healthy` when the instance came back, `failed` otherwise. */
+  status: string;
+  error?: string;
+}
+
+/** `PATCH /api/providers/{id}`: a rotated secret restarts every attached instance. */
+export interface ProviderRotateResult {
+  provider: ProviderSummary;
+  restarted: ProviderRestart[];
+}
+
+/** `POST /api/providers/{id}/test`: never contains the key. */
+export interface ProviderTestResult {
+  ok: boolean;
+  /** HTTP status of `${base_url}/models`, `0` when no answer arrived. */
+  status: number;
+  latency_ms: number;
+  error?: string;
+}
+
+/** `POST /api/providers`. */
+export interface CreateProviderInput {
+  name: string;
+  kind: string;
+  base_url: string;
+  api_key_env: string;
+  /** Write-only. Encrypted at rest. */
+  secret: string;
+}
+
+/** `PATCH /api/providers/{id}`. A missing field is left untouched. */
+export interface PatchProviderInput {
+  name?: string;
+  kind?: string;
+  base_url?: string;
+  api_key_env?: string;
+  /** Write-only. Rotates the credential and restarts attached instances. */
+  secret?: string;
+}
+
+/** `409 provider_in_use`: the instances that still reference the provider. */
+export interface ProviderInUseDetails {
+  provider?: string;
+  instances?: ProviderInstanceRef[];
+}
+
 /** One variable of an instance, as returned by the API. */
 export interface EnvEntry {
   key: string;
@@ -123,6 +203,8 @@ export interface InstanceSummary {
   shares: string[];
   /** true = also attached to the `fleett-lan` network, so the LAN is reachable. */
   allow_lan: boolean;
+  /** Provider the instance draws its API key from; absent for a legacy instance. */
+  provider?: string;
   created_at: string;
 }
 
@@ -144,6 +226,8 @@ export interface InstanceDetail {
   model: string;
   base_url: string;
   api_key_env: string;
+  /** Provider the instance draws its API key from; absent for a legacy instance. */
+  provider?: string;
   /** API.md returns the channel type as a string on read. */
   channel: string;
   status: InstanceStatus;
@@ -186,6 +270,8 @@ export interface CreateInstanceInput {
   model: string;
   base_url: string;
   api_key_env: string;
+  /** Reusable provider credential. `base_url`/`api_key_env` default to its values. */
+  provider?: string;
   /** Write-only. Encrypted at rest as HERMES_GATE_PROFILE_TOKEN. */
   gate_token?: string;
   channel: ChannelInput;
@@ -209,6 +295,11 @@ export interface CloneInstanceInput {
   name?: string;
   /** Defaults to the source model. */
   model?: string;
+  /**
+   * Provider of the clone. Omitted inherits the source provider; an empty
+   * string detaches it (then a gate token is required).
+   */
+  provider?: string;
   /** Replacement for `HERMES_GATE_PROFILE_TOKEN` (and `api_key_env`). */
   gate_token?: string;
   /** Replacement for the platform bot token of the source channel. */
@@ -230,6 +321,8 @@ export interface PatchInstanceInput {
   model?: string;
   base_url?: string;
   api_key_env?: string;
+  /** `null` detaches the provider; a missing field leaves it in place. */
+  provider?: string | null;
   /** Write-only. Rotates the provider key written as HERMES_GATE_PROFILE_TOKEN. */
   gate_token?: string;
   channel?: ChannelInput;
@@ -393,6 +486,12 @@ export interface FleetApi {
   /** Clears the session cookies. Harmless when there is no session. */
   logout(): Promise<void>;
   listTemplates(): Promise<Template[]>;
+  listProviders(): Promise<ProviderSummary[]>;
+  createProvider(input: CreateProviderInput): Promise<ProviderSummary>;
+  getProvider(id: string): Promise<ProviderDetail>;
+  patchProvider(id: string, input: PatchProviderInput): Promise<ProviderRotateResult>;
+  deleteProvider(id: string): Promise<void>;
+  testProvider(id: string): Promise<ProviderTestResult>;
   listInstances(): Promise<InstanceSummary[]>;
   getInstance(id: string): Promise<InstanceDetail>;
   /** Replaces the whole environment and applies it: rewrites compose and runs `up -d`. */

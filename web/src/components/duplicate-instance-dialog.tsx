@@ -16,7 +16,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ErrorAlert } from "@/components/error-alert";
+import { ProviderSelect } from "@/components/provider-select";
 import { isValidSlug } from "@/lib/validation";
+import { useResource } from "@/lib/use-resource";
 
 const GATE_ENV = "HERMES_GATE_PROFILE_TOKEN";
 const ID_MAX = 32;
@@ -67,6 +69,7 @@ const FIELD_IDS: Record<string, string> = {
   channel_token: "duplicate-channel-token",
   id: "duplicate-id",
   name: "duplicate-name",
+  provider: "duplicate-provider",
 };
 
 export function DuplicateInstanceDialog({
@@ -83,6 +86,7 @@ export function DuplicateInstanceDialog({
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
+  const [providerId, setProviderId] = useState("");
   const [gateToken, setGateToken] = useState("");
   const [channelToken, setChannelToken] = useState("");
   const [copyData, setCopyData] = useState(true);
@@ -92,6 +96,7 @@ export function DuplicateInstanceDialog({
   const [error, setError] = useState<ApiError | null>(null);
   const [missing, setMissing] = useState<string[]>([]);
   const [idConflict, setIdConflict] = useState<string | null>(null);
+  const providers = useResource(() => api.listProviders(), []);
 
   // The page refreshes the source while the dialog is open; only the props
   // captured when it opened may seed the draft.
@@ -104,6 +109,7 @@ export function DuplicateInstanceDialog({
     setId(defaultCloneId(current.id));
     setName(defaultCloneName(current.name));
     setModel("");
+    setProviderId(current.provider ?? "");
     setGateToken("");
     setChannelToken("");
     setCopyData(true);
@@ -117,18 +123,24 @@ export function DuplicateInstanceDialog({
 
   const providerKeys = gateKeys(source);
   const botKey = channelKey(source);
-  const providerRequired = providerKeys.some((key) => holdsEnv(source, key));
+  const gateEnvPresent = providerKeys.some((key) => holdsEnv(source, key));
   const botRequired = botKey !== null && holdsEnv(source, botKey);
+
+  const providerSelected = providerId !== "";
+  const selectedProvider = (providers.data ?? []).find((provider) => provider.id === providerId) ?? null;
+  const providerLabel = selectedProvider?.name ?? providerId;
 
   const missingProvider = missing.filter((key) => key !== botKey);
   const missingChannel = botKey ? missing.filter((key) => key === botKey) : [];
-  // A refusal names keys the read missed, so it also makes them required.
-  const providerNeeded = providerRequired || missingProvider.length > 0;
+  // A refusal names keys the read missed, so it also makes them required. A
+  // source on a provider holds no gate secret of its own, yet a clone detached
+  // from it still needs one: the provider was supplying that credential.
+  const providerNeeded =
+    !providerSelected && (gateEnvPresent || source.provider !== undefined || missingProvider.length > 0);
   const botNeeded = botRequired || missingChannel.length > 0;
   // A source holding a bot token always gets the field; so does a refusal that
   // names it, should the read have missed the key.
   const showBotField = botKey !== null && botNeeded;
-  const tokensNeeded = providerNeeded || botNeeded;
 
   const errors: Record<string, string> = {};
   const trimmedId = id.trim();
@@ -143,7 +155,7 @@ export function DuplicateInstanceDialog({
     errors.channel_token = "Enter a replacement bot token.";
   }
 
-  const providerError = !gateToken.trim()
+  const providerError = !providerSelected && !gateToken.trim()
     ? missingProvider.length > 0
       ? `The source holds ${missingProvider.join(", ")}. Clones never inherit secrets; enter a replacement.`
       : attempted
@@ -164,6 +176,17 @@ export function DuplicateInstanceDialog({
     document.getElementById(FIELD_IDS[key] ?? key)?.focus();
   }
 
+  function selectProvider(next: string) {
+    setProviderId(next);
+    if (next) {
+      // A provider supplies the gate credential; drop any typed token and the
+      // refusal that named it.
+      setGateToken("");
+      setMissing((previous) => previous.filter((key) => key === botKey));
+      if (error?.code === "clone_token_required") setError(null);
+    }
+  }
+
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setAttempted(true);
@@ -178,7 +201,8 @@ export function DuplicateInstanceDialog({
       new_id: trimmedId,
       name: name.trim(),
       model: model.trim() || undefined,
-      gate_token: gateToken.trim() || undefined,
+      provider: providerId,
+      gate_token: providerSelected ? undefined : gateToken.trim() || undefined,
       channel_token: channelToken.trim() || undefined,
       shares_inherit: inheritShares,
       copy_data: copyData,
@@ -201,7 +225,11 @@ export function DuplicateInstanceDialog({
         const keys = cloneMissing(failure);
         setMissing(keys);
         // Focus the first field that needs a value, in reading order.
-        const target = keys.some((key) => key !== botKey) ? "gate_token" : "channel_token";
+        const target = keys.some((key) => key !== botKey)
+          ? providerSelected
+            ? "provider"
+            : "gate_token"
+          : "channel_token";
         window.requestAnimationFrame(() => focusField(target));
       } else {
         setError(failure);
@@ -290,64 +318,115 @@ export function DuplicateInstanceDialog({
 
             <div className="space-y-4 rounded-md border p-4">
               <div className="space-y-1">
-                <p className="text-sm font-medium">Tokens</p>
+                <p className="text-sm font-medium">Credential</p>
                 <p className="text-xs text-muted-foreground">
-                  {tokensNeeded
-                    ? "The clone gets new tokens. Nothing is carried over from the source."
-                    : "The source holds no tokens. Nothing to replace."}
+                  A provider is a reference, not a secret: the clone can keep the source provider without a
+                  token. The chat bot token stays per instance.
                 </p>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="duplicate-gate-token">
-                  Provider token{" "}
-                  <span className="font-normal text-muted-foreground">
-                    {providerNeeded ? "(required)" : "(optional)"}
-                  </span>
-                </Label>
-                <Input
-                  id="duplicate-gate-token"
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="font-mono"
-                  value={gateToken}
-                  aria-invalid={!!providerError}
-                  aria-describedby={
-                    providerError
-                      ? "duplicate-gate-token-help duplicate-gate-token-error"
-                      : "duplicate-gate-token-help"
-                  }
-                  onChange={(event) => {
-                    setGateToken(event.target.value);
-                    if (missingProvider.length > 0) {
-                      setMissing((previous) => previous.filter((key) => key === botKey));
-                    }
-                  }}
+                <Label htmlFor="duplicate-provider">Provider</Label>
+                <ProviderSelect
+                  id="duplicate-provider"
+                  value={providerId}
+                  onChange={selectProvider}
+                  providers={providers.data ?? []}
+                  loading={providers.loading && !providers.data}
+                  describedBy="duplicate-provider-help"
                 />
-                {providerError ? (
-                  <p id="duplicate-gate-token-error" className="text-xs text-destructive">
-                    {providerError}
+                <p id="duplicate-provider-help" className="text-xs text-muted-foreground">
+                  {source.provider ? (
+                    <>
+                      The source uses a provider and the clone inherits it by default. Choosing{" "}
+                      <span className="text-foreground">None</span> requires a replacement token.
+                    </>
+                  ) : (
+                    <>
+                      The source has no provider. Pick one to share a credential, or leave{" "}
+                      <span className="text-foreground">None</span> to give the clone its own token.
+                    </>
+                  )}
+                </p>
+                {providers.error ? (
+                  <p className="text-xs text-destructive">
+                    Providers could not be loaded: {providers.error.message}{" "}
+                    <button
+                      type="button"
+                      className="underline underline-offset-4"
+                      onClick={providers.reload}
+                    >
+                      Retry
+                    </button>
                   </p>
                 ) : null}
-                <p id="duplicate-gate-token-help" className="text-xs text-muted-foreground">
-                  {providerError ? null : providerRequired ? (
-                    <>
-                      The source holds{" "}
-                      <span className="font-mono break-all">
-                        {providerKeys.filter((key) => holdsEnv(source, key)).join(", ")}
-                      </span>
-                      .{" "}
-                    </>
-                  ) : missingProvider.length > 0 ? (
-                    <>
-                      The source holds{" "}
-                      <span className="font-mono break-all">{missingProvider.join(", ")}</span>.{" "}
-                    </>
-                  ) : null}
-                  Encrypted at rest and never returned by the API.
-                </p>
               </div>
+
+              {providerSelected ? (
+                <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
+                  <p className="text-sm">
+                    Credential supplied by provider{" "}
+                    <span className="font-mono">{providerLabel}</span>.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    No token is copied or required. Rotating that secret later restarts every attached
+                    instance, this clone included.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <Label htmlFor="duplicate-gate-token">
+                    Provider token{" "}
+                    <span className="font-normal text-muted-foreground">
+                      {providerNeeded ? "(required)" : "(optional)"}
+                    </span>
+                  </Label>
+                  <Input
+                    id="duplicate-gate-token"
+                    type="password"
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="font-mono"
+                    value={gateToken}
+                    aria-invalid={!!providerError}
+                    aria-describedby={
+                      providerError
+                        ? "duplicate-gate-token-help duplicate-gate-token-error"
+                        : "duplicate-gate-token-help"
+                    }
+                    onChange={(event) => {
+                      setGateToken(event.target.value);
+                      if (missingProvider.length > 0) {
+                        setMissing((previous) => previous.filter((key) => key === botKey));
+                      }
+                    }}
+                  />
+                  {providerError ? (
+                    <p id="duplicate-gate-token-error" className="text-xs text-destructive">
+                      {providerError}
+                    </p>
+                  ) : null}
+                  <p id="duplicate-gate-token-help" className="text-xs text-muted-foreground">
+                    {providerError ? null : gateEnvPresent ? (
+                      <>
+                        The source holds{" "}
+                        <span className="font-mono break-all">
+                          {providerKeys.filter((key) => holdsEnv(source, key)).join(", ")}
+                        </span>
+                        .{" "}
+                      </>
+                    ) : source.provider ? (
+                      <>The source draws its key from a provider; detaching needs a replacement token. </>
+                    ) : missingProvider.length > 0 ? (
+                      <>
+                        The source holds{" "}
+                        <span className="font-mono break-all">{missingProvider.join(", ")}</span>.{" "}
+                      </>
+                    ) : null}
+                    Encrypted at rest and never returned by the API.
+                  </p>
+                </div>
+              )}
 
               {showBotField && botKey ? (
                 <div className="space-y-2">

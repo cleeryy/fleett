@@ -4,6 +4,16 @@ export function isValidSlug(value: string): boolean {
   return SLUG_RE.test(value);
 }
 
+/**
+ * Provider names follow the controller grammar (`[a-z0-9-]{2,63}`, starting
+ * with a letter or digit). Unlike an instance id, a trailing hyphen is allowed.
+ */
+export const PROVIDER_NAME_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
+
+export function isValidProviderName(value: string): boolean {
+  return PROVIDER_NAME_RE.test(value);
+}
+
 /** Extensions the instance editor accepts, mirroring `docs/FILES.md`. */
 export const EDITABLE_EXTENSIONS = ["md", "yaml", "yml", "json", "txt", "toml"] as const;
 

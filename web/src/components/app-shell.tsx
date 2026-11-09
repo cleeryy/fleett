@@ -7,6 +7,7 @@ import {
   LogOut,
   Menu,
   Moon,
+  Plug,
   ScrollText,
   Sun,
   type LucideIcon,
@@ -42,6 +43,7 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { key: "instances", label: "Instances", href: "#/instances", icon: Boxes },
+  { key: "providers", label: "Providers", href: "#/providers", icon: Plug },
   { key: "shares", label: "Shares", href: "#/shares", icon: FolderTree },
   { key: "templates", label: "Templates", href: "#/templates", icon: LayoutTemplate },
   { key: "tokens", label: "Tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
@@ -49,6 +51,7 @@ const NAV: NavItem[] = [
 ];
 
 function activeKey(path: string): string {
+  if (path.startsWith("/providers")) return "providers";
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/templates")) return "templates";
   if (path.startsWith("/tokens")) return "tokens";

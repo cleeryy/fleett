@@ -5,6 +5,7 @@ import type {
   AuditEntry,
   AuthConfig,
   CreateInstanceInput,
+  CreateProviderInput,
   CreateTokenInput,
   CreatedToken,
   EnvInput,
@@ -23,6 +24,11 @@ import type {
   LifecycleResult,
   MkdirResult,
   PatchInstanceInput,
+  PatchProviderInput,
+  ProviderDetail,
+  ProviderRotateResult,
+  ProviderSummary,
+  ProviderTestResult,
   RevertInput,
   RevertResult,
   Share,
@@ -134,6 +140,25 @@ export const httpApi: FleetApi = {
   logout: () => request<void>("/auth/logout", { method: "POST" }, { signalUnauthorized: false }),
 
   listTemplates: () => request<Template[]>("/api/templates"),
+
+  listProviders: () => request<ProviderSummary[]>("/api/providers"),
+
+  createProvider: (input: CreateProviderInput) =>
+    request<ProviderSummary>("/api/providers", { method: "POST", body: JSON.stringify(input) }),
+
+  getProvider: (id) => request<ProviderDetail>(`/api/providers/${encodeURIComponent(id)}`),
+
+  patchProvider: (id, input: PatchProviderInput) =>
+    request<ProviderRotateResult>(`/api/providers/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deleteProvider: (id) =>
+    request<void>(`/api/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  testProvider: (id) =>
+    request<ProviderTestResult>(`/api/providers/${encodeURIComponent(id)}/test`, { method: "POST" }),
 
   listInstances: () => request<InstanceSummary[]>("/api/instances"),
 

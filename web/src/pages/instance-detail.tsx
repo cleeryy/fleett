@@ -14,7 +14,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { ChannelType, EnvEntry, InstanceDetail, PatchInstanceInput, ShareRef } from "@/api/types";
+import type { ChannelType, EnvEntry, InstanceDetail, PatchInstanceInput, ProviderSummary, ShareRef } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -52,7 +52,7 @@ import { SharePicker } from "@/components/share-picker";
 import { StatusBadge } from "@/components/status-badge";
 import { envRowsFromDetail, envRowsMatch, type EnvRow } from "@/lib/env";
 import { formatClock, formatDateTime, formatRelative, formatUptime, plural } from "@/lib/format";
-import { navigate } from "@/lib/router";
+import { navigate, hrefFor } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 import { isHttpUrl } from "@/lib/validation";
@@ -93,15 +93,18 @@ function hasEnv(detail: InstanceDetail, key: string): boolean {
 
 function OverviewTab({
   detail,
+  provider,
   canEdit,
   onConfigure,
 }: {
   detail: InstanceDetail;
+  provider: ProviderSummary | null;
   canEdit: boolean;
   onConfigure: () => void;
 }) {
   const env = tokenEnv(detail);
-  const providerKeySet = hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
+  const suppliedByProvider = !!detail.provider;
+  const providerKeySet = suppliedByProvider || hasEnv(detail, "HERMES_GATE_PROFILE_TOKEN");
   const secretCount = detail.env.filter((entry) => entry.secret).length;
 
   return (
@@ -122,10 +125,44 @@ function OverviewTab({
             items={[
               { label: "Model", value: <Mono>{detail.model}</Mono> },
               { label: "Base URL", value: <CopyValue value={detail.base_url} label="base URL" /> },
+              ...(detail.provider
+                ? [
+                    {
+                      label: "Provider",
+                      value: (
+                        <span className="flex flex-wrap items-center gap-2">
+                          <a
+                            href={hrefFor(`/providers/${detail.provider}`)}
+                            className="font-mono text-xs underline-offset-4 hover:underline"
+                          >
+                            {provider?.name ?? detail.provider}
+                          </a>
+                          {provider ? (
+                            <Badge variant="outline" className="font-mono text-xs font-normal">
+                              {provider.kind}
+                            </Badge>
+                          ) : null}
+                          <span className="text-xs text-muted-foreground">
+                            supplies the API key
+                          </span>
+                        </span>
+                      ),
+                    },
+                  ]
+                : []),
               { label: "API key env", value: <Mono>{detail.api_key_env}</Mono> },
               {
                 label: "Provider key",
-                value: providerKeySet ? (
+                value: suppliedByProvider ? (
+                  <span className="flex flex-wrap items-center gap-2">
+                    <Badge variant="secondary" className="font-mono text-xs font-normal">
+                      provider
+                    </Badge>
+                    <Mono className="text-muted-foreground">
+                      {provider?.name ?? detail.provider}
+                    </Mono>
+                  </span>
+                ) : providerKeySet ? (
                   <span className="flex flex-wrap items-center gap-2">
                     <Badge variant="outline" className="font-mono text-xs font-normal">
                       set
@@ -378,6 +415,7 @@ const CONFIG_FIELD_IDS: Record<string, string> = {
 
 function ConfigurationTab({
   detail,
+  provider,
   draft,
   onDraftChange,
   envRows,
@@ -386,6 +424,7 @@ function ConfigurationTab({
   onEnvApplied,
 }: {
   detail: InstanceDetail;
+  provider: ProviderSummary | null;
   draft: ConfigDraft;
   onDraftChange: (next: ConfigDraft) => void;
   envRows: EnvRow[];
@@ -557,28 +596,47 @@ function ConfigurationTab({
           </div>
         </div>
 
-        <div className="space-y-2">
-          <Label htmlFor="cfg-gate-token">Provider token</Label>
-          <Input
-            id="cfg-gate-token"
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            className="font-mono"
-            value={draft.gate_token}
-            placeholder={providerKeySet ? "Keep current token" : "Not set"}
-            aria-describedby="cfg-gate-token-help"
-            onChange={(event) => update("gate_token", event.target.value)}
-          />
-          <p id="cfg-gate-token-help" className="text-xs text-muted-foreground">
-            {providerKeySet
-              ? "A provider key is stored. Leave empty to keep it."
-              : "No provider key stored. The agent cannot call the model without one."}{" "}
-            Encrypted at rest and never returned by the API. The host needs its secrets key
-            (<span className="font-mono">sudo fleett secrets init</span>).
-          </p>
-          {secretsError ? <ErrorAlert error={secretsError} /> : null}
-        </div>
+        {provider ? (
+          <div className="space-y-1 rounded-md border bg-muted/20 px-3 py-2.5">
+            <p className="text-sm">
+              Credential supplied by provider{" "}
+              <a
+                href={hrefFor(`/providers/${provider.id}`)}
+                className="font-mono underline-offset-4 hover:underline"
+              >
+                {provider.name}
+              </a>
+              .
+            </p>
+            <p className="text-xs text-muted-foreground">
+              No per-instance key is stored. Base URL and API key env stay editable here; rotate the
+              secret on the provider to change the credential for every attached instance.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <Label htmlFor="cfg-gate-token">Provider token</Label>
+            <Input
+              id="cfg-gate-token"
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              value={draft.gate_token}
+              placeholder={providerKeySet ? "Keep current token" : "Not set"}
+              aria-describedby="cfg-gate-token-help"
+              onChange={(event) => update("gate_token", event.target.value)}
+            />
+            <p id="cfg-gate-token-help" className="text-xs text-muted-foreground">
+              {providerKeySet
+                ? "A provider key is stored. Leave empty to keep it."
+                : "No provider key stored. The agent cannot call the model without one."}{" "}
+              Encrypted at rest and never returned by the API. The host needs its secrets key
+              (<span className="font-mono">sudo fleett secrets init</span>).
+            </p>
+            {secretsError ? <ErrorAlert error={secretsError} /> : null}
+          </div>
+        )}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
@@ -822,6 +880,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const [duplicateOpen, setDuplicateOpen] = useState(false);
 
   const detail = useResource(() => api.getInstance(id), [id, nonce]);
+  const providers = useResource(() => api.listProviders(), []);
 
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [envRows, setEnvRows] = useState<EnvRow[] | null>(null);
@@ -903,6 +962,9 @@ export function InstanceDetailPage({ id }: { id: string }) {
   const data = detail.data;
   const running = data.status === "running";
   const busy = pendingAction !== null;
+  const provider = data.provider
+    ? (providers.data?.find((candidate) => candidate.id === data.provider) ?? null)
+    : null;
   const uptime =
     running && data.container ? formatUptime(data.container.uptime_s) : null;
 
@@ -1014,7 +1076,12 @@ export function InstanceDetailPage({ id }: { id: string }) {
         </div>
 
         <TabsContent value="overview" className="mt-4">
-          <OverviewTab detail={data} canEdit={canEdit} onConfigure={() => setTab("configuration")} />
+          <OverviewTab
+            detail={data}
+            provider={provider}
+            canEdit={canEdit}
+            onConfigure={() => setTab("configuration")}
+          />
         </TabsContent>
 
         {canEdit ? (
@@ -1022,6 +1089,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
             {configDraft && envRows ? (
               <ConfigurationTab
                 detail={data}
+                provider={provider}
                 draft={configDraft}
                 onDraftChange={setConfigDraft}
                 envRows={envRows}

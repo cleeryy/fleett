@@ -7,6 +7,7 @@ import type {
   CloneInstanceInput,
   CommitInfo,
   CreateInstanceInput,
+  CreateProviderInput,
   CreateTokenInput,
   CreatedToken,
   EnvInput,
@@ -26,6 +27,12 @@ import type {
   LifecycleResult,
   MkdirResult,
   PatchInstanceInput,
+  PatchProviderInput,
+  ProviderDetail,
+  ProviderRestart,
+  ProviderRotateResult,
+  ProviderSummary,
+  ProviderTestResult,
   RevertInput,
   RevertResult,
   Role,
@@ -38,7 +45,7 @@ import type {
 } from "./types";
 import { toPatch } from "@/lib/diff";
 import { tokenStore } from "@/lib/token";
-import { isValidSlug } from "@/lib/validation";
+import { isValidProviderName, isValidSlug, isHttpUrl } from "@/lib/validation";
 
 /**
  * In-memory adapter used when VITE_MOCK is on (default in development).
@@ -111,6 +118,8 @@ interface Stored {
   model: string;
   base_url: string;
   api_key_env: string;
+  /** Provider credential this instance draws its key from. */
+  provider: string | null;
   /** Write-only secret; only its presence is exposed through the env list. */
   gate_token: string | null;
   /** Write-only secret for the platform bot; never returned. */
@@ -133,6 +142,24 @@ interface Stored {
   fail_next: boolean;
   logs: string[];
 }
+
+/** One reusable credential (issue #25). The secret stays inside the mock. */
+interface StoredProvider {
+  id: string;
+  name: string;
+  kind: string;
+  base_url: string;
+  api_key_env: string;
+  secret: string;
+  created_at: string;
+  updated_at: string;
+}
+
+const PROVIDER_KINDS = ["openai-compatible", "anthropic", "google"] as const;
+
+const SHARED_PROVIDER_ID = "9e2c1a44-6b1e-4f2c-9d1a-3f6c1e7a2b10";
+const ANTHROPIC_PROVIDER_ID = "4b7d2f10-8c3a-4e5b-a6d9-1f2e3c4b5a60";
+const GOOGLE_PROVIDER_ID = "c1a2b3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -168,6 +195,7 @@ let shares: Share[] = [];
 let templates: Template[] = [];
 let tokens: TokenInfo[] = [];
 let audit: AuditEntry[] = [];
+let providerStore: StoredProvider[] = [];
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -284,6 +312,66 @@ function cloneDefaultName(source: string): string {
   return base ? `${base}${suffix}` : "copy";
 }
 
+function findProvider(id: string): StoredProvider {
+  const provider = providerStore.find((candidate) => candidate.id === id);
+  if (!provider) fail(404, "not_found", `provider "${id}" not found`);
+  return provider;
+}
+
+/** Instances whose `provider` is this id, sorted by id like the controller. */
+function providerInstances(provider: StoredProvider): { id: string; name: string }[] {
+  return rows
+    .filter((row) => row.provider === provider.id)
+    .map((row) => ({ id: row.id, name: row.name }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function providerSummary(provider: StoredProvider): ProviderSummary {
+  return {
+    id: provider.id,
+    name: provider.name,
+    kind: provider.kind,
+    base_url: provider.base_url,
+    api_key_env: provider.api_key_env,
+    instances_count: providerInstances(provider).length,
+    created_at: provider.created_at,
+    updated_at: provider.updated_at,
+  };
+}
+
+function providerDetail(provider: StoredProvider): ProviderDetail {
+  const instances = providerInstances(provider);
+  return { ...providerSummary(provider), instances };
+}
+
+function assertProviderName(name: string): void {
+  if (!isValidProviderName(name)) {
+    fail(
+      400,
+      "invalid_name",
+      "provider name must be 2 to 63 characters: lowercase letters, digits and hyphens, starting with a letter or digit",
+    );
+  }
+}
+
+function assertProviderKind(kind: string): void {
+  if (!PROVIDER_KINDS.includes(kind as (typeof PROVIDER_KINDS)[number])) {
+    fail(400, "invalid_kind", `kind must be one of ${PROVIDER_KINDS.join(", ")}`);
+  }
+}
+
+function assertProviderBaseUrl(value: string): void {
+  if (!value.trim() || !isHttpUrl(value.trim())) {
+    fail(400, "invalid_base_url", "base_url must be an absolute http or https URL");
+  }
+}
+
+function assertProviderKeyEnv(value: string): void {
+  if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(value)) {
+    fail(400, "invalid_api_key_env", "api_key_env must match ^[A-Z_][A-Z0-9_]{0,63}$");
+  }
+}
+
 function composeYaml(row: Stored): string {
   const mounts = [`      - ./data:/opt/data`];
   for (const share of row.shares) {
@@ -302,7 +390,9 @@ function composeYaml(row: Stored): string {
     `      HERMES_BASE_URL: ${row.base_url}`,
     channelLine,
   ];
-  if (row.gate_token) {
+  if (row.provider) {
+    environment.push(`      ${row.api_key_env}: \${${row.api_key_env}}`);
+  } else if (row.gate_token) {
     environment.push("      HERMES_GATE_PROFILE_TOKEN: ${HERMES_GATE_PROFILE_TOKEN}");
   }
   if (row.channel === "telegram") {
@@ -363,6 +453,7 @@ function toDetail(row: Stored): InstanceDetail {
     model: row.model,
     base_url: row.base_url,
     api_key_env: row.api_key_env,
+    provider: row.provider ?? undefined,
     channel: row.channel,
     status: row.status,
     shares: row.shares.map((share) => ({ ...share })),
@@ -395,6 +486,7 @@ function toSummary(row: Stored): InstanceSummary {
     status: row.status,
     shares: row.shares.map((share) => share.name),
     allow_lan: row.allow_lan,
+    provider: row.provider ?? undefined,
     created_at: row.created_at,
   };
 }
@@ -517,18 +609,24 @@ function seedRow(input: {
   allow_lan?: boolean;
   notes?: string;
   last_error?: string | null;
+  /** Reusable credential the instance draws its API key from. */
+  provider?: string;
   gate_token?: string;
   env?: { key: string; value: string; secret?: boolean }[];
 }): Stored {
   const created = SEEDED_AT - input.age_days * DAY;
   const running = input.status === "running";
+  const provider = input.provider
+    ? providerStore.find((candidate) => candidate.id === input.provider)
+    : undefined;
   const row: Stored = {
     id: input.id,
     name: input.name,
     template: input.template,
     model: input.model,
-    base_url: "https://opencode.ai/inference/go/openai/v1",
-    api_key_env: "HERMES_GATE_PROFILE_TOKEN",
+    base_url: provider?.base_url ?? "https://opencode.ai/inference/go/openai/v1",
+    api_key_env: provider?.api_key_env ?? "HERMES_GATE_PROFILE_TOKEN",
+    provider: provider?.id ?? null,
     gate_token: input.gate_token ?? null,
     channel_token: input.channel === "none" ? null : `seed-${input.id}-channel-token`,
     channel: input.channel,
@@ -1199,6 +1297,39 @@ export function resetMock(): void {
     },
   ];
 
+  providerStore = [
+    {
+      id: SHARED_PROVIDER_ID,
+      name: "shared",
+      kind: "openai-compatible",
+      base_url: "https://opencode.ai/inference/go/openai/v1",
+      api_key_env: GATE_ENV,
+      secret: "sk-demo-shared",
+      created_at: iso(SEEDED_AT - 30 * DAY),
+      updated_at: iso(SEEDED_AT - 2 * DAY),
+    },
+    {
+      id: ANTHROPIC_PROVIDER_ID,
+      name: "anthropic-main",
+      kind: "anthropic",
+      base_url: "https://api.anthropic.com/v1",
+      api_key_env: "ANTHROPIC_API_KEY",
+      secret: "sk-ant-demo",
+      created_at: iso(SEEDED_AT - 18 * DAY),
+      updated_at: iso(SEEDED_AT - 6 * HOUR),
+    },
+    {
+      id: GOOGLE_PROVIDER_ID,
+      name: "google-free",
+      kind: "google",
+      base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+      api_key_env: "GEMINI_API_KEY",
+      secret: "AIza-demo",
+      created_at: iso(SEEDED_AT - 4 * DAY),
+      updated_at: iso(SEEDED_AT - DAY),
+    },
+  ];
+
   rows = [
     seedRow({
       id: "alice",
@@ -1210,7 +1341,7 @@ export function resetMock(): void {
       shares: [{ name: "findings", mode: "rw" }],
       age_days: 3,
       uptime_hours: 4.2,
-      gate_token: "seed-alice",
+      provider: SHARED_PROVIDER_ID,
       env: [{ key: "TELEGRAM_ALLOWED_USERS", value: "81459823" }],
       notes: "Friend account. Telegram bot for personal use.",
     }),
@@ -1244,7 +1375,7 @@ export function resetMock(): void {
       ],
       age_days: 6,
       uptime_hours: 51,
-      gate_token: "seed-ops",
+      provider: SHARED_PROVIDER_ID,
       mem_limit_mb: 3072,
       allow_lan: true,
       notes: "Homelab diagnostics. No Docker socket. Reaches the management VLAN.",
@@ -1265,13 +1396,13 @@ export function resetMock(): void {
       id: "workshop",
       name: "Workshop",
       template: "ops",
-      model: "muse-spark-1.3-contributor",
+      model: "claude-sonnet-4-20250514",
       channel: "none",
       status: "error",
       shares: [],
       age_days: 1,
       uptime_hours: null,
-      gate_token: "seed-workshop",
+      provider: ANTHROPIC_PROVIDER_ID,
       last_error: DOCKER_ERROR,
       notes: "Template check. Kept for the error state.",
     }),
@@ -1486,6 +1617,173 @@ export const mockApi: FleetApi = {
     }));
   },
 
+  async listProviders(): Promise<ProviderSummary[]> {
+    requireAuth();
+    await delay();
+    return [...providerStore]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(providerSummary);
+  },
+
+  async createProvider(input: CreateProviderInput): Promise<ProviderSummary> {
+    requireAdmin();
+    await delay(320);
+    const name = input.name.trim();
+    assertProviderName(name);
+    if (providerStore.some((provider) => provider.name === name)) {
+      fail(409, "provider_exists", `a provider named "${name}" already exists`);
+    }
+    const kind = input.kind.trim();
+    assertProviderKind(kind);
+    const base_url = input.base_url.trim();
+    assertProviderBaseUrl(base_url);
+    const api_key_env = input.api_key_env.trim();
+    assertProviderKeyEnv(api_key_env);
+    if (!input.secret.trim()) fail(400, "invalid_secret", "secret must not be empty");
+    assertSecretsKey(input.secret);
+
+    const created = Date.now();
+    const provider: StoredProvider = {
+      id: crypto.randomUUID(),
+      name,
+      kind,
+      base_url,
+      api_key_env,
+      secret: input.secret,
+      created_at: iso(created),
+      updated_at: iso(created),
+    };
+    providerStore = [...providerStore, provider];
+    recordAudit(requireAuth(), "provider.create", provider.id, {
+      name,
+      kind,
+      base_url,
+      api_key_env,
+    });
+    return providerSummary(provider);
+  },
+
+  async getProvider(id: string): Promise<ProviderDetail> {
+    requireAuth();
+    await delay();
+    return providerDetail(findProvider(id));
+  },
+
+  async patchProvider(id: string, input: PatchProviderInput): Promise<ProviderRotateResult> {
+    requireAdmin();
+    await delay(340);
+    const provider = findProvider(id);
+
+    if (input.name !== undefined) {
+      const name = input.name.trim();
+      assertProviderName(name);
+      if (providerStore.some((candidate) => candidate.id !== id && candidate.name === name)) {
+        fail(409, "provider_exists", `a provider named "${name}" already exists`);
+      }
+      provider.name = name;
+    }
+    if (input.kind !== undefined) {
+      const kind = input.kind.trim();
+      assertProviderKind(kind);
+      provider.kind = kind;
+    }
+    if (input.base_url !== undefined) {
+      const base_url = input.base_url.trim();
+      assertProviderBaseUrl(base_url);
+      provider.base_url = base_url;
+    }
+    if (input.api_key_env !== undefined) {
+      const api_key_env = input.api_key_env.trim();
+      assertProviderKeyEnv(api_key_env);
+      provider.api_key_env = api_key_env;
+    }
+
+    const rotated = input.secret !== undefined;
+    if (rotated) {
+      if (!input.secret?.trim()) fail(400, "invalid_secret", "secret must not be empty");
+      assertSecretsKey(input.secret);
+      provider.secret = input.secret;
+    }
+    provider.updated_at = nowIso();
+
+    // A rotation restarts every attached instance sequentially and reports one
+    // outcome per instance; a failure never blocks the others.
+    const restarted: ProviderRestart[] = [];
+    if (rotated) {
+      for (const row of rows.filter((candidate) => candidate.provider === id)) {
+        row.updated_at = nowIso();
+        if (row.status === "error") {
+          restarted.push({
+            id: row.id,
+            status: "failed",
+            error: row.last_error ?? "the instance did not become healthy",
+          });
+          continue;
+        }
+        row.status = "running";
+        row.container_id = row.container_id ?? containerId();
+        row.started_at = Date.now();
+        row.last_error = null;
+        restarted.push({ id: row.id, status: "healthy" });
+      }
+      recordAudit(requireAuth(), "provider.rotate", provider.id, {
+        name: provider.name,
+        api_key_env: provider.api_key_env,
+        restarted: restarted.map((entry) => ({ id: entry.id, status: entry.status })),
+      });
+    } else {
+      recordAudit(requireAuth(), "provider.update", provider.id, {
+        name: provider.name,
+        kind: provider.kind,
+        base_url: provider.base_url,
+        api_key_env: provider.api_key_env,
+      });
+    }
+
+    return { provider: providerSummary(provider), restarted };
+  },
+
+  async deleteProvider(id: string): Promise<void> {
+    requireAdmin();
+    await delay(280);
+    const provider = findProvider(id);
+    const attached = providerInstances(provider);
+    if (attached.length > 0) {
+      fail(
+        409,
+        "provider_in_use",
+        `provider "${provider.name}" is still used by ${attached.length} instance(s)`,
+        { provider: id, instances: attached },
+      );
+    }
+    providerStore = providerStore.filter((candidate) => candidate.id !== id);
+    recordAudit(requireAuth(), "provider.delete", id, {
+      name: provider.name,
+      kind: provider.kind,
+      base_url: provider.base_url,
+      api_key_env: provider.api_key_env,
+    });
+  },
+
+  async testProvider(id: string): Promise<ProviderTestResult> {
+    requireAdmin();
+    await delay(520);
+    const provider = findProvider(id);
+    if (!mockConfig.secretsKey) {
+      fail(409, "secrets_key_missing", SECRETS_ERROR);
+    }
+    const latency_ms = 60 + Math.floor(Math.random() * 260);
+    if (/(invalid|unreachable|localhost)/i.test(provider.base_url)) {
+      return {
+        ok: false,
+        status: 0,
+        latency_ms,
+        error: "cannot reach the provider: connection refused",
+      };
+    }
+    return { ok: true, status: 200, latency_ms };
+  },
+
   async listInstances(): Promise<InstanceSummary[]> {
     requireAuth();
     await delay();
@@ -1585,6 +1883,17 @@ export const mockApi: FleetApi = {
     if (!input.model.trim()) {
       fail(400, "invalid_input", "Model is required.");
     }
+    let provider: StoredProvider | null = null;
+    if (input.provider?.trim()) {
+      const requested = input.provider.trim();
+      provider = providerStore.find((candidate) => candidate.id === requested) ?? null;
+      if (!provider) {
+        fail(400, "unknown_provider", `provider "${requested}" does not exist`);
+      }
+    }
+    const baseUrl = input.base_url.trim() || provider?.base_url || "";
+    if (!baseUrl) fail(400, "invalid_base_url", "base_url is required");
+    const apiKeyEnv = input.api_key_env.trim() || provider?.api_key_env || GATE_ENV;
     validateChannel(input.channel, "none");
     assertSharesExist(input.shares);
     assertEnvInputs(input.env ?? [], { requireValue: true, requireSecret: true });
@@ -1602,8 +1911,9 @@ export const mockApi: FleetApi = {
       name: input.name.trim(),
       template: input.template,
       model: input.model.trim(),
-      base_url: input.base_url.trim(),
-      api_key_env: input.api_key_env.trim(),
+      base_url: baseUrl,
+      api_key_env: apiKeyEnv,
+      provider: provider?.id ?? null,
       gate_token: gateToken,
       channel_token: channelToken,
       channel: input.channel.type,
@@ -1663,15 +1973,32 @@ export const mockApi: FleetApi = {
     assertSecretsKey(input.gate_token);
     assertSecretsKey(input.channel_token);
 
+    // The clone inherits the source provider unless the request overrides it;
+    // an empty string detaches the clone and then demands a token.
+    const explicitProvider = input.provider !== undefined;
+    const requestedProvider = explicitProvider ? (input.provider ?? "").trim() : (source.provider ?? "");
+    let cloneProvider: StoredProvider | null = null;
+    if (requestedProvider) {
+      cloneProvider = providerStore.find((candidate) => candidate.id === requestedProvider) ?? null;
+      if (!cloneProvider) {
+        fail(400, "unknown_provider", `provider "${requestedProvider}" does not exist`);
+      }
+    }
+
     // Tokens are never inherited, exactly like the controller: every token the
-    // source holds has to be replaced before anything is written.
+    // source holds has to be replaced before anything is written. A provider
+    // supplies the gate key at runtime, so a clone that keeps one needs none.
     const sourceKeys = envKeys(source);
     const sourceChannelEnv = channelEnv(source.channel);
     const gateToken = input.gate_token?.trim() ?? "";
     const channelToken = input.channel_token?.trim() ?? "";
     const missing: string[] = [];
-    if (!gateToken) {
-      missing.push(...gateKeys(source).filter((key) => sourceKeys.includes(key)));
+    if (!gateToken && !cloneProvider) {
+      // A source on a provider has no stored gate key, yet a clone detached
+      // from it still needs one: the provider was supplying that secret.
+      missing.push(
+        ...gateKeys(source).filter((key) => source.provider !== null || sourceKeys.includes(key)),
+      );
     }
     if (!channelToken && sourceChannelEnv && sourceKeys.includes(sourceChannelEnv)) {
       missing.push(sourceChannelEnv);
@@ -1697,8 +2024,9 @@ export const mockApi: FleetApi = {
       name: input.name?.trim() || cloneDefaultName(source.name),
       template: source.template,
       model: input.model?.trim() || source.model,
-      base_url: source.base_url,
-      api_key_env: source.api_key_env,
+      base_url: cloneProvider ? cloneProvider.base_url : source.base_url,
+      api_key_env: cloneProvider ? cloneProvider.api_key_env : source.api_key_env,
+      provider: cloneProvider?.id ?? null,
       // Only the replacement token: the source secret is never copied.
       gate_token: gateToken || null,
       channel_token: source.channel === "none" ? null : channelToken || null,
@@ -1757,6 +2085,16 @@ export const mockApi: FleetApi = {
     if (input.shares) assertSharesExist(input.shares);
     if (input.env) assertEnvInputs(input.env, { requireValue: false, requireSecret: false });
     assertSecretsKey(input.gate_token);
+    let nextProvider: StoredProvider | null = null;
+    if (input.provider !== undefined) {
+      const requested = (input.provider ?? "").trim();
+      if (requested) {
+        nextProvider = providerStore.find((candidate) => candidate.id === requested) ?? null;
+        if (!nextProvider) {
+          fail(400, "unknown_provider", `provider "${requested}" does not exist`);
+        }
+      }
+    }
     // Only a transition to restricted needs the host firewall; a stale
     // allow_lan=false in a full form save must not block unrelated edits.
     if (input.allow_lan === false && row.allow_lan) assertEgress(false);
@@ -1818,6 +2156,15 @@ export const mockApi: FleetApi = {
 
     if (input.name !== undefined) row.name = input.name.trim();
     if (input.model !== undefined) row.model = input.model.trim();
+    if (input.provider !== undefined) {
+      // The provider comes first: its endpoint and variable name apply unless
+      // the same request sets them explicitly.
+      row.provider = nextProvider?.id ?? null;
+      if (nextProvider) {
+        if (input.base_url === undefined) row.base_url = nextProvider.base_url;
+        if (input.api_key_env === undefined) row.api_key_env = nextProvider.api_key_env;
+      }
+    }
     if (input.base_url !== undefined) row.base_url = input.base_url.trim();
     if (input.api_key_env !== undefined) row.api_key_env = input.api_key_env.trim();
     if (input.mem_limit_mb !== undefined) row.mem_limit_mb = input.mem_limit_mb;
