@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod driver;
 pub mod egress;
+pub mod egress_policy;
 pub mod envs;
 pub mod files;
 pub mod history;

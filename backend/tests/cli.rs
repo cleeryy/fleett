@@ -110,6 +110,14 @@ fn app(state: MockState) -> Router {
         .route("/api/instances/{id}/stop", post(stop_instance))
         .route("/api/instances/{id}/restart", post(restart_instance))
         .route("/api/instances/{id}/logs", get(logs))
+        .route(
+            "/api/instances/{id}/egress",
+            get(egress_policy).put(set_egress),
+        )
+        .route(
+            "/api/instances/{id}/egress/blocks",
+            get(egress_blocks).delete(clear_egress_blocks),
+        )
         .route("/api/usage", get(usage))
         .route("/api/images", get(images))
         .route("/api/upgrade", get(upgrade_status).post(start_upgrade))
@@ -251,6 +259,51 @@ async fn restart_instance(Path(_id): Path<String>) -> Json<Value> {
 
 async fn delete_instance(Path(_id): Path<String>) -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+fn policy_view(id: &str, source: &str, mode: &str, fqdns: &[&str]) -> Value {
+    json!({
+        "instance": id,
+        "source": source,
+        "mode": mode,
+        "fqdns": fqdns,
+        "cidrs": [],
+        "ports": [443],
+        "updated_at": "2026-11-09T00:00:00Z",
+        "proxy": "http://fleett-egress-proxy:3128",
+        "warnings": []
+    })
+}
+
+async fn egress_policy(Path(id): Path<String>) -> Json<Value> {
+    Json(policy_view(&id, "explicit", "deny", &["api.github.com"]))
+}
+
+async fn set_egress(Path(id): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+    let mode = body["mode"].as_str().unwrap_or("deny");
+    let fqdns: Vec<&str> = body["fqdns"]
+        .as_array()
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    Json(policy_view(&id, "explicit", mode, &fqdns))
+}
+
+async fn egress_blocks(Path(id): Path<String>) -> Json<Value> {
+    if id != "alice" {
+        return Json(json!([]));
+    }
+    Json(json!([{
+        "id": 1,
+        "instance_id": "alice",
+        "host": "10.1.20.1",
+        "port": 443,
+        "reason": "destination denied by policy",
+        "at": "2026-11-09T00:01:00Z"
+    }]))
+}
+
+async fn clear_egress_blocks(Path(_id): Path<String>) -> Json<Value> {
+    Json(json!({"removed": 1}))
 }
 
 async fn logs(
@@ -931,4 +984,86 @@ async fn images_json_passes_the_server_payload_through() {
     let images = value.as_array().expect("array");
     assert_eq!(images.len(), 2);
     assert_eq!(images[0]["instances"], json!(["alice"]));
+}
+
+#[tokio::test]
+async fn egress_policy_prints_the_effective_policy() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["egress", "policy", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let text = stdout(&output);
+    assert!(text.contains("instance: alice"), "{text}");
+    assert!(text.contains("source:   explicit"), "{text}");
+    assert!(text.contains("mode:     deny"), "{text}");
+    assert!(text.contains("fqdns:    api.github.com"), "{text}");
+    assert!(
+        text.contains("proxy:    http://fleett-egress-proxy:3128"),
+        "{text}"
+    );
+
+    let request = server.request("GET", "/api/instances/alice/egress");
+    assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+}
+
+#[tokio::test]
+async fn egress_set_puts_the_policy_and_prints_it() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(
+        &server,
+        home.path(),
+        &[
+            "egress",
+            "set",
+            "alice",
+            "--mode",
+            "deny",
+            "--fqdn",
+            "api.github.com",
+            "--cidr",
+            "10.0.0.0/8",
+            "--port",
+            "443",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("fqdns:    api.github.com"));
+
+    let request = server.request("PUT", "/api/instances/alice/egress");
+    let body = request.body.expect("policy body");
+    assert_eq!(body["mode"], "deny");
+    assert_eq!(body["fqdns"], json!(["api.github.com"]));
+    assert_eq!(body["cidrs"], json!(["10.0.0.0/8"]));
+    assert_eq!(body["ports"], json!([443]));
+}
+
+#[tokio::test]
+async fn egress_blocks_lists_and_clears() {
+    let server = MockServer::start(true).await;
+    let home = tempfile::tempdir().expect("home");
+    let output = run_against(&server, home.path(), &["egress", "blocks", "alice"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("HOST"), "{text}");
+    assert!(text.contains("10.1.20.1"), "{text}");
+    assert!(text.contains("destination denied by policy"), "{text}");
+    assert_eq!(
+        server
+            .request("GET", "/api/instances/alice/egress/blocks")
+            .query("limit"),
+        Some("200")
+    );
+
+    let output = run_against(
+        &server,
+        home.path(),
+        &["egress", "blocks", "alice", "--clear"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("cleared 1 blocked destination(s)"));
+    server.request("DELETE", "/api/instances/alice/egress/blocks");
 }

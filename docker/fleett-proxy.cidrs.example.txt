@@ -1,0 +1,5 @@
+# Example allowlist: one CIDR per line.
+# Generate it from a policy with:
+#   curl -fsS -H "Authorization: Bearer $FLEETT_TOKEN" \
+#     "$FLEETT_URL/api/instances/alice/egress" | jq -r '.cidrs[]'
+10.1.0.0/16

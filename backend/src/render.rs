@@ -5,6 +5,7 @@
 //! with a small, fixed set of placeholders.
 
 use crate::config::{Config, Hardening};
+use crate::egress_policy::{self, EgressPolicy};
 use crate::models::{
     ChannelKind, EnvSuggestion, InstanceSpec, ShareMode, TemplateInfo, TemplateMeta,
     DEFAULT_API_KEY_ENV, DEFAULT_TEMPLATE, GATE_TOKEN_ENV,
@@ -280,8 +281,24 @@ pub fn render_instance_with_project(
     project: Option<&str>,
     env_keys: &[String],
 ) -> Result<RenderedInstance, RenderError> {
+    render_instance_with_project_and_policy(cfg, spec, template, project, env_keys, None)
+}
+
+/// Same as [`render_instance_with_project`] with the destination policy of the
+/// instance, when it has one.
+///
+/// Only the compose document changes: a policy adds the proxy variables. The
+/// Hermes `config.yaml` is untouched.
+pub fn render_instance_with_project_and_policy(
+    cfg: &Config,
+    spec: &InstanceSpec,
+    template: &TemplateSource,
+    project: Option<&str>,
+    env_keys: &[String],
+    policy: Option<&EgressPolicy>,
+) -> Result<RenderedInstance, RenderError> {
     Ok(RenderedInstance {
-        compose_yaml: render_compose_with_project(cfg, spec, project, env_keys)?,
+        compose_yaml: render_compose_with_project_and_policy(cfg, spec, project, env_keys, policy)?,
         config_yaml: render_config(spec, &template.config_yaml)?,
         soul_md: template.soul_md.as_ref().map(|soul| substitute(soul, spec)),
     })
@@ -436,6 +453,19 @@ pub fn render_compose_with_project(
     project: Option<&str>,
     env_keys: &[String],
 ) -> Result<String, RenderError> {
+    render_compose_with_project_and_policy(cfg, spec, project, env_keys, None)
+}
+
+/// Same as [`render_compose_with_project`] with the instance destination
+/// policy. A policy points the container at the operator-run egress proxy;
+/// without one the compose bytes are exactly the historical ones.
+pub fn render_compose_with_project_and_policy(
+    cfg: &Config,
+    spec: &InstanceSpec,
+    project: Option<&str>,
+    env_keys: &[String],
+    policy: Option<&EgressPolicy>,
+) -> Result<String, RenderError> {
     let project = project
         .map(str::to_string)
         .unwrap_or_else(|| project_name(&spec.id));
@@ -461,6 +491,18 @@ pub fn render_compose_with_project(
     for key in env_keys {
         if crate::models::validate_secret_name(key).is_ok() {
             environment.insert(key.clone(), format!("${{{key}}}"));
+        }
+    }
+    // A destination policy is enforced by the external proxy: point the agent
+    // at it. Instances without a policy keep their historical bytes.
+    if policy.is_some() {
+        if let Some(proxy) = cfg.egress_proxy_url() {
+            environment.insert("HTTP_PROXY".to_string(), proxy.to_string());
+            environment.insert("HTTPS_PROXY".to_string(), proxy.to_string());
+            environment.insert(
+                "NO_PROXY".to_string(),
+                egress_policy::no_proxy(&cfg.network),
+            );
         }
     }
 
@@ -1042,6 +1084,58 @@ networks:
                 .and_then(Value::as_str),
             Some("${VALID}")
         );
+    }
+
+    #[test]
+    fn compose_renders_the_proxy_only_when_a_policy_exists() {
+        use crate::egress_policy::PolicyMode;
+
+        let instance = spec(ChannelKind::None);
+        let policy = EgressPolicy {
+            instance_id: "alice".to_string(),
+            mode: PolicyMode::Deny,
+            fqdns: vec!["api.github.com".to_string()],
+            cidrs: Vec::new(),
+            ports: vec![443],
+            updated_at: "2026-11-09T00:00:00Z".to_string(),
+        };
+
+        let rendered =
+            render_compose_with_project_and_policy(&config(), &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        let environment = &doc["services"]["agent"]["environment"];
+        assert_eq!(
+            environment.get("HTTP_PROXY").and_then(Value::as_str),
+            Some("http://fleett-egress-proxy:3128")
+        );
+        assert_eq!(
+            environment.get("HTTPS_PROXY").and_then(Value::as_str),
+            Some("http://fleett-egress-proxy:3128")
+        );
+        assert!(environment
+            .get("NO_PROXY")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains("fleett")));
+
+        // Without a policy the historical bytes are untouched.
+        let rendered = render_compose(&config(), &instance, &[]).expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(doc["services"]["agent"]["environment"]
+            .get("HTTP_PROXY")
+            .is_none());
+
+        // `FLEETT_EGRESS_PROXY=off` leaves the policy stored but renders no
+        // proxy address instead of writing a dead one.
+        let mut cfg = config();
+        cfg.egress_proxy = "off".to_string();
+        let rendered =
+            render_compose_with_project_and_policy(&cfg, &instance, None, &[], Some(&policy))
+                .expect("compose renders");
+        let doc: Value = serde_yaml::from_str(&rendered).expect("parses");
+        assert!(doc["services"]["agent"]["environment"]
+            .get("HTTP_PROXY")
+            .is_none());
     }
 
     #[test]

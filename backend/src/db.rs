@@ -164,6 +164,34 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — per-instance destination policy and the refused-destination log
+    // (issue #41). The absence of a policy row means "legacy `allow_lan`"; the
+    // `instances` table is deliberately untouched so an existing fleet keeps
+    // its current behaviour after the upgrade.
+    r#"
+CREATE TABLE IF NOT EXISTS egress_policies (
+    instance_id  TEXT PRIMARY KEY NOT NULL,
+    mode         TEXT NOT NULL,
+    fqdns        TEXT NOT NULL DEFAULT '',
+    cidrs        TEXT NOT NULL DEFAULT '',
+    ports        TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS egress_blocks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id  TEXT NOT NULL,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    reason       TEXT,
+    at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_instance
+    ON egress_blocks (instance_id, at);
+CREATE INDEX IF NOT EXISTS idx_egress_blocks_at
+    ON egress_blocks (at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -526,6 +554,15 @@ impl Db {
         )?;
         transaction.execute(
             "DELETE FROM instance_env WHERE instance_id = ?1",
+            params![id],
+        )?;
+        // A destination policy and its block log belong to the instance.
+        transaction.execute(
+            "DELETE FROM egress_policies WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute(
+            "DELETE FROM egress_blocks WHERE instance_id = ?1",
             params![id],
         )?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;

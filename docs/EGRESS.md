@@ -161,6 +161,26 @@ as-is instead of being compared.
 `FLEETT_EGRESS_MARKER` overrides the marker path (default
 `/etc/fleett/egress.json`); keep it in sync between the CLI and the service.
 
+## Per-instance destination policy
+
+The firewall above is a binary LAN switch. For "this agent may reach
+`api.github.com` and nothing else", set a destination policy:
+
+```bash
+fleett egress set alice --mode deny --fqdn api.github.com --port 443
+fleett egress policy alice
+fleett egress blocks alice
+```
+
+A policy is stored in `egress_policies`, rendered as
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in the agent container and enforced by an
+external Squid proxy the operator deploys (`docker/fleett-proxy.example.yaml`).
+`allow_lan` and `FLEETT_EGRESS` remain shortcuts: an instance without a policy
+is unchanged. See [EGRESS-POLICY.md](EGRESS-POLICY.md) for the model, the API,
+the block log and — importantly — the enforcement gaps (the proxy is not
+deployed by fleett, `HTTP_PROXY` is advisory, and one shared proxy cannot apply
+a different allowlist per instance without extra work).
+
 ## Remove
 
 ```bash

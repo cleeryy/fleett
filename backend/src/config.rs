@@ -20,6 +20,8 @@ pub const DEFAULT_IMAGE: &str = "hermes-agent:0.22.2-local";
 pub const DEFAULT_NETWORK: &str = "fleett";
 /// Marker written by `fleett egress install` and read by the control plane.
 pub const DEFAULT_EGRESS_MARKER: &str = "/etc/fleett/egress.json";
+/// Proxy every instance with a destination policy is pointed at (issue #41).
+pub const DEFAULT_EGRESS_PROXY: &str = "http://fleett-egress-proxy:3128";
 /// Key file used to encrypt instance secrets at rest.
 ///
 /// Outside `FLEETT_ROOT` on purpose: a backup of the data root must never
@@ -344,6 +346,9 @@ pub struct Config {
     pub egress: EgressMode,
     /// Marker written by `fleett egress install` (`FLEETT_EGRESS_MARKER`).
     pub egress_marker: PathBuf,
+    /// Proxy rendered into instances that have a destination policy
+    /// (`FLEETT_EGRESS_PROXY`). Empty or `off` renders no proxy variables.
+    pub egress_proxy: String,
     /// Base64 AES-256 key (`FLEETT_SECRETS_KEY`), when set directly.
     pub secrets_key: Option<String>,
     /// Key file (`FLEETT_SECRETS_KEY_FILE`), read when no inline key is set.
@@ -557,6 +562,8 @@ impl Config {
         let egress_marker = get("EGRESS_MARKER")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_EGRESS_MARKER));
+        let egress_proxy =
+            get_raw("EGRESS_PROXY").unwrap_or_else(|| DEFAULT_EGRESS_PROXY.to_string());
 
         let secrets_key = get("SECRETS_KEY");
         let secrets_key_file = get("SECRETS_KEY_FILE")
@@ -592,6 +599,7 @@ impl Config {
             max_total_mem_mb,
             egress,
             egress_marker,
+            egress_proxy,
             secrets_key,
             secrets_key_file,
             secrets_autoimport,
@@ -627,6 +635,7 @@ impl Config {
             max_total_mem_mb: 0,
             egress: EgressMode::Off,
             egress_marker,
+            egress_proxy: DEFAULT_EGRESS_PROXY.to_string(),
             secrets_key: None,
             secrets_key_file,
             secrets_autoimport: false,
@@ -640,6 +649,24 @@ impl Config {
     /// Name of the unrestricted network attached to `allow_lan` instances.
     pub fn lan_network(&self) -> String {
         format!("{}-lan", self.network)
+    }
+
+    /// Proxy URL rendered into an instance with a destination policy.
+    ///
+    /// `None` when `FLEETT_EGRESS_PROXY` is empty, `off` or `none`: the policy
+    /// is still stored, but no `HTTP(S)_PROXY` variable is written (an honest
+    /// gap the API reports).
+    pub fn egress_proxy_url(&self) -> Option<&str> {
+        let value = self.egress_proxy.trim();
+        if value.is_empty()
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("none")
+            || value.eq_ignore_ascii_case("disabled")
+        {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -1324,6 +1351,7 @@ FLEETT_NETWORK='fleett-net'
             .expect("defaults resolve");
         assert_eq!(cfg.egress, EgressMode::Restrict);
         assert_eq!(cfg.egress_marker, PathBuf::from(DEFAULT_EGRESS_MARKER));
+        assert_eq!(cfg.egress_proxy_url(), Some(DEFAULT_EGRESS_PROXY));
         assert_eq!(cfg.lan_network(), "fleett-lan");
 
         for value in ["off", "OFF", "disabled"] {

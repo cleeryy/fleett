@@ -315,6 +315,27 @@ pub enum Command {
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
+    EgressPolicy { id: String },
+    EgressSet(EgressSetArgs),
+    EgressBlocks(EgressBlocksArgs),
+}
+
+/// Arguments of `fleett egress set`.
+#[derive(Debug, Clone)]
+pub struct EgressSetArgs {
+    pub id: String,
+    pub mode: Option<String>,
+    pub fqdns: Vec<String>,
+    pub cidrs: Vec<String>,
+    pub ports: Vec<u16>,
+}
+
+/// Arguments of `fleett egress blocks`.
+#[derive(Debug, Clone)]
+pub struct EgressBlocksArgs {
+    pub id: String,
+    pub clear: bool,
+    pub limit: usize,
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +434,9 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::EgressPolicy { id } => egress_policy(&client, json, &id).await,
+        Command::EgressSet(args) => egress_set(&client, json, &args).await,
+        Command::EgressBlocks(args) => egress_blocks(&client, json, &args).await,
     }
 }
 
@@ -1403,6 +1427,151 @@ fn encode_path_segment(value: &str) -> String {
         }
     }
     out
+}
+
+/// One explicit or effective egress policy, as printed by `fleett egress policy`.
+#[derive(Debug, Clone, Deserialize)]
+struct EgressPolicyView {
+    instance: String,
+    source: String,
+    mode: String,
+    #[serde(default)]
+    fqdns: Vec<String>,
+    #[serde(default)]
+    cidrs: Vec<String>,
+    #[serde(default)]
+    ports: Vec<u16>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+impl EgressPolicyView {
+    fn render(&self) -> String {
+        fn list(values: &[String]) -> String {
+            if values.is_empty() {
+                "-".to_string()
+            } else {
+                values.join(", ")
+            }
+        }
+        let mut out = format!(
+            "instance: {}\nsource:   {}\nmode:     {}\nfqdns:    {}\ncidrs:    {}\nports:    {}\n",
+            self.instance,
+            self.source,
+            self.mode,
+            list(&self.fqdns),
+            list(&self.cidrs),
+            if self.ports.is_empty() {
+                "-".to_string()
+            } else {
+                self.ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        if let Some(proxy) = &self.proxy {
+            out.push_str(&format!("proxy:    {proxy}\n"));
+        }
+        if let Some(updated) = &self.updated_at {
+            out.push_str(&format!("updated:  {updated}\n"));
+        }
+        for warning in &self.warnings {
+            out.push_str(&format!("warning:  {warning}\n"));
+        }
+        out
+    }
+}
+
+/// One refused destination, as printed by `fleett egress blocks`.
+#[derive(Debug, Clone, Deserialize)]
+struct EgressBlockView {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    at: String,
+}
+
+async fn egress_policy(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/egress", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: EgressPolicyView = decode(value)?;
+    print!("{}", view.render());
+    Ok(())
+}
+
+async fn egress_set(client: &Client, json: bool, args: &EgressSetArgs) -> Result<(), CliError> {
+    let body = json!({
+        "mode": args.mode.clone().unwrap_or_else(|| "deny".to_string()),
+        "fqdns": args.fqdns,
+        "cidrs": args.cidrs,
+        "ports": args.ports,
+    });
+    let path = format!("/api/instances/{}/egress", encode_path_segment(&args.id));
+    let value = client.value(Method::PUT, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let view: EgressPolicyView = decode(value)?;
+    print!("{}", view.render());
+    Ok(())
+}
+
+async fn egress_blocks(
+    client: &Client,
+    json: bool,
+    args: &EgressBlocksArgs,
+) -> Result<(), CliError> {
+    let path = format!(
+        "/api/instances/{}/egress/blocks",
+        encode_path_segment(&args.id)
+    );
+    if args.clear {
+        let value = client.value(Method::DELETE, &path, &[], None).await?;
+        if json {
+            return print_json(&value);
+        }
+        let removed = value
+            .get("removed")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        println!("cleared {removed} blocked destination(s)");
+        return Ok(());
+    }
+
+    let query = [("limit", args.limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let blocks: Vec<EgressBlockView> = decode(value)?;
+    if blocks.is_empty() {
+        println!("no blocked destinations recorded");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = blocks
+        .iter()
+        .map(|block| {
+            vec![
+                block.at.clone(),
+                block.host.clone(),
+                block.port.to_string(),
+                block.reason.clone().unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    print!("{}", render_table(&["AT", "HOST", "PORT", "REASON"], &rows));
+    Ok(())
 }
 
 #[cfg(test)]

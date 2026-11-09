@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bus;
+pub mod egress;
 pub mod error;
 pub mod files;
 pub mod git;
@@ -50,6 +51,8 @@ pub struct AppState {
     pub upgrade: Arc<upgrade::UpgradeManager>,
     /// Prometheus counters and the cached utilisation sample (`GET /metrics`).
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Ingestion budget of `POST /api/egress/blocks`.
+    pub block_ingest: Arc<egress::BlockRateLimiter>,
     pub started_at: Instant,
 }
 
@@ -92,6 +95,7 @@ impl AppState {
             locks: Arc::new(InstanceLocks::default()),
             upgrade: Arc::new(upgrade::UpgradeManager::default()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            block_ingest: Arc::new(egress::BlockRateLimiter::default()),
             started_at: Instant::now(),
         })
     }
@@ -167,6 +171,21 @@ fn api_routes(state: AppState) -> Router<AppState> {
         )
         .route("/instances/{id}/env", put(instances::put_env))
         .route("/instances/{id}/env/{key}", delete(instances::delete_env))
+        .route(
+            "/instances/{id}/egress",
+            get(egress::get_policy)
+                .put(egress::put_policy)
+                .delete(egress::delete_policy),
+        )
+        .route("/instances/{id}/egress/test", post(egress::test))
+        .route(
+            "/instances/{id}/egress/blocks",
+            get(egress::list_blocks).delete(egress::clear_blocks),
+        )
+        .route(
+            "/egress/blocks",
+            get(egress::list_all_blocks).post(egress::ingest_block),
+        )
         .route("/instances/{id}/files", get(files::list))
         .route(
             "/instances/{id}/files/content",
@@ -326,9 +345,15 @@ pub(crate) async fn apply_compose(
 pub(crate) fn write_compose_file(state: &AppState, spec: &InstanceSpec) -> Result<(), ApiError> {
     let project = store::declared_project(&state.cfg, &spec.id);
     let keys = compose_env_keys(state, spec)?;
-    let compose =
-        crate::render::render_compose_with_project(&state.cfg, spec, project.as_deref(), &keys)
-            .map_err(ApiError::from)?;
+    let policy = crate::egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
+    let compose = crate::render::render_compose_with_project_and_policy(
+        &state.cfg,
+        spec,
+        project.as_deref(),
+        &keys,
+        policy.as_ref(),
+    )
+    .map_err(ApiError::from)?;
     store::write_compose(&state.cfg, &spec.id, &compose)
         .map_err(|err| ApiError::internal(format!("failed to write compose file: {err}")))
 }

@@ -18,8 +18,9 @@ token = "flt_0123456789abcdef0123456789abcdef"
   `https://` only.
 - `token`: bearer token (`FLEETT_TOKEN`, or a named token created with `POST /api/tokens`).
   It is optional: a server started with `FLEETT_ALLOW_NO_AUTH=1` answers without one.
-- The file is read for client commands only. `fleett serve`, `migrate`, `egress`, `secrets`,
-  `backup` keep reading the server environment (`~/.fleett/fleett.env`).
+- The file is read for client commands only. `fleett serve`, `migrate`,
+  `egress install|remove|status|print`, `secrets`, `backup` keep reading the server
+  environment (`~/.fleett/fleett.env`); `egress policy|set|blocks` are client commands.
 
 Environment variables win over the file, field by field:
 
@@ -56,6 +57,9 @@ fleett upgrade --image TAG [--parallel N] [--dry-run] [--timeout N]
 fleett say <to> <body> [--kind ask|tell|result] [--from ID] [--correlation ID] [--ttl S]
 fleett messages <id> [--view inbox|outbox|all] [--status queued|delivered|read] [--limit N]
 fleett ack <id> <message-id>
+fleett egress policy <id>
+fleett egress set <id> [--mode deny|allow] [--fqdn HOST]... [--cidr CIDR]... [--port N]...
+fleett egress blocks <id> [--clear] [--limit N]
 fleett doctor
 ```
 
@@ -184,6 +188,30 @@ fleett ack tchouniz 3f2a…
 
 The sender defaults to `--from`, then to `FLEETT_INSTANCE`. `--json` prints the raw
 `Message` objects.
+
+### `egress policy` / `egress set` / `egress blocks`
+
+Client commands for the per-instance destination policy
+([docs/EGRESS-POLICY.md](EGRESS-POLICY.md)). They talk to a running control
+plane and use the normal `[server]` credentials; the server-side
+`fleett egress install|remove|status|print` commands keep reading
+`~/.fleett/fleett.env` and need no token.
+
+```bash
+fleett egress policy alice
+fleett egress set alice --mode deny --fqdn api.github.com --port 443
+fleett egress set alice --mode allow --cidr 10.0.0.0/8 --port 22
+fleett egress blocks alice
+fleett egress blocks alice --clear
+fleett --json egress policy alice
+```
+
+`--mode deny` (default) is an allowlist; `--mode allow` is a blocklist.
+`--fqdn`, `--cidr` and `--port` are repeatable. `set` replaces the whole policy:
+omitted lists become empty. `policy` prints `source`, `mode`, the lists, the
+proxy address and every warning. `blocks` prints the refused destinations
+(newest first, `--limit` default 200); `--clear` deletes them and prints the
+count. `--json` prints the raw server payload.
 
 ### `doctor`
 

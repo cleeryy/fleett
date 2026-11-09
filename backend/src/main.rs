@@ -45,8 +45,10 @@ enum Commands {
     },
     /// Manage the host firewall that keeps agent egress off the LAN.
     ///
-    /// Runs on the Docker host, as root or with CAP_NET_ADMIN; no bearer token
-    /// is needed. See docs/EGRESS.md.
+    /// `install`, `remove`, `status` and `print` run on the Docker host, as
+    /// root or with CAP_NET_ADMIN; no bearer token is needed. `policy`, `set`
+    /// and `blocks` are client commands that talk to a running control plane.
+    /// See docs/EGRESS.md and docs/EGRESS-POLICY.md.
     Egress {
         #[command(subcommand)]
         action: EgressCommands,
@@ -266,7 +268,7 @@ enum SecretsCommands {
     },
 }
 
-#[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
+#[derive(Subcommand, Clone)]
 enum EgressCommands {
     /// Install the DOCKER-USER rules for the current fleett subnet (idempotent).
     Install,
@@ -276,15 +278,50 @@ enum EgressCommands {
     Status,
     /// Print the exact iptables commands without running them.
     Print,
+    /// Show the egress policy in force for one instance (client mode).
+    Policy {
+        /// Instance id.
+        id: String,
+    },
+    /// Replace the egress policy of one instance (client mode).
+    Set {
+        /// Instance id.
+        id: String,
+        /// `deny` (allowlist, default) or `allow` (blocklist).
+        #[arg(long)]
+        mode: Option<String>,
+        /// Allowed/blocked FQDN; repeat for several hosts.
+        #[arg(long = "fqdn")]
+        fqdn: Vec<String>,
+        /// Allowed/blocked CIDR; repeat for several ranges.
+        #[arg(long = "cidr")]
+        cidr: Vec<String>,
+        /// Allowed/blocked destination port; repeat for several ports.
+        #[arg(long = "port")]
+        port: Vec<u16>,
+    },
+    /// List or clear the refused destinations of one instance (client mode).
+    Blocks {
+        /// Instance id.
+        id: String,
+        /// Delete the block log instead of listing it.
+        #[arg(long)]
+        clear: bool,
+        /// Maximum rows when listing (default 200, max 1000).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
-impl From<EgressCommands> for egress::Action {
-    fn from(command: EgressCommands) -> Self {
-        match command {
-            EgressCommands::Install => Self::Install,
-            EgressCommands::Remove => Self::Remove,
-            EgressCommands::Status => Self::Status,
-            EgressCommands::Print => Self::Print,
+impl EgressCommands {
+    /// Server-side firewall action, if this subcommand is one.
+    fn firewall_action(&self) -> Option<egress::Action> {
+        match self {
+            Self::Install => Some(egress::Action::Install),
+            Self::Remove => Some(egress::Action::Remove),
+            Self::Status => Some(egress::Action::Status),
+            Self::Print => Some(egress::Action::Print),
+            Self::Policy { .. } | Self::Set { .. } | Self::Blocks { .. } => None,
         }
     }
 }
@@ -314,9 +351,51 @@ async fn main() -> anyhow::Result<()> {
             0
         }
         Commands::Egress { action } => {
-            // Firewall commands never serve HTTP: no bearer token is needed.
-            let cfg = Config::from_env_for_maintenance()?;
-            egress::run(action.into(), &cfg)?
+            if let Some(firewall) = action.firewall_action() {
+                // Firewall commands never serve HTTP: no bearer token is needed.
+                let cfg = Config::from_env_for_maintenance()?;
+                egress::run(firewall, &cfg)?
+            } else {
+                match action {
+                    EgressCommands::Policy { id } => {
+                        cli::run(cli::Command::EgressPolicy { id }, json).await
+                    }
+                    EgressCommands::Set {
+                        id,
+                        mode,
+                        fqdn,
+                        cidr,
+                        port,
+                    } => {
+                        cli::run(
+                            cli::Command::EgressSet(cli::EgressSetArgs {
+                                id,
+                                mode,
+                                fqdns: fqdn,
+                                cidrs: cidr,
+                                ports: port,
+                            }),
+                            json,
+                        )
+                        .await
+                    }
+                    EgressCommands::Blocks { id, clear, limit } => {
+                        cli::run(
+                            cli::Command::EgressBlocks(cli::EgressBlocksArgs {
+                                id,
+                                clear,
+                                limit: limit.unwrap_or(fleett::egress_policy::BLOCKS_DEFAULT_LIMIT),
+                            }),
+                            json,
+                        )
+                        .await
+                    }
+                    EgressCommands::Install
+                    | EgressCommands::Remove
+                    | EgressCommands::Status
+                    | EgressCommands::Print => unreachable!("handled by firewall_action"),
+                }
+            }
         }
         Commands::Secrets { action } => {
             // Key management never serves HTTP: no bearer token is needed.

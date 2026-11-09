@@ -7,6 +7,7 @@ use crate::auth::AuthContext;
 use crate::config::EgressMode;
 use crate::driver::LogsOptions;
 use crate::egress;
+use crate::egress_policy;
 use crate::envs::{self, EnvWrite};
 use crate::instance_archive::{ArchiveError, MAX_ARCHIVE_BYTES};
 use crate::logs;
@@ -406,6 +407,9 @@ pub async fn clone(
     ensure_lan_network(&state, &clone).await?;
 
     let template = clone_template(&state, &source)?;
+    // A clone of a restricted instance inherits its destination policy: a
+    // security setting must never loosen silently when an agent is duplicated.
+    let source_policy = egress_policy::load(&state.db, &source.id).map_err(ApiError::from)?;
     let inherited: BTreeMap<String, String> = source_env
         .iter()
         .filter(|entry| !entry.secret)
@@ -423,11 +427,29 @@ pub async fn clone(
     envs::check_storable(&state.cfg, &entries).map_err(ApiError::from)?;
     let mut env_keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
     crate::api::push_provider_key(&mut env_keys, &clone);
-    let rendered = render::render_instance(&state.cfg, &clone, &template, &env_keys)
-        .map_err(ApiError::from)?;
+    let rendered = render::render_instance_with_project_and_policy(
+        &state.cfg,
+        &clone,
+        &template,
+        None,
+        &env_keys,
+        source_policy.as_ref(),
+    )
+    .map_err(ApiError::from)?;
 
     // From here on the clone exists: any failure rolls it back completely.
     state.db.insert_instance(&clone).map_err(ApiError::from)?;
+    if let Some(policy) = &source_policy {
+        let cloned = egress_policy::EgressPolicy {
+            instance_id: new_id.clone(),
+            updated_at: now_iso(),
+            ..policy.clone()
+        };
+        if let Err(err) = egress_policy::upsert(&state.db, &cloned) {
+            rollback_clone(&state, &new_id);
+            return Err(ApiError::from(err));
+        }
+    }
     if let Err(err) = write_clone(&state, &source.id, &clone, &entries, &rendered, copy_data).await
     {
         rollback_clone(&state, &new_id);
@@ -1183,13 +1205,15 @@ fn render_for_update(
     let mut spec = spec.clone();
     crate::api::hydrate_previous_image(state, &mut spec);
     let spec = &spec;
+    let policy = egress_policy::load(&state.db, &spec.id).map_err(ApiError::from)?;
     match render::load_template(&state.cfg, &spec.template) {
-        Ok(template) => render::render_instance_with_project(
+        Ok(template) => render::render_instance_with_project_and_policy(
             &state.cfg,
             spec,
             &template,
             project.as_deref(),
             env_keys,
+            policy.as_ref(),
         )
         .map_err(ApiError::from),
         Err(RenderError::UnknownTemplate(_)) if spec.template == "custom" => {
@@ -1201,11 +1225,12 @@ fn render_for_update(
                 ))
             })?;
             Ok(render::RenderedInstance {
-                compose_yaml: render::render_compose_with_project(
+                compose_yaml: render::render_compose_with_project_and_policy(
                     &state.cfg,
                     spec,
                     project.as_deref(),
                     env_keys,
+                    policy.as_ref(),
                 )
                 .map_err(ApiError::from)?,
                 config_yaml: render::render_config(spec, &existing).map_err(ApiError::from)?,
