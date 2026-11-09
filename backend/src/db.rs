@@ -164,6 +164,54 @@ CREATE INDEX IF NOT EXISTS idx_messages_outbox
 CREATE INDEX IF NOT EXISTS idx_messages_correlation
     ON messages (correlation_id);
 "#,
+    // v10 — per-agent cron schedules and their run history (issue #30).
+    // `schedules.next_run_at` is NULL while the schedule is disabled; the
+    // background loop only reads enabled rows, so a disabled schedule never
+    // affects another instance. `schedule_runs.status` is one of `running`,
+    // `ok`, `error`, `timeout` or `skipped`; a `running` row left behind by a
+    // crash is turned into `error` at startup.
+    r#"
+CREATE TABLE IF NOT EXISTS schedules (
+    id           TEXT PRIMARY KEY NOT NULL,
+    instance_id  TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    cron         TEXT NOT NULL,
+    prompt       TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    timezone     TEXT NOT NULL DEFAULT 'UTC',
+    overlap      TEXT NOT NULL DEFAULT 'skip',
+    timeout_s    INTEGER NOT NULL DEFAULT 300,
+    catchup      INTEGER NOT NULL DEFAULT 0,
+    last_run_at  TEXT,
+    next_run_at  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE (instance_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_instance ON schedules (instance_id, name);
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules (enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    id           TEXT PRIMARY KEY NOT NULL,
+    schedule_id  TEXT NOT NULL,
+    instance_id  TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    status       TEXT NOT NULL,
+    exit_code    INTEGER,
+    output       TEXT,
+    duration_ms  INTEGER,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_schedule
+    ON schedule_runs (schedule_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_instance
+    ON schedule_runs (instance_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_schedule_runs_status
+    ON schedule_runs (status, started_at);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -528,6 +576,14 @@ impl Db {
             "DELETE FROM instance_env WHERE instance_id = ?1",
             params![id],
         )?;
+        // Schedules have no foreign key (a deleted instance must not keep an
+        // orphan that fails on every tick), so their history is removed with
+        // the instance.
+        transaction.execute(
+            "DELETE FROM schedule_runs WHERE instance_id = ?1",
+            params![id],
+        )?;
+        transaction.execute("DELETE FROM schedules WHERE instance_id = ?1", params![id])?;
         transaction.execute("DELETE FROM instances WHERE id = ?1", params![id])?;
         transaction.commit()?;
         Ok(())

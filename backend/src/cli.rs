@@ -315,6 +315,25 @@ pub enum Command {
     Say(SayArgs),
     Messages(MessagesArgs),
     Ack { id: String, message_id: String },
+    Schedules { id: String },
+    ScheduleAdd(ScheduleAddArgs),
+    ScheduleRm { schedule_id: String },
+    ScheduleRun { schedule_id: String },
+    Runs { id: String, limit: usize },
+}
+
+/// Arguments of `fleett schedule add`.
+#[derive(Debug, Clone)]
+pub struct ScheduleAddArgs {
+    pub id: String,
+    pub name: String,
+    pub cron: String,
+    pub prompt: String,
+    pub enabled: Option<bool>,
+    pub overlap: Option<String>,
+    pub timeout_s: Option<u64>,
+    pub timezone: Option<String>,
+    pub catchup: bool,
 }
 
 /// Arguments of `fleett say`.
@@ -413,6 +432,11 @@ async fn execute(command: Command, json: bool) -> Result<(), CliError> {
         Command::Say(args) => say(&client, json, &args).await,
         Command::Messages(args) => messages(&client, json, &args).await,
         Command::Ack { id, message_id } => ack(&client, json, &id, &message_id).await,
+        Command::Schedules { id } => schedules(&client, json, &id).await,
+        Command::ScheduleAdd(args) => schedule_add(&client, json, &args).await,
+        Command::ScheduleRm { schedule_id } => schedule_rm(&client, json, &schedule_id).await,
+        Command::ScheduleRun { schedule_id } => schedule_run(&client, json, &schedule_id).await,
+        Command::Runs { id, limit } => runs(&client, json, &id, limit).await,
     }
 }
 
@@ -750,6 +774,49 @@ struct MessageView {
     read_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ScheduleView {
+    id: String,
+    instance_id: String,
+    name: String,
+    cron: String,
+    #[serde(default)]
+    prompt: String,
+    enabled: bool,
+    #[serde(default)]
+    timezone: String,
+    overlap: String,
+    #[serde(default)]
+    timeout: u64,
+    #[serde(default)]
+    catchup: bool,
+    #[serde(default)]
+    last_run_at: Option<String>,
+    #[serde(default)]
+    next_run_at: Option<String>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ScheduleRunView {
+    id: String,
+    schedule_id: String,
+    instance_id: String,
+    started_at: String,
+    #[serde(default)]
+    finished_at: Option<String>,
+    status: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    duration_ms: Option<i64>,
+}
+
 async fn say(client: &Client, json: bool, args: &SayArgs) -> Result<(), CliError> {
     let from = args
         .from
@@ -851,6 +918,173 @@ async fn ack(client: &Client, json: bool, id: &str, message_id: &str) -> Result<
     }
     println!("message {message_id} marked as read");
     Ok(())
+}
+
+async fn schedules(client: &Client, json: bool, id: &str) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/schedules", encode_path_segment(id));
+    let value = client.value(Method::GET, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let schedules: Vec<ScheduleView> = decode(value)?;
+    if schedules.is_empty() {
+        println!("no schedules");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = schedules
+        .iter()
+        .map(|schedule| {
+            vec![
+                schedule.name.clone(),
+                schedule.cron.clone(),
+                if schedule.enabled { "yes" } else { "no" }.to_string(),
+                schedule
+                    .next_run_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                schedule
+                    .last_run_at
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                schedule.overlap.clone(),
+                format!("{}s", schedule.timeout),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            &["NAME", "CRON", "ENABLED", "NEXT", "LAST", "OVERLAP", "TIMEOUT"],
+            &rows
+        )
+    );
+    Ok(())
+}
+
+async fn schedule_add(client: &Client, json: bool, args: &ScheduleAddArgs) -> Result<(), CliError> {
+    let mut body = json!({
+        "name": args.name,
+        "cron": args.cron,
+        "prompt": args.prompt,
+    });
+    let object = body.as_object_mut().expect("object");
+    if let Some(enabled) = args.enabled {
+        object.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(overlap) = &args.overlap {
+        object.insert("overlap".to_string(), json!(overlap));
+    }
+    if let Some(timeout) = args.timeout_s {
+        object.insert("timeout".to_string(), json!(timeout));
+    }
+    if let Some(timezone) = &args.timezone {
+        object.insert("timezone".to_string(), json!(timezone));
+    }
+    if args.catchup {
+        object.insert("catchup".to_string(), json!(true));
+    }
+    let path = format!("/api/instances/{}/schedules", encode_path_segment(&args.id));
+    let value = client.value(Method::POST, &path, &[], Some(body)).await?;
+    if json {
+        return print_json(&value);
+    }
+    let schedule: ScheduleView = decode(value)?;
+    println!(
+        "created schedule {} ({} on {}, next {})",
+        schedule.id,
+        schedule.name,
+        schedule.cron,
+        schedule.next_run_at.as_deref().unwrap_or("-")
+    );
+    Ok(())
+}
+
+async fn schedule_rm(client: &Client, json: bool, schedule_id: &str) -> Result<(), CliError> {
+    let path = format!("/api/schedules/{}", encode_path_segment(schedule_id));
+    client.text(Method::DELETE, &path, &[], None).await?;
+    if json {
+        return print_json(&json!({ "id": schedule_id, "deleted": true }));
+    }
+    println!("deleted schedule {schedule_id}");
+    Ok(())
+}
+
+async fn schedule_run(client: &Client, json: bool, schedule_id: &str) -> Result<(), CliError> {
+    let path = format!("/api/schedules/{}/run", encode_path_segment(schedule_id));
+    let value = client.value(Method::POST, &path, &[], None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let run: ScheduleRunView = decode(value)?;
+    let mut line = format!(
+        "run {}: {}{}",
+        run.id,
+        run.status,
+        run.duration_ms
+            .map(|duration| format!(" ({duration} ms)"))
+            .unwrap_or_default()
+    );
+    if let Some(code) = run.exit_code {
+        line.push_str(&format!(", exit {code}"));
+    }
+    println!("{line}");
+    if run.status != "ok" {
+        if let Some(output) = run.output.as_deref().filter(|text| !text.trim().is_empty()) {
+            for line in output.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn runs(client: &Client, json: bool, id: &str, limit: usize) -> Result<(), CliError> {
+    let path = format!("/api/instances/{}/runs", encode_path_segment(id));
+    let query = vec![("limit", limit.to_string())];
+    let value = client.value(Method::GET, &path, &query, None).await?;
+    if json {
+        return print_json(&value);
+    }
+    let runs: Vec<ScheduleRunView> = decode(value)?;
+    if runs.is_empty() {
+        println!("no runs");
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = runs
+        .iter()
+        .map(|run| {
+            vec![
+                run.started_at.clone(),
+                run.status.clone(),
+                run.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                run.duration_ms
+                    .map(|duration| format!("{duration}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                run.output
+                    .as_deref()
+                    .map(|output| single_line(output, 80))
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(&["STARTED", "STATUS", "EXIT", "DURATION", "OUTPUT"], &rows)
+    );
+    Ok(())
+}
+
+/// First `max` characters of `text` on one line.
+fn single_line(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut out: String = collapsed.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 async fn create(client: &Client, json: bool, args: &CreateArgs) -> Result<(), CliError> {

@@ -3958,3 +3958,323 @@ async fn a_message_loop_is_stopped_by_hops() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(parse(&body)["error"]["code"], "message_loop");
 }
+
+// ---------------------------------------------------------------------------
+// Cron schedules (issue #30)
+// ---------------------------------------------------------------------------
+
+fn schedule_body(name: &str, cron: &str, prompt: &str) -> Value {
+    json!({
+        "name": name,
+        "cron": cron,
+        "prompt": prompt,
+    })
+}
+
+async fn create_schedule(harness: &Harness, id: &str, body: Value) -> Value {
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            &format!("/api/instances/{id}/schedules"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {text}");
+    parse(&text)
+}
+
+fn force_schedule_due(harness: &Harness, schedule_id: &str) {
+    harness
+        .state
+        .db
+        .with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules SET next_run_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![schedule_id],
+            )
+        })
+        .expect("force due");
+}
+
+#[tokio::test]
+async fn schedules_can_be_created_listed_and_run() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "summarize the incidents"),
+    )
+    .await;
+    assert_eq!(schedule["instance_id"], "alice");
+    assert_eq!(schedule["name"], "every-five");
+    assert_eq!(schedule["cron"], "*/5 * * * *");
+    assert_eq!(schedule["enabled"], true);
+    assert_eq!(schedule["overlap"], "skip");
+    assert_eq!(schedule["timeout"], 300);
+    assert!(schedule["next_run_at"].is_string());
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body).as_array().expect("array").len(), 1);
+
+    // Disabling clears the next occurrence without touching the schedule.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{schedule_id}"),
+            Some(json!({"enabled": false, "timeout": 45, "overlap": "queue"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let patched = parse(&body);
+    assert_eq!(patched["enabled"], false);
+    assert_eq!(patched["timeout"], 45);
+    assert_eq!(patched["overlap"], "queue");
+    assert!(patched["next_run_at"].is_null());
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "ok");
+    assert_eq!(run["exit_code"], 0);
+    assert!(
+        run["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("summarize the incidents"),
+        "{run}"
+    );
+    assert!(run["duration_ms"].is_number());
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs?limit=10", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["schedule_id"], schedule_id);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = parse(&body);
+    assert_eq!(view.as_array().expect("array").len(), 1);
+    assert_eq!(view[0]["runs_total"], 1);
+    assert_eq!(view[0]["runs_failed"], 0);
+    assert_eq!(view[0]["failure_rate"], 0.0);
+    assert_eq!(view[0]["last_run"]["status"], "ok");
+
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/schedules", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    let (status, _) = harness
+        .request(
+            Method::DELETE,
+            &format!("/api/schedules/{schedule_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_failing_run_is_visible_with_its_exit_code() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    harness.mock.force_exec(
+        "alice",
+        fleett::driver::ExecResult {
+            exit_code: Some(3),
+            stdout: String::new(),
+            stderr: "gateway: provider timeout".to_string(),
+            timed_out: false,
+        },
+    );
+    let schedule = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("every-five", "*/5 * * * *", "probe"),
+    )
+    .await;
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/schedules/{schedule_id}/run"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let run = parse(&body);
+    assert_eq!(run["status"], "error");
+    assert_eq!(run["exit_code"], 3);
+    assert!(run["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("provider timeout"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse(&body)[0]["exit_code"], 3);
+
+    let (status, body) = harness.request(Method::GET, "/api/schedules", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let view = parse(&body);
+    assert_eq!(view[0]["runs_failed"], 1);
+    assert_eq!(view[0]["failure_rate"], 1.0);
+}
+
+#[tokio::test]
+async fn schedule_input_is_validated() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    for (body, code) in [
+        (schedule_body("bad", "not a cron", "p"), "invalid_cron"),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 0}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "timeout": 3601}),
+            "invalid_timeout",
+        ),
+        (
+            json!({"name": "bad", "cron": "* * * * *", "prompt": "p", "overlap": "parallel"}),
+            "invalid_overlap",
+        ),
+    ] {
+        let (status, text) = harness
+            .request(Method::POST, "/api/instances/alice/schedules", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert_eq!(parse(&text)["error"]["code"], code);
+    }
+
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/ghost/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "unknown_instance");
+
+    create_schedule(&harness, "alice", schedule_body("daily", "0 9 * * *", "p")).await;
+    let (status, text) = harness
+        .request(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("daily", "0 10 * * *", "p")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert_eq!(parse(&text)["error"]["code"], "schedule_exists");
+
+    let (status, text) = harness
+        .request(Method::POST, "/api/schedules/ghost/run", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+}
+
+#[tokio::test]
+async fn the_tick_runs_due_schedules_but_never_a_disabled_one() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+    create_instance(&harness, "bob").await;
+    let alice = create_schedule(
+        &harness,
+        "alice",
+        schedule_body("five", "*/5 * * * *", "alice prompt"),
+    )
+    .await;
+    let bob = create_schedule(
+        &harness,
+        "bob",
+        schedule_body("five", "*/5 * * * *", "bob prompt"),
+    )
+    .await;
+    let bob_id = bob["id"].as_str().expect("id").to_string();
+    let (status, _) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/schedules/{bob_id}"),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    force_schedule_due(&harness, alice["id"].as_str().expect("id"));
+    force_schedule_due(&harness, &bob_id);
+
+    fleett::scheduler::tick(&harness.state).await;
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/alice/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = parse(&body);
+    assert_eq!(runs.as_array().expect("array").len(), 1);
+    assert_eq!(runs[0]["status"], "ok");
+    assert!(runs[0]["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("alice prompt"));
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/bob/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(parse(&body).as_array().expect("array").is_empty());
+    assert!(harness
+        .mock
+        .exec_calls()
+        .iter()
+        .all(|call| call.instance == "alice"));
+}
+
+#[tokio::test]
+async fn schedule_endpoints_require_authentication() {
+    let harness = Harness::new();
+    create_instance(&harness, "alice").await;
+
+    let (status, body) = harness
+        .request_as(
+            Method::POST,
+            "/api/instances/alice/schedules",
+            Some(schedule_body("x", "* * * * *", "p")),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/instances/ghost/runs", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "unknown_instance");
+}
