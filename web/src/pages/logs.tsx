@@ -107,7 +107,7 @@ export function LogsPage() {
 
   // The SSE endpoint authenticates with the session cookie or a bearer header,
   // and EventSource cannot send the header. Rather than break bearer-only
-  // deployments, `follow` polls every 2 s and resumes from the newest line.
+  // deployments, `follow` polls every second and resumes from the newest line.
   useEffect(() => {
     if (!follow) return;
     setLive([]);
