@@ -36,6 +36,18 @@ clients are exempt.
 | GET | `/auth/callback` | `303` to `/` and sets `fleett_session` + `fleett_csrf`; failures carry `details.reason` (`cookie_missing`, `state_mismatch`, `expired`). Browsers (`Accept: text/html`) get an HTML page with a retry link, and a missing state cookie redirects to `/auth/login`; API clients keep JSON `400`/`401`/`403`. State lifetime: `FLEETT_OIDC_STATE_TTL_SECS` (default 600) |
 | POST | `/auth/logout` | `204`, clears the fleett cookies |
 
+## Doctor and onboarding
+
+Read-only diagnostics and first-run state, available to every authenticated role.
+
+| Method | Route | Response |
+|---|---|---|
+| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?}]}` — api, docker, image, secrets, egress, providers, instances, permissions, disk, dns |
+| GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, instance; `complete` when at least one instance exists |
+
+`fix` is either a copyable command or a UI link; a failing check is reported inline and never
+turns the response into a 500. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
 ## Audit and tokens
 
 | Method | Route | Body | Response |
