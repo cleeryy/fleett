@@ -237,6 +237,10 @@ export interface SkillSummary {
   versions: string[];
   /** Instances mounting the skill, pinned or not. */
   instances_count: number;
+  /** Marketplace origin of the followed version; absent after a local publish. */
+  source?: string;
+  ref?: string;
+  commit?: string;
   created_at: string;
   updated_at: string;
 }
@@ -254,6 +258,14 @@ export interface SkillVersionInfo {
   files_count: number;
   size_bytes: number;
   published_at: string;
+  /** Provenance fields, flattened into the version when the marketplace installed it. */
+  source?: string;
+  ref?: string;
+  commit?: string;
+  upstream_version?: string;
+  author?: string;
+  tags?: string[];
+  installed_at?: string;
 }
 
 /**
@@ -271,6 +283,10 @@ export interface SkillDetail {
   /** Ids of the instances mounting the skill, sorted. */
   instances: string[];
   instances_count: number;
+  /** Provenance of the followed version (absent for a local publish). */
+  source?: string;
+  ref?: string;
+  commit?: string;
   created_at: string;
   updated_at: string;
 }
@@ -342,6 +358,305 @@ export interface SkillRefDetail {
   version: string | null;
   /** Version the compose file actually mounts; `null` when unresolvable. */
   effective_version: string | null;
+}
+
+/* --------------------------------------------------------------------------
+ * Skills marketplace (issue #61, docs/MARKETPLACE.md)
+ * -------------------------------------------------------------------------- */
+
+export type MarketplaceSourceStatus = "ok" | "disabled" | "error";
+
+/** Health of one provider for the current search. */
+export interface MarketplaceSource {
+  /** Provider id: `local`, `git`, `github`, `skills.sh`. */
+  source: string;
+  status: MarketplaceSourceStatus;
+  count: number;
+  message?: string;
+}
+
+/** One catalogue search hit. */
+export interface MarketplaceEntry {
+  name: string;
+  description: string;
+  /** Provider id that produced the entry. */
+  provider: string;
+  /** Canonical install source (`github:owner/repo`, `url:…`, …). */
+  source?: string;
+  ref?: string;
+  url?: string;
+  author?: string;
+  tags?: string[];
+  version?: string;
+  commit?: string;
+}
+
+/** `GET /api/marketplace/skills`: every provider at once. */
+export interface MarketplaceSearch {
+  entries: MarketplaceEntry[];
+  sources: MarketplaceSource[];
+}
+
+export interface MarketplacePreviewFile {
+  path: string;
+  size: number;
+  /** `true` when the file is executable content shipped with the skill. */
+  script: boolean;
+}
+
+/** `POST /api/marketplace/skills/preview`: resolved without writing anything. */
+export interface MarketplacePreview {
+  name: string;
+  description: string;
+  version?: string;
+  author?: string;
+  files: MarketplacePreviewFile[];
+  total_bytes: number;
+  skill_md: string;
+  scripts: string[];
+  commit?: string;
+  source?: string;
+  /** An install must set `confirm_scripts` explicitly. */
+  requires_confirmation: boolean;
+}
+
+export interface MarketplaceInstallInput {
+  source: string;
+  ref?: string;
+  /** Overrides the upstream name. */
+  name?: string;
+  confirm_scripts?: boolean;
+}
+
+/** `409 scripts_require_confirmation` carries the offending paths. */
+export interface MarketplaceScriptsDetails {
+  scripts?: string[];
+}
+
+export interface MarketplaceUpdateInput {
+  /** Move `latest` and restart the agents that follow it. */
+  promote?: boolean;
+  confirm_scripts?: boolean;
+}
+
+export type SkillFileChangeStatus = "added" | "modified" | "removed";
+
+/** One path an update added, changed or removed. */
+export interface SkillFileChange {
+  path: string;
+  status: SkillFileChangeStatus;
+}
+
+/** `POST /api/marketplace/skills/{name}/update`. */
+export interface MarketplaceUpdateResult {
+  name: string;
+  from: string;
+  to: string;
+  commit?: string;
+  files: SkillFileChange[];
+  /** Present when `promote` was requested. */
+  promoted?: SkillPromoteResult;
+}
+
+/** One installed skill with a newer upstream. */
+export interface MarketplaceUpdateInfo {
+  name: string;
+  installed_version: string;
+  upstream_version?: string;
+  commit?: string;
+  source: string;
+  ref?: string;
+}
+
+/** `GET /api/marketplace/updates`: an outage yields warnings, never a 500. */
+export interface MarketplaceUpdates {
+  updates: MarketplaceUpdateInfo[];
+  warnings: string[];
+}
+
+/** `POST /api/marketplace/sync`. */
+export interface MarketplaceSyncResult {
+  skills: number;
+  source: string;
+  commit?: string;
+}
+
+/* --------------------------------------------------------------------------
+ * MCP servers (issue #62, docs/MCP-SERVERS.md)
+ * -------------------------------------------------------------------------- */
+
+/** `stdio`, `streamable-http` or `sse`. */
+export type McpKind = "stdio" | "streamable-http" | "sse" | string;
+
+export interface McpCatalogEnv {
+  key: string;
+  secret: boolean;
+  required: boolean;
+}
+
+/** One catalogue entry, built-in or imported. */
+export interface McpCatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+  kind: McpKind;
+  image: string;
+  command: string[];
+  port: number;
+  path: string;
+  env: McpCatalogEnv[];
+  tags: string[];
+}
+
+/** One environment variable of a server; the value is never returned. */
+export interface McpEnvView {
+  key: string;
+  secret: boolean;
+  set: boolean;
+}
+
+/** One tool reported by `tools/list`. */
+export interface McpTool {
+  name: string;
+  description?: string;
+  input_schema?: unknown;
+  [key: string]: unknown;
+}
+
+export interface McpServerView {
+  id: string;
+  name: string;
+  description: string;
+  kind: McpKind;
+  image: string;
+  command: string[];
+  port: number;
+  path: string;
+  persist: boolean;
+  cpu_limit: number;
+  mem_limit_mb: number;
+  host: string;
+  status: string;
+  /** `healthy`, `unhealthy`, `starting` or `none`. */
+  health: string;
+  last_error?: string | null;
+  last_probe_at?: string | null;
+  /** Docker-DNS endpoint rendered into an agent config; `null` for stdio. */
+  endpoint: string | null;
+  tools: McpTool[];
+  tools_count: number;
+  tools_hash: string;
+  env: McpEnvView[];
+  /** Header names only; values are never returned. */
+  headers: string[];
+  /** Instances that attach this server and share its container. */
+  instances: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpEnvInput {
+  key: string;
+  value?: string;
+  secret?: boolean;
+}
+
+/** `POST /api/mcp/servers`: a catalogue id, or a complete spec. */
+export interface CreateMcpServerInput {
+  catalog?: string;
+  id?: string;
+  name?: string;
+  description?: string;
+  kind?: McpKind;
+  image?: string;
+  command?: string[];
+  port?: number;
+  path?: string;
+  persist?: boolean;
+  cpu_limit?: number;
+  mem_limit_mb?: number;
+  host?: string;
+  env?: McpEnvInput[];
+  headers?: Record<string, string>;
+}
+
+/** `PATCH /api/mcp/servers/{id}`: a missing field is left untouched. */
+export interface PatchMcpServerInput {
+  name?: string;
+  description?: string;
+  image?: string;
+  command?: string[];
+  port?: number;
+  path?: string;
+  persist?: boolean;
+  cpu_limit?: number;
+  mem_limit_mb?: number;
+  host?: string;
+  /** `null` clears every header; an object replaces the map. */
+  headers?: Record<string, string> | null;
+}
+
+/** `POST /api/mcp/servers/{id}/test`. */
+export interface McpTestResult {
+  server: string;
+  reachable: boolean;
+  latency_ms: number;
+  tools: McpTool[];
+  tools_count: number;
+  tools_hash: string;
+  protocol_version: string;
+  server_info: unknown;
+}
+
+/** `GET /api/mcp/servers/{id}/tools`: the cached discovery result. */
+export interface McpToolsSnapshot {
+  server: string;
+  tools: McpTool[];
+  count: number;
+  hash: string;
+  probed_at?: string | null;
+}
+
+/** One supervision incident of a server. */
+export interface McpIncident {
+  id: number;
+  server_id: string;
+  cause: string;
+  status: string;
+  opened_at: string;
+  closed_at?: string | null;
+  detail?: string | null;
+  actions: unknown[];
+  restart_count: number;
+  last_seen_at: string;
+}
+
+export interface McpLogParams {
+  tail?: number;
+  since?: string;
+}
+
+/** One server attached to an agent. */
+export interface AttachedMcpServer {
+  server: string;
+  mode: string;
+  kind: McpKind;
+  status: string;
+  health: string;
+  tools_count: number;
+  endpoint: string | null;
+}
+
+/** Response of the instance MCP routes. */
+export interface InstanceMcpView {
+  id: string;
+  status: string;
+  servers: AttachedMcpServer[];
+}
+
+export interface McpRefInput {
+  server: string;
+  mode?: string;
 }
 
 /* --------------------------------------------------------------------------
@@ -1715,6 +2030,50 @@ export interface FleetApi {
   deleteSkill(name: string): Promise<void>;
   skillGitLog(name: string, options?: SkillGitLogOptions): Promise<SkillGitLog>;
   skillGitDiff(name: string, options?: SkillGitDiffOptions): Promise<SkillGitDiff>;
+  /* Skills marketplace */
+  marketplaceSearch(params?: {
+    q?: string;
+    source?: string;
+    limit?: number;
+  }): Promise<MarketplaceSearch>;
+  /** Resolves a source without writing; rate-limited per process. */
+  marketplacePreview(input: { source: string; ref?: string }): Promise<MarketplacePreview>;
+  /** Publishes the next free version; `409 scripts_require_confirmation` carries the paths. */
+  marketplaceInstall(input: MarketplaceInstallInput): Promise<SkillDetail>;
+  /** `409 no_upstream` or `409 upstream_unchanged` when there is nothing to apply. */
+  marketplaceUpdate(
+    name: string,
+    input?: MarketplaceUpdateInput,
+  ): Promise<MarketplaceUpdateResult>;
+  marketplaceUpdates(): Promise<MarketplaceUpdates>;
+  marketplaceSync(): Promise<MarketplaceSyncResult>;
+  /* MCP servers */
+  listMcpCatalog(q?: string): Promise<McpCatalogEntry[]>;
+  importMcpCatalog(entry: McpCatalogEntry): Promise<McpCatalogEntry>;
+  listMcpServers(): Promise<McpServerView[]>;
+  getMcpServer(id: string): Promise<McpServerView>;
+  createMcpServer(input: CreateMcpServerInput): Promise<McpServerView>;
+  patchMcpServer(id: string, input: PatchMcpServerInput): Promise<McpServerView>;
+  /** `409 mcp_server_in_use` carries the attached instance ids. */
+  deleteMcpServer(id: string, purge?: boolean): Promise<void>;
+  mcpServerAction(
+    id: string,
+    action: "start" | "stop" | "restart",
+  ): Promise<McpServerView>;
+  testMcpServer(id: string): Promise<McpTestResult>;
+  mcpServerLogs(id: string, params?: McpLogParams): Promise<string>;
+  mcpServerTools(id: string): Promise<McpToolsSnapshot>;
+  putMcpServerEnv(id: string, env: McpEnvInput[]): Promise<McpServerView>;
+  deleteMcpServerEnv(id: string, key: string): Promise<McpServerView>;
+  mcpServerIncidents(
+    id: string,
+    params?: { status?: string; limit?: number },
+  ): Promise<McpIncident[]>;
+  closeMcpIncident(id: number): Promise<McpIncident>;
+  instanceMcpServers(id: string): Promise<InstanceMcpView>;
+  putInstanceMcpServers(id: string, servers: McpRefInput[]): Promise<InstanceMcpView>;
+  attachInstanceMcpServer(id: string, server: string, mode?: string): Promise<InstanceMcpView>;
+  detachInstanceMcpServer(id: string, server: string): Promise<InstanceMcpView>;
   listProviders(): Promise<ProviderSummary[]>;
   createProvider(input: CreateProviderInput): Promise<ProviderSummary>;
   getProvider(id: string): Promise<ProviderDetail>;

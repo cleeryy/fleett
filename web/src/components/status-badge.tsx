@@ -26,7 +26,16 @@ const STATUS_STYLES: Record<InstanceStatus, { dot: string; className: string }> 
   },
 };
 
-export function StatusBadge({ status, className }: { status: string; className?: string }) {
+export function StatusBadge({
+  status,
+  className,
+  labelPrefix = "status",
+}: {
+  status: string;
+  className?: string;
+  /** Dictionary area for the label; MCP servers are masculine, instances are not. */
+  labelPrefix?: string;
+}) {
   const { t } = useI18n();
   const key = (status in STATUS_STYLES ? status : "unknown") as InstanceStatus;
   const style = STATUS_STYLES[key];
@@ -36,7 +45,7 @@ export function StatusBadge({ status, className }: { status: string; className?:
       className={cn("gap-1.5 font-mono text-xs font-normal", style.className, className)}
     >
       <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", style.dot)} />
-      {t(`status.${key}`)}
+      {t(`${labelPrefix}.${key}`)}
     </Badge>
   );
 }

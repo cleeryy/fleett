@@ -24,6 +24,9 @@ import { InstanceDetailPage } from "@/pages/instance-detail";
 import { NewInstancePage } from "@/pages/instance-new";
 import { LoginPage } from "@/pages/login";
 import { LogsPage } from "@/pages/logs";
+import { MarketplacePage } from "@/pages/marketplace";
+import { McpServerDetailPage } from "@/pages/mcp-server-detail";
+import { McpServersPage } from "@/pages/mcp-servers";
 import { MemoryPage } from "@/pages/memory";
 import { MessagesPage } from "@/pages/messages";
 import { PersonaDetailPage } from "@/pages/persona-detail";
@@ -61,6 +64,9 @@ function titleFor(path: string, t: Translate): string {
   if (path.startsWith("/personas/")) return t("nav.personaDetail");
   if (path === "/skills") return t("nav.skills");
   if (path.startsWith("/skills/")) return t("nav.skillDetail");
+  if (path === "/marketplace") return t("nav.marketplace");
+  if (path === "/mcp-servers") return t("nav.mcpServers");
+  if (path.startsWith("/mcp-servers/")) return t("nav.mcpServerDetail");
   if (path === "/tokens") return t("nav.tokens");
   if (path === "/audit") return t("nav.audit");
   if (path === "/schedules") return t("nav.schedules");
@@ -289,6 +295,7 @@ export default function App() {
   const providerMatch = /^\/providers\/([^/]+)$/.exec(path);
   const personaMatch = /^\/personas\/([^/]+)$/.exec(path);
   const skillMatch = /^\/skills\/([^/]+)$/.exec(path);
+  const mcpMatch = /^\/mcp-servers\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
     crumbs = [{ label: t("nav.instances") }];
@@ -334,6 +341,19 @@ export default function App() {
     const name = decodeURIComponent(skillMatch[1]);
     crumbs = [{ label: t("nav.skills"), href: "#/skills" }, { label: name, mono: true }];
     screen = <SkillDetailPage key={name} name={name} />;
+  } else if (path === "/marketplace") {
+    crumbs = [{ label: t("nav.marketplace") }];
+    screen = <MarketplacePage />;
+  } else if (path === "/mcp-servers") {
+    crumbs = [{ label: t("nav.mcpServers") }];
+    screen = <McpServersPage />;
+  } else if (mcpMatch) {
+    const id = decodeURIComponent(mcpMatch[1]);
+    crumbs = [
+      { label: t("nav.mcpServers"), href: "#/mcp-servers" },
+      { label: id, mono: true },
+    ];
+    screen = <McpServerDetailPage key={id} id={id} />;
   } else if (path === "/schedules") {
     crumbs = [{ label: t("nav.schedules") }];
     screen = admin ? (

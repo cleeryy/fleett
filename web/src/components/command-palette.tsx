@@ -16,9 +16,11 @@ import {
   RotateCw,
   ScrollText,
   Search,
+  Server,
   SlidersHorizontal,
   Sparkles,
   Square,
+  Store,
   Sun,
   type LucideIcon,
 } from "lucide-react";
@@ -81,6 +83,8 @@ function navigationItems(t: (key: string) => string): NavigationItem[] {
   if (SKILLS_SCREEN) {
     items.splice(4, 0, { label: t("nav.skills"), href: "/skills", icon: Sparkles });
   }
+  items.splice(5, 0, { label: t("nav.marketplace"), href: "/marketplace", icon: Store });
+  items.splice(6, 0, { label: t("nav.mcpServers"), href: "/mcp-servers", icon: Server });
   return items;
 }
 
@@ -268,6 +272,15 @@ export function CommandPalette({
         keywords: [...base, "env", "environment", "variables", "secrets"],
         icon: SlidersHorizontal,
         perform: () => navigate(`${path}?tab=configuration`),
+      });
+      list.push({
+        id: `mcp:${instance.id}`,
+        group: "instances",
+        label: t("palette.mcp", { name: instance.name }),
+        detail: instance.id,
+        keywords: [...base, "mcp", "servers", "tools", "attach"],
+        icon: Server,
+        perform: () => navigate(`${path}?tab=mcp`),
       });
     }
 

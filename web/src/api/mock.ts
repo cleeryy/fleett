@@ -24,6 +24,7 @@ import type {
   CostReportParams,
   CostTotals,
   CreateInstanceInput,
+  CreateMcpServerInput,
   CreateMemoryInput,
   CreatePersonaInput,
   CreatePipelineInput,
@@ -61,6 +62,7 @@ import type {
   Incident,
   InstanceAcl,
   InstanceDetail,
+  InstanceMcpView,
   InstanceMessagesParams,
   InstanceStatus,
   InstanceSummary,
@@ -76,6 +78,24 @@ import type {
   MaintenanceStatus,
   MaintenanceWindow,
   MaintenanceWindowInput,
+  MarketplaceEntry,
+  MarketplaceInstallInput,
+  MarketplacePreview,
+  MarketplacePreviewFile,
+  MarketplaceSearch,
+  MarketplaceSource,
+  MarketplaceSyncResult,
+  MarketplaceUpdateInfo,
+  MarketplaceUpdateResult,
+  MarketplaceUpdates,
+  McpCatalogEntry,
+  McpEnvInput,
+  McpIncident,
+  McpLogParams,
+  McpServerView,
+  McpTestResult,
+  McpTool,
+  McpToolsSnapshot,
   MemoryEntry,
   MemoryVersion,
   Message,
@@ -87,6 +107,7 @@ import type {
   OnboardingReport,
   OnboardingStep,
   PatchInstanceInput,
+  PatchMcpServerInput,
   PatchPipelineInput,
   PatchPersonaInput,
   PatchProviderInput,
@@ -412,6 +433,14 @@ interface StoredSkillVersion {
   description: string;
   files: SkillFile[];
   published_at: string;
+  /** Marketplace provenance, flattened into the version view. */
+  source?: string;
+  ref?: string;
+  commit?: string;
+  upstream_version?: string;
+  author?: string;
+  tags?: string[];
+  installed_at?: string;
 }
 interface StoredSkill {
   name: string;
@@ -422,6 +451,53 @@ interface StoredSkill {
 }
 let skillStore: StoredSkill[] = [];
 const skillRepos = new Map<string, MockRepo>();
+
+/* Skills marketplace (issue #61): a small installable catalogue and one
+ * upstream newer than the installed `homelab` skill, so the badge, the update
+ * dialog and its promote report are all reachable in the demo. */
+interface MockMarketplaceSkill {
+  entry: MarketplaceEntry;
+  files: SkillFile[];
+  scripts: string[];
+}
+let marketplaceStore: MockMarketplaceSkill[] = [];
+interface MockUpstream {
+  entry: MarketplaceEntry;
+  files: SkillFile[];
+  scripts: string[];
+}
+let marketplaceUpstream = new Map<string, MockUpstream>();
+
+/* MCP servers (issue #62): one shared server with tools attached to two
+ * agents, a second one stopped with a secret environment. */
+interface StoredMcpServer {
+  id: string;
+  name: string;
+  description: string;
+  kind: string;
+  image: string;
+  command: string[];
+  port: number;
+  path: string;
+  persist: boolean;
+  cpu_limit: number;
+  mem_limit_mb: number;
+  host: string;
+  status: string;
+  health: string;
+  last_error: string | null;
+  last_probe_at: string | null;
+  tools: McpTool[];
+  tools_hash: string;
+  env: { key: string; value: string; secret: boolean }[];
+  headers: Record<string, string>;
+  created_at: string;
+  updated_at: string;
+}
+let mcpCatalogStore: McpCatalogEntry[] = [];
+let mcpServerStore: StoredMcpServer[] = [];
+let instanceMcpStore: Record<string, { server: string; mode: string }[]> = {};
+let mcpIncidentStore: McpIncident[] = [];
 let busMessages: Message[] = [];
 let memoryStore: MemoryEntry[] = [];
 /** Soft-deleted entries stay addressable by history and rollback. */
@@ -965,16 +1041,27 @@ function skillVersionsView(skill: StoredSkill): SkillVersionInfo[] {
     files_count: entry.files.length,
     size_bytes: entry.files.reduce((total, file) => total + byteLength(file.content), 0),
     published_at: entry.published_at,
+    ...(entry.source ? { source: entry.source } : {}),
+    ...(entry.ref ? { ref: entry.ref } : {}),
+    ...(entry.commit ? { commit: entry.commit } : {}),
+    ...(entry.upstream_version ? { upstream_version: entry.upstream_version } : {}),
+    ...(entry.author ? { author: entry.author } : {}),
+    ...(entry.tags?.length ? { tags: [...entry.tags] } : {}),
+    ...(entry.installed_at ? { installed_at: entry.installed_at } : {}),
   }));
 }
 
 function skillSummary(skill: StoredSkill): SkillSummary {
+  const provenance = skillVersion(skill, skill.latest ?? "") ?? skill.versions[skill.versions.length - 1];
   return {
     name: skill.name,
     description: skillDescription(skill),
     latest: skill.latest,
     versions: skill.versions.map((entry) => entry.version),
     instances_count: skillInstances(skill.name).length,
+    ...(provenance?.source ? { source: provenance.source } : {}),
+    ...(provenance?.ref ? { ref: provenance.ref } : {}),
+    ...(provenance?.commit ? { commit: provenance.commit } : {}),
     created_at: skill.created_at,
     updated_at: skill.updated_at,
   };
@@ -991,6 +1078,9 @@ function skillDetail(skill: StoredSkill): SkillDetail {
     files: (latest?.files ?? []).map((file) => ({ ...file })),
     instances,
     instances_count: instances.length,
+    ...(latest?.source ? { source: latest.source } : {}),
+    ...(latest?.ref ? { ref: latest.ref } : {}),
+    ...(latest?.commit ? { commit: latest.commit } : {}),
     created_at: skill.created_at,
     updated_at: skill.updated_at,
   };
@@ -1037,6 +1127,254 @@ function recordSkillCommit(skill: StoredSkill, identity: Identity, message: stri
     },
     files: snapshot,
   });
+}
+
+/* ---------------------------------------------------------------------------
+ * Skills marketplace (issue #61)
+ * ------------------------------------------------------------------------- */
+
+function findMarketplaceSkill(source: string): MockMarketplaceSkill {
+  const found = marketplaceStore.find((candidate) => candidate.entry.source === source);
+  if (!found) fail(404, "not_found", `marketplace skill "${source}" not found`);
+  return found;
+}
+
+function marketplacePreviewOf(skill: MockMarketplaceSkill): MarketplacePreview {
+  const skillMd = skill.files.find((file) => file.path === "SKILL.md");
+  const files: MarketplacePreviewFile[] = skill.files.map((file) => ({
+    path: file.path,
+    size: byteLength(file.content),
+    script: skill.scripts.includes(file.path),
+  }));
+  return {
+    name: skill.entry.name,
+    description: skill.entry.description,
+    ...(skill.entry.version ? { version: skill.entry.version } : {}),
+    ...(skill.entry.author ? { author: skill.entry.author } : {}),
+    files,
+    total_bytes: files.reduce((total, file) => total + file.size, 0),
+    skill_md: skillMd?.content ?? "",
+    scripts: [...skill.scripts],
+    ...(skill.entry.commit ? { commit: skill.entry.commit } : {}),
+    ...(skill.entry.source ? { source: skill.entry.source } : {}),
+    requires_confirmation: skill.scripts.length > 0,
+  };
+}
+
+function installMarketplaceSkill(
+  input: MarketplaceInstallInput,
+  identity: Identity,
+): SkillDetail {
+  const found = findMarketplaceSkill(input.source);
+  if (found.scripts.length > 0 && !input.confirm_scripts) {
+    fail(
+      409,
+      "scripts_require_confirmation",
+      "this skill contains scripts; confirm them explicitly to install it",
+      { scripts: found.scripts },
+    );
+  }
+  const name = (input.name ?? found.entry.name).trim();
+  if (!isValidSlug(name)) {
+    fail(400, "invalid_skill", "name must be 2-32 characters: lowercase letters, digits, hyphens.");
+  }
+  let skill = skillStore.find((candidate) => candidate.name === name) ?? null;
+  const at = Date.now();
+  if (!skill) {
+    skill = { name, latest: null, versions: [], created_at: iso(at), updated_at: iso(at) };
+    skillStore.push(skill);
+  }
+  let highest = 0;
+  for (const entry of skill.versions) {
+    highest = Math.max(highest, Number(entry.version.slice(1)) || 0);
+  }
+  const version = `v${highest + 1}`;
+  skill.versions.push({
+    version,
+    description: found.entry.description,
+    files: found.files.map((file) => ({ ...file })),
+    published_at: iso(at),
+    ...(found.entry.source ? { source: found.entry.source } : {}),
+    ...(found.entry.ref ? { ref: found.entry.ref } : {}),
+    ...(found.entry.commit ? { commit: found.entry.commit } : {}),
+    ...(found.entry.version ? { upstream_version: found.entry.version } : {}),
+    ...(found.entry.author ? { author: found.entry.author } : {}),
+    ...(found.entry.tags?.length ? { tags: [...found.entry.tags] } : {}),
+    installed_at: iso(at),
+  });
+  if (!skill.latest) skill.latest = version;
+  skill.updated_at = iso(at);
+  recordSkillCommit(skill, identity, `marketplace: ${name}@${version} from ${input.source}`);
+  recordAudit(identity, "marketplace.install", name, {
+    source: input.source,
+    version,
+    scripts: found.scripts.length,
+  });
+  return skillDetail(skill);
+}
+
+function marketplaceSources(entries: MarketplaceEntry[]): MarketplaceSource[] {
+  const count = (provider: string) =>
+    entries.filter((entry) => entry.provider === provider).length;
+  return [
+    { source: "local", status: "ok", count: count("local") },
+    {
+      source: "git",
+      status: "error",
+      count: count("git"),
+      message: "the last sync failed; cached entries are still shown.",
+    },
+    { source: "github", status: "ok", count: count("github") },
+    { source: "skills.sh", status: "ok", count: count("skills.sh") },
+  ];
+}
+
+function updateFileChanges(skill: StoredSkill, files: SkillFile[]): MarketplaceUpdateResult["files"] {
+  const current = skillVersion(skill, skill.latest ?? "")?.files ?? [];
+  const before = new Map(current.map((file) => [file.path, file.content]));
+  const after = new Map(files.map((file) => [file.path, file.content]));
+  const changes: MarketplaceUpdateResult["files"] = [];
+  for (const [path, content] of after) {
+    if (!before.has(path)) changes.push({ path, status: "added" });
+    else if (before.get(path) !== content) changes.push({ path, status: "modified" });
+  }
+  for (const path of before.keys()) {
+    if (!after.has(path)) changes.push({ path, status: "removed" });
+  }
+  return changes.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+/* ---------------------------------------------------------------------------
+ * MCP servers (issue #62)
+ * ------------------------------------------------------------------------- */
+
+function mcpEndpoint(server: Pick<StoredMcpServer, "id" | "kind" | "port" | "path">): string | null {
+  if (server.kind === "stdio") return null;
+  const path = server.path.startsWith("/") ? server.path : `/${server.path}`;
+  return `http://fleett-mcp-${server.id}:${server.port}${path}`;
+}
+
+function mcpToolsHash(tools: McpTool[]): string {
+  let hash = 0x811c9dc5;
+  const text = JSON.stringify(tools);
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0").repeat(4);
+}
+
+function mcpAttachedInstances(server: string): string[] {
+  return Object.entries(instanceMcpStore)
+    .filter(([, refs]) => refs.some((ref) => ref.server === server))
+    .map(([id]) => id)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function mcpServerView(stored: StoredMcpServer): McpServerView {
+  return {
+    id: stored.id,
+    name: stored.name,
+    description: stored.description,
+    kind: stored.kind,
+    image: stored.image,
+    command: [...stored.command],
+    port: stored.port,
+    path: stored.path,
+    persist: stored.persist,
+    cpu_limit: stored.cpu_limit,
+    mem_limit_mb: stored.mem_limit_mb,
+    host: stored.host,
+    status: stored.status,
+    health: stored.health,
+    last_error: stored.last_error,
+    last_probe_at: stored.last_probe_at,
+    endpoint: mcpEndpoint(stored),
+    tools: stored.tools.map((tool) => ({ ...tool })),
+    tools_count: stored.tools.length,
+    tools_hash: stored.tools_hash,
+    env: stored.env.map((entry) => ({
+      key: entry.key,
+      secret: entry.secret,
+      set: entry.value.length > 0,
+    })),
+    headers: Object.keys(stored.headers),
+    instances: mcpAttachedInstances(stored.id),
+    created_at: stored.created_at,
+    updated_at: stored.updated_at,
+  };
+}
+
+function findMcpServer(id: string): StoredMcpServer {
+  const server = mcpServerStore.find((candidate) => candidate.id === id);
+  if (!server) fail(404, "not_found", `MCP server "${id}" not found`);
+  return server;
+}
+
+function mcpLogsText(server: StoredMcpServer, tail: number): string {
+  const lines = [
+    `${iso(Date.now() - 240_000)} [INFO] fleett-mcp-${server.id}: starting ${server.kind} server`,
+    `${iso(Date.now() - 239_000)} [INFO] listening on :${server.port}${server.path}`,
+    `${iso(Date.now() - 238_000)} [INFO] tools/list returned ${server.tools.length} tool(s)`,
+    `${iso(Date.now() - 180_000)} [INFO] probe ok, health ${server.health}`,
+    `${iso(Date.now() - 60_000)} [INFO] ${server.tools.length} tool(s) ready`,
+  ];
+  if (server.last_error) lines.push(`${iso(Date.now() - 30_000)} [ERROR] ${server.last_error}`);
+  return lines.slice(-tail).join("\n");
+}
+
+function assertMcpId(value: string): string {
+  const id = value.trim();
+  if (!/^[a-z0-9][a-z0-9-]{1,31}$/.test(id)) {
+    fail(
+      400,
+      "invalid_mcp_server",
+      "id must be 2-32 characters: lowercase letters, digits or hyphens",
+    );
+  }
+  return id;
+}
+
+function normalizeMcpMode(value: string | undefined): string {
+  const mode = (value ?? "rw").trim().toLowerCase();
+  if (mode !== "rw" && mode !== "readonly") {
+    fail(400, "invalid_mcp_server", `unknown mode "${value}" (expected readonly or rw)`);
+  }
+  return mode;
+}
+
+function defaultMcpTools(id: string): McpTool[] {
+  return [
+    {
+      name: id,
+      description: `Tool exposed by the ${id} MCP server.`,
+      input_schema: { type: "object", properties: {} },
+    },
+  ];
+}
+
+function mcpInstanceView(id: string): InstanceMcpView {
+  const row = findRow(id);
+  const refs = instanceMcpStore[id] ?? [];
+  return {
+    id: row.id,
+    status: row.status,
+    servers: refs.flatMap((ref) => {
+      const server = mcpServerStore.find((candidate) => candidate.id === ref.server);
+      if (!server) return [];
+      return [
+        {
+          server: server.id,
+          mode: ref.mode,
+          kind: server.kind,
+          status: server.status,
+          health: server.health,
+          tools_count: server.tools.length,
+          endpoint: mcpEndpoint(server),
+        },
+      ];
+    }),
+  };
 }
 
 function skillInstancesUsing(name: string, pinned: boolean): string[] {
@@ -3717,6 +4055,12 @@ export function resetMock(): void {
 
   skillStore = [];
   skillRepos.clear();
+  marketplaceStore = [];
+  marketplaceUpstream.clear();
+  mcpCatalogStore = [];
+  mcpServerStore = [];
+  instanceMcpStore = {};
+  mcpIncidentStore = [];
 
   seedSkill(
     {
@@ -3737,6 +4081,13 @@ export function resetMock(): void {
             { path: "notes/proxmox.md", content: proxmoxNotes },
           ],
           published_at: iso(SEEDED_AT - 2 * DAY),
+          source: "github:cleeryy/skills:homelab@main",
+          ref: "main",
+          commit: "7c41b90d5e2a8f6c3d1b0a94e7f25c8d6b3a1e40",
+          upstream_version: "2.0.0",
+          author: "cleeryy",
+          tags: ["homelab", "proxmox", "caddy"],
+          installed_at: iso(SEEDED_AT - 2 * DAY),
         },
       ],
       created_at: iso(SEEDED_AT - 24 * DAY),
@@ -4028,6 +4379,344 @@ export function resetMock(): void {
   seedBusAndMemory();
   seedOperations();
 
+  /* Marketplace catalogue, one upstream update and MCP seeds. */
+  const homelabV3 = [
+    "# Homelab",
+    "",
+    "Use this skill for Proxmox, Caddy, DNS and the SSH bastion.",
+    "",
+    "## Steps",
+    "1. Check the cluster from the bastion, never on a host console.",
+    "2. `pct list` on `pve3` before touching a container.",
+    "3. Confirm the Caddy route in Git before editing it.",
+    "4. Read the DNS chain from `flux-matrix-opnsense.md`.",
+    "",
+    "## References",
+    "- `notes/proxmox.md`",
+    "- `notes/caddy.md`",
+    "",
+  ].join("\n");
+  const caddyNotes = [
+    "# Caddy routes",
+    "",
+    "Caddy runs on CT 2010 and reads its routes from the `caddy-config` repository.",
+    "",
+    "- Never edit the Caddyfile on the container.",
+    "- A missing route is a Git change, not a proxy restart.",
+    "",
+  ].join("\n");
+  const marketplaceSkillMd = [
+    "# Incident triage",
+    "",
+    "Use this skill when an alert reaches the on-call queue.",
+    "",
+    "## Steps",
+    "1. Read the alert and name the indicator.",
+    "2. Check the last 24 hours for the same indicator.",
+    "3. Record the decision, the source and the timestamp.",
+    "",
+  ].join("\n");
+
+  marketplaceStore = [
+    {
+      entry: {
+        name: "incident-triage",
+        description: "Triage an alert, qualify the indicator and record a decision the team can audit.",
+        provider: "local",
+        source: "local:incident-triage",
+        author: "cleeryy",
+        tags: ["security", "triage"],
+        version: "1.2.0",
+        commit: "9f3a1c2d7e6b5a4039281706f5e4d3c2b1a09786",
+      },
+      files: [
+        { path: "SKILL.md", content: marketplaceSkillMd },
+        {
+          path: "templates/decision.md",
+          content: "# Decision\n\n- Indicator:\n- Source:\n- Decision:\n- Owner:\n",
+        },
+      ],
+      scripts: [],
+    },
+    {
+      entry: {
+        name: "docker-debug",
+        description: "Inspect a container that restarts, read its logs and find the failing health check.",
+        provider: "github",
+        source: "github:acme/agent-skills:docker-debug@main",
+        ref: "main",
+        url: "https://github.com/acme/agent-skills",
+        author: "acme",
+        tags: ["docker", "debugging"],
+        version: "0.4.1",
+        commit: "c41d9e2a8b7f60514233241506f7e8d9a0b1c2d3",
+      },
+      files: [
+        {
+          path: "SKILL.md",
+          content: [
+            "# Docker debug",
+            "",
+            "Use this skill when a container is unhealthy or restarting.",
+            "",
+            "1. Read `docker compose logs --tail=100`.",
+            "2. Inspect the health check and its start period.",
+            "3. Reproduce the failure before changing the image.",
+            "",
+          ].join("\n"),
+        },
+        {
+          path: "scripts/inspect.sh",
+          content: "#!/bin/sh\nset -eu\ndocker compose ps\ndocker compose logs --tail=100\n",
+        },
+      ],
+      scripts: ["scripts/inspect.sh"],
+    },
+    {
+      entry: {
+        name: "web-checks",
+        description: "Verify an HTTP endpoint, its certificate and its DNS record before blaming the proxy.",
+        provider: "git",
+        source: "git:cleeryy/skills:web-checks",
+        ref: "main",
+        author: "cleeryy",
+        tags: ["web", "dns"],
+        version: "2.1.0",
+        commit: "5b1e7d3c9a2f80617263544538291a0b1c2d3e4f",
+      },
+      files: [
+        {
+          path: "SKILL.md",
+          content: [
+            "# Web checks",
+            "",
+            "Use this skill before opening an incident on a website.",
+            "",
+            "1. `curl -sS -o /dev/null -w '%{http_code}' https://<host>/`.",
+            "2. `dig +short <host>` and compare with the Caddy route.",
+            "3. Check the certificate dates.",
+            "",
+          ].join("\n"),
+        },
+      ],
+      scripts: [],
+    },
+    {
+      entry: {
+        name: "note-taker",
+        description: "Turn a working session into a short note with decisions, commands and follow-ups.",
+        provider: "skills.sh",
+        source: "skills.sh:note-taker",
+        url: "https://skills.sh/note-taker",
+        author: "skills.sh",
+        tags: ["writing", "notes"],
+        version: "1.0.3",
+      },
+      files: [
+        {
+          path: "SKILL.md",
+          content: [
+            "# Note taker",
+            "",
+            "Write a note with four sections: context, decisions, commands and follow-ups.",
+            "",
+          ].join("\n"),
+        },
+        {
+          path: "scripts/render.sh",
+          content: "#!/bin/sh\nprintf '%s\\n' \"$1\" | sed 's/^/  /'\n",
+        },
+      ],
+      scripts: ["scripts/render.sh"],
+    },
+  ];
+
+  marketplaceUpstream = new Map([
+    [
+      "homelab",
+      {
+        entry: {
+          name: "homelab",
+          description: "Homelab notes: Proxmox, Caddy, the bastion and the DNS chain.",
+          provider: "github",
+          source: "github:cleeryy/skills:homelab@main",
+          ref: "main",
+          author: "cleeryy",
+          tags: ["homelab", "proxmox", "caddy"],
+          version: "3.0.0",
+          commit: "d8e2f4a6b0c1d3e5f7a9b2c4d6e8f0a1b3c5d7e9",
+        },
+        files: [
+          { path: "SKILL.md", content: homelabV3 },
+          { path: "notes/proxmox.md", content: proxmoxNotes },
+          { path: "notes/caddy.md", content: caddyNotes },
+        ],
+        scripts: [],
+      },
+    ],
+  ]);
+
+  const fetchTools: McpTool[] = [
+    {
+      name: "fetch",
+      description: "Fetch a URL and return its content as markdown.",
+      input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+    },
+    {
+      name: "fetch_links",
+      description: "List the links found on a page.",
+      input_schema: { type: "object", properties: { url: { type: "string" } } },
+    },
+  ];
+  const githubTools: McpTool[] = [
+    {
+      name: "search_repositories",
+      description: "Search public repositories by name, topic or owner.",
+      input_schema: { type: "object", properties: { query: { type: "string" } } },
+    },
+  ];
+  mcpCatalogStore = [
+    {
+      id: "fetch",
+      name: "Fetch",
+      description: "Fetch a URL and convert it to markdown for the model (reference implementation).",
+      kind: "streamable-http",
+      image: "mcp/fetch:latest",
+      command: [],
+      port: 8080,
+      path: "/mcp",
+      env: [],
+      tags: ["web", "reference"],
+    },
+    {
+      id: "filesystem",
+      name: "Filesystem",
+      description: "Read and write files under one directory served by the container.",
+      kind: "streamable-http",
+      image: "mcp/filesystem:latest",
+      command: [],
+      port: 8080,
+      path: "/mcp",
+      env: [{ key: "ALLOWED_DIR", secret: false, required: true }],
+      tags: ["files", "reference"],
+    },
+    {
+      id: "github",
+      name: "GitHub",
+      description: "Search repositories, read issues and open pull requests with a personal token.",
+      kind: "streamable-http",
+      image: "ghcr.io/github/github-mcp-server:latest",
+      command: [],
+      port: 8080,
+      path: "/mcp",
+      env: [
+        { key: "GITHUB_TOKEN", secret: true, required: true },
+        { key: "GITHUB_OWNER", secret: false, required: false },
+      ],
+      tags: ["git", "code"],
+    },
+    {
+      id: "postgres",
+      name: "Postgres",
+      description: "Read-only SQL access to one database, with the schema exposed as a resource.",
+      kind: "stdio",
+      image: "mcp/postgres:latest",
+      command: ["postgres", "--dsn", "${DATABASE_URL}"],
+      port: 8080,
+      path: "/mcp",
+      env: [{ key: "DATABASE_URL", secret: true, required: true }],
+      tags: ["database", "sql"],
+    },
+  ];
+
+  mcpServerStore = [
+    {
+      id: "fetch",
+      name: "Fetch",
+      description: "Fetch a URL and convert it to markdown for the model.",
+      kind: "streamable-http",
+      image: "mcp/fetch:latest",
+      command: [],
+      port: 8080,
+      path: "/mcp",
+      persist: false,
+      cpu_limit: 0.5,
+      mem_limit_mb: 256,
+      host: "local",
+      status: "running",
+      health: "healthy",
+      last_error: null,
+      last_probe_at: iso(SEEDED_AT - 25 * 60_000),
+      tools: fetchTools,
+      tools_hash: mcpToolsHash(fetchTools),
+      env: [
+        { key: "FETCH_MAX_BYTES", value: "2000000", secret: false },
+        { key: "FETCH_USER_AGENT", value: "fleett-demo", secret: false },
+      ],
+      headers: {},
+      created_at: iso(SEEDED_AT - 8 * DAY),
+      updated_at: iso(SEEDED_AT - 25 * 60_000),
+    },
+    {
+      id: "github",
+      name: "GitHub",
+      description: "Repository search and issue triage for the fleet's agents.",
+      kind: "streamable-http",
+      image: "ghcr.io/github/github-mcp-server:latest",
+      command: [],
+      port: 8080,
+      path: "/mcp",
+      persist: false,
+      cpu_limit: 0.5,
+      mem_limit_mb: 512,
+      host: "local",
+      status: "stopped",
+      health: "none",
+      last_error: null,
+      last_probe_at: null,
+      tools: githubTools,
+      tools_hash: mcpToolsHash(githubTools),
+      env: [
+        { key: "GITHUB_TOKEN", value: "ghp_mock_token", secret: true },
+        { key: "GITHUB_OWNER", value: "cleeryy", secret: false },
+      ],
+      headers: {},
+      created_at: iso(SEEDED_AT - 3 * DAY),
+      updated_at: iso(SEEDED_AT - 3 * DAY),
+    },
+  ];
+  instanceMcpStore = {
+    alice: [{ server: "fetch", mode: "rw" }],
+    bob: [{ server: "fetch", mode: "readonly" }],
+  };
+  mcpIncidentStore = [
+    {
+      id: 1,
+      server_id: "fetch",
+      cause: "probe_timeout",
+      status: "closed",
+      opened_at: iso(SEEDED_AT - 2 * DAY),
+      closed_at: iso(SEEDED_AT - 2 * DAY + 90_000),
+      detail: "initialize did not answer within 10 s; the container was starting.",
+      actions: [{ action: "restart", at: iso(SEEDED_AT - 2 * DAY + 60_000) }],
+      restart_count: 1,
+      last_seen_at: iso(SEEDED_AT - 2 * DAY + 90_000),
+    },
+    {
+      id: 2,
+      server_id: "github",
+      cause: "health_check_failed",
+      status: "open",
+      opened_at: iso(SEEDED_AT - 6 * HOUR),
+      closed_at: null,
+      detail: "The container is stopped after repeated failed health checks.",
+      actions: [],
+      restart_count: 2,
+      last_seen_at: iso(SEEDED_AT - 6 * HOUR),
+    },
+  ];
+
+
   filesystems.clear();
   repositories.clear();
   for (const row of rows) {
@@ -4063,6 +4752,9 @@ export function resetMock(): void {
     snapshotStore = [];
     aclStore = {};
     egressStore = {};
+    mcpServerStore = [];
+    instanceMcpStore = {};
+    mcpIncidentStore = [];
   }
 }
 
@@ -5697,6 +6389,457 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       to: to.info.id,
       diff: buildDiff(from?.files ?? {}, to.files),
     };
+  },
+
+  /* Skills marketplace */
+
+  async marketplaceSearch(params = {}): Promise<MarketplaceSearch> {
+    requireAuth();
+    await delay(180);
+    const query = (params.q ?? "").trim().toLowerCase();
+    const source = params.source?.trim() || null;
+    const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
+    const every = marketplaceStore.map((candidate) => candidate.entry);
+    let matching = every.map((entry) => ({ ...entry, tags: [...(entry.tags ?? [])] }));
+    if (query) {
+      matching = matching.filter((entry) =>
+        [entry.name, entry.description, entry.author ?? "", ...(entry.tags ?? [])]
+          .join(" ")
+          .toLowerCase()
+          .includes(query),
+      );
+    }
+    const entries = source
+      ? matching.filter((entry) => entry.provider === source)
+      : matching;
+    return {
+      entries: entries.slice(0, limit),
+      sources: marketplaceSources(matching),
+    };
+  },
+
+  async marketplacePreview(input): Promise<MarketplacePreview> {
+    requireAuth();
+    await delay(320);
+    return marketplacePreviewOf(findMarketplaceSkill(input.source));
+  },
+
+  async marketplaceInstall(input): Promise<SkillDetail> {
+    const identity = requireAdmin();
+    await delay(420);
+    return installMarketplaceSkill(input, identity);
+  },
+
+  async marketplaceUpdate(name, input = {}): Promise<MarketplaceUpdateResult> {
+    const identity = requireAdmin();
+    await delay(480);
+    const skill = findSkill(name);
+    const upstream = marketplaceUpstream.get(name);
+    if (!upstream) {
+      fail(409, "no_upstream", `skill "${name}" has no upstream provenance`);
+    }
+    if (upstream.scripts.length > 0 && !input.confirm_scripts) {
+      fail(
+        409,
+        "scripts_require_confirmation",
+        "this skill contains scripts; confirm them explicitly to install it",
+        { scripts: upstream.scripts },
+      );
+    }
+    const from = skill.latest ?? "v0";
+    let highest = 0;
+    for (const entry of skill.versions) {
+      highest = Math.max(highest, Number(entry.version.slice(1)) || 0);
+    }
+    const to = `v${highest + 1}`;
+    const changes = updateFileChanges(skill, upstream.files);
+    if (changes.length === 0) {
+      fail(409, "upstream_unchanged", `the upstream content of "${name}" has not changed`);
+    }
+    const at = Date.now();
+    skill.versions.push({
+      version: to,
+      description: upstream.entry.description,
+      files: upstream.files.map((file) => ({ ...file })),
+      published_at: iso(at),
+      ...(upstream.entry.source ? { source: upstream.entry.source } : {}),
+      ...(upstream.entry.ref ? { ref: upstream.entry.ref } : {}),
+      ...(upstream.entry.commit ? { commit: upstream.entry.commit } : {}),
+      ...(upstream.entry.version ? { upstream_version: upstream.entry.version } : {}),
+      ...(upstream.entry.author ? { author: upstream.entry.author } : {}),
+      ...(upstream.entry.tags?.length ? { tags: [...upstream.entry.tags] } : {}),
+      installed_at: iso(at),
+    });
+    skill.updated_at = iso(at);
+    recordSkillCommit(skill, identity, `marketplace: ${name}@${to} from ${upstream.entry.source ?? "upstream"}`);
+    let promoted: MarketplaceUpdateResult["promoted"];
+    if (input.promote) {
+      promoted = await mockApi.promoteSkill(name, to);
+    } else {
+      recordAudit(identity, "marketplace.update", name, { from, to, files: changes.length });
+    }
+    marketplaceUpstream.delete(name);
+    return {
+      name,
+      from,
+      to,
+      ...(upstream.entry.commit ? { commit: upstream.entry.commit } : {}),
+      files: changes,
+      ...(promoted ? { promoted } : {}),
+    };
+  },
+
+  async marketplaceUpdates(): Promise<MarketplaceUpdates> {
+    requireAuth();
+    await delay(200);
+    const updates: MarketplaceUpdateInfo[] = [];
+    for (const [name, upstream] of marketplaceUpstream) {
+      const skill = skillStore.find((candidate) => candidate.name === name);
+      if (!skill || !skill.latest) continue;
+      if (skill.latest === upstream.entry.version) continue;
+      updates.push({
+        name,
+        installed_version: skill.latest,
+        ...(upstream.entry.version ? { upstream_version: upstream.entry.version } : {}),
+        ...(upstream.entry.commit ? { commit: upstream.entry.commit } : {}),
+        source: upstream.entry.source ?? "unknown",
+        ...(upstream.entry.ref ? { ref: upstream.entry.ref } : {}),
+      });
+    }
+    return { updates, warnings: [] };
+  },
+
+  async marketplaceSync(): Promise<MarketplaceSyncResult> {
+    requireAdmin();
+    await delay(620);
+    return {
+      skills: marketplaceStore.length,
+      source: "local index",
+      commit: "4f2a9c1e7b3d5068a2c4e6f8091b3d5c7e9f0a2b",
+    };
+  },
+
+  /* MCP servers */
+
+  async listMcpCatalog(q?: string): Promise<McpCatalogEntry[]> {
+    requireAuth();
+    await delay(140);
+    const query = (q ?? "").trim().toLowerCase();
+    return mcpCatalogStore
+      .filter((entry) => !query || `${entry.id} ${entry.name} ${entry.description} ${entry.tags.join(" ")}`.toLowerCase().includes(query))
+      .map((entry) => ({ ...entry, command: [...entry.command], env: entry.env.map((item) => ({ ...item })), tags: [...entry.tags] }));
+  },
+
+  async importMcpCatalog(entry: McpCatalogEntry): Promise<McpCatalogEntry> {
+    const identity = requireAdmin();
+    await delay(260);
+    const id = assertMcpId(entry.id);
+    if (mcpCatalogStore.some((candidate) => candidate.id === id)) {
+      fail(409, "mcp_duplicate", `catalogue entry "${id}" already exists`);
+    }
+    const stored: McpCatalogEntry = {
+      ...entry,
+      id,
+      command: [...(entry.command ?? [])],
+      env: (entry.env ?? []).map((item) => ({ ...item })),
+      tags: [...(entry.tags ?? [])],
+    };
+    mcpCatalogStore.push(stored);
+    recordAudit(identity, "mcp.catalog.import", id, { kind: stored.kind, image: stored.image });
+    return stored;
+  },
+
+  async listMcpServers(): Promise<McpServerView[]> {
+    requireAuth();
+    await delay(180);
+    return mcpServerStore
+      .map((server) => mcpServerView(server))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  },
+
+  async getMcpServer(id: string): Promise<McpServerView> {
+    requireAuth();
+    await delay(140);
+    return mcpServerView(findMcpServer(id));
+  },
+
+  async createMcpServer(input: CreateMcpServerInput): Promise<McpServerView> {
+    const identity = requireAdmin();
+    await delay(700);
+    const catalogEntry = input.catalog
+      ? mcpCatalogStore.find((entry) => entry.id === input.catalog)
+      : undefined;
+    if (input.catalog && !catalogEntry) {
+      fail(404, "not_found", `catalogue entry "${input.catalog}" not found`);
+    }
+    const id = assertMcpId(input.id ?? catalogEntry?.id ?? "");
+    if (mcpServerStore.some((server) => server.id === id)) {
+      fail(409, "mcp_duplicate", `MCP server "${id}" already exists`);
+    }
+    const kind = input.kind ?? catalogEntry?.kind ?? "streamable-http";
+    const image = input.image ?? catalogEntry?.image ?? "";
+    if (kind !== "stdio" && !image.trim()) {
+      fail(400, "invalid_mcp_server", "an image is required for a deployed server");
+    }
+    const at = Date.now();
+    const tools = defaultMcpTools(id);
+    const server: StoredMcpServer = {
+      id,
+      name: input.name?.trim() || catalogEntry?.name || id,
+      description: input.description ?? catalogEntry?.description ?? "",
+      kind,
+      image,
+      command: [...(input.command ?? catalogEntry?.command ?? [])],
+      port: input.port ?? catalogEntry?.port ?? 8080,
+      path: input.path ?? catalogEntry?.path ?? "/mcp",
+      persist: input.persist ?? false,
+      cpu_limit: input.cpu_limit ?? 0.5,
+      mem_limit_mb: input.mem_limit_mb ?? 256,
+      host: input.host ?? "local",
+      status: kind === "stdio" ? "created" : "running",
+      health: kind === "stdio" ? "none" : "healthy",
+      last_error: null,
+      last_probe_at: kind === "stdio" ? null : iso(at),
+      tools: kind === "stdio" ? [] : tools,
+      tools_hash: mcpToolsHash(kind === "stdio" ? [] : tools),
+      env: (input.env ?? [])
+        .filter((entry) => entry.key.trim())
+        .map((entry) => ({
+          key: entry.key.trim(),
+          value: entry.value ?? "",
+          secret: entry.secret ?? false,
+        })),
+      headers: { ...(input.headers ?? {}) },
+      created_at: iso(at),
+      updated_at: iso(at),
+    };
+    mcpServerStore.push(server);
+    recordAudit(identity, "mcp_server.create", id, {
+      kind,
+      image,
+      env: server.env.map((entry) => entry.key),
+    });
+    return mcpServerView(server);
+  },
+
+  async patchMcpServer(id: string, input: PatchMcpServerInput): Promise<McpServerView> {
+    const identity = requireAdmin();
+    await delay(280);
+    const server = findMcpServer(id);
+    if (input.name !== undefined) server.name = input.name;
+    if (input.description !== undefined) server.description = input.description;
+    if (input.image !== undefined) server.image = input.image;
+    if (input.command !== undefined) server.command = [...input.command];
+    if (input.port !== undefined) server.port = input.port;
+    if (input.path !== undefined) server.path = input.path;
+    if (input.persist !== undefined) server.persist = input.persist;
+    if (input.cpu_limit !== undefined) server.cpu_limit = input.cpu_limit;
+    if (input.mem_limit_mb !== undefined) server.mem_limit_mb = input.mem_limit_mb;
+    if (input.host !== undefined) server.host = input.host;
+    if (input.headers !== undefined) server.headers = { ...(input.headers ?? {}) };
+    server.updated_at = nowIso();
+    recordAudit(identity, "mcp_server.update", id, { redeploy_required: server.kind !== "stdio" });
+    return mcpServerView(server);
+  },
+
+  async deleteMcpServer(id: string, purge = false): Promise<void> {
+    const identity = requireAdmin();
+    await delay(360);
+    findMcpServer(id);
+    const attached = mcpAttachedInstances(id);
+    if (attached.length > 0) {
+      fail(409, "mcp_server_in_use", `MCP server "${id}" is still attached to one or more agents`, {
+        instances: attached,
+      });
+    }
+    mcpServerStore = mcpServerStore.filter((server) => server.id !== id);
+    mcpIncidentStore = mcpIncidentStore.filter((incident) => incident.server_id !== id);
+    recordAudit(identity, "mcp_server.delete", id, { purge });
+  },
+
+  async mcpServerAction(id, action): Promise<McpServerView> {
+    const identity = requireAdmin();
+    await delay(520);
+    const server = findMcpServer(id);
+    if (action === "stop") {
+      server.status = "stopped";
+      server.health = "none";
+      server.last_error = null;
+    } else {
+      server.status = "running";
+      server.health = "healthy";
+      server.last_error = null;
+      server.last_probe_at = nowIso();
+      if (server.tools.length === 0) {
+        server.tools = defaultMcpTools(server.id);
+        server.tools_hash = mcpToolsHash(server.tools);
+      }
+    }
+    server.updated_at = nowIso();
+    recordAudit(identity, `mcp_server.${action}`, id);
+    return mcpServerView(server);
+  },
+
+  async testMcpServer(id: string): Promise<McpTestResult> {
+    const identity = requireAdmin();
+    await delay(560);
+    const server = findMcpServer(id);
+    if (server.status !== "running") {
+      fail(422, "mcp_unreachable", `MCP server "${id}" is unreachable: connection refused`);
+    }
+    server.health = "healthy";
+    server.last_probe_at = nowIso();
+    server.updated_at = nowIso();
+    recordAudit(identity, "mcp_server.test", id, {
+      latency_ms: 32,
+      tools: server.tools.length,
+    });
+    return {
+      server: id,
+      reachable: true,
+      latency_ms: 32,
+      tools: server.tools.map((tool) => ({ ...tool })),
+      tools_count: server.tools.length,
+      tools_hash: server.tools_hash,
+      protocol_version: "2025-06-18",
+      server_info: { name: id, version: "1.0.0" },
+    };
+  },
+
+  async mcpServerLogs(id: string, params: McpLogParams = {}): Promise<string> {
+    requireAuth();
+    await delay(160);
+    const server = findMcpServer(id);
+    const tail = params.tail ?? 100;
+    if (!Number.isInteger(tail) || tail < 1 || tail > 5_000) {
+      fail(400, "invalid_tail", "tail must be between 1 and 5000");
+    }
+    return mcpLogsText(server, tail);
+  },
+
+  async mcpServerTools(id: string): Promise<McpToolsSnapshot> {
+    requireAuth();
+    await delay(120);
+    const server = findMcpServer(id);
+    return {
+      server: id,
+      tools: server.tools.map((tool) => ({ ...tool })),
+      count: server.tools.length,
+      hash: server.tools_hash,
+      probed_at: server.last_probe_at,
+    };
+  },
+
+  async putMcpServerEnv(id: string, env: McpEnvInput[]): Promise<McpServerView> {
+    const identity = requireAdmin();
+    await delay(420);
+    const server = findMcpServer(id);
+    server.env = env
+      .filter((entry) => entry.key.trim())
+      .map((entry) => ({
+        key: entry.key.trim(),
+        value: entry.value ?? "",
+        secret: entry.secret ?? false,
+      }));
+    server.updated_at = nowIso();
+    recordAudit(identity, "mcp_server.env.update", id, {
+      keys: server.env.map((entry) => entry.key),
+    });
+    return mcpServerView(server);
+  },
+
+  async deleteMcpServerEnv(id: string, key: string): Promise<McpServerView> {
+    const identity = requireAdmin();
+    await delay(300);
+    const server = findMcpServer(id);
+    const before = server.env.length;
+    server.env = server.env.filter((entry) => entry.key !== key);
+    if (server.env.length === before) {
+      fail(404, "not_found", `MCP server "${id}" has no environment variable "${key}"`);
+    }
+    server.updated_at = nowIso();
+    recordAudit(identity, "mcp_server.env.delete", id, { key });
+    return mcpServerView(server);
+  },
+
+  async mcpServerIncidents(id, params = {}): Promise<McpIncident[]> {
+    requireAuth();
+    await delay(140);
+    findMcpServer(id);
+    const limit = Math.min(Math.max(params.limit ?? 50, 1), 500);
+    return mcpIncidentStore
+      .filter((incident) => incident.server_id === id && (!params.status || incident.status === params.status))
+      .sort((left, right) => right.opened_at.localeCompare(left.opened_at))
+      .slice(0, limit)
+      .map((incident) => ({ ...incident, actions: [...incident.actions] }));
+  },
+
+  async closeMcpIncident(id: number): Promise<McpIncident> {
+    const identity = requireAdmin();
+    await delay(260);
+    const incident = mcpIncidentStore.find((candidate) => candidate.id === id && candidate.status === "open");
+    if (!incident) {
+      fail(404, "not_found", `MCP incident ${id} not found or already closed`);
+    }
+    incident.status = "closed";
+    incident.closed_at = nowIso();
+    incident.last_seen_at = incident.closed_at;
+    recordAudit(identity, "mcp_incident.close", incident.server_id, { incident: id });
+    return { ...incident, actions: [...incident.actions] };
+  },
+
+  async instanceMcpServers(id: string): Promise<InstanceMcpView> {
+    requireAuth();
+    await delay(140);
+    return mcpInstanceView(id);
+  },
+
+  async putInstanceMcpServers(id: string, servers): Promise<InstanceMcpView> {
+    const identity = requireAdmin();
+    await delay(620);
+    findRow(id);
+    const next: { server: string; mode: string }[] = [];
+    for (const ref of servers) {
+      findMcpServer(ref.server);
+      const mode = normalizeMcpMode(ref.mode);
+      if (next.some((entry) => entry.server === ref.server)) {
+        fail(400, "invalid_mcp_server", `MCP server "${ref.server}" is attached twice`);
+      }
+      next.push({ server: ref.server, mode });
+    }
+    instanceMcpStore[id] = next;
+    recordAudit(identity, "instance.mcp.attach", id, { replace: true });
+    return mcpInstanceView(id);
+  },
+
+  async attachInstanceMcpServer(id: string, server: string, mode?: string): Promise<InstanceMcpView> {
+    const identity = requireAdmin();
+    await delay(620);
+    findRow(id);
+    findMcpServer(server);
+    const selected = normalizeMcpMode(mode);
+    const current = instanceMcpStore[id] ?? [];
+    const existing = current.find((entry) => entry.server === server);
+    if (existing) existing.mode = selected;
+    else current.push({ server, mode: selected });
+    current.sort((left, right) => left.server.localeCompare(right.server));
+    instanceMcpStore[id] = current;
+    recordAudit(identity, "instance.mcp.attach", id, { server, mode: selected });
+    return mcpInstanceView(id);
+  },
+
+  async detachInstanceMcpServer(id: string, server: string): Promise<InstanceMcpView> {
+    const identity = requireAdmin();
+    await delay(620);
+    findRow(id);
+    const current = instanceMcpStore[id] ?? [];
+    const before = current.length;
+    instanceMcpStore[id] = current.filter((entry) => entry.server !== server);
+    if (instanceMcpStore[id].length === before) {
+      fail(404, "not_found", `instance "${id}" is not attached to MCP server "${server}"`);
+    }
+    recordAudit(identity, "instance.mcp.detach", id, { server });
+    return mcpInstanceView(id);
   },
 
   async listInstances(): Promise<InstanceSummary[]> {

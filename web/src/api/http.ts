@@ -52,6 +52,7 @@ import type {
   InstanceAcl,
   InstanceDetail,
   InstanceLogQuery,
+  InstanceMcpView,
   InstanceMessagesParams,
   InstanceSummary,
   LifecycleResult,
@@ -66,6 +67,16 @@ import type {
   MaintenanceStatus,
   MaintenanceWindow,
   MaintenanceWindowInput,
+  MarketplacePreview,
+  MarketplaceSearch,
+  MarketplaceSyncResult,
+  MarketplaceUpdateResult,
+  MarketplaceUpdates,
+  McpCatalogEntry,
+  McpIncident,
+  McpServerView,
+  McpTestResult,
+  McpToolsSnapshot,
   MemoryEntry,
   MemoryVersion,
   Message,
@@ -437,6 +448,142 @@ export const httpApi: FleetApi = {
         from: options.from,
         to: options.to,
       })}`,
+    ),
+
+  /* Skills marketplace */
+
+  marketplaceSearch: (params = {}) =>
+    request<MarketplaceSearch>(
+      `/api/marketplace/skills${queryString({
+        q: params.q,
+        source: params.source,
+        limit: params.limit,
+      })}`,
+    ),
+
+  marketplacePreview: (input) =>
+    request<MarketplacePreview>("/api/marketplace/skills/preview", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  marketplaceInstall: (input) =>
+    request<SkillDetail>("/api/marketplace/skills/install", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  marketplaceUpdate: (name, input = {}) =>
+    request<MarketplaceUpdateResult>(
+      `/api/marketplace/skills/${encodeURIComponent(name)}/update`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+
+  marketplaceUpdates: () => request<MarketplaceUpdates>("/api/marketplace/updates"),
+
+  marketplaceSync: () =>
+    request<MarketplaceSyncResult>("/api/marketplace/sync", { method: "POST" }),
+
+  /* MCP servers */
+
+  listMcpCatalog: (q) => request<McpCatalogEntry[]>(`/api/mcp/catalog${queryString({ q })}`),
+
+  importMcpCatalog: (entry) =>
+    request<McpCatalogEntry>("/api/mcp/catalog/import", {
+      method: "POST",
+      body: JSON.stringify(entry),
+    }),
+
+  listMcpServers: () => request<McpServerView[]>("/api/mcp/servers"),
+
+  getMcpServer: (id) => request<McpServerView>(`/api/mcp/servers/${encodeURIComponent(id)}`),
+
+  createMcpServer: (input) =>
+    request<McpServerView>("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  patchMcpServer: (id, input) =>
+    request<McpServerView>(`/api/mcp/servers/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
+  deleteMcpServer: (id, purge = false) =>
+    request<void>(
+      `/api/mcp/servers/${encodeURIComponent(id)}${purge ? "?purge=true" : ""}`,
+      { method: "DELETE" },
+    ),
+
+  mcpServerAction: (id, action) =>
+    request<McpServerView>(`/api/mcp/servers/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+    }),
+
+  testMcpServer: (id) =>
+    request<McpTestResult>(`/api/mcp/servers/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+    }),
+
+  mcpServerLogs: (id, params = {}) =>
+    request<string>(
+      `/api/mcp/servers/${encodeURIComponent(id)}/logs${queryString({
+        tail: params.tail,
+        since: params.since,
+      })}`,
+    ),
+
+  mcpServerTools: (id) =>
+    request<McpToolsSnapshot>(`/api/mcp/servers/${encodeURIComponent(id)}/tools`),
+
+  putMcpServerEnv: (id, env) =>
+    request<McpServerView>(`/api/mcp/servers/${encodeURIComponent(id)}/env`, {
+      method: "PUT",
+      body: JSON.stringify({ env }),
+    }),
+
+  deleteMcpServerEnv: (id, key) =>
+    request<McpServerView>(
+      `/api/mcp/servers/${encodeURIComponent(id)}/env/${encodeURIComponent(key)}`,
+      { method: "DELETE" },
+    ),
+
+  mcpServerIncidents: (id, params = {}) =>
+    request<McpIncident[]>(
+      `/api/mcp/servers/${encodeURIComponent(id)}/incidents${queryString({
+        status: params.status,
+        limit: params.limit,
+      })}`,
+    ),
+
+  closeMcpIncident: (id) =>
+    request<McpIncident>(`/api/mcp-incidents/${encodeURIComponent(String(id))}/close`, {
+      method: "POST",
+    }),
+
+  instanceMcpServers: (id) =>
+    request<InstanceMcpView>(`/api/instances/${encodeURIComponent(id)}/mcp-servers`),
+
+  putInstanceMcpServers: (id, servers) =>
+    request<InstanceMcpView>(`/api/instances/${encodeURIComponent(id)}/mcp-servers`, {
+      method: "PUT",
+      body: JSON.stringify({ servers }),
+    }),
+
+  attachInstanceMcpServer: (id, server, mode) =>
+    request<InstanceMcpView>(
+      `/api/instances/${encodeURIComponent(id)}/mcp-servers/${encodeURIComponent(server)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(mode ? { mode } : {}),
+      },
+    ),
+
+  detachInstanceMcpServer: (id, server) =>
+    request<InstanceMcpView>(
+      `/api/instances/${encodeURIComponent(id)}/mcp-servers/${encodeURIComponent(server)}`,
+      { method: "DELETE" },
     ),
 
   listProviders: () => request<ProviderSummary[]>("/api/providers"),

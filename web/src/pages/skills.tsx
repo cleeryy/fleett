@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { FileArchive, Plus, RefreshCw, Sparkles, Users } from "lucide-react";
+import { ArrowUpCircle, FileArchive, Plus, RefreshCw, Sparkles, Users } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
-import type { SkillSummary } from "@/api/types";
+import type { MarketplaceUpdateInfo, SkillSummary } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -14,11 +14,18 @@ import { SkillCreateDialog } from "@/components/skill-create-dialog";
 import { SkillImportDialog } from "@/components/skill-import-dialog";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
+import { refreshMarketplaceUpdates, useMarketplaceUpdates } from "@/lib/marketplace";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
 
-function SkillRow({ skill }: { skill: SkillSummary }) {
+function SkillRow({
+  skill,
+  update,
+}: {
+  skill: SkillSummary;
+  update?: MarketplaceUpdateInfo;
+}) {
   const { t, lang } = useI18n();
   return (
     <li>
@@ -27,7 +34,22 @@ function SkillRow({ skill }: { skill: SkillSummary }) {
         className="grid gap-x-4 gap-y-1 px-4 py-3 outline-none transition-colors hover:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-ring/50 sm:grid-cols-[minmax(0,1fr)_96px_92px_96px_116px] sm:items-center"
       >
         <div className="min-w-0">
-          <p className="truncate font-mono text-sm font-medium">{skill.name}</p>
+          <p className="flex min-w-0 items-center gap-2">
+            <span className="truncate font-mono text-sm font-medium" title={skill.name}>{skill.name}</span>
+            {update ? (
+              <Badge
+                variant="outline"
+                className="shrink-0 gap-1 border-sky-600/40 font-mono text-[10px] font-normal text-sky-700 dark:text-sky-400"
+                title={t("skills.list.updateBadgeTitle", {
+                  version: update.upstream_version ?? "",
+                  installed: update.installed_version,
+                })}
+              >
+                <ArrowUpCircle aria-hidden />
+                {t("skills.list.updateBadge", { version: update.upstream_version ?? "" })}
+              </Badge>
+            ) : null}
+          </p>
           <p className="line-clamp-2 text-sm text-muted-foreground">
             {skill.description || t("skills.picker.noDescription")}
           </p>
@@ -95,7 +117,16 @@ export function SkillsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const skills = useResource(() => api.listSkills(), [nonce]);
+  const updates = useMarketplaceUpdates();
   const rows = skills.data ?? [];
+  const updatesByName = new Map(
+    (updates.data?.updates ?? []).map((entry) => [entry.name, entry]),
+  );
+
+  function refresh() {
+    setNonce((value) => value + 1);
+    refreshMarketplaceUpdates();
+  }
 
   return (
     <>
@@ -107,7 +138,7 @@ export function SkillsPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setNonce((value) => value + 1)}
+              onClick={refresh}
               disabled={skills.refreshing}
             >
               <RefreshCw aria-hidden className={skills.refreshing ? "animate-spin" : undefined} />
@@ -136,6 +167,18 @@ export function SkillsPage() {
       ) : null}
 
       {skills.error ? <ErrorAlert error={skills.error} onRetry={skills.reload} /> : null}
+
+      {updatesByName.size > 0 ? (
+        <div className="flex items-start gap-2 rounded-md border border-sky-600/30 bg-sky-50/40 px-3 py-2 text-sm dark:bg-sky-950/20">
+          <ArrowUpCircle aria-hidden className="mt-0.5 size-4 shrink-0 text-sky-700 dark:text-sky-400" />
+          <p className="min-w-0 text-muted-foreground">
+            {t(
+              updatesByName.size === 1 ? "skills.list.updatesOne" : "skills.list.updatesMany",
+              { count: updatesByName.size },
+            )}
+          </p>
+        </div>
+      ) : null}
 
       {skills.loading && !skills.data ? (
         <div className="space-y-2 rounded-md border p-2">
@@ -179,7 +222,7 @@ export function SkillsPage() {
           </div>
           <ul className="divide-y">
             {rows.map((skill) => (
-              <SkillRow key={skill.name} skill={skill} />
+              <SkillRow key={skill.name} skill={skill} update={updatesByName.get(skill.name)} />
             ))}
           </ul>
         </div>

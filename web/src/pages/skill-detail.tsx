@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  ArrowUpCircle,
   FileArchive,
   FileText,
   GitCommitHorizontal,
@@ -35,8 +36,10 @@ import { PageHeader } from "@/components/page-header";
 import { SkillCreateDialog } from "@/components/skill-create-dialog";
 import { SkillDeleteDialog } from "@/components/skill-delete-dialog";
 import { SkillPromoteDialog } from "@/components/skill-promote-dialog";
+import { SkillUpdateDialog } from "@/components/skill-update-dialog";
 import { formatBytes, formatDateTime, formatRelative } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
+import { useMarketplaceUpdates, refreshMarketplaceUpdates } from "@/lib/marketplace";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import {
@@ -339,10 +342,14 @@ export function SkillDetailPage({ name }: { name: string }) {
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [promoteOpen, setPromoteOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const detail = useResource(() => api.getSkill(name), [name, nonce]);
   const instances = useResource(() => api.listInstances(), [name, nonce]);
   const log = useResource(() => api.skillGitLog(name, { limit: 50 }), [name, nonce]);
+  const updates = useMarketplaceUpdates();
+  const upstream =
+    updates.data?.updates.find((entry) => entry.name === name) ?? null;
 
   if (detail.loading && !detail.data) {
     return (
@@ -397,6 +404,10 @@ export function SkillDetailPage({ name }: { name: string }) {
         (entry) => entry.name === skill.name && entry.version === version,
       ),
     ).length;
+  const provenanceSource = skill.source ?? latestInfo?.source ?? null;
+  const provenanceRef = skill.ref ?? latestInfo?.ref ?? null;
+  const provenanceCommit = skill.commit ?? latestInfo?.commit ?? null;
+  const provenanceAuthor = latestInfo?.author ?? null;
 
   return (
     <>
@@ -407,6 +418,21 @@ export function SkillDetailPage({ name }: { name: string }) {
             {latestInfo ? (
               <Badge variant="secondary" className="font-mono text-xs font-normal">
                 {t("skills.picker.latestBadge", { version: latestInfo.version })}
+              </Badge>
+            ) : null}
+            {upstream ? (
+              <Badge
+                variant="outline"
+                className="gap-1 border-sky-600/40 font-mono text-xs font-normal text-sky-700 dark:text-sky-400"
+                title={t("skills.detail.upstreamTitle", {
+                  installed: upstream.installed_version,
+                  upstream: upstream.upstream_version ?? "",
+                })}
+              >
+                <ArrowUpCircle aria-hidden />
+                {t("skills.detail.upstreamBadge", {
+                  version: upstream.upstream_version ?? "",
+                })}
               </Badge>
             ) : null}
           </span>
@@ -452,7 +478,10 @@ export function SkillDetailPage({ name }: { name: string }) {
             <Button
               variant="outline"
               size="icon-sm"
-              onClick={() => setNonce((value) => value + 1)}
+              onClick={() => {
+                setNonce((value) => value + 1);
+                refreshMarketplaceUpdates();
+              }}
               aria-label={t("skills.detail.refresh")}
               title={t("skills.detail.refresh")}
             >
@@ -460,6 +489,12 @@ export function SkillDetailPage({ name }: { name: string }) {
             </Button>
             {canEdit ? (
               <>
+                {upstream ? (
+                  <Button size="sm" onClick={() => setUpdateOpen(true)}>
+                    <ArrowUpCircle aria-hidden />
+                    {t("skills.detail.update")}
+                  </Button>
+                ) : null}
                 <Button size="sm" variant="outline" onClick={() => setPromoteOpen(true)}>
                   <RotateCw aria-hidden />
                   {t("skills.detail.promote")}
@@ -696,6 +731,72 @@ export function SkillDetailPage({ name }: { name: string }) {
               ),
             },
             {
+              label: t("skills.detail.source"),
+              value: provenanceSource ? (
+                <span className="flex min-w-0 items-start gap-1">
+                  <span className="min-w-0 flex-1 font-mono text-xs break-all">
+                    {provenanceSource}
+                  </span>
+                  <CopyButton
+                    value={provenanceSource}
+                    label={`${t("common.copy")} ${t("skills.detail.source")}`}
+                    size="icon-xs"
+                    className="shrink-0"
+                  />
+                </span>
+              ) : (
+                <span className="text-muted-foreground">{t("skills.detail.localPublish")}</span>
+              ),
+            },
+            ...(provenanceRef
+              ? [
+                  {
+                    label: t("skills.detail.ref"),
+                    value: <span className="font-mono text-xs break-all">{provenanceRef}</span>,
+                  },
+                ]
+              : []),
+            ...(provenanceCommit
+              ? [
+                  {
+                    label: t("skills.detail.commit"),
+                    value: (
+                      <span className="flex min-w-0 items-start gap-1">
+                        <span className="min-w-0 flex-1 font-mono text-xs break-all">
+                          {provenanceCommit}
+                        </span>
+                        <CopyButton
+                          value={provenanceCommit}
+                          label={`${t("common.copy")} ${t("skills.detail.commit")}`}
+                          size="icon-xs"
+                          className="shrink-0"
+                        />
+                      </span>
+                    ),
+                  },
+                ]
+              : []),
+            ...(provenanceAuthor
+              ? [
+                  {
+                    label: t("skills.detail.author"),
+                    value: <span className="text-sm">{provenanceAuthor}</span>,
+                  },
+                ]
+              : []),
+            ...(latestInfo?.installed_at
+              ? [
+                  {
+                    label: t("skills.detail.installedAt"),
+                    value: (
+                      <span className="font-mono text-xs">
+                        {formatDateTime(latestInfo.installed_at)}
+                      </span>
+                    ),
+                  },
+                ]
+              : []),
+            {
               label: t("skills.detail.versions"),
               value: (
                 <span className="flex flex-wrap gap-1">
@@ -769,6 +870,17 @@ export function SkillDetailPage({ name }: { name: string }) {
             open={promoteOpen}
             onOpenChange={setPromoteOpen}
             onPromoted={() => setNonce((value) => value + 1)}
+          />
+          <SkillUpdateDialog
+            skill={skill}
+            upstream={upstream}
+            followers={followers.length}
+            open={updateOpen}
+            onOpenChange={setUpdateOpen}
+            onUpdated={() => {
+              setSelectedVersion(null);
+              setNonce((value) => value + 1);
+            }}
           />
           <SkillDeleteDialog
             skill={skill}

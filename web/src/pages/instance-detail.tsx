@@ -48,6 +48,7 @@ import { InstanceEnvironment } from "@/components/instance-env";
 import { InstanceLogs } from "@/components/instance-logs";
 import { InstanceFiles } from "@/components/instance-files";
 import { InstanceHistory } from "@/components/instance-history";
+import { InstanceMcp } from "@/components/instance-mcp";
 import {
   InstanceAccess,
   InstanceEgress,
@@ -1188,6 +1189,7 @@ const TAB_PAGES: Record<string, string> = {
   memory: "nav.memory",
   history: "skills.detail.history",
   logs: "nav.logs",
+  mcp: "detail.tab.mcp",
   access: "detail.tab.access",
   egress: "detail.tab.egress",
   terminal: "detail.tab.terminal",
@@ -1590,6 +1592,7 @@ export function InstanceDetailPage({ id }: { id: string }) {
             <TabsTrigger value="memory">{t(TAB_PAGES.memory)}</TabsTrigger>
             <TabsTrigger value="history">{t(TAB_PAGES.history)}</TabsTrigger>
             <TabsTrigger value="logs">{t(TAB_PAGES.logs)}</TabsTrigger>
+            <TabsTrigger value="mcp">{t(TAB_PAGES.mcp)}</TabsTrigger>
             <TabsTrigger value="access">{t(TAB_PAGES.access)}</TabsTrigger>
             <TabsTrigger value="egress">{t(TAB_PAGES.egress)}</TabsTrigger>
             {canEdit ? (
@@ -1674,6 +1677,9 @@ export function InstanceDetailPage({ id }: { id: string }) {
 
         <TabsContent value="logs" className="mt-4">
           <InstanceLogs id={data.id} />
+        </TabsContent>
+        <TabsContent value="mcp" className="mt-4">
+          <InstanceMcp id={data.id} />
         </TabsContent>
         <TabsContent value="access" className="mt-4">
           <InstanceAccess id={data.id} />

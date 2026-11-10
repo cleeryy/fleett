@@ -43,7 +43,11 @@ export function ErrorAlert({
   className?: string;
 }) {
   const { t } = useI18n();
-  const docker = error.status === 502;
+  const upstream =
+    error.code === "mcp_upstream" ||
+    error.code === "marketplace_unavailable" ||
+    error.code === "assistant_provider_error";
+  const docker = error.status === 502 && !upstream;
   const egress = error.code === "egress_not_enforced";
   const secrets = error.code === "secrets_key_missing";
   const message = apiErrorMessage(error, t);
@@ -51,17 +55,19 @@ export function ErrorAlert({
   const detail = error.code === "driver_error" ? error.message : null;
   const mono = !egress && !secrets && (docker || message.length > 120);
 
-  const title = egress
-    ? t("errors.title.egress")
-    : secrets
-      ? t("errors.title.secrets")
-      : docker
-        ? t("errors.title.docker")
-        : error.status === 401
-          ? t("errors.title.unauthorized")
-          : error.status === 403
-            ? t("errors.title.forbidden")
-            : t("errors.title.generic");
+  const title = upstream
+    ? t("errors.title.upstream")
+    : egress
+      ? t("errors.title.egress")
+      : secrets
+        ? t("errors.title.secrets")
+        : docker
+          ? t("errors.title.docker")
+          : error.status === 401
+            ? t("errors.title.unauthorized")
+            : error.status === 403
+              ? t("errors.title.forbidden")
+              : t("errors.title.generic");
 
   return (
     <Alert variant="destructive" className={cn("items-start", className)}>

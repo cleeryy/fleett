@@ -18,8 +18,10 @@ import {
   Rocket,
   ScrollText,
   Search,
+  Server,
   ShieldCheck,
   Sparkles,
+  Store,
   Sun,
   TriangleAlert,
   Workflow,
@@ -75,6 +77,8 @@ const NAV: NavItem[] = [
   { key: "templates", labelKey: "nav.templates", href: "#/templates", icon: LayoutTemplate },
   { key: "personas", labelKey: "nav.personas", href: "#/personas", icon: Fingerprint },
   { key: "skills", labelKey: "nav.skills", href: "#/skills", icon: Sparkles },
+  { key: "marketplace", labelKey: "nav.marketplace", href: "#/marketplace", icon: Store },
+  { key: "mcp", labelKey: "nav.mcpServers", href: "#/mcp-servers", icon: Server },
   { key: "setup", labelKey: "nav.setup", href: "#/setup", icon: ListChecks },
   { key: "tokens", labelKey: "nav.tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
   { key: "audit", labelKey: "nav.audit", href: "#/audit", icon: FileClock, adminOnly: true },
@@ -93,6 +97,8 @@ function activeKey(path: string): string {
   if (path.startsWith("/templates")) return "templates";
   if (path.startsWith("/personas")) return "personas";
   if (path.startsWith("/skills")) return "skills";
+  if (path.startsWith("/marketplace")) return "marketplace";
+  if (path.startsWith("/mcp-servers")) return "mcp";
   if (path.startsWith("/setup")) return "setup";
   if (path.startsWith("/tokens")) return "tokens";
   if (path.startsWith("/audit")) return "audit";
