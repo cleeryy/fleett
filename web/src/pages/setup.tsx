@@ -15,7 +15,7 @@ function revealDiagnostics() {
 }
 
 /**
- * Setup: the four first-run steps and the doctor report. Readable by every
+ * Setup: the five first-run steps and the doctor report. Readable by every
  * role; neither section writes to the host, so an operator can diagnose a
  * broken fleet without an admin account.
  */

@@ -182,6 +182,18 @@ impl Harness {
         Self::build(true, Some(MODEL.to_string()), budget)
     }
 
+    /// Harness whose `FLEETT_ASSISTANT_PROVIDER` names an id that does not
+    /// exist (a deleted provider).
+    fn with_env_provider(id: &str) -> Self {
+        Self::build_full(
+            Some(id.to_string()),
+            Some(MODEL.to_string()),
+            50_000,
+            true,
+            false,
+        )
+    }
+
     fn build(attach_provider: bool, model: Option<String>, budget: u64) -> Self {
         Self::build_with(attach_provider, model, budget, true)
     }
@@ -192,17 +204,33 @@ impl Harness {
         budget: u64,
         enabled: bool,
     ) -> Self {
+        Self::build_full(
+            attach_provider.then(|| PROVIDER_ID.to_string()),
+            model,
+            budget,
+            enabled,
+            attach_provider,
+        )
+    }
+
+    fn build_full(
+        env_provider: Option<String>,
+        model: Option<String>,
+        budget: u64,
+        enabled: bool,
+        with_provider: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut cfg = Config::for_tests(dir.path().to_path_buf());
         cfg.secrets_key = Some(fleett::secrets::encode_key(&SECRETS_KEY_BYTES));
         cfg.assistant_enabled = enabled;
-        cfg.assistant_provider = attach_provider.then(|| PROVIDER_ID.to_string());
+        cfg.assistant_provider = env_provider;
         cfg.assistant_model = model.unwrap_or_else(|| MODEL.to_string());
         cfg.assistant_budget_tokens = budget;
         let mock = Arc::new(MockDriver::new());
         let state = AppState::bootstrap(cfg, mock.clone()).expect("bootstrap state");
         let provider = MockProvider::spawn();
-        if attach_provider {
+        if with_provider {
             attach(&state, &provider.base_url);
         }
         Self {
@@ -212,13 +240,34 @@ impl Harness {
         }
     }
 
+    /// Insert one more provider row, pointing at the same mock upstream.
+    fn add_provider(&self, id: &str, name: &str) {
+        insert_provider(&self.state, id, name, &self.provider.base_url);
+    }
+
+    /// A `viewer` token, for the RBAC assertions.
+    async fn viewer_token(&self) -> String {
+        let (status, body) = self
+            .request(
+                Method::POST,
+                "/api/tokens",
+                Some(json!({"name": "assistant-viewer", "role": "viewer"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "token: {body}");
+        parse(&body)["token"]
+            .as_str()
+            .expect("token once")
+            .to_string()
+    }
+
     async fn request(
         &self,
         method: Method,
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, String) {
-        self.request_with(method, uri, body, &[]).await
+        self.request_as(method, uri, body, Some(TOKEN)).await
     }
 
     async fn request_with(
@@ -228,10 +277,33 @@ impl Harness {
         body: Option<Value>,
         headers: &[(&str, &str)],
     ) -> (StatusCode, String) {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        self.request_full(method, uri, body, Some(TOKEN), headers)
+            .await
+    }
+
+    /// Send one request with an explicit bearer token (`None` sends none).
+    async fn request_as(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        self.request_full(method, uri, body, token, &[]).await
+    }
+
+    async fn request_full(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -298,11 +370,16 @@ impl Harness {
 
 /// Insert the provider row the assistant reads at request time.
 fn attach(state: &AppState, base_url: &str) {
+    insert_provider(state, PROVIDER_ID, "assistant-provider", base_url);
+}
+
+/// Insert one provider row with a placeholder id and name.
+fn insert_provider(state: &AppState, id: &str, name: &str, base_url: &str) {
     let sealed = fleett::providers::seal(&state.cfg, PROVIDER_SECRET).expect("seal");
     let now = now_iso();
     let spec = ProviderSpec {
-        id: PROVIDER_ID.to_string(),
-        name: "assistant-provider".to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
         kind: "openai-compatible".to_string(),
         base_url: base_url.to_string(),
         api_key_env: "PROVIDER_API_KEY".to_string(),
@@ -338,6 +415,9 @@ async fn config_reports_the_defaults_and_off_removes_every_route() {
     let config = parse(&body);
     assert_eq!(config["enabled"], true);
     assert!(config["provider"].is_null(), "{config}");
+    // `null` is never bare: the reason tells "empty fleet" from "not selected".
+    assert_eq!(config["provider_source"], "none");
+    assert_eq!(config["reason"], "no_provider");
     assert_eq!(config["model"], MODEL);
     assert_eq!(config["budget_tokens"], 50_000);
     assert_eq!(config["used_tokens"], 0);
@@ -351,6 +431,269 @@ async fn config_reports_the_defaults_and_off_removes_every_route() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
         assert_eq!(parse(&body)["error"]["code"], "not_found");
     }
+    let (status, body) = disabled
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn a_single_provider_is_used_automatically() {
+    let harness = Harness::unconfigured();
+    harness.add_provider("solo-provider", "opencode-go");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert_eq!(config["provider"]["id"], "solo-provider");
+    assert_eq!(config["provider"]["name"], "opencode-go");
+    assert_eq!(config["provider_source"], "auto");
+    assert!(config["reason"].is_null(), "{config}");
+
+    // And the chat works with no manual configuration at all: the panel must
+    // stop claiming there is no provider when one exists.
+    harness
+        .provider
+        .answer_with("{\"message\":\"draft\"}", 10, 5);
+    let (status, body) = harness
+        .chat(chat_body("auto", "skill", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["message"], "draft");
+    assert_eq!(harness.provider.last().path, "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn several_providers_are_never_selected_implicitly() {
+    let harness = Harness::unconfigured();
+    harness.add_provider("p-one", "one");
+    harness.add_provider("p-two", "two");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert!(config["provider"].is_null(), "{config}");
+    assert_eq!(config["provider_source"], "none");
+    assert_eq!(config["reason"], "not_selected");
+
+    // No credential is guessed: the chat refuses and names the reason.
+    let (status, body) = harness
+        .chat(chat_body("pick", "skill", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].clone();
+    assert_eq!(error["code"], "assistant_not_configured");
+    assert_eq!(error["details"]["reason"], "not_selected");
+    assert_eq!(error["details"]["providers"], "/api/providers");
+    assert!(harness.provider.requests().is_empty(), "no paid call");
+}
+
+#[tokio::test]
+async fn patch_selects_a_provider_and_persists_it() {
+    let harness = Harness::unconfigured();
+    harness.add_provider("p-one", "one");
+    harness.add_provider("p-two", "two");
+
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "p-two"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert_eq!(config["provider"]["id"], "p-two");
+    assert_eq!(config["provider_source"], "setting");
+    assert!(config["reason"].is_null(), "{config}");
+
+    // The selection survives the request: it is stored, not echoed.
+    assert_eq!(
+        harness
+            .state
+            .db
+            .setting(fleett::assistant::SETTING_ASSISTANT_PROVIDER)
+            .expect("setting")
+            .as_deref(),
+        Some("p-two")
+    );
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["provider_source"], "setting");
+
+    // The chat now answers through that provider.
+    harness
+        .provider
+        .answer_with("{\"message\":\"selected\"}", 10, 5);
+    let (status, body) = harness
+        .chat(chat_body("selected", "skill", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["message"], "selected");
+
+    // `null` clears the selection; two providers remain, so nothing is guessed.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert!(config["provider"].is_null(), "{config}");
+    assert_eq!(config["reason"], "not_selected");
+    assert_eq!(
+        harness
+            .state
+            .db
+            .setting(fleett::assistant::SETTING_ASSISTANT_PROVIDER)
+            .expect("setting"),
+        None
+    );
+
+    let rows = harness.audit("assistant.config").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["details"]["provider"], "p-two");
+    assert_eq!(rows[1]["details"]["source"], "setting");
+    assert_eq!(rows[1]["details"]["env_override"], false);
+}
+
+#[tokio::test]
+async fn the_environment_still_wins_over_the_stored_selection() {
+    let harness = Harness::new();
+    harness.add_provider("p-two", "two");
+
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "p-two"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    // The body is stored, but `FLEETT_ASSISTANT_PROVIDER` still answers, and
+    // the panel is told exactly that instead of pretending otherwise.
+    assert_eq!(config["provider"]["id"], PROVIDER_ID, "{config}");
+    assert_eq!(config["provider_source"], "env");
+    assert_eq!(
+        harness
+            .state
+            .db
+            .setting(fleett::assistant::SETTING_ASSISTANT_PROVIDER)
+            .expect("setting")
+            .as_deref(),
+        Some("p-two")
+    );
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["provider_source"], "env");
+
+    let rows = harness.audit("assistant.config").await;
+    assert_eq!(rows[0]["details"]["env_override"], true, "{}", rows[0]);
+}
+
+#[tokio::test]
+async fn a_broken_reference_answers_422_with_the_valid_ids() {
+    // A deleted id in `FLEETT_ASSISTANT_PROVIDER`.
+    let harness = Harness::with_env_provider("deleted-provider");
+    harness.add_provider("p-one", "one");
+    let valid = json!(["p-one"]);
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(error["details"]["provider"], "deleted-provider");
+    assert_eq!(error["details"]["source"], "env");
+    assert_eq!(error["details"]["valid"], valid);
+
+    // The chat reports the same thing instead of a 500 or a silent null.
+    let (status, body) = harness
+        .chat(chat_body("broken", "skill", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "assistant_provider_unknown");
+
+    // The same for a stored setting pointing at a provider that was deleted.
+    let stored = Harness::unconfigured();
+    stored.add_provider("p-one", "one");
+    stored
+        .state
+        .db
+        .set_setting(fleett::assistant::SETTING_ASSISTANT_PROVIDER, "gone")
+        .expect("setting");
+    let (status, body) = stored
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(error["details"]["source"], "setting");
+    assert_eq!(error["details"]["valid"], valid);
+}
+
+#[tokio::test]
+async fn patch_validates_the_provider_and_requires_admin() {
+    let harness = Harness::unconfigured();
+    harness.add_provider("p-one", "one");
+
+    // A viewer may read the config but never select a provider.
+    let viewer = harness.viewer_token().await;
+    let (status, body) = harness
+        .request_as(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "p-one"})),
+            Some(&viewer),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        harness
+            .state
+            .db
+            .setting(fleett::assistant::SETTING_ASSISTANT_PROVIDER)
+            .expect("setting"),
+        None
+    );
+
+    // An unknown id is refused with the ids that would work.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "nope"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(error["details"]["source"], "setting");
+    assert_eq!(error["details"]["valid"], json!(["p-one"]));
+
+    // The field is required: a typo must never clear a working selection.
+    let (status, body) = harness
+        .request(Method::PATCH, "/api/assistant/config", Some(json!({})))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "invalid_body");
 }
 
 #[tokio::test]

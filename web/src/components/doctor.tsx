@@ -89,6 +89,23 @@ function Fix({ fix }: { fix: string }) {
   );
 }
 
+/** A check can carry a page to open in addition to the command that repairs it. */
+function FixLink({ to }: { to: string }) {
+  const { t } = useI18n();
+  const external = isUrl(to);
+  return (
+    <Button asChild variant="outline" size="sm" className="mt-1.5">
+      <a
+        href={external ? to : hrefFor(to)}
+        {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
+      >
+        <ExternalLink aria-hidden />
+        {t("health.openFix")}
+      </a>
+    </Button>
+  );
+}
+
 /** Check labels are server copy; map the stable id to translator keys. */
 function checkTitle(
   check: DoctorCheck,
@@ -125,7 +142,10 @@ function CheckRow({ check }: { check: DoctorCheck }) {
           ) : null}
         </div>
         <p className="text-sm break-words text-muted-foreground">{check.detail}</p>
-        {check.fix ? <Fix fix={check.fix} /> : null}
+        {check.link ? <FixLink to={check.link} /> : null}
+        {check.fix && !(check.link && (isUrl(check.fix) || isInternalPath(check.fix))) ? (
+          <Fix fix={check.fix} />
+        ) : null}
       </div>
     </li>
   );

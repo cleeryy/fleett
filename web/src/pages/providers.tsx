@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/table";
 import { DeleteProviderDialog } from "@/components/provider-delete-dialog";
 import { ProviderFormDialog } from "@/components/provider-form-dialog";
+import { AssistantProviderCard } from "@/components/assistant-provider";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
@@ -122,6 +123,13 @@ export function ProvidersPage() {
             ) : null}
           </>
         }
+      />
+
+      <AssistantProviderCard
+        providers={rows}
+        providersLoading={providers.loading}
+        nonce={nonce}
+        onCreate={() => setCreateOpen(true)}
       />
 
       {providers.error ? <ErrorAlert error={providers.error} onRetry={providers.reload} /> : null}

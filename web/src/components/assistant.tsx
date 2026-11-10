@@ -11,7 +11,6 @@ import {
   ArrowUp,
   Loader2,
   Paperclip,
-  Plug,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -25,6 +24,7 @@ import type {
   AssistantProposal,
   AssistantRedaction,
   AssistantUsage,
+  ProviderSummary,
 } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -39,6 +39,10 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { AssistantProposalCard, type LoadedProposalFile } from "@/components/assistant-proposal";
+import {
+  AssistantProviderNotice,
+  ProviderSourceLabel,
+} from "@/components/assistant-provider";
 import { ErrorAlert } from "@/components/error-alert";
 import {
   QUICK_TASKS,
@@ -51,7 +55,12 @@ import {
   useAssistantScopeValue,
   type QuickTask,
 } from "@/lib/assistant";
+import {
+  assistantNeedsProviders,
+  assistantProviderState,
+} from "@/lib/assistant-provider";
 import { apiErrorMessage } from "@/api/errors";
+import { ASSISTANT_CONFIG_EVENT } from "@/lib/events";
 import { formatBytes, formatTokens } from "@/lib/format";
 import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useRoute } from "@/lib/router";
@@ -136,6 +145,8 @@ export function AssistantPanel() {
 
   const [config, setConfig] = useState<AssistantConfig | null>(null);
   const [configError, setConfigError] = useState<ApiError | null>(null);
+  const [providers, setProviders] = useState<ProviderSummary[]>([]);
+  const [providersLoading, setProvidersLoading] = useState(true);
   const [open, setOpen] = useState(false);
   const [threads, setThreads] = useState<Record<string, Conversation>>({});
   const [busy, setBusy] = useState(false);
@@ -167,9 +178,33 @@ export function AssistantPanel() {
     }
   }, []);
 
+  const loadProviders = useCallback(async () => {
+    try {
+      setProviders(await api.listProviders());
+    } catch {
+      // The notice falls back to the Providers link; the list is a convenience.
+    } finally {
+      setProvidersLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadConfig();
   }, [loadConfig]);
+
+  // A provider created or chosen elsewhere changes what the assistant can do.
+  useEffect(() => {
+    const reload = () => {
+      void loadConfig();
+      void loadProviders();
+    };
+    window.addEventListener(ASSISTANT_CONFIG_EVENT, reload);
+    return () => window.removeEventListener(ASSISTANT_CONFIG_EVENT, reload);
+  }, [loadConfig, loadProviders]);
+
+  useEffect(() => {
+    void loadProviders();
+  }, [loadProviders]);
 
   // Usage is authoritative on the controller; re-read it when the panel opens.
   useEffect(() => {
@@ -185,10 +220,11 @@ export function AssistantPanel() {
       .catch(() => {
         /* a stale count is harmless */
       });
+    void loadProviders();
     return () => {
       alive = false;
     };
-  }, [open, config?.enabled]);
+  }, [open, config?.enabled, loadProviders]);
 
   useEffect(() => {
     if (!open) return;
@@ -226,8 +262,16 @@ export function AssistantPanel() {
   // `FLEETT_ASSISTANT=off` answers 404: nothing is rendered at all.
   const hidden = config ? !config.enabled : configError ? configError.status === 404 : true;
 
-  const noProvider = config !== null && config.provider === null;
-  const notConfigured = noProvider || error?.code === "assistant_not_configured";
+  // Providers that still exist: when the select needs options, an old
+  // controller gives none, so wait for the list before choosing the copy.
+  const state = assistantNeedsProviders(config) && providersLoading
+    ? null
+    : assistantProviderState(config, configError, providers);
+  const providerReady = state?.kind === "resolved";
+  const unknownProvider = state?.kind === "unknown";
+
+  const notConfigured =
+    (state !== null && !providerReady) || error?.code === "assistant_not_configured";
   const budgetExceeded = error?.code === "assistant_budget_exceeded";
   const composerDisabled = busy || config === null || notConfigured || budgetExceeded;
 
@@ -323,10 +367,33 @@ export function AssistantPanel() {
 
   if (hidden) return null;
 
-  const providerName = config?.provider?.name ?? t("assistant.noProvider");
   const model = config?.model?.trim();
   const budget = config?.budget_tokens ?? 0;
   const percent = budget > 0 ? Math.min(100, Math.round((usedTokens / budget) * 100)) : 0;
+  const providerBadge =
+    state?.kind === "resolved" ? (
+      <>
+        <Badge variant="secondary" className="max-w-40 font-normal">
+          <span className="truncate">{state.provider.name}</span>
+        </Badge>
+        <ProviderSourceLabel source={state.source} />
+      </>
+    ) : state?.kind === "not_selected" ? (
+      <Badge variant="outline" className="font-normal">
+        {t("assistant.providerNotSelected")}
+      </Badge>
+    ) : unknownProvider ? (
+      <Badge
+        variant="outline"
+        className="border-destructive/40 font-normal text-destructive"
+      >
+        {t("assistant.providerMissing")}
+      </Badge>
+    ) : state?.kind === "no_provider" ? (
+      <Badge variant="outline" className="font-normal">
+        {t("assistant.noProvider")}
+      </Badge>
+    ) : null;
   const contextLabel = [scope.instance, page, scope.path ? baseName(scope.path) : null]
     .filter(Boolean)
     .join(" · ");
@@ -345,39 +412,39 @@ export function AssistantPanel() {
               <Sparkles aria-hidden className="size-4 text-muted-foreground" />
               {t("assistant.title")}
             </h2>
-            <Badge variant="secondary" className="max-w-40 font-normal">
-              <span className="truncate">{providerName}</span>
-            </Badge>
+            {providerBadge}
           </div>
-          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
-            {model ? (
-              <span className="truncate font-mono">{model}</span>
-            ) : (
-              <span>{t("assistant.noModel")}</span>
-            )}
-            <span aria-hidden>·</span>
-            <span className="flex items-center gap-1.5">
-              <span>
-                {t("assistant.tokenUsage", {
-                  used: formatTokens(usedTokens),
-                  budget: formatTokens(budget),
-                })}
-              </span>
-              <span
-                className="h-1 w-14 overflow-hidden rounded-full bg-muted"
-                role="progressbar"
-                aria-label={t("assistant.budgetAria")}
-                aria-valuemin={0}
-                aria-valuemax={Math.max(budget, 1)}
-                aria-valuenow={Math.min(usedTokens, budget)}
-              >
+          {config ? (
+            <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
+              {model ? (
+                <span className="truncate font-mono">{model}</span>
+              ) : (
+                <span>{t("assistant.noModel")}</span>
+              )}
+              <span aria-hidden>·</span>
+              <span className="flex items-center gap-1.5">
+                <span>
+                  {t("assistant.tokenUsage", {
+                    used: formatTokens(usedTokens),
+                    budget: formatTokens(budget),
+                  })}
+                </span>
                 <span
-                  className="block h-full rounded-full bg-foreground/30"
-                  style={{ width: `${percent}%` }}
-                />
+                  className="h-1 w-14 overflow-hidden rounded-full bg-muted"
+                  role="progressbar"
+                  aria-label={t("assistant.budgetAria")}
+                  aria-valuemin={0}
+                  aria-valuemax={Math.max(budget, 1)}
+                  aria-valuenow={Math.min(usedTokens, budget)}
+                >
+                  <span
+                    className="block h-full rounded-full bg-foreground/30"
+                    style={{ width: `${percent}%` }}
+                  />
+                </span>
               </span>
-            </span>
-          </p>
+            </p>
+          ) : null}
           <div className="mt-2">
             <Popover>
               <PopoverTrigger asChild>
@@ -456,28 +523,34 @@ export function AssistantPanel() {
     </header>
   );
 
+  const showProviderNotice = state !== null && !providerReady;
+  const showConfigError =
+    configError !== null &&
+    configError.status !== 404 &&
+    configError.code !== "assistant_provider_unknown";
+  const showChatError =
+    error !== null &&
+    !budgetExceeded &&
+    !(showProviderNotice && error.code === "assistant_not_configured");
+
   const banners = (
     <>
-      {configError && configError.status !== 404 ? (
+      {showConfigError ? (
         <div className="shrink-0 px-4 pt-3">
           <ErrorAlert error={configError} onRetry={() => void loadConfig()} />
         </div>
       ) : null}
-      {notConfigured ? (
-        <div className="shrink-0 px-4 pt-3">
-          <Alert className="items-start">
-            <Plug aria-hidden className="mt-0.5" />
-            <AlertTitle>{t("assistant.noProviderTitle")}</AlertTitle>
-            <AlertDescription>
-              <p>{t("assistant.noProviderBody")}</p>
-              <Button asChild variant="outline" size="sm" className="mt-2">
-                <a href="#/providers" onClick={() => setOpen(false)}>
-                  {t("assistant.openProviders")}
-                </a>
-              </Button>
-            </AlertDescription>
-          </Alert>
-        </div>
+      {showProviderNotice ? (
+        <AssistantProviderNotice
+          state={state}
+          providers={providers}
+          onSaved={(value) => {
+            setConfig(value);
+            setConfigError(null);
+            setUsedTokens(value.used_tokens);
+          }}
+          onNavigate={() => setOpen(false)}
+        />
       ) : null}
       {budgetExceeded ? (
         <div className="shrink-0 px-4 pt-3">
@@ -498,7 +571,7 @@ export function AssistantPanel() {
           </Alert>
         </div>
       ) : null}
-      {error && !notConfigured && !budgetExceeded ? (
+      {showChatError ? (
         <div className="shrink-0 px-4 pt-3">
           <ErrorAlert error={error} />
         </div>
@@ -512,7 +585,7 @@ export function AssistantPanel() {
       className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4"
       aria-live="polite"
     >
-      {turns.length === 0 ? (
+      {turns.length === 0 && providerReady ? (
         <div className="space-y-1 py-6 text-center">
           <p className="text-sm font-medium">{t("assistant.emptyTitle")}</p>
           <p className="text-xs text-muted-foreground">{t("assistant.emptyBody")}</p>
@@ -602,11 +675,15 @@ export function AssistantPanel() {
           rows={2}
           aria-label={t("assistant.inputAria")}
           placeholder={
-            notConfigured
-              ? t("assistant.placeholderNoProvider")
-              : budgetExceeded
-                ? t("assistant.placeholderBudget")
-                : t("assistant.placeholder")
+            unknownProvider
+              ? t("assistant.placeholderProviderMissing")
+              : state?.kind === "not_selected"
+                ? t("assistant.placeholderChooseProvider")
+                : notConfigured
+                  ? t("assistant.placeholderNoProvider")
+                  : budgetExceeded
+                    ? t("assistant.placeholderBudget")
+                    : t("assistant.placeholder")
           }
           className="max-h-40 min-h-16 resize-none"
           disabled={composerDisabled}

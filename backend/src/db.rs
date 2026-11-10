@@ -760,6 +760,18 @@ CREATE INDEX IF NOT EXISTS idx_mcp_incidents_server
 CREATE INDEX IF NOT EXISTS idx_mcp_incidents_status
     ON mcp_incidents (status);
 "#,
+    // v31 — control-plane settings (issue #63). Small, non-secret preferences
+    // that used to cost an environment variable and a restart; the assistant
+    // provider selection (`assistant_provider`) is the first one. An explicit
+    // environment variable always wins over a stored value, so this table can
+    // never override the operator's `fleett.env`.
+    r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -2383,6 +2395,39 @@ impl Db {
             .collect())
     }
 
+    /// One stored setting, `None` when the key was never written.
+    pub fn setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self.lock();
+        let value = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Insert or replace one setting, stamping `updated_at`.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value, \
+             updated_at = excluded.updated_at",
+            params![key, value, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete one setting. Returns `false` when the key was absent.
+    pub fn clear_setting(&self, key: &str) -> Result<bool, DbError> {
+        let deleted = self
+            .lock()
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(deleted > 0)
+    }
+
     /// Every registered host, sorted by id. The local host is always present.
     pub fn list_hosts(&self) -> Result<Vec<HostSpec>, DbError> {
         let conn = self.lock();
@@ -3324,6 +3369,32 @@ mod tests {
         assert!(!db.is_share_attached("findings").expect("check"));
     }
 
+    #[test]
+    fn settings_round_trip_and_clear() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        assert_eq!(db.setting("assistant_provider").expect("read"), None);
+        assert!(!db.clear_setting("assistant_provider").expect("clear"));
+
+        db.set_setting("assistant_provider", "abc").expect("write");
+        assert_eq!(
+            db.setting("assistant_provider").expect("read").as_deref(),
+            Some("abc")
+        );
+
+        // A second write replaces the value instead of failing on the key.
+        db.set_setting("assistant_provider", "def")
+            .expect("replace");
+        assert_eq!(
+            db.setting("assistant_provider").expect("read").as_deref(),
+            Some("def")
+        );
+
+        assert!(db.clear_setting("assistant_provider").expect("clear"));
+        assert_eq!(db.setting("assistant_provider").expect("read"), None);
+    }
+
     fn table_exists(conn: &Connection, name: &str) -> bool {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -3340,7 +3411,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
-        assert_eq!(SCHEMA_VERSION, 30, "MCP marketplace is schema v30");
+        assert_eq!(SCHEMA_VERSION, 31, "settings table is schema v31");
         let conn = db.lock();
         for table in [
             "instances",
@@ -3352,6 +3423,7 @@ mod tests {
             "api_tokens",
             "instance_acl",
             "providers",
+            "settings",
             "incidents",
             "hosts",
             "mcp_servers",

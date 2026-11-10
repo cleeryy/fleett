@@ -113,9 +113,13 @@ function StepAction({ step, canEdit }: { step: OnboardingStep; canEdit: boolean 
   const label =
     step.id === "provider"
       ? t("providers.form.newTitle")
-      : step.id === "instance"
-        ? t("nav.newInstance")
-        : t("common.open");
+      : step.id === "assistant"
+        ? action.to.includes("new=1")
+          ? t("providers.form.newTitle")
+          : t("setup.chooseProvider")
+        : step.id === "instance"
+          ? t("nav.newInstance")
+          : t("common.open");
   return (
     <div className="pt-1.5">
       <Button asChild variant="outline" size="sm">
@@ -149,7 +153,7 @@ function stepDescription(
   return hasTranslation(key) ? t(key) : step.description;
 }
 
-/** The four steps, with the first unfinished one marked as the next action. */
+/** The steps, with the first unfinished one marked as the next action. */
 export function OnboardingSteps({
   report,
   className,

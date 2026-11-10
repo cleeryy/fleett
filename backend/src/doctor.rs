@@ -15,6 +15,7 @@
 //! reads `/etc/resolv.conf`, so the rest of the checklist still answers on an
 //! isolated host.
 
+use crate::assistant::{self, ProviderResolution};
 use crate::config::{Config, DriverKind, EgressMode, VERSION};
 use crate::db::Db;
 use crate::driver::Driver;
@@ -27,7 +28,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Ids of every check, in the order the report lists them.
-pub const CHECK_IDS: [&str; 11] = [
+pub const CHECK_IDS: [&str; 12] = [
     "api",
     "docker",
     "image",
@@ -35,6 +36,7 @@ pub const CHECK_IDS: [&str; 11] = [
     "egress",
     "egress-policy",
     "providers",
+    "assistant",
     "instances",
     "permissions",
     "disk",
@@ -57,6 +59,10 @@ pub const EGRESS_INSTALL_HINT: &str = "sudo fleett egress install";
 pub const SECRETS_INIT_HINT: &str = "sudo fleett secrets init";
 /// Repair offered when plaintext `secrets.env` files remain.
 pub const SECRETS_MIGRATE_HINT: &str = "fleett secrets migrate --apply";
+/// Console page where the assistant provider is selected.
+pub const ASSISTANT_SELECTION_LINK: &str = "/providers?assistant=1";
+/// Console form that creates the first provider.
+pub const PROVIDER_CREATE_LINK: &str = "/providers?new=1";
 
 /// Severity of one check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,6 +96,14 @@ pub struct Check {
     /// Exact command (or setting) that fixes an `error`/`warn`, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Internal console route that repairs the check, when one exists
+    /// (`/providers?assistant=1`). `fix` stays the command form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Machine-readable cause of the line, for the console to branch on
+    /// (`no_provider`, `not_selected`); absent when the detail says it all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Check {
@@ -105,6 +119,8 @@ impl Check {
             status,
             detail: detail.into(),
             fix: None,
+            link: None,
+            reason: None,
         }
     }
 
@@ -122,6 +138,16 @@ impl Check {
 
     fn with_fix(mut self, fix: impl Into<String>) -> Self {
         self.fix = Some(fix.into());
+        self
+    }
+
+    fn with_link(mut self, link: impl Into<String>) -> Self {
+        self.link = Some(link.into());
+        self
+    }
+
+    fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
         self
     }
 }
@@ -160,6 +186,7 @@ pub async fn report(
         )
         .await,
         guarded_now("providers", "Providers", check_providers(db)),
+        guarded_now("assistant", "Assistant", check_assistant(cfg, db)),
         guarded_now("instances", "Instances", check_instances(db)),
         check_permissions(cfg, docker_host.as_deref()),
         check_disk(&cfg.root),
@@ -446,6 +473,79 @@ fn check_providers(db: &Db) -> Result<Check, String> {
         "Providers",
         format!("{} configured", count(providers.len(), "provider")),
     ))
+}
+
+/// Assistant provider resolution (issue #63).
+///
+/// The assistant borrows the secret of a provider; the panel is unusable
+/// without one. Three outcomes the console must tell apart:
+///
+/// * resolved from `env`, the stored selection or `auto` → `ok` (a disabled
+///   assistant is a deliberate choice, also `ok`);
+/// * no provider at all, or several and none selected → `warn` with `reason`
+///   and a `link` to the page that fixes it;
+/// * a reference to a deleted provider → `error`, never a silent `null`.
+fn check_assistant(cfg: &Config, db: &Db) -> Result<Check, String> {
+    if !cfg.assistant_enabled {
+        return Ok(Check::ok(
+            "assistant",
+            "Assistant",
+            "FLEETT_ASSISTANT=off: the panel and its routes are disabled",
+        ));
+    }
+    match assistant::resolve(cfg, db).map_err(|err| err.to_string())? {
+        ProviderResolution::Provider { spec, source } => Ok(Check::ok(
+            "assistant",
+            "Assistant",
+            format!(
+                "provider \"{}\" selected ({}), model {}",
+                spec.name,
+                source.as_str(),
+                cfg.assistant_model
+            ),
+        )),
+        ProviderResolution::Missing { reason } => Ok(Check::warn(
+            "assistant",
+            "Assistant",
+            match reason {
+                assistant::Reason::NoProvider => {
+                    "no provider configured; the assistant has nothing to borrow".to_string()
+                }
+                assistant::Reason::NotSelected => {
+                    "providers exist but none is selected for the assistant".to_string()
+                }
+            },
+        )
+        .with_reason(reason.as_str())
+        .with_link(if reason == assistant::Reason::NotSelected {
+            ASSISTANT_SELECTION_LINK
+        } else {
+            PROVIDER_CREATE_LINK
+        })),
+        ProviderResolution::Broken { id, source, valid } => {
+            let ids = if valid.is_empty() {
+                "no provider exists".to_string()
+            } else {
+                format!("valid ids: {}", valid.join(", "))
+            };
+            let mut check = Check::error(
+                "assistant",
+                "Assistant",
+                format!(
+                    "provider \"{id}\" ({}) does not exist; {ids}",
+                    source.as_str()
+                ),
+            );
+            check = if source == assistant::ProviderSource::Env {
+                check.with_fix(
+                    "set FLEETT_ASSISTANT_PROVIDER to an existing provider id, or unset it",
+                )
+            } else {
+                check.with_link(ASSISTANT_SELECTION_LINK)
+            };
+            Ok(check)
+        }
+    }
 }
 
 fn check_instances(db: &Db) -> Result<Check, String> {
@@ -825,6 +925,22 @@ mod tests {
         assert_eq!(format_bytes(1023), "1023 B");
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn link_and_reason_are_optional_fields() {
+        let check = Check::warn("assistant", "Assistant", "none selected")
+            .with_reason("not_selected")
+            .with_link(ASSISTANT_SELECTION_LINK);
+        let value = serde_json::to_value(check).expect("check");
+        assert_eq!(value["reason"], "not_selected");
+        assert_eq!(value["link"], "/providers?assistant=1");
+        assert!(value.get("fix").is_none(), "{value}");
+
+        let plain = serde_json::to_value(Check::ok("api", "API", "up")).expect("check");
+        assert!(plain.get("fix").is_none(), "{plain}");
+        assert!(plain.get("link").is_none(), "{plain}");
+        assert!(plain.get("reason").is_none(), "{plain}");
     }
 
     #[test]

@@ -2,12 +2,13 @@
 //!
 //! A fresh host has no Docker access, no agent image, no provider and no
 //! instance; the console used to show an empty fleet without saying why. The
-//! step list makes the four prerequisites explicit, in the order they have to
-//! be satisfied, and carries the hint the console needs to act (`action`).
+//! step list makes the prerequisites explicit, in the order they have to be
+//! satisfied, and carries the hint the console needs to act (`action`).
 //!
 //! The list is derived from the live state, never stored: creating the first
 //! instance marks the tour complete, and deleting the last one brings it back.
 
+use crate::assistant::{self, ProviderResolution, Reason};
 use crate::config::Config;
 use crate::db::Db;
 use crate::doctor;
@@ -46,7 +47,7 @@ pub enum Action {
     Command { command: String },
 }
 
-/// Evaluate the four steps against the live state.
+/// Evaluate the steps against the live state.
 ///
 /// Driver and database failures mark the step undone instead of failing the
 /// request: the tour is a hint, and an unreachable engine must not blank the
@@ -70,6 +71,7 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
         tracing::warn!(%err, "onboarding cannot count the instances");
         0
     });
+    let assistant = assistant_step(cfg, db);
 
     let steps = vec![
         Step {
@@ -102,9 +104,10 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
                 .to_string(),
             done: providers > 0,
             action: (providers == 0).then(|| Action::Link {
-                to: "/providers?new=1".to_string(),
+                to: doctor::PROVIDER_CREATE_LINK.to_string(),
             }),
         },
+        assistant,
         Step {
             id: "instance",
             title: "Create your first instance",
@@ -121,6 +124,77 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
     Onboarding {
         complete: instances > 0,
         steps,
+    }
+}
+
+/// The `assistant` step (issue #63): the panel needs a provider too.
+///
+/// `done` as soon as one is resolved (`env`, the stored selection or `auto`);
+/// otherwise the description says which of the two cases the fleet is in, so
+/// the operator does not finish the tour with a panel that cannot answer.
+fn assistant_step(cfg: &Config, db: &Db) -> Step {
+    let selection = doctor::ASSISTANT_SELECTION_LINK;
+    let (done, description, action) = match assistant::resolve(cfg, db) {
+        Ok(ProviderResolution::Provider { spec, source }) => (
+            true,
+            format!(
+                "The assistant borrows the secret of provider \"{}\" ({}).",
+                spec.name,
+                source.as_str()
+            ),
+            None,
+        ),
+        Ok(ProviderResolution::Missing {
+            reason: Reason::NotSelected,
+        }) => (
+            false,
+            "Several providers exist: choose the one the assistant should use, otherwise the \
+             panel cannot answer."
+                .to_string(),
+            Some(Action::Link {
+                to: selection.to_string(),
+            }),
+        ),
+        Ok(ProviderResolution::Missing {
+            reason: Reason::NoProvider,
+        }) => (
+            false,
+            "The assistant borrows the secret of a provider; create one, then it is used \
+             automatically."
+                .to_string(),
+            Some(Action::Link {
+                to: doctor::PROVIDER_CREATE_LINK.to_string(),
+            }),
+        ),
+        Ok(ProviderResolution::Broken { id, source, .. }) => (
+            false,
+            format!(
+                "The assistant points at provider \"{id}\" ({}), which no longer exists: select \
+                 another provider.",
+                source.as_str()
+            ),
+            Some(Action::Link {
+                to: selection.to_string(),
+            }),
+        ),
+        Err(err) => {
+            tracing::warn!(%err, "onboarding cannot resolve the assistant provider");
+            (
+                false,
+                "The assistant provider cannot be resolved: check GET /api/assistant/config."
+                    .to_string(),
+                Some(Action::Link {
+                    to: selection.to_string(),
+                }),
+            )
+        }
+    };
+    Step {
+        id: "assistant",
+        title: "Select the assistant provider",
+        description,
+        done,
+        action,
     }
 }
 

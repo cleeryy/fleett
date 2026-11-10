@@ -7,6 +7,9 @@ import type {
   AssistantConfig,
   AssistantEnvVar,
   AssistantProposal,
+  AssistantProviderInput,
+  AssistantProviderReason,
+  AssistantProviderSource,
   AssistantRedaction,
   AssistantReply,
   AuditEntry,
@@ -217,9 +220,11 @@ export const mockConfig = {
   egressEnforced: (import.meta.env.VITE_MOCK_EGRESS_ENFORCED ?? "1") !== "0",
   secretsKey: (import.meta.env.VITE_MOCK_SECRETS_KEY ?? "1") !== "0",
   /**
-   * Assistant behaviour, from `VITE_MOCK_ASSISTANT` or assignable at runtime:
-   * `live` (default), `off` (FLEETT_ASSISTANT=off), `unconfigured` (409, no
-   * provider) and `exhausted` (429, budget spent).
+   * Assistant behaviour, from `VITE_MOCK_ASSISTANT` or `?mock_assistant=`:
+   * `live` (default, env > setting > auto), `setting` (chosen in the console),
+   * `auto` (only provider), `env` (FLEETT_ASSISTANT_PROVIDER), `not_selected`
+   * (providers exist, none chosen), `no_provider` (bare fleet), `deleted`
+   * (stale id, 422), `off` (FLEETT_ASSISTANT=off) and `exhausted` (429).
    */
   assistant: readAssistantMode(import.meta.env.VITE_MOCK_ASSISTANT as string | undefined),
   /**
@@ -246,7 +251,20 @@ export const mockConfig = {
 /** SSE stream, polling fallback, or both endpoints down. */
 export type MockLogTransport = "live" | "poll" | "down";
 
-export type MockAssistantMode = "live" | "off" | "unconfigured" | "exhausted";
+/**
+ * Assistant scenario: the resolved sources, the two empty states, a stale
+ * reference, the hard switch and the spent budget.
+ */
+export type MockAssistantMode =
+  | "live"
+  | "setting"
+  | "auto"
+  | "env"
+  | "not_selected"
+  | "no_provider"
+  | "deleted"
+  | "off"
+  | "exhausted";
 
 /** First-run scenario: the normal demo, two prerequisites done, or a bare host. */
 export type MockOnboardingMode = "complete" | "partial" | "empty";
@@ -287,16 +305,23 @@ function readMockLogTransport(raw: string | undefined): MockLogTransport {
 }
 
 function readAssistantMode(raw: string | undefined): MockAssistantMode {
-  // `?mock_assistant=off|unconfigured|exhausted` switches the demo without a
-  // rebuild; the env var is the default.
+  // `?mock_assistant=` switches the demo without a rebuild; the env var is the
+  // default.
   const query =
     typeof window === "undefined"
       ? null
       : new URLSearchParams(window.location.search).get("mock_assistant");
   const value = (query ?? raw)?.trim().toLowerCase();
   if (value === "off" || value === "disabled") return "off";
-  if (value === "unconfigured" || value === "no-provider") return "unconfigured";
+  if (value === "unconfigured" || value === "no-provider" || value === "no_provider") {
+    return "no_provider";
+  }
+  if (value === "not-selected" || value === "not_selected") return "not_selected";
+  if (value === "auto") return "auto";
+  if (value === "env") return "env";
+  if (value === "deleted" || value === "unknown" || value === "missing") return "deleted";
   if (value === "exhausted" || value === "budget") return "exhausted";
+  if (value === "setting" || value === "selected") return "setting";
   return "live";
 }
 
@@ -543,6 +568,10 @@ let egressStore: Record<string, EgressPolicyView> = {};
 /* Assistant (issue #56): one borrowed provider, a token budget, canned drafts. */
 const ASSISTANT_BUDGET_TOKENS = 50_000;
 let assistantSpentTokens = 1_240;
+/** The selection stored by `PATCH /api/assistant/config`; seeded in the demo. */
+let assistantSetting: string | null = null;
+/** Preview mode, until a PATCH stores a real selection for this session. */
+let assistantModeOverride: MockAssistantMode | null = null;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -4734,6 +4763,14 @@ export function resetMock(): void {
     putFile(filesystems.get(row.id) as MockFs, "/SOUL.md", content, SEEDED_AT - 2 * DAY);
   }
 
+  // A preview of the bare-fleet assistant starts from zero providers too, so
+  // the panel, the Providers page and the doctor agree with each other.
+  if (mockConfig.assistant === "no_provider") {
+    providerStore = [];
+  }
+  assistantSetting = SHARED_PROVIDER_ID;
+  assistantModeOverride = null;
+
   // A first-run preview (`?mock_onboarding=partial|empty`) starts from a host
   // with nothing to manage; the normal demo keeps its seeded fleet.
   if (mockConfig.onboarding !== "complete") {
@@ -4766,13 +4803,16 @@ export function resetMock(): void {
 export function setMockScenario(next: {
   onboarding?: MockOnboardingMode;
   doctor?: MockDoctorMode;
+  assistant?: MockAssistantMode;
 }): void {
   if (next.onboarding) mockConfig.onboarding = next.onboarding;
   if (next.doctor) mockConfig.doctor = next.doctor;
+  if (next.assistant) mockConfig.assistant = next.assistant;
 
   const url = new URL(window.location.href);
   if (next.onboarding) url.searchParams.set("mock_onboarding", next.onboarding);
   if (next.doctor) url.searchParams.set("mock_doctor", next.doctor);
+  if (next.assistant) url.searchParams.set("mock_assistant", next.assistant);
   window.history.replaceState(null, "", url.toString());
 
   resetMock();
@@ -4793,6 +4833,11 @@ function mockOnboardingReport(): OnboardingReport {
   const imageDone = mockConfig.onboarding !== "empty";
   const providerDone = providerStore.length > 0;
   const instanceDone = rows.length > 0;
+  const assistantReady =
+    assistantMode() !== "deleted" && resolveAssistantProvider().provider !== null;
+  // With no provider at all, the step points at the create form, like the
+  // controller; otherwise at the assistant selection on the Providers page.
+  const assistantLink = providerDone ? "/providers?assistant=1" : "/providers?new=1";
 
   const steps: OnboardingStep[] = [
     {
@@ -4823,6 +4868,21 @@ function mockOnboardingReport(): OnboardingReport {
       done: providerDone,
       action: onboardingAction(providerDone, { kind: "link", to: "/providers?new=1" }),
     },
+    ...(assistantMode() === "off"
+      ? []
+      : [
+          {
+            id: "assistant",
+            title: "Choose the assistant provider",
+            description:
+              "The assistant borrows the credential of a provider. Pick one now; an admin can change it later from Providers.",
+            done: assistantReady,
+            action: onboardingAction(assistantReady, {
+              kind: "link" as const,
+              to: assistantLink,
+            }),
+          },
+        ]),
     {
       id: "instance",
       title: "Create your first instance",
@@ -4836,13 +4896,18 @@ function mockOnboardingReport(): OnboardingReport {
   return { complete: instanceDone, steps };
 }
 
-/** `GET /api/doctor`: the eleven checks, shaped by the selected demo scenario. */
+/** `GET /api/doctor`: the twelve checks, shaped by the selected demo scenario. */
 function mockDoctorReport(): DoctorReport {
   const mode = mockConfig.doctor;
   const bare = mockConfig.onboarding === "empty";
   const complete = mockConfig.onboarding === "complete";
   const providerCount = providerStore.length;
   const instanceCount = rows.length;
+  const assistant = resolveAssistantProvider();
+  const assistantBroken = assistantMode() === "deleted";
+  const assistantOk = !assistantBroken && assistant.provider !== null;
+  const assistantProviderName = assistant.provider?.name ?? "";
+  const assistantSource = assistant.source;
   const explicitPolicies = Object.values(egressStore).filter(
     (policy) => policy.source === "explicit",
   );
@@ -4919,6 +4984,22 @@ function mockDoctorReport(): DoctorReport {
         providerCount === 0
           ? "no provider configured; instances cannot reuse a credential"
           : `${providerCount} configured`,
+    },
+    {
+      id: "assistant",
+      label: "Assistant",
+      status: assistantOk ? "ok" : assistantBroken ? "error" : "warn",
+      detail: assistantOk
+        ? `assistant uses provider "${assistantProviderName}" (${assistantSource})`
+        : assistantBroken
+          ? "the assistant points at a provider that no longer exists"
+          : providerCount === 0
+            ? "no provider yet; the assistant cannot answer"
+            : `${providerCount} providers configured; none is selected for the assistant`,
+      fix: assistantOk
+        ? undefined
+        : `curl -fsS -X PATCH -H "Authorization: Bearer $FLEETT_TOKEN" -H "Content-Type: application/json" -d '{"provider":"${providerStore[0]?.id ?? "<provider id>"}"}' http://127.0.0.1:8090/api/assistant/config`,
+      link: assistantOk ? undefined : "/providers?assistant=1",
     },
     {
       id: "instances",
@@ -5568,10 +5649,50 @@ function snapshotDigest(id: string): Record<string, { size: number; sha256: stri
 // ---------------------------------------------------------------------------
 // assistant (issue #56)
 
-function assistantProvider(): { id: string; name: string } | null {
-  if (mockConfig.assistant === "unconfigured") return null;
-  const provider = providerStore.find((candidate) => candidate.id === SHARED_PROVIDER_ID);
-  return provider ? { id: provider.id, name: provider.name } : null;
+/** The mode a preview puts the demo in; a PATCH clears the broken ones. */
+function assistantMode(): MockAssistantMode {
+  return assistantModeOverride ?? mockConfig.assistant;
+}
+
+interface ResolvedAssistant {
+  provider: { id: string; name: string } | null;
+  source: AssistantProviderSource;
+  reason: AssistantProviderReason | null;
+}
+
+/**
+ * `env > setting > auto > none`, like the controller. A configured id that no
+ * longer exists falls back to the two empty states instead of `null` silence.
+ */
+function resolveAssistantProvider(): ResolvedAssistant {
+  const mode = assistantMode();
+  const pick = (id: string | null) =>
+    id ? providerStore.find((candidate) => candidate.id === id) ?? null : null;
+  const named = (id: string | null, source: AssistantProviderSource): ResolvedAssistant | null => {
+    const provider = pick(id);
+    return provider ? { provider: { id: provider.id, name: provider.name }, source, reason: null } : null;
+  };
+  const empty = (): ResolvedAssistant =>
+    providerStore.length > 0
+      ? { provider: null, source: "none", reason: "not_selected" }
+      : { provider: null, source: "none", reason: "no_provider" };
+
+  if (mode === "no_provider") {
+    return { provider: null, source: "none", reason: "no_provider" };
+  }
+  if (mode === "not_selected") {
+    return { provider: null, source: "none", reason: "not_selected" };
+  }
+  if (mode === "auto") return named(providerStore[0]?.id ?? null, "auto") ?? empty();
+  if (mode === "env") return named(providerStore[0]?.id ?? null, "env") ?? empty();
+  if (mode === "setting") return named(assistantSetting, "setting") ?? empty();
+
+  // live / exhausted: the full chain.
+  return (
+    named(assistantSetting, "setting") ??
+    (providerStore.length === 1 ? named(providerStore[0].id, "auto") : null) ??
+    empty()
+  );
 }
 
 function assistantSoul(instance: string): string {
@@ -5842,6 +5963,9 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       updated_at: iso(created),
     };
     providerStore = [...providerStore, provider];
+    // The demo was showing a bare fleet: the assistant now has exactly one
+    // provider, so it picks it automatically, like the controller.
+    if (assistantMode() === "no_provider") assistantModeOverride = "auto";
     recordAudit(requireAuth(), "provider.create", provider.id, {
       name,
       kind,
@@ -9272,35 +9396,98 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
   async assistantConfig(): Promise<AssistantConfig> {
     requireAuth();
     await delay(90);
-    if (mockConfig.assistant === "off") {
-      return { enabled: false, provider: null, model: "", budget_tokens: 0, used_tokens: 0 };
+    const mode = assistantMode();
+    if (mode === "off") {
+      return {
+        enabled: false,
+        provider: null,
+        provider_source: "none",
+        reason: null,
+        model: "",
+        budget_tokens: 0,
+        used_tokens: 0,
+      };
     }
-    const provider = assistantProvider();
+    if (mode === "deleted") {
+      fail(
+        422,
+        "assistant_provider_unknown",
+        "the assistant points at a provider that no longer exists",
+        { valid: providerStore.map((provider) => provider.id) },
+      );
+    }
+    const resolved = resolveAssistantProvider();
     return {
       enabled: true,
-      provider,
-      model: provider ? "deepseek-v4.1-flash" : "",
+      provider: resolved.provider,
+      provider_source: resolved.source,
+      reason: resolved.reason,
+      model: resolved.provider ? "deepseek-v4.1-flash" : "",
       budget_tokens: ASSISTANT_BUDGET_TOKENS,
       used_tokens:
-        mockConfig.assistant === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens,
+        mode === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens,
+    };
+  },
+
+  async patchAssistantConfig(input: AssistantProviderInput): Promise<AssistantConfig> {
+    requireAdmin();
+    await delay(260);
+    if (assistantMode() === "off") {
+      fail(404, "not_found", "the assistant is disabled");
+    }
+    if (input.provider !== null) {
+      const id = typeof input.provider === "string" ? input.provider.trim() : "";
+      if (!id) fail(400, "invalid_provider", "provider must be a provider id or null");
+      if (!providerStore.some((provider) => provider.id === id)) {
+        fail(
+          422,
+          "assistant_provider_unknown",
+          `provider "${id}" does not exist`,
+          { valid: providerStore.map((provider) => provider.id) },
+        );
+      }
+      assistantSetting = id;
+    } else {
+      assistantSetting = null;
+    }
+    // The broken previews are left behind as soon as a real choice is stored.
+    assistantModeOverride = "live";
+    const resolved = resolveAssistantProvider();
+    return {
+      enabled: true,
+      provider: resolved.provider,
+      provider_source: resolved.source,
+      reason: resolved.reason,
+      model: resolved.provider ? "deepseek-v4.1-flash" : "",
+      budget_tokens: ASSISTANT_BUDGET_TOKENS,
+      used_tokens: assistantSpentTokens,
     };
   },
 
   async assistantChat(input: AssistantChatInput): Promise<AssistantReply> {
     const identity = requireAuth();
     await delay(760);
-    if (mockConfig.assistant === "off") {
+    const mode = assistantMode();
+    if (mode === "off") {
       fail(404, "not_found", "the assistant is disabled");
     }
-    if (!assistantProvider()) {
-      fail(409, "assistant_not_configured", "the assistant has no provider: create one in Providers");
+    if (mode === "deleted") {
+      fail(
+        422,
+        "assistant_provider_unknown",
+        "the assistant points at a provider that no longer exists",
+        { valid: providerStore.map((provider) => provider.id) },
+      );
+    }
+    if (!resolveAssistantProvider().provider) {
+      fail(409, "assistant_not_configured", "the assistant has no provider: choose one in Providers");
     }
     if (input.messages.length === 0) {
       fail(400, "invalid_message", "at least one message is required");
     }
-    if (mockConfig.assistant === "exhausted" || assistantSpentTokens >= ASSISTANT_BUDGET_TOKENS) {
+    if (mode === "exhausted" || assistantSpentTokens >= ASSISTANT_BUDGET_TOKENS) {
       const spent =
-        mockConfig.assistant === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens;
+        mode === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens;
       fail(
         429,
         "assistant_budget_exceeded",

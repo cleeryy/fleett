@@ -3,6 +3,7 @@ import { FlaskConical } from "lucide-react";
 import {
   mockConfig,
   setMockScenario,
+  type MockAssistantMode,
   type MockDoctorMode,
   type MockOnboardingMode,
 } from "@/api/mock";
@@ -24,6 +25,14 @@ const DOCTOR_OPTIONS: { value: MockDoctorMode; labelKey: string }[] = [
   { value: "error", labelKey: "mock.doctorError" },
 ];
 
+const ASSISTANT_OPTIONS: { value: MockAssistantMode; labelKey: string }[] = [
+  { value: "auto", labelKey: "mock.assistantAuto" },
+  { value: "setting", labelKey: "mock.assistantSetting" },
+  { value: "not_selected", labelKey: "mock.assistantNotSelected" },
+  { value: "no_provider", labelKey: "mock.assistantNoProvider" },
+  { value: "deleted", labelKey: "mock.assistantDeleted" },
+];
+
 /**
  * Mock-only scenario switch for the first-run assistant and the diagnostics.
  * It reseeds the in-memory demo and keeps both choices in the URL, so a reload
@@ -39,10 +48,18 @@ export function MockPreviewBar({
   const { t } = useI18n();
   const [onboarding, setOnboarding] = useState<MockOnboardingMode>(mockConfig.onboarding);
   const [doctor, setDoctor] = useState<MockDoctorMode>(mockConfig.doctor);
+  const [assistant, setAssistant] = useState<MockAssistantMode>(
+    mockConfig.assistant === "live" ? "setting" : mockConfig.assistant,
+  );
 
-  function apply(next: { onboarding?: MockOnboardingMode; doctor?: MockDoctorMode }) {
+  function apply(next: {
+    onboarding?: MockOnboardingMode;
+    doctor?: MockDoctorMode;
+    assistant?: MockAssistantMode;
+  }) {
     if (next.onboarding) setOnboarding(next.onboarding);
     if (next.doctor) setDoctor(next.doctor);
+    if (next.assistant) setAssistant(next.assistant);
     setMockScenario(next);
     onChange();
   }
@@ -101,6 +118,29 @@ export function MockPreviewBar({
                 variant={doctor === option.value ? "secondary" : "outline"}
                 aria-pressed={doctor === option.value}
                 onClick={() => apply({ doctor: option.value })}
+              >
+                {t(option.labelKey)}
+              </Button>
+            ))}
+          </div>
+        </div>
+        <div className="space-y-1.5 sm:col-span-2">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("assistant.title")}
+          </p>
+          <div
+            role="group"
+            aria-label={t("mock.assistantAria")}
+            className="flex flex-wrap gap-1.5"
+          >
+            {ASSISTANT_OPTIONS.map((option) => (
+              <Button
+                key={option.value}
+                type="button"
+                size="sm"
+                variant={assistant === option.value ? "secondary" : "outline"}
+                aria-pressed={assistant === option.value}
+                onClick={() => apply({ assistant: option.value })}
               >
                 {t(option.labelKey)}
               </Button>

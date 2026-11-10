@@ -10396,6 +10396,51 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Select the provider the assistant borrows",
+        "operationId": "patchAssistantConfig",
+        "tags": [
+          "Assistant"
+        ],
+        "description": "Admin only. Stores the selection (settings.assistant_provider) and returns the freshly resolved configuration. FLEETT_ASSISTANT_PROVIDER still wins; provider_source reports the winner.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssistantConfigPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
           }
         }
       }
@@ -10705,7 +10750,33 @@
             "type": "boolean"
           },
           "provider": {
-            "$ref": "#/components/schemas/ProviderSummary"
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AssistantProvider"
+              }
+            ],
+            "description": "Resolved provider; null when nothing is resolved (see reason)."
+          },
+          "provider_source": {
+            "type": "string",
+            "enum": [
+              "env",
+              "setting",
+              "auto",
+              "none"
+            ],
+            "description": "Where the provider comes from: FLEETT_ASSISTANT_PROVIDER (env), the stored selection (setting), the single existing provider (auto), or nothing (none)."
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "no_provider",
+              "not_selected",
+              null
+            ],
+            "description": "Why no provider is resolved: no_provider (none exists) or not_selected (several exist, none selected). null when a provider is resolved."
           },
           "model": {
             "type": "string"
@@ -10721,6 +10792,8 @@
         },
         "required": [
           "enabled",
+          "provider_source",
+          "model",
           "budget_tokens",
           "used_tokens"
         ]
@@ -11968,6 +12041,16 @@
           "fix": {
             "type": "string",
             "nullable": true
+          },
+          "link": {
+            "type": "string",
+            "nullable": true,
+            "description": "Internal console route that repairs the check (e.g. /providers?assistant=1). fix stays the command form."
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Machine-readable cause of the line when the console branches on it (no_provider, not_selected)."
           }
         },
         "required": [
@@ -17936,6 +18019,34 @@
           "editable",
           "rendered",
           "restarted"
+        ]
+      },
+      "AssistantProvider": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      },
+      "AssistantConfigPatch": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "nullable": true,
+            "description": "Provider id the assistant must borrow, or null to clear the stored selection (auto takes over again)."
+          }
+        },
+        "required": [
+          "provider"
         ]
       }
     }

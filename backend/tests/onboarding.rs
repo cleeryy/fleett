@@ -157,12 +157,16 @@ fn write_marker(harness: &Harness, version: &str) {
 }
 
 async fn create_provider(harness: &Harness) -> Value {
+    create_provider_named(harness, "openai").await
+}
+
+async fn create_provider_named(harness: &Harness, name: &str) -> Value {
     let (status, body) = harness
         .request(
             Method::POST,
             "/api/providers",
             Some(json!({
-                "name": "openai",
+                "name": name,
                 "kind": "openai-compatible",
                 "base_url": PROVIDER_BASE_URL,
                 "api_key_env": "PROVIDER_API_KEY",
@@ -175,6 +179,19 @@ async fn create_provider(harness: &Harness) -> Value {
         StatusCode::CREATED,
         "create provider failed: {body}"
     );
+    parse(&body)
+}
+
+/// Select the assistant provider from the console route.
+async fn select_assistant_provider(harness: &Harness, id: &str) -> Value {
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "select provider: {body}");
     parse(&body)
 }
 
@@ -567,7 +584,10 @@ async fn onboarding_walks_an_empty_host_to_a_complete_fleet() {
         .iter()
         .map(|step| step["id"].as_str().expect("id"))
         .collect();
-    assert_eq!(ids, ["docker", "image", "provider", "instance"]);
+    assert_eq!(
+        ids,
+        ["docker", "image", "provider", "assistant", "instance"]
+    );
     assert!(
         onboarding["steps"]
             .as_array()
@@ -596,26 +616,36 @@ async fn onboarding_walks_an_empty_host_to_a_complete_fleet() {
         json!({"kind": "link", "to": "/instances?new=1"})
     );
 
-    // The engine answers and the image is built: two of four.
+    // The engine answers and the image is built: two of five.
     harness.mock.set_engine_down(false);
     harness.mock.register_image(MISSING_IMAGE);
     let onboarding = harness.onboarding().await;
     assert_eq!(done_count(&onboarding), 2, "{onboarding}");
 
-    // A provider: three of four, with the remaining action on the instance.
+    // A provider: four of five (the assistant resolves it automatically), with
+    // the remaining action on the instance.
     let provider = create_provider(&harness).await;
     let provider_id = provider["id"].as_str().expect("provider id").to_string();
     let onboarding = harness.onboarding().await;
-    assert_eq!(done_count(&onboarding), 3, "{onboarding}");
+    assert_eq!(done_count(&onboarding), 4, "{onboarding}");
     assert_eq!(step(&onboarding, "provider")["done"], true);
     assert!(step(&onboarding, "provider").get("action").is_none());
+    assert_eq!(step(&onboarding, "assistant")["done"], true);
+    assert!(
+        step(&onboarding, "assistant")["description"]
+            .as_str()
+            .expect("description")
+            .contains("openai"),
+        "{onboarding}"
+    );
+    assert!(step(&onboarding, "assistant").get("action").is_none());
     assert_eq!(onboarding["complete"], false);
 
     // The first instance completes the tour.
     create_instance(&harness, "probe", Some(&provider_id)).await;
     let onboarding = harness.onboarding().await;
     assert_eq!(onboarding["complete"], true, "{onboarding}");
-    assert_eq!(done_count(&onboarding), 4, "{onboarding}");
+    assert_eq!(done_count(&onboarding), 5, "{onboarding}");
     assert!(
         onboarding["steps"]
             .as_array()
@@ -631,17 +661,24 @@ async fn onboarding_is_complete_once_an_instance_exists() {
     let harness = Harness::new();
     let onboarding = harness.onboarding().await;
     // The mock fleet starts with its image registered: Docker and the image
-    // are already satisfied, the provider and instance are not.
+    // are already satisfied, the provider, the assistant and the instance are
+    // not.
     assert_eq!(done_count(&onboarding), 2, "{onboarding}");
     assert_eq!(onboarding["complete"], false);
+    assert_eq!(step(&onboarding, "assistant")["done"], false);
+    assert_eq!(
+        step(&onboarding, "assistant")["action"],
+        json!({"kind": "link", "to": "/providers?new=1"})
+    );
 
-    // An instance can be created without a provider: it is the fourth step
+    // An instance can be created without a provider: it is the instance step
     // that decides, not the provider whoever skipped it.
     create_instance(&harness, "probe", None).await;
     let onboarding = harness.onboarding().await;
     assert_eq!(onboarding["complete"], true, "{onboarding}");
     assert_eq!(step(&onboarding, "instance")["done"], true);
     assert_eq!(step(&onboarding, "provider")["done"], false);
+    assert_eq!(step(&onboarding, "assistant")["done"], false);
 }
 
 #[tokio::test]
@@ -672,4 +709,171 @@ async fn a_viewer_reads_the_doctor_and_the_onboarding() {
         let (status, _) = harness.request_as(Method::GET, path, None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Assistant provider resolution (issue #63)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn doctor_explains_a_fleet_without_a_provider() {
+    let harness = Harness::new();
+    let report = harness.get_json("/api/doctor").await;
+
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "warn", "{report}");
+    assert_eq!(assistant["reason"], "no_provider");
+    assert_eq!(assistant["link"], "/providers?new=1");
+    assert!(
+        assistant.get("fix").is_none(),
+        "a link is not a command: {assistant}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_resolves_a_single_provider_automatically() {
+    let harness = Harness::new();
+    create_provider(&harness).await;
+    let report = harness.get_json("/api/doctor").await;
+
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "ok", "{report}");
+    let detail = assistant["detail"].as_str().expect("detail");
+    assert!(detail.contains("auto"), "{detail}");
+    assert!(detail.contains(MODEL), "{detail}");
+    assert!(assistant.get("link").is_none(), "{assistant}");
+    assert!(assistant.get("reason").is_none(), "{assistant}");
+    assert_ok_matches(&report);
+}
+
+#[tokio::test]
+async fn doctor_asks_for_a_selection_when_several_providers_exist() {
+    let harness = Harness::new();
+    create_provider(&harness).await;
+    let second = create_provider_named(&harness, "second").await;
+    let second_id = second["id"].as_str().expect("provider id").to_string();
+
+    let report = harness.get_json("/api/doctor").await;
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "warn", "{report}");
+    assert_eq!(assistant["reason"], "not_selected");
+    assert_eq!(assistant["link"], "/providers?assistant=1");
+    assert_ok_matches(&report);
+
+    // One click in the console clears the warning, without a restart.
+    let config = select_assistant_provider(&harness, &second_id).await;
+    assert_eq!(config["provider"]["id"], second_id.as_str());
+    assert_eq!(config["provider_source"], "setting");
+
+    let report = harness.get_json("/api/doctor").await;
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "ok", "{report}");
+    let detail = assistant["detail"].as_str().expect("detail");
+    assert!(detail.contains("setting"), "{detail}");
+}
+
+#[tokio::test]
+async fn doctor_reports_a_broken_environment_reference_as_an_error() {
+    let harness = Harness::with_config(|cfg| {
+        cfg.assistant_provider = Some("11111111-2222-3333-4444-555555555555".to_string())
+    });
+    create_provider(&harness).await;
+
+    let report = harness.get_json("/api/doctor").await;
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "error", "{report}");
+    let detail = assistant["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("11111111-2222-3333-4444-555555555555"),
+        "{detail}"
+    );
+    assert!(detail.contains("env"), "{detail}");
+    assert!(
+        assistant["fix"]
+            .as_str()
+            .expect("fix")
+            .contains("FLEETT_ASSISTANT_PROVIDER"),
+        "{assistant}"
+    );
+    assert_eq!(report["ok"], false, "{report}");
+
+    // The panel is told the same thing, with the ids that would work.
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(
+        error["details"]["valid"].as_array().expect("valid").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn doctor_reports_a_deleted_selection_as_an_error_with_the_picker() {
+    let harness = Harness::new();
+    let provider = create_provider(&harness).await;
+    let id = provider["id"].as_str().expect("provider id").to_string();
+    select_assistant_provider(&harness, &id).await;
+
+    // The provider is deleted after it was selected: the stored reference
+    // dangles, exactly like a deleted env target.
+    harness
+        .state
+        .db
+        .delete_provider(&id)
+        .expect("delete provider");
+    let report = harness.get_json("/api/doctor").await;
+    let assistant = check(&report, "assistant");
+    assert_eq!(assistant["status"], "error", "{report}");
+    assert!(
+        assistant["detail"].as_str().expect("detail").contains(&id),
+        "{assistant}"
+    );
+    assert!(assistant["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("setting"));
+    assert_eq!(assistant["link"], "/providers?assistant=1");
+    assert!(assistant.get("fix").is_none(), "{assistant}");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = parse(&body)["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(error["details"]["source"], "setting");
+    assert_eq!(error["details"]["valid"], json!([]));
+}
+
+#[tokio::test]
+async fn onboarding_selects_the_assistant_provider_when_several_exist() {
+    let harness = Harness::new();
+    create_provider(&harness).await;
+    let second = create_provider_named(&harness, "second").await;
+    let second_id = second["id"].as_str().expect("provider id").to_string();
+
+    let onboarding = harness.onboarding().await;
+    let assistant = step(&onboarding, "assistant");
+    assert_eq!(assistant["done"], false, "{onboarding}");
+    assert_eq!(
+        assistant["action"],
+        json!({"kind": "link", "to": "/providers?assistant=1"})
+    );
+    assert!(assistant["description"]
+        .as_str()
+        .expect("description")
+        .contains("choose"));
+
+    select_assistant_provider(&harness, &second_id).await;
+    let onboarding = harness.onboarding().await;
+    let assistant = step(&onboarding, "assistant");
+    assert_eq!(assistant["done"], true, "{onboarding}");
+    assert!(assistant.get("action").is_none(), "{assistant}");
+    assert!(assistant["description"]
+        .as_str()
+        .expect("description")
+        .contains("setting"));
 }

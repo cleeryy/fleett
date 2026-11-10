@@ -397,10 +397,25 @@ export interface AssistantChatResponse {
 
 export interface AssistantConfig {
   enabled: boolean;
-  provider?: ProviderSummary | null;
+  /** Resolved provider; `null` when nothing is resolved (see `reason`). */
+  provider: AssistantProvider | null;
+  /** `env` (FLEETT_ASSISTANT_PROVIDER), `setting`, `auto` or `none`. */
+  provider_source: "env" | "setting" | "auto" | "none";
+  /** `null` when resolved, else `no_provider` or `not_selected`. */
+  reason: "no_provider" | "not_selected" | null;
   model: string;
   budget_tokens: number;
   used_tokens: number;
+}
+
+export interface AssistantProvider {
+  id: string;
+  name: string;
+}
+
+/** Body of `PATCH /api/assistant/config`: an id, or `null` to clear. */
+export interface AssistantConfigPatch {
+  provider: string | null;
 }
 
 type Query = Record<string, string | number | boolean | undefined>;

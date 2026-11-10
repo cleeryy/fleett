@@ -1134,6 +1134,12 @@ export const httpApi: FleetApi = {
   assistantConfig: () =>
     request<AssistantConfig>("/api/assistant/config", {}, { signalUnauthorized: false }),
 
+  patchAssistantConfig: (input) =>
+    request<AssistantConfig>("/api/assistant/config", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+
   assistantChat: (input: AssistantChatInput) =>
     request<AssistantReply>("/api/assistant/chat", {
       method: "POST",

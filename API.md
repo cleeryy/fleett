@@ -56,34 +56,42 @@ Read-only diagnostics and first-run state, available to every authenticated role
 
 | Method | Route | Response |
 |---|---|---|
-| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?}]}` — api, docker, image, secrets, egress, egress-policy, providers, instances, permissions, disk, dns |
-| GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, instance; `complete` when at least one instance exists |
+| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?,link?,reason?}]}` — api, docker, image, secrets, egress, egress-policy, providers, assistant, instances, permissions, disk, dns |
+| GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, assistant, instance; `complete` when at least one instance exists |
 
-`fix` is either a copyable command or a UI link; a failing check is reported inline and never
+`fix` is a copyable command or setting; `link` is an internal console route that repairs the
+check (`/providers?assistant=1`); `reason` is the machine-readable cause when the console
+branches on it (`no_provider`, `not_selected`). A failing check is reported inline and never
 turns the response into a 500. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
 ## Assistant
 
 A contextual drafting copilot available on every page. It borrows the secret and
-base URL of the provider named by `FLEETT_ASSISTANT_PROVIDER` and never stores a
-credential of its own. The context is redacted server-side before it leaves the
+base URL of one provider and never stores a credential of its own. The provider
+is resolved at request time, in this order: `FLEETT_ASSISTANT_PROVIDER` (`env`)
+> the selection stored by `PATCH /api/assistant/config` (`setting`) > a single
+provider (`auto`). More than one provider and no selection is `not_selected`:
+never a guess. The context is redacted server-side before it leaves the
 process: secret environment values, the provider key and known token shapes
 (`sk-…`, `ghp_…`, `xoxb-…`, `Bearer …`, PEM blocks) are withheld or replaced.
 Proposals are applied by the console through the regular file/env routes, so
 they keep their ETag, `.bak`, git commit and audit row (`via: "assistant"`).
-`FLEETT_ASSISTANT=off` removes both routes (generic `404`) and hides the panel.
+`FLEETT_ASSISTANT=off` removes every route (generic `404`) and hides the panel.
 Full semantics: [docs/ASSISTANT.md](docs/ASSISTANT.md).
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,model,budget_tokens,used_tokens}`; `provider` is `null` when unset |
-| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured`, `422 invalid_messages`, `429 assistant_budget_exceeded` |
+| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,provider_source,reason,model,budget_tokens,used_tokens}`; `provider` is `null` with `reason` `no_provider`/`not_selected` when nothing is resolved, `422 assistant_provider_unknown` when the reference is dangling |
+| PATCH | `/api/assistant/config` | `{provider:"<id>"\|null}`, admin | the resolved config, same shape as `GET`; `422 assistant_provider_unknown` (with `details.valid`) for an unknown id, `400 invalid_body` without the field |
+| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured`, `422 invalid_messages`, `422 assistant_provider_unknown`, `429 assistant_budget_exceeded` |
 
-`task` is `freeform` (default), `skill`, `soul`, `env`, `pipeline`, `fleet_yaml`,
-`explain` or `config`. A proposal is `{kind:"file"|"yaml",path,content}` or
-`{kind:"env",env:[{key,value?,secret}]}`; a secret env entry never carries a
-value. `redaction` lists what was sent and what was withheld, so the operator can
-audit the exact prompt context.
+`provider_source` is `env`, `setting`, `auto` or `none`. `FLEETT_ASSISTANT_PROVIDER` still
+wins over a stored selection: the body is stored and `provider_source` says `env`, so the
+console never pretends otherwise. `task` is `freeform` (default), `skill`, `soul`, `env`,
+`pipeline`, `fleet_yaml`, `explain` or `config`. A proposal is
+`{kind:"file"|"yaml",path,content}` or `{kind:"env",env:[{key,value?,secret}]}`; a secret env
+entry never carries a value. `redaction` lists what was sent and what was withheld, so the
+operator can audit the exact prompt context.
 
 ## Audit and tokens
 

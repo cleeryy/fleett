@@ -1856,6 +1856,10 @@ export interface DoctorCheck {
   detail: string;
   /** Exact command or setting that repairs the check; absent on `ok` lines. */
   fix?: string;
+  /** Console page where the check is repaired; absent when only `fix` applies. */
+  link?: string;
+  /** Machine-readable cause (`no_provider`, `not_selected`) when the console branches on it. */
+  reason?: string;
 }
 
 /** `GET /api/doctor`: `ok` is false only when a check is an `error`. */
@@ -1889,14 +1893,36 @@ export interface OnboardingReport {
  * Integrated assistant (issue #56)
  * -------------------------------------------------------------------------- */
 
+/**
+ * Where the assistant provider id came from, strongest first:
+ * `env` (`FLEETT_ASSISTANT_PROVIDER`) > `setting` (chosen in the console) >
+ * `auto` (the only provider, used without a choice).
+ */
+export type AssistantProviderSource = "env" | "setting" | "auto" | "none";
+
+/**
+ * Why `provider` is `null`: the fleet has no provider at all, or several exist
+ * and none was chosen for the assistant. The two cases render different copy.
+ */
+export type AssistantProviderReason = "no_provider" | "not_selected" | "provider_deleted";
+
 /** `GET /api/assistant/config`. `enabled: false` hides the panel entirely. */
 export interface AssistantConfig {
   enabled: boolean;
-  /** Provider the assistant borrows; `null` until an operator selects one. */
+  /** Provider the assistant borrows; `null` until one is resolved. */
   provider: AssistantProvider | null;
+  /** Source fields are absent on controllers older than 0.9. */
+  provider_source?: AssistantProviderSource;
+  /** `null` (or absent) when a provider is resolved. */
+  reason?: AssistantProviderReason | null;
   model: string;
   budget_tokens: number;
   used_tokens: number;
+}
+
+/** `PATCH /api/assistant/config`; admin. `null` clears the stored selection. */
+export interface AssistantProviderInput {
+  provider: string | null;
 }
 
 export interface AssistantProvider {
@@ -2248,7 +2274,9 @@ export interface FleetApi {
   onboarding(): Promise<OnboardingReport>;
 
   /* Assistant */
-  /** 404 hides the panel (`FLEETT_ASSISTANT=off`). */
+  /** 404 hides the panel (`FLEETT_ASSISTANT=off`). `422` names a deleted provider. */
   assistantConfig(): Promise<AssistantConfig>;
+  /** Admin: stores the provider the assistant borrows; `null` clears it. */
+  patchAssistantConfig(input: AssistantProviderInput): Promise<AssistantConfig>;
   assistantChat(input: AssistantChatInput): Promise<AssistantReply>;
 }
