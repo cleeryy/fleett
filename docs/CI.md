@@ -7,6 +7,27 @@ one that executes the generated `compose.yaml` with `docker compose`, so a regre
 rendering (a field Compose rejects, a broken volume or network reference) fails CI instead of
 the next deployment.
 
+## API contract gates
+
+`openapi.json` is the advertised contract (`GET /api/openapi.json`) and two independent gates
+keep it honest:
+
+1. **Route coverage (Rust).** `api::openapi::tests::every_router_route_is_documented_and_nothing_else_is`
+   runs with `cargo test` in the `backend` job. It scans the `fn api_routes(…)` region of
+   `backend/src/api/mod.rs`, extracts every `(METHOD, /api/path)` pair and compares it with
+   the embedded `openapi.json` in both directions. A route added without documentation, or a
+   documented operation the router no longer serves, fails the build with the exact
+   `METHOD /path` pairs in the panic message. There is no allowlist.
+   The sibling tests `the_served_version_is_the_binary_version` and
+   `the_version_is_injected_regardless_of_the_stored_value` also prove that
+   `info.version` is always `CARGO_PKG_VERSION`, never the literal stored in the file.
+2. **Spec validation (Python).** The `spec` job installs `openapi-spec-validator` and runs it
+   on `openapi.json`; the same job installs the SDK dependencies and runs
+   `pnpm typecheck` in `sdk/typescript`, because the typed client mirrors this document.
+
+Neither gate changes the existing `backend` or `web` jobs: the Rust test runs inside the
+normal `cargo test --locked` step, and the `spec` job is additive.
+
 ## What the job covers
 
 1. `docker build -t fleett-test-agent tests/compose` builds the stand-in image.

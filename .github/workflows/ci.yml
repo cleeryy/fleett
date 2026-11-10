@@ -61,3 +61,27 @@ jobs:
         if: ${{ hashFiles('web/package.json') != '' }}
         working-directory: web
         run: node scripts/check-i18n.mjs --strict
+
+  spec:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install openapi-spec-validator
+        run: python3 -m pip install --quiet openapi-spec-validator
+      - name: Validate the OpenAPI contract
+        run: openapi-spec-validator openapi.json
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install the TypeScript SDK dependencies
+        working-directory: sdk/typescript
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck the TypeScript SDK
+        working-directory: sdk/typescript
+        run: pnpm typecheck

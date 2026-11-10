@@ -420,6 +420,11 @@ export class FleettClient {
   readonly providers: ProvidersApi;
   readonly webhooks: WebhooksApi;
   readonly assistant: AssistantApi;
+  readonly skills: SkillsApi;
+  readonly marketplace: MarketplaceApi;
+  readonly mcp: McpApi;
+  readonly egress: EgressApi;
+  readonly doctor: DoctorApi;
 
   constructor(options: FleettClientOptions) {
     this.base = options.url.replace(/\/+$/, "");
@@ -430,6 +435,11 @@ export class FleettClient {
     this.providers = new ProvidersApi(this);
     this.webhooks = new WebhooksApi(this);
     this.assistant = new AssistantApi(this);
+    this.skills = new SkillsApi(this);
+    this.marketplace = new MarketplaceApi(this);
+    this.mcp = new McpApi(this);
+    this.egress = new EgressApi(this);
+    this.doctor = new DoctorApi(this);
   }
 
   /** Low-level request; every typed method delegates to it. */
@@ -692,5 +702,651 @@ export class AssistantApi {
 
   chat(body: AssistantChatRequest): Promise<AssistantChatResponse> {
     return this.client.request("POST", "/api/assistant/chat", { body });
+  }
+}
+
+// --- skills, marketplace, MCP, egress and doctor (issues #59, #60, #61, #62) --
+
+export interface SkillFile {
+  path: string;
+  content: string;
+}
+
+export interface Provenance {
+  source?: string;
+  ref?: string;
+  commit?: string;
+  upstream_version?: string;
+  author?: string;
+  tags?: string[];
+  installed_at?: string;
+}
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  latest: string | null;
+  versions: string[];
+  instances_count: number;
+  source?: string;
+  ref?: string;
+  commit?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SkillVersionInfo extends Provenance {
+  version: string;
+  description: string;
+  files_count: number;
+  size_bytes: number;
+  published_at: string;
+}
+
+export interface SkillDetail {
+  name: string;
+  description: string;
+  latest: string | null;
+  versions: SkillVersionInfo[];
+  files: SkillFile[];
+  instances: string[];
+  instances_count: number;
+  source?: string;
+  ref?: string;
+  commit?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PublishSkillRequest {
+  name?: string;
+  version?: string;
+  description?: string;
+  files?: SkillFile[];
+}
+
+export interface SkillPromoteRequest {
+  version?: string;
+}
+
+export interface SkillPromoteResult {
+  id: string;
+  status: string;
+  error?: string | null;
+}
+
+export interface SkillPromoteResponse {
+  latest: string;
+  results: SkillPromoteResult[];
+}
+
+export interface GitLog {
+  commits: GitCommit[];
+}
+
+export interface MarketplaceEntry {
+  name: string;
+  description: string;
+  provider: string;
+  source?: string;
+  ref?: string;
+  url?: string;
+  author?: string;
+  tags?: string[];
+  version?: string;
+  commit?: string;
+}
+
+export interface MarketplaceSourceStatus {
+  source: string;
+  status: string;
+  count: number;
+  message?: string;
+}
+
+export interface MarketplaceSearchResponse {
+  entries: MarketplaceEntry[];
+  sources: MarketplaceSourceStatus[];
+}
+
+export interface MarketplaceFile {
+  path: string;
+  size: number;
+  script: boolean;
+}
+
+export interface MarketplacePreview {
+  name: string;
+  description: string;
+  version?: string;
+  author?: string;
+  files: MarketplaceFile[];
+  total_bytes: number;
+  skill_md: string;
+  scripts: string[];
+  commit?: string;
+  source?: string;
+  requires_confirmation: boolean;
+}
+
+export interface MarketplacePreviewRequest {
+  source: string;
+  ref?: string;
+}
+
+export interface MarketplaceInstallRequest extends MarketplacePreviewRequest {
+  name?: string;
+  confirm_scripts?: boolean;
+}
+
+export interface MarketplaceUpdateInfo {
+  name: string;
+  installed_version: string;
+  upstream_version?: string;
+  commit?: string;
+  source: string;
+  ref?: string;
+}
+
+export interface MarketplaceUpdatesResponse {
+  updates: MarketplaceUpdateInfo[];
+  warnings: string[];
+}
+
+export interface MarketplaceFileChange {
+  path: string;
+  status: string;
+}
+
+export interface MarketplaceUpdateResult {
+  name: string;
+  from: string;
+  to: string;
+  commit?: string;
+  files: MarketplaceFileChange[];
+  promoted?: SkillPromoteResponse;
+}
+
+export interface MarketplaceUpdateRequest {
+  promote?: boolean;
+  confirm_scripts?: boolean;
+}
+
+export interface MarketplaceSyncResult {
+  skills: number;
+  source: string;
+  commit?: string;
+}
+
+export type McpKind = "stdio" | "streamable-http" | "sse";
+export type McpMode = "ro" | "rw";
+
+export interface McpCatalogEnv {
+  key: string;
+  secret?: boolean;
+  required?: boolean;
+}
+
+export interface McpCatalogEntry {
+  id: string;
+  name: string;
+  description?: string;
+  kind: McpKind;
+  image?: string;
+  command?: string[];
+  port?: number;
+  path?: string;
+  env?: McpCatalogEnv[];
+  tags?: string[];
+}
+
+export interface McpServerEnv {
+  key: string;
+  secret: boolean;
+  set: boolean;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  description: string;
+  kind: McpKind;
+  image: string;
+  command: string[];
+  port: number;
+  path: string;
+  persist: boolean;
+  cpu_limit: number;
+  mem_limit_mb: number;
+  host: string;
+  status: string;
+  health: string;
+  last_error: string | null;
+  last_probe_at: string | null;
+  endpoint: string | null;
+  tools: unknown[];
+  tools_count: number;
+  tools_hash: string;
+  env: McpServerEnv[];
+  headers: string[];
+  instances: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpTool {
+  name: string;
+  description: string;
+  input_schema: unknown;
+}
+
+export interface McpTestResult {
+  server: string;
+  reachable: boolean;
+  latency_ms: number;
+  tools: McpTool[];
+  tools_count: number;
+  tools_hash: string;
+  protocol_version: string;
+  server_info: unknown;
+}
+
+export interface McpIncident {
+  id: number;
+  server_id: string;
+  cause: string;
+  status: string;
+  opened_at: string;
+  closed_at: string | null;
+  detail: string | null;
+  actions: unknown[];
+  restart_count: number;
+  last_seen_at: string;
+}
+
+export interface McpEnvInput {
+  key: string;
+  value?: string;
+  secret?: boolean;
+}
+
+export interface CreateMcpServerRequest {
+  catalog?: string;
+  id?: string;
+  name?: string;
+  description?: string;
+  kind?: McpKind;
+  image?: string;
+  command?: string[];
+  port?: number;
+  path?: string;
+  persist?: boolean;
+  cpu_limit?: number;
+  mem_limit_mb?: number;
+  host?: string;
+  env?: McpEnvInput[];
+  headers?: Record<string, string>;
+}
+
+export interface UpdateMcpServerRequest {
+  name?: string;
+  description?: string;
+  image?: string;
+  command?: string[];
+  port?: number;
+  path?: string;
+  persist?: boolean;
+  cpu_limit?: number;
+  mem_limit_mb?: number;
+  host?: string;
+  headers?: Record<string, string>;
+}
+
+export interface McpRefInput {
+  server: string;
+  mode?: McpMode;
+}
+
+export interface AttachedMcpServer {
+  server: string;
+  mode: string;
+  kind: string;
+  status: string;
+  health: string;
+  tools_count: number;
+  endpoint: string | null;
+}
+
+export interface InstanceMcpResponse {
+  id: string;
+  status: string;
+  servers: AttachedMcpServer[];
+}
+
+export interface EgressPolicy {
+  instance: string;
+  source: string;
+  mode: string;
+  fqdns: string[];
+  cidrs: string[];
+  ports: number[];
+  updated_at?: string;
+  proxy?: string;
+  proxy_acl?: string;
+  legacy_equivalent: boolean;
+  proxy_reachable?: boolean;
+  proxy_error?: string;
+  warnings: string[];
+}
+
+export interface EgressSummaryEntry {
+  instance: string;
+  policy: string;
+  mode: string;
+  fqdns: string[];
+  cidrs: string[];
+  ports: number[];
+  proxy: string | null;
+  proxy_reachable: boolean | null;
+  proxy_error?: string;
+  source: string;
+  warnings: string[];
+}
+
+export interface EgressSummary {
+  instances: EgressSummaryEntry[];
+}
+
+export interface EgressBlock {
+  id: number;
+  instance_id: string;
+  host: string;
+  port: number;
+  reason?: string;
+  at: string;
+}
+
+export interface EgressTestRequest {
+  host: string;
+  port?: number;
+}
+
+export interface EgressTestResult {
+  instance: string;
+  host: string;
+  port: number;
+  allowed: boolean;
+  reason: string;
+  source: string;
+  mode: string;
+  enforced: boolean;
+  enforcement?: string;
+  proxy?: string;
+}
+
+export interface DoctorCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix?: string;
+}
+
+export interface DoctorReport {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
+export interface OnboardingAction {
+  kind: "link" | "command";
+  to?: string;
+  command?: string;
+}
+
+export interface OnboardingStep {
+  id: string;
+  title: string;
+  description: string;
+  done: boolean;
+  action?: OnboardingAction;
+}
+
+export interface Onboarding {
+  complete: boolean;
+  steps: OnboardingStep[];
+}
+
+/** Shared skill registry (issue #54): versions, files, promotion and git. */
+export class SkillsApi {
+  constructor(private readonly client: FleettClient) {}
+
+  list(): Promise<SkillSummary[]> {
+    return this.client.request("GET", "/api/skills");
+  }
+
+  get(name: string): Promise<SkillDetail> {
+    return this.client.request("GET", `/api/skills/${encode(name)}`);
+  }
+
+  publish(body: PublishSkillRequest): Promise<SkillDetail> {
+    return this.client.request("POST", "/api/skills", { body });
+  }
+
+  delete(name: string): Promise<void> {
+    return this.client.request("DELETE", `/api/skills/${encode(name)}`);
+  }
+
+  /** Move `latest` and restart the instances that follow it. */
+  promote(name: string, version?: string): Promise<SkillPromoteResponse> {
+    return this.client.request("POST", `/api/skills/${encode(name)}/promote`, {
+      body: { version },
+    });
+  }
+
+  log(name: string, limit = 50): Promise<GitLog> {
+    return this.client.request("GET", `/api/skills/${encode(name)}/git/log`, {
+      query: { limit },
+    });
+  }
+
+  diff(name: string, from?: string, to?: string): Promise<GitDiff> {
+    return this.client.request("GET", `/api/skills/${encode(name)}/git/diff`, {
+      query: { from, to },
+    });
+  }
+}
+
+/** Marketplace search, preview, install and update (issue #61). */
+export class MarketplaceApi {
+  constructor(private readonly client: FleettClient) {}
+
+  search(options: { q?: string; source?: string; limit?: number } = {}): Promise<MarketplaceSearchResponse> {
+    return this.client.request("GET", "/api/marketplace/skills", {
+      query: { ...options },
+    });
+  }
+
+  preview(body: MarketplacePreviewRequest): Promise<MarketplacePreview> {
+    return this.client.request("POST", "/api/marketplace/skills/preview", { body });
+  }
+
+  install(body: MarketplaceInstallRequest): Promise<SkillDetail> {
+    return this.client.request("POST", "/api/marketplace/skills/install", { body });
+  }
+
+  update(name: string, body: MarketplaceUpdateRequest = {}): Promise<MarketplaceUpdateResult> {
+    return this.client.request("POST", `/api/marketplace/skills/${encode(name)}/update`, { body });
+  }
+
+  updates(): Promise<MarketplaceUpdatesResponse> {
+    return this.client.request("GET", "/api/marketplace/updates");
+  }
+
+  sync(): Promise<MarketplaceSyncResult> {
+    return this.client.request("POST", "/api/marketplace/sync");
+  }
+}
+
+/** MCP server catalog, lifecycle and instance attachment (issue #62). */
+export class McpApi {
+  constructor(private readonly client: FleettClient) {}
+
+  catalog(q?: string): Promise<McpCatalogEntry[]> {
+    return this.client.request("GET", "/api/mcp/catalog", { query: { q } });
+  }
+
+  importCatalog(entry: McpCatalogEntry): Promise<McpCatalogEntry> {
+    return this.client.request("POST", "/api/mcp/catalog/import", { body: entry });
+  }
+
+  deleteCatalog(id: string): Promise<void> {
+    return this.client.request("DELETE", `/api/mcp/catalog/${encode(id)}`);
+  }
+
+  list(): Promise<McpServer[]> {
+    return this.client.request("GET", "/api/mcp/servers");
+  }
+
+  get(id: string): Promise<McpServer> {
+    return this.client.request("GET", `/api/mcp/servers/${encode(id)}`);
+  }
+
+  create(body: CreateMcpServerRequest): Promise<McpServer> {
+    return this.client.request("POST", "/api/mcp/servers", { body });
+  }
+
+  patch(id: string, body: UpdateMcpServerRequest): Promise<McpServer> {
+    return this.client.request("PATCH", `/api/mcp/servers/${encode(id)}`, { body });
+  }
+
+  delete(id: string, purge = false): Promise<void> {
+    return this.client.request("DELETE", `/api/mcp/servers/${encode(id)}`, {
+      query: purge ? { purge: true } : {},
+    });
+  }
+
+  start(id: string): Promise<McpServer> {
+    return this.client.request("POST", `/api/mcp/servers/${encode(id)}/start`);
+  }
+
+  stop(id: string): Promise<McpServer> {
+    return this.client.request("POST", `/api/mcp/servers/${encode(id)}/stop`);
+  }
+
+  restart(id: string): Promise<McpServer> {
+    return this.client.request("POST", `/api/mcp/servers/${encode(id)}/restart`);
+  }
+
+  test(id: string): Promise<McpTestResult> {
+    return this.client.request("POST", `/api/mcp/servers/${encode(id)}/test`);
+  }
+
+  logs(id: string, options: { tail?: number; since?: string } = {}): Promise<string> {
+    return this.client.request("GET", `/api/mcp/servers/${encode(id)}/logs`, {
+      query: { ...options },
+    });
+  }
+
+  tools(id: string): Promise<unknown> {
+    return this.client.request("GET", `/api/mcp/servers/${encode(id)}/tools`);
+  }
+
+  putEnv(id: string, env: McpEnvInput[]): Promise<McpServer> {
+    return this.client.request("PUT", `/api/mcp/servers/${encode(id)}/env`, { body: { env } });
+  }
+
+  deleteEnv(id: string, key: string): Promise<McpServer> {
+    return this.client.request("DELETE", `/api/mcp/servers/${encode(id)}/env/${encode(key)}`);
+  }
+
+  incidents(id: string, options: { status?: "open" | "closed"; limit?: number } = {}): Promise<McpIncident[]> {
+    return this.client.request("GET", `/api/mcp/servers/${encode(id)}/incidents`, {
+      query: { ...options },
+    });
+  }
+
+  closeIncident(id: number): Promise<McpIncident> {
+    return this.client.request("POST", `/api/mcp-incidents/${encode(String(id))}/close`);
+  }
+
+  instanceList(id: string): Promise<InstanceMcpResponse> {
+    return this.client.request("GET", `/api/instances/${encode(id)}/mcp-servers`);
+  }
+
+  instancePut(id: string, servers: McpRefInput[]): Promise<InstanceMcpResponse> {
+    return this.client.request("PUT", `/api/instances/${encode(id)}/mcp-servers`, {
+      body: { servers },
+    });
+  }
+
+  attach(id: string, server: string, mode: McpMode = "ro"): Promise<InstanceMcpResponse> {
+    return this.client.request(
+      "POST",
+      `/api/instances/${encode(id)}/mcp-servers/${encode(server)}`,
+      { body: { mode } },
+    );
+  }
+
+  detach(id: string, server: string): Promise<InstanceMcpResponse> {
+    return this.client.request(
+      "DELETE",
+      `/api/instances/${encode(id)}/mcp-servers/${encode(server)}`,
+    );
+  }
+}
+
+/** Egress destination policy and proxy status (issue #60). */
+export class EgressApi {
+  constructor(private readonly client: FleettClient) {}
+
+  getPolicy(instance: string): Promise<EgressPolicy> {
+    return this.client.request("GET", `/api/instances/${encode(instance)}/egress`);
+  }
+
+  putPolicy(instance: string, body: Record<string, unknown>): Promise<EgressPolicy> {
+    return this.client.request("PUT", `/api/instances/${encode(instance)}/egress`, { body });
+  }
+
+  deletePolicy(instance: string): Promise<EgressPolicy> {
+    return this.client.request("DELETE", `/api/instances/${encode(instance)}/egress`);
+  }
+
+  test(instance: string, body: EgressTestRequest): Promise<EgressTestResult> {
+    return this.client.request("POST", `/api/instances/${encode(instance)}/egress/test`, { body });
+  }
+
+  summary(): Promise<EgressSummary> {
+    return this.client.request("GET", "/api/egress/summary");
+  }
+
+  blocks(instance: string, limit?: number): Promise<EgressBlock[]> {
+    return this.client.request("GET", `/api/instances/${encode(instance)}/egress/blocks`, {
+      query: { limit },
+    });
+  }
+
+  clearBlocks(instance: string): Promise<{ removed: number }> {
+    return this.client.request("DELETE", `/api/instances/${encode(instance)}/egress/blocks`);
+  }
+
+  allBlocks(options: { limit?: number; instance?: string } = {}): Promise<EgressBlock[]> {
+    return this.client.request("GET", "/api/egress/blocks", { query: { ...options } });
+  }
+
+  ingestBlock(body: { instance: string; host: string; port?: number; reason?: string }): Promise<EgressBlock> {
+    return this.client.request("POST", "/api/egress/blocks", { body });
+  }
+}
+
+/** Installation checks and first-run onboarding. */
+export class DoctorApi {
+  constructor(private readonly client: FleettClient) {}
+
+  doctor(): Promise<DoctorReport> {
+    return this.client.request("GET", "/api/doctor");
+  }
+
+  onboarding(): Promise<Onboarding> {
+    return this.client.request("GET", "/api/onboarding");
   }
 }

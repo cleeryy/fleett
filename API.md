@@ -2,8 +2,9 @@
 
 Base: `http://127.0.0.1:8090`. Every `/api/*` route requires a bearer token
 (`Authorization: Bearer <FLEETT_TOKEN>`) or, when `FLEETT_AUTH` includes
-`oidc`, a `fleett_session` cookie, except `GET /api/health` and
-`GET /api/auth/config`. See `docs/OIDC.md` for the SSO setup.
+`oidc`, a `fleett_session` cookie, except `GET /api/health`,
+`GET /api/auth/config` and `GET /api/openapi.json`. See `docs/OIDC.md` for the
+SSO setup.
 
 Errors: `{"error":{"code":"...","message":"..."}}` with the matching HTTP status
 (`400` invalid input, `401` missing/wrong credential, `403` role or CSRF
@@ -12,6 +13,19 @@ refusal, `404` unknown, `409` conflict, `422` invalid YAML/compose,
 A `429` always carries `Retry-After` (whole seconds) and
 `details.retry_after_s`. Unauthenticated API calls never redirect: `401` JSON,
 always.
+
+## OpenAPI contract
+
+`GET /api/openapi.json` is the authoritative contract of the running binary. It
+is public, and its `info.version` is the binary version (`fleett --version`,
+the same `CARGO_PKG_VERSION` as the `fleett_build_info` metric): the handler
+parses the embedded document once and overwrites the stored version, so a stale
+literal can never be served. A unit test compares the document with
+`api_routes` in both directions — `cargo test` fails when a router route is not
+documented, and when the document claims an operation the router does not
+serve. CI validates the file with `openapi-spec-validator`. The TypeScript SDK
+in `sdk/typescript` is a hand-written typed client of this contract; it is
+typechecked in CI.
 
 Credentials are resolved in this order: session cookie, then bearer token
 (`FLEETT_TOKEN` = admin, then named tokens). Authorization is granted per

@@ -507,6 +507,15 @@ async fn the_openapi_document_describes_every_api_route() {
             );
         }
     }
-    // The served bytes are the embedded document.
-    assert_eq!(body.trim(), api::openapi::DOCUMENT.trim());
+    // The served bytes are the embedded document with `info.version` replaced
+    // by the running binary version (see `api::openapi::document_json`).
+    let served = parse(&body);
+    let embedded: serde_json::Value =
+        serde_json::from_str(api::openapi::DOCUMENT).expect("embedded document");
+    assert_eq!(served["paths"], embedded["paths"]);
+    assert_eq!(served["components"], embedded["components"]);
+    assert_eq!(
+        served["info"]["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
 }
