@@ -15,6 +15,7 @@
 //! | `FLEETT_ASSISTANT_PROVIDER` | id of the provider that answers |
 //! | `FLEETT_ASSISTANT_MODEL` | model name (`deepseek-v4.1-flash` by default) |
 //! | `FLEETT_ASSISTANT_BUDGET_TOKENS` | per-session token budget, `0` disables |
+//! | `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` | output ceiling (`4096` by default), `0` lets the provider decide |
 //!
 //! ## Redaction
 //!
@@ -61,8 +62,16 @@ pub const MAX_SESSION_ID_CHARS: usize = 200;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Most history messages accepted in one request.
 pub const MAX_MESSAGES: usize = 40;
-/// Cap of one assistant reply (`max_tokens`).
-pub const MAX_REPLY_TOKENS: u64 = 1200;
+/// Output ceiling of one assistant reply when
+/// `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` is unset (issue #68).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4096;
+/// Message returned when no visible content was produced (reasoning only).
+pub const TRUNCATED_EMPTY_MESSAGE: &str = "The model hit the output token ceiling before writing \
+     a visible answer: its reasoning consumed the whole budget. Raise \
+     FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS or ask for a shorter answer, then press Continue.";
+/// Readable fallback when the structured answer cannot be repaired at all.
+pub const UNUSABLE_REPLY_MESSAGE: &str = "The model's reply could not be read (invalid \
+     structured output). Nothing was applied — try again or rephrase the request.";
 /// Sampling temperature of the provider call.
 pub const TEMPERATURE: f64 = 0.2;
 /// Hard timeout of one provider call.
@@ -185,6 +194,10 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub task: Task,
+    /// Optional output ceiling for this turn, bounded by
+    /// `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` when it is set (issue #68).
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// One environment variable of an `env` proposal.
@@ -217,12 +230,60 @@ pub struct Proposal {
     pub env: Option<Vec<ProposalEnvEntry>>,
 }
 
-/// Token accounting of one turn.
+/// Why the provider stopped generating.
+///
+/// OpenCode and OpenAI-compatible gateways map their upstream value onto
+/// `length` or `stop`; anything else is reported as `other` instead of being
+/// guessed. `length` means the reply was cut at `max_tokens` (issue #68).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinishReason {
+    Stop,
+    Length,
+    #[default]
+    Other,
+}
+
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::Other => "other",
+        }
+    }
+
+    /// Map the upstream `choices[0].finish_reason` value.
+    pub fn from_upstream(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("stop") => Self::Stop,
+            Some("length") => Self::Length,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for FinishReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Token accounting of one turn, including how generation ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub prompt: u64,
     pub completion: u64,
     pub total: u64,
+    /// Reasoning tokens reported by the provider (`reasoning_content`); they
+    /// share the same `max_tokens` budget as the visible answer (issue #68).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
+    /// Ceiling actually sent upstream; absent when the provider decided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    pub finish_reason: FinishReason,
+    pub truncated: bool,
 }
 
 /// What left the process, and what did not.
@@ -241,9 +302,15 @@ pub struct Redaction {
 pub struct ChatResponse {
     /// Explanation shown in the panel.
     pub message: String,
-    /// Applicable draft, when the model returned one.
+    /// Applicable draft, when the model returned one. Never present on a
+    /// truncated completion (`finish_reason: "length"`), which the route
+    /// refuses with `422 assistant_proposal_truncated` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal: Option<Proposal>,
+    /// Whether generation stopped at the output ceiling (issue #68).
+    pub truncated: bool,
+    /// Normalized upstream stop reason: `stop`, `length` or `other`.
+    pub finish_reason: FinishReason,
     pub usage: Usage,
     pub redaction: Redaction,
 }
@@ -352,6 +419,8 @@ pub struct AssistantConfig {
     pub model: String,
     pub budget_tokens: u64,
     pub used_tokens: u64,
+    /// Output ceiling of one reply; `0` lets the provider decide (issue #68).
+    pub max_output_tokens: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -375,6 +444,18 @@ pub enum AssistantError {
     Provider(String),
     #[error("the assistant provider returned an unexpected payload")]
     BadPayload,
+    /// The model was cut at the output ceiling while writing a proposal: the
+    /// route refuses instead of handing the console a half file (issue #68).
+    #[error("the assistant reply was cut before its proposal was complete")]
+    ProposalTruncated {
+        finish_reason: FinishReason,
+        /// Ceiling actually sent upstream, absent when the provider decided.
+        max_tokens: Option<u64>,
+    },
+    /// The structured answer could not be repaired: never show the raw JSON
+    /// (issue #69).
+    #[error("the assistant returned a structured reply that could not be parsed")]
+    UnusableReply,
     #[error(transparent)]
     Secrets(#[from] crate::secrets::SecretsError),
     #[error(transparent)]
@@ -429,15 +510,20 @@ impl Sessions {
 
 /// Whether one more turn fits in the budget.
 ///
-/// The whole reply (`max_tokens`) plus the prompt has to fit: a budget smaller
-/// than one answer can never produce one, which is what `0` (disabled) is for.
-pub fn budget_allows(budget: u64, used: u64, prompt_tokens: u64) -> bool {
+/// The whole reply ceiling plus the prompt has to fit: a budget smaller than
+/// one answer can never produce one, which is what `0` (disabled) is for. When
+/// `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS=0` the provider decides; the budget then
+/// reserves [`DEFAULT_MAX_OUTPUT_TOKENS`], the shipped default.
+pub fn budget_allows(budget: u64, used: u64, prompt_tokens: u64, max_output_tokens: u64) -> bool {
     if budget == 0 {
         return true;
     }
-    used.saturating_add(prompt_tokens)
-        .saturating_add(MAX_REPLY_TOKENS)
-        <= budget
+    let allowance = if max_output_tokens == 0 {
+        DEFAULT_MAX_OUTPUT_TOKENS
+    } else {
+        max_output_tokens
+    };
+    used.saturating_add(prompt_tokens).saturating_add(allowance) <= budget
 }
 
 // ---------------------------------------------------------------------------
@@ -625,8 +711,9 @@ Your job is to remove the friction of writing configuration: SKILL.md, SOUL.md, 
 Rules:
 - Answer in English, concise and concrete.
 - The console context below is already redacted: secret values are replaced by [REDACTED] and secret environment values are never sent. Never ask for a secret and never invent one; use a placeholder such as <set-in-console>.
-- Reply with ONE JSON object and nothing else, no code fence around it:
+- Reply with exactly ONE JSON object and nothing else. A single ```json code fence around that object is accepted; never emit several blocks or prose before/after it:
   {"message": "<the explanation shown in the panel>", "proposal": <optional object>}
+- If the answer is long, finish it. Never start a proposal you cannot complete inside the output ceiling: a cut proposal is refused instead of applied.
 - A proposal replaces a whole target, so it must be complete:
   - a file: {"kind":"file","path":"/SKILL.md","content":"<complete file>"}
   - a YAML document: {"kind":"yaml","path":"/fleet.yaml","content":"<complete YAML>"}
@@ -687,6 +774,21 @@ pub struct ChatTarget<'a> {
     pub session_id: &'a str,
 }
 
+/// Effective `max_tokens` of one call.
+///
+/// `cap` is `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` (`0` = the provider decides).
+/// A per-request value is honoured but never exceeds the cap. `None` means the
+/// field is omitted entirely, so the provider applies its own default.
+pub fn effective_max_tokens(cap: u64, requested: Option<u64>) -> Option<u64> {
+    match requested {
+        Some(0) => None,
+        Some(value) if cap == 0 => Some(value),
+        Some(value) => Some(value.min(cap)),
+        None if cap == 0 => None,
+        None => Some(cap),
+    }
+}
+
 /// Build `${base_url}/chat/completions` for an OpenAI-compatible provider.
 ///
 /// Header order matters: the credential and the JSON content type first, then
@@ -698,6 +800,7 @@ pub fn prepare_chat(
     target: &ChatTarget<'_>,
     system: &str,
     messages: &[ChatMessage],
+    max_tokens: Option<u64>,
 ) -> PreparedCall {
     let mut outgoing = Vec::with_capacity(messages.len() + 1);
     outgoing.push(json!({"role": "system", "content": system}));
@@ -723,6 +826,15 @@ pub fn prepare_chat(
     let mut needles = vec![target.secret.to_string()];
     needles.extend(target.headers.values().cloned());
 
+    let mut body = json!({
+        "model": target.model,
+        "messages": outgoing,
+        "temperature": TEMPERATURE,
+    });
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+
     PreparedCall {
         url: format!(
             "{}{}",
@@ -730,12 +842,7 @@ pub fn prepare_chat(
             providers::COMPLETION_PATH
         ),
         headers: headers.into_iter().collect(),
-        body: json!({
-            "model": target.model,
-            "messages": outgoing,
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_REPLY_TOKENS,
-        }),
+        body,
         needles,
     }
 }
@@ -743,9 +850,23 @@ pub fn prepare_chat(
 /// One parsed provider answer.
 #[derive(Debug, Clone)]
 pub struct Completion {
+    /// Visible answer (`message.content`).
     pub text: String,
+    /// Reasoning of a thinking model (`message.reasoning_content`), which is
+    /// generated inside the same `max_tokens` budget as `text`.
+    pub reasoning: Option<String>,
+    pub finish_reason: FinishReason,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Reasoning tokens reported by the provider, when it reports them.
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl Completion {
+    /// Whether the provider stopped at the output ceiling.
+    pub fn truncated(&self) -> bool {
+        self.finish_reason == FinishReason::Length
+    }
 }
 
 /// Conservative token estimate (four characters per token).
@@ -814,13 +935,32 @@ pub async fn complete(call: &PreparedCall) -> Result<Completion, AssistantError>
 }
 
 /// Parse one OpenAI-compatible completion payload.
+///
+/// `reasoning_content` is kept aside and never shown: on a thinking model it
+/// consumes the same `max_tokens` budget, so a long reasoning can leave the
+/// visible answer empty. That case is accepted only when the provider also
+/// reports `finish_reason: "length"` (the route then explains the ceiling); a
+/// reasoning-only answer that stopped normally is still a bad payload.
 pub fn parse_completion(value: &Value) -> Result<Completion, AssistantError> {
     let text = value
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let reasoning = value
+        .pointer("/choices/0/message/reasoning_content")
+        .or_else(|| value.pointer("/choices/0/message/reasoning"))
+        .and_then(Value::as_str)
         .map(str::to_string)
-        .filter(|text| !text.trim().is_empty())
-        .ok_or(AssistantError::BadPayload)?;
+        .filter(|text| !text.trim().is_empty());
+    let finish_reason = FinishReason::from_upstream(
+        value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+    );
+    if text.trim().is_empty() && (reasoning.is_none() || finish_reason != FinishReason::Length) {
+        return Err(AssistantError::BadPayload);
+    }
     let prompt_tokens = value
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64)
@@ -829,10 +969,16 @@ pub fn parse_completion(value: &Value) -> Result<Completion, AssistantError> {
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let reasoning_tokens = value
+        .pointer("/usage/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64);
     Ok(Completion {
         text,
+        reasoning,
+        finish_reason,
         prompt_tokens,
         completion_tokens,
+        reasoning_tokens,
     })
 }
 
@@ -935,17 +1081,212 @@ pub fn validate_proposal(value: &Value) -> Option<Proposal> {
     }
 }
 
-/// Parse the model answer: a JSON object `{message, proposal?}`, or the raw
-/// text when the model did not honour the contract.
-pub fn parse_reply(text: &str) -> (String, Option<Proposal>) {
+/// One model answer, after repair (issue #69).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedReply {
+    /// Readable text shown in the panel: never raw JSON.
+    pub message: String,
+    pub proposal: Option<Proposal>,
+    /// The payload looked structured but had to be repaired (missing brace,
+    /// string cut in the middle): the generation was truncated.
+    pub incomplete: bool,
+    /// Nothing usable could be extracted; `message` is a readable fallback.
+    pub unusable: bool,
+}
+
+impl ParsedReply {
+    fn structured(message: String, proposal: Option<Proposal>) -> Self {
+        Self {
+            message,
+            proposal,
+            incomplete: false,
+            unusable: false,
+        }
+    }
+
+    fn repaired(message: String, proposal: Option<Proposal>) -> Self {
+        Self {
+            message,
+            proposal,
+            incomplete: true,
+            unusable: false,
+        }
+    }
+
+    fn unusable() -> Self {
+        Self {
+            message: UNUSABLE_REPLY_MESSAGE.to_string(),
+            proposal: None,
+            incomplete: false,
+            unusable: true,
+        }
+    }
+}
+
+/// Log one parse failure with its size and a redacted preview, instead of
+/// silently swallowing it (issue #69).
+fn warn_parse_failure(text: &str) {
+    let redactor = Redactor::new(Vec::new());
+    let preview = redactor.redact_capped(text, 200);
+    tracing::warn!(
+        bytes = text.len(),
+        preview = %preview,
+        "assistant reply is not valid structured output"
+    );
+}
+
+/// Whether the payload clearly tried to follow the `{message, proposal?}`
+/// contract (and therefore must never be shown verbatim).
+fn looks_structured(candidate: &str) -> bool {
+    candidate.trim_start().starts_with('{') || candidate.contains("\"message\"")
+}
+
+/// Candidate repairs for a cut JSON object, tried in order.
+///
+/// The first one closes a string cut in the middle (`…` → `…"}`); the others
+/// close one or two missing braces when the cut fell between complete values.
+fn repair_candidates(candidate: &str) -> Vec<String> {
+    let base = candidate.trim_end();
+    ["\"}", "}", "\"}}", "}}", "\"}"]
+        .iter()
+        .map(|suffix| format!("{base}{suffix}"))
+        .collect()
+}
+
+/// Extract the `message` string by scanning, even when the JSON is cut in the
+/// middle of that string. Escapes are decoded exactly like `serde_json` would.
+fn extract_message(candidate: &str) -> Option<String> {
+    let key = "\"message\"";
+    let start = candidate.find(key)? + key.len();
+    let rest = &candidate[start..];
+    let colon = rest.find(':')?;
+    let rest = rest[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+
+    let mut message = String::new();
+    let mut chars = rest.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('n') => message.push('\n'),
+                Some('r') => message.push('\r'),
+                Some('t') => message.push('\t'),
+                Some('b') => message.push('\u{8}'),
+                Some('f') => message.push('\u{c}'),
+                Some('"') => message.push('"'),
+                Some('\\') => message.push('\\'),
+                Some('/') => message.push('/'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    let decoded = (hex.len() == 4)
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    if let Some(decoded) = decoded {
+                        message.push(decoded);
+                    }
+                }
+                Some(other) => message.push(other),
+                None => break,
+            },
+            '"' => break,
+            _ => message.push(ch),
+        }
+    }
+    let message = message.trim().to_string();
+    (!message.is_empty()).then_some(message)
+}
+
+/// Parse the model answer: a JSON object `{message, proposal?}`, a repairable
+/// cut of that object, or plain text.
+///
+/// A payload that looks structured is **never** returned verbatim: it is
+/// repaired (completing the missing quote/brace, else extracting `message` by
+/// scan) or reported as unusable, so the panel can never display `{"message":`
+/// or literal `\n` (issue #69).
+pub fn parse_reply(text: &str) -> ParsedReply {
     let candidate = strip_fence(text);
     if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(candidate) {
         if let Some(message) = object.get("message").and_then(Value::as_str) {
             let proposal = object.get("proposal").and_then(validate_proposal);
-            return (message.to_string(), proposal);
+            return ParsedReply::structured(message.to_string(), proposal);
         }
+        // Valid JSON that is not the contract: never show the object.
+        warn_parse_failure(text);
+        return ParsedReply::unusable();
     }
-    (text.trim().to_string(), None)
+
+    if looks_structured(candidate) {
+        warn_parse_failure(text);
+        for repaired in repair_candidates(candidate) {
+            if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&repaired) {
+                if let Some(message) = object.get("message").and_then(Value::as_str) {
+                    // A repaired object is structurally incomplete: never trust
+                    // a proposal from it, even when the braces could be closed.
+                    return ParsedReply::repaired(message.to_string(), None);
+                }
+            }
+        }
+        if let Some(message) = extract_message(candidate) {
+            return ParsedReply::repaired(message, None);
+        }
+        return ParsedReply::unusable();
+    }
+
+    ParsedReply {
+        message: text.trim().to_string(),
+        proposal: None,
+        incomplete: false,
+        unusable: false,
+    }
+}
+
+/// One complete reply, ready for the HTTP layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    pub message: String,
+    pub proposal: Option<Proposal>,
+    pub truncated: bool,
+    pub finish_reason: FinishReason,
+    /// Whether the structured output had to be repaired (logged).
+    pub parse_failed: bool,
+}
+
+/// Turn one completion into a reply, enforcing the truncation rules.
+///
+/// A completion cut at the output ceiling never yields a proposal: if the
+/// model had started one, this is `AssistantError::ProposalTruncated` (mapped
+/// to `422 assistant_proposal_truncated`) rather than a half file. A
+/// structured payload that cannot be repaired is `AssistantError::UnusableReply`
+/// rather than raw JSON (issue #69).
+pub fn build_reply(
+    completion: &Completion,
+    max_tokens: Option<u64>,
+) -> Result<Reply, AssistantError> {
+    let parsed = parse_reply(&completion.text);
+    let truncated = completion.truncated() || parsed.incomplete;
+    let proposal_attempted = parsed.proposal.is_some() || completion.text.contains("\"proposal\"");
+    if truncated && proposal_attempted {
+        return Err(AssistantError::ProposalTruncated {
+            finish_reason: completion.finish_reason,
+            max_tokens,
+        });
+    }
+    if parsed.unusable && !truncated {
+        return Err(AssistantError::UnusableReply);
+    }
+    let message = if parsed.message.trim().is_empty() {
+        TRUNCATED_EMPTY_MESSAGE.to_string()
+    } else {
+        parsed.message
+    };
+    Ok(Reply {
+        message,
+        proposal: if truncated { None } else { parsed.proposal },
+        truncated,
+        finish_reason: completion.finish_reason,
+        parse_failed: parsed.unusable || parsed.incomplete,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1450,7 @@ pub fn config_payload(
             .unwrap_or_else(|| cfg.assistant_model.clone()),
         budget_tokens: cfg.assistant_budget_tokens,
         used_tokens,
+        max_output_tokens: cfg.assistant_max_output_tokens,
     })
 }
 
@@ -1319,11 +1661,12 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
             }],
+            Some(4096),
         );
         assert_eq!(call.url, "https://api.example.test/v1/chat/completions");
         assert_eq!(call.body["model"], "model-x");
         assert_eq!(call.body["temperature"], 0.2);
-        assert_eq!(call.body["max_tokens"], 1200);
+        assert_eq!(call.body["max_tokens"], 4096);
         assert_eq!(call.body["messages"][0]["role"], "system");
         assert_eq!(call.body["messages"][0]["content"], "system");
         assert_eq!(call.body["messages"][1]["role"], "user");
@@ -1355,6 +1698,7 @@ mod tests {
             },
             "system",
             &[],
+            Some(4096),
         );
         let header = |name: &str| {
             call.headers
@@ -1392,6 +1736,7 @@ mod tests {
             },
             "system",
             &[],
+            Some(4096),
         );
         assert!(call
             .headers
@@ -1416,6 +1761,7 @@ mod tests {
             },
             "system",
             &[],
+            Some(4096),
         );
         assert!(!call
             .headers
@@ -1433,23 +1779,224 @@ mod tests {
     }
 
     #[test]
-    fn replies_are_parsed_or_fall_back_to_the_raw_text() {
-        let (message, proposal) = parse_reply(
+    fn output_ceiling_is_bounded_by_the_cap_and_zero_omits_it() {
+        assert_eq!(effective_max_tokens(4096, None), Some(4096));
+        assert_eq!(effective_max_tokens(4096, Some(8192)), Some(4096));
+        assert_eq!(effective_max_tokens(4096, Some(100)), Some(100));
+        assert_eq!(effective_max_tokens(0, None), None);
+        assert_eq!(effective_max_tokens(0, Some(2048)), Some(2048));
+
+        let headers = std::collections::BTreeMap::new();
+        let call = prepare_chat(
+            &ChatTarget {
+                provider: &provider(),
+                secret: "sk-secret",
+                headers: &headers,
+                model: "model-x",
+                session_id: "s",
+            },
+            "system",
+            &[],
+            None,
+        );
+        assert!(
+            call.body.get("max_tokens").is_none(),
+            "0 must omit max_tokens entirely: {}",
+            call.body
+        );
+    }
+
+    #[test]
+    fn completion_reports_the_stop_reason_and_reasoning() {
+        let stop = json!({
+            "choices": [{"message": {"content": "{\"message\":\"ok\"}"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        });
+        let completion = parse_completion(&stop).expect("stop");
+        assert_eq!(completion.finish_reason, FinishReason::Stop);
+        assert!(!completion.truncated());
+        assert!(completion.reasoning.is_none());
+
+        let length = json!({
+            "choices": [{
+                "message": {"content": "{\"message\":\"cut", "reasoning_content": "thinking…"},
+                "finish_reason": "length",
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4096,
+                "total_tokens": 4106,
+                "completion_tokens_details": {"reasoning_tokens": 3000},
+            },
+        });
+        let completion = parse_completion(&length).expect("length");
+        assert_eq!(completion.finish_reason, FinishReason::Length);
+        assert!(completion.truncated());
+        assert_eq!(completion.reasoning.as_deref(), Some("thinking…"));
+        assert_eq!(completion.reasoning_tokens, Some(3000));
+
+        // A reasoning-only answer is accepted only when the ceiling was hit:
+        // otherwise there is no visible answer at all.
+        let reasoning_only = json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "…"}, "finish_reason": "length"}],
+        });
+        let completion = parse_completion(&reasoning_only).expect("reasoning consumed the cap");
+        assert!(completion.text.is_empty());
+        assert!(completion.truncated());
+        let stopped = json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "…"}, "finish_reason": "stop"}],
+        });
+        assert!(parse_completion(&stopped).is_err());
+
+        // Unknown upstream values are reported as `other`, never guessed.
+        let other =
+            json!({"choices": [{"message": {"content": "ok"}, "finish_reason": "content_filter"}]});
+        assert_eq!(
+            parse_completion(&other).expect("other").finish_reason,
+            FinishReason::Other
+        );
+    }
+
+    #[test]
+    fn replies_are_parsed_repaired_or_reported_as_unusable() {
+        // Valid JSON, with a proposal.
+        let parsed = parse_reply(
             r#"{"message":"Here it is","proposal":{"kind":"file","path":"/SKILL.md","content":"---\nname: x\n---\n"}}"#,
         );
-        assert_eq!(message, "Here it is");
-        let proposal = proposal.expect("proposal");
+        assert_eq!(parsed.message, "Here it is");
+        assert!(!parsed.incomplete && !parsed.unusable);
+        let proposal = parsed.proposal.expect("proposal");
         assert_eq!(proposal.kind, "file");
         assert_eq!(proposal.path.as_deref(), Some("/SKILL.md"));
 
         // A fenced JSON object is accepted too.
-        let (message, _) = parse_reply("```json\n{\"message\":\"ok\"}\n```");
-        assert_eq!(message, "ok");
+        let parsed = parse_reply("```json\n{\"message\":\"ok\"}\n```");
+        assert_eq!(parsed.message, "ok");
+        assert!(!parsed.incomplete);
+
+        // Missing closing brace: repaired, flagged incomplete.
+        let parsed = parse_reply(r#"{"message": "cut after the value""#);
+        assert_eq!(parsed.message, "cut after the value");
+        assert!(parsed.incomplete);
+        assert!(parsed.proposal.is_none());
+
+        // Cut in the middle of the string: the scan recovers the message, with
+        // real newlines and no braces.
+        let parsed = parse_reply(r#"{"message":"line one\nline two and then it sto"#);
+        assert_eq!(parsed.message, "line one\nline two and then it sto");
+        assert!(parsed.incomplete);
+        assert!(
+            !parsed.message.contains("\\n"),
+            "literal \\n left: {parsed:?}"
+        );
+        assert!(!parsed.message.contains('{'));
+
+        // A cut proposal never yields one, even when the message is complete.
+        let parsed = parse_reply(
+            r#"{"message":"draft","proposal":{"kind":"file","path":"/SKILL.md","content":"half"#,
+        );
+        assert_eq!(parsed.message, "draft");
+        assert!(parsed.proposal.is_none());
+        assert!(parsed.incomplete);
 
         // Plain text is the message.
-        let (message, proposal) = parse_reply("Voici une explication.");
-        assert_eq!(message, "Voici une explication.");
-        assert!(proposal.is_none());
+        let parsed = parse_reply("Voici une explication.");
+        assert_eq!(parsed.message, "Voici une explication.");
+        assert!(parsed.proposal.is_none());
+        assert!(!parsed.incomplete && !parsed.unusable);
+
+        // A JSON object without `message` is unusable, never displayed raw.
+        for broken in [r#"{"foo":"bar"}"#, r#"{"message": 42}"#] {
+            let parsed = parse_reply(broken);
+            assert!(parsed.unusable, "{broken}: {parsed:?}");
+            assert!(parsed.proposal.is_none());
+            assert!(!parsed.message.contains('{'));
+        }
+    }
+
+    #[test]
+    fn a_truncated_completion_never_yields_a_proposal() {
+        let completion = |text: &str, finish_reason: FinishReason| Completion {
+            text: text.to_string(),
+            reasoning: None,
+            finish_reason,
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            reasoning_tokens: None,
+        };
+
+        // `length` + a proposal marker: refused, never applied.
+        let err = build_reply(
+            &completion(
+                r#"{"message":"draft","proposal":{"kind":"file","path":"/SKILL.md","content":"half"#,
+                FinishReason::Length,
+            ),
+            Some(4096),
+        )
+        .expect_err("truncated proposal");
+        match err {
+            AssistantError::ProposalTruncated { finish_reason, .. } => {
+                assert_eq!(finish_reason, FinishReason::Length)
+            }
+            other => panic!("expected a truncated proposal, got {other:?}"),
+        }
+
+        // `length` without proposal intent: a normal reply marked truncated.
+        let reply = build_reply(
+            &completion(r#"{"message":"long answer cut"#, FinishReason::Length),
+            Some(4096),
+        )
+        .expect("truncated message");
+        assert!(reply.truncated);
+        assert!(reply.proposal.is_none());
+        assert_eq!(reply.finish_reason, FinishReason::Length);
+
+        // `length` with no visible content (reasoning ate the budget): a
+        // readable notice instead of an empty bubble.
+        let reply = build_reply(&completion("", FinishReason::Length), Some(4096))
+            .expect("reasoning-only truncation");
+        assert!(reply.truncated);
+        assert_eq!(reply.message, TRUNCATED_EMPTY_MESSAGE);
+        assert!(reply.proposal.is_none());
+
+        // A complete proposal with `stop` is still offered.
+        let reply = build_reply(
+            &completion(
+                r#"{"message":"here","proposal":{"kind":"file","path":"/SKILL.md","content":"x"}}"#,
+                FinishReason::Stop,
+            ),
+            Some(4096),
+        )
+        .expect("complete proposal");
+        assert!(!reply.truncated);
+        assert_eq!(reply.proposal.expect("proposal").kind, "file");
+
+        // Unbalanced braces without `length` are treated as a cut proposal too.
+        let err = build_reply(
+            &completion(
+                r#"{"message":"draft","proposal":{"kind":"file","path":"/SKILL.md","content":"half"#,
+                FinishReason::Stop,
+            ),
+            Some(4096),
+        )
+        .expect_err("unbalanced proposal");
+        assert!(matches!(err, AssistantError::ProposalTruncated { .. }));
+    }
+
+    #[test]
+    fn an_unusable_reply_is_an_error_not_raw_json() {
+        let completion = Completion {
+            text: r#"{"foo":"bar"}"#.to_string(),
+            reasoning: None,
+            finish_reason: FinishReason::Stop,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            reasoning_tokens: None,
+        };
+        assert!(matches!(
+            build_reply(&completion, Some(4096)),
+            Err(AssistantError::UnusableReply)
+        ));
     }
 
     #[test]
@@ -1499,11 +2046,16 @@ mod tests {
 
     #[test]
     fn budgets_cover_prompt_and_reply() {
-        assert!(budget_allows(0, 1_000_000, 1_000_000));
-        assert!(budget_allows(50_000, 0, 100));
-        assert!(!budget_allows(1_000, 0, 0));
-        assert!(!budget_allows(50_000, 49_000, 0));
-        assert!(budget_allows(50_000, 40_000, 100));
+        assert!(budget_allows(0, 1_000_000, 1_000_000, 4096));
+        assert!(budget_allows(50_000, 0, 100, 4096));
+        assert!(!budget_allows(1_000, 0, 0, 4096));
+        assert!(!budget_allows(50_000, 49_000, 0, 4096));
+        assert!(budget_allows(50_000, 40_000, 100, 4096));
+        // The ceiling is the effective one, not the default.
+        assert!(budget_allows(2_000, 0, 0, 1200));
+        assert!(!budget_allows(2_000, 0, 0, 4096));
+        // `0` (provider decides) still reserves the shipped default.
+        assert!(!budget_allows(2_000, 0, 0, 0));
     }
 
     #[test]

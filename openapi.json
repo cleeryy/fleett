@@ -10722,6 +10722,11 @@
           },
           "task": {
             "type": "string"
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Optional output ceiling for this turn; bounded by FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS."
           }
         },
         "required": [
@@ -10737,6 +10742,19 @@
           "proposal": {
             "$ref": "#/components/schemas/AssistantProposal"
           },
+          "truncated": {
+            "type": "boolean",
+            "description": "Generation stopped at the output ceiling or the structured output was incomplete."
+          },
+          "finish_reason": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "other"
+            ],
+            "description": "Normalized upstream stop reason; length means the reply was cut."
+          },
           "usage": {
             "$ref": "#/components/schemas/AssistantUsage"
           },
@@ -10746,6 +10764,8 @@
         },
         "required": [
           "message",
+          "truncated",
+          "finish_reason",
           "usage",
           "redaction"
         ]
@@ -10757,7 +10777,13 @@
             "type": "boolean"
           },
           "provider": {
-            "$ref": "#/components/schemas/ProviderSummary"
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AssistantProvider"
+              }
+            ],
+            "description": "Resolved provider; null when nothing is resolved (see reason)."
           },
           "model": {
             "type": "string"
@@ -10769,6 +10795,10 @@
           "used_tokens": {
             "type": "integer",
             "format": "int64"
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "description": "Output ceiling of one reply; 0 lets the provider decide."
           },
           "provider_source": {
             "type": "string",
@@ -10792,8 +10822,13 @@
         },
         "required": [
           "enabled",
+          "provider",
+          "provider_source",
+          "reason",
+          "model",
           "budget_tokens",
-          "used_tokens"
+          "used_tokens",
+          "max_output_tokens"
         ]
       },
       "AssistantContext": {
@@ -10899,12 +10934,35 @@
           "total": {
             "type": "integer",
             "format": "int64"
+          },
+          "reasoning": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Reasoning tokens reported by the provider; they share the same output ceiling."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ceiling actually sent upstream; absent when the provider decided."
+          },
+          "finish_reason": {
+            "type": "string",
+            "enum": [
+              "stop",
+              "length",
+              "other"
+            ]
+          },
+          "truncated": {
+            "type": "boolean"
           }
         },
         "required": [
           "prompt",
           "completion",
-          "total"
+          "total",
+          "finish_reason",
+          "truncated"
         ]
       },
       "AttachShareRequest": {
@@ -18080,6 +18138,21 @@
             "description": "Provider id to select, or null to clear the selection."
           }
         }
+      },
+      "AssistantProvider": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
       }
     }
   }

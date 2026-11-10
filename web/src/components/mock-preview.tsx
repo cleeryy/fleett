@@ -27,6 +27,8 @@ const DOCTOR_OPTIONS: { value: MockDoctorMode; labelKey: string }[] = [
 
 const ASSISTANT_OPTIONS: { value: MockAssistantMode; labelKey: string }[] = [
   { value: "live", labelKey: "mock.assistantLive" },
+  { value: "auto", labelKey: "mock.assistantAuto" },
+  { value: "env", labelKey: "mock.assistantEnv" },
   { value: "not-selected", labelKey: "mock.assistantNotSelected" },
   { value: "unconfigured", labelKey: "mock.assistantNoProvider" },
   { value: "unknown", labelKey: "mock.assistantUnknown" },

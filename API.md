@@ -79,9 +79,9 @@ Full semantics: [docs/ASSISTANT.md](docs/ASSISTANT.md).
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,provider_source:"env\|setting\|auto\|none",reason:"no_provider\|not_selected"\|null,model,budget_tokens,used_tokens}`; `422 assistant_provider_unknown` with `details.valid` when a reference is dangling |
+| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,provider_source:"env\|setting\|auto\|none",reason:"no_provider\|not_selected"\|null,model,budget_tokens,used_tokens,max_output_tokens}`; `422 assistant_provider_unknown` with `details.valid` when a reference is dangling |
 | PATCH | `/api/assistant/config` | `{"provider":"<id>"}` or `{"provider":null}` | resolved config (same shape as `GET`), admin only; `422 assistant_provider_unknown` with `details.valid` |
-| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured` (with `details.reason`), `422 invalid_messages`, `422 assistant_provider_unknown`, `429 assistant_budget_exceeded`, `502 assistant_provider_error` (with `details.provider_status` and `details.upstream:{status,body}`) |
+| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?,max_tokens?}` | `{message,proposal?,truncated,finish_reason:"stop\|length\|other",usage,redaction}`; `409 assistant_not_configured` (with `details.reason`), `422 invalid_messages`, `422 invalid_max_tokens`, `422 assistant_provider_unknown`, `422 assistant_proposal_truncated` (a cut proposal is never returned), `422 assistant_reply_unusable`, `429 assistant_budget_exceeded`, `502 assistant_provider_error` (with `details.provider_status` and `details.upstream:{status,body}`) |
 
 `task` is `freeform` (default), `skill`, `soul`, `env`, `pipeline`, `fleet_yaml`,
 `explain` or `config`. A proposal is `{kind:"file"|"yaml",path,content}` or

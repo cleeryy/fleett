@@ -361,6 +361,8 @@ export interface AssistantChatRequest {
   context: AssistantContext;
   messages: AssistantMessage[];
   task?: AssistantTask;
+  /** Optional output ceiling for this turn, bounded by the server cap. */
+  max_tokens?: number;
 }
 
 export interface AssistantEnvEntry {
@@ -376,10 +378,18 @@ export interface AssistantProposal {
   env?: AssistantEnvEntry[];
 }
 
+export type AssistantFinishReason = "stop" | "length" | "other";
+
 export interface AssistantUsage {
   prompt: number;
   completion: number;
   total: number;
+  /** Reasoning tokens reported by the provider, sharing the same ceiling. */
+  reasoning?: number;
+  /** Ceiling actually sent upstream; absent when the provider decided. */
+  max_tokens?: number;
+  finish_reason: AssistantFinishReason;
+  truncated: boolean;
 }
 
 export interface AssistantRedaction {
@@ -391,16 +401,36 @@ export interface AssistantRedaction {
 export interface AssistantChatResponse {
   message: string;
   proposal?: AssistantProposal;
+  /** Generation stopped at the output ceiling; no proposal is then present. */
+  truncated: boolean;
+  finish_reason: AssistantFinishReason;
   usage: AssistantUsage;
   redaction: AssistantRedaction;
 }
 
 export interface AssistantConfig {
   enabled: boolean;
-  provider?: ProviderSummary | null;
+  /** Resolved provider; `null` when nothing is resolved (see `reason`). */
+  provider: AssistantProvider | null;
+  /** `env` (FLEETT_ASSISTANT_PROVIDER), the stored selection, `auto`, or none. */
+  provider_source: "env" | "setting" | "auto" | "none";
+  /** `null` when resolved, else `no_provider` or `not_selected`. */
+  reason: "no_provider" | "not_selected" | null;
   model: string;
   budget_tokens: number;
   used_tokens: number;
+  /** Output ceiling of one reply; `0` lets the provider decide. */
+  max_output_tokens: number;
+}
+
+export interface AssistantProvider {
+  id: string;
+  name: string;
+}
+
+/** Body of `PATCH /api/assistant/config`: an id, or `null` to clear it. */
+export interface AssistantConfigPatch {
+  provider: string | null;
 }
 
 type Query = Record<string, string | number | boolean | undefined>;
@@ -702,6 +732,16 @@ export class AssistantApi {
 
   chat(body: AssistantChatRequest): Promise<AssistantChatResponse> {
     return this.client.request("POST", "/api/assistant/chat", { body });
+  }
+
+  /**
+   * Select the provider the assistant borrows (admin), or clear the selection
+   * with `null`. `FLEETT_ASSISTANT_PROVIDER` still wins: read `provider_source`
+   * from the answer instead of assuming the body applied.
+   */
+  selectProvider(provider: string | null): Promise<AssistantConfig> {
+    const body: AssistantConfigPatch = { provider };
+    return this.client.request("PATCH", "/api/assistant/config", { body });
   }
 }
 
@@ -1089,7 +1129,10 @@ export interface DoctorCheck {
   label: string;
   status: "ok" | "warn" | "fail";
   detail: string;
+  /** Exact command (or setting) that repairs the check. */
   fix?: string;
+  /** Internal console route that repairs the check (`/providers?assistant=1`). */
+  link?: string;
 }
 
 export interface DoctorReport {

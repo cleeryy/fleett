@@ -116,6 +116,30 @@ fn map_error(err: AssistantError) -> ApiError {
             "assistant_provider_error",
             "the assistant provider returned an unexpected payload",
         ),
+        AssistantError::ProposalTruncated {
+            finish_reason,
+            max_tokens,
+        } => ApiError::unprocessable(
+            "assistant_proposal_truncated",
+            "the assistant reply was cut at the output token ceiling before its proposal was \
+             complete: raise FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS or ask for a shorter file",
+        )
+        .with_details(json!({
+            "finish_reason": finish_reason.as_str(),
+            "max_tokens": max_tokens,
+            "env": "FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS",
+            "hint": "increase FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS (0 lets the provider decide) or \
+                     ask for a shorter file; nothing was applied",
+        })),
+        AssistantError::UnusableReply => ApiError::unprocessable(
+            "assistant_reply_unusable",
+            "the assistant returned a structured reply that could not be parsed: nothing was \
+             applied, retry or rephrase the request",
+        )
+        .with_details(json!({
+            "retryable": true,
+            "hint": "retry the request; the raw payload is never shown",
+        })),
         AssistantError::Secrets(crate::secrets::SecretsError::MissingKey) => ApiError::conflict(
             crate::secrets::MISSING_KEY_CODE,
             crate::secrets::SecretsError::MissingKey.to_string(),
@@ -179,6 +203,12 @@ fn validate_request(request: &ChatRequest) -> Result<(), ApiError> {
         return Err(ApiError::unprocessable(
             "invalid_messages",
             format!("at most {MAX_MESSAGES} messages are accepted"),
+        ));
+    }
+    if request.max_tokens == Some(0) {
+        return Err(ApiError::unprocessable(
+            "invalid_max_tokens",
+            "max_tokens must be at least 1; omit it to use FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS",
         ));
     }
     for message in &request.messages {
@@ -311,8 +341,15 @@ pub async fn chat(
     .map_err(map_error)?;
     let system = assistant::system_with_context(request.task, &context_text);
     let estimated = prompt_estimate(&system, &request);
+    let max_tokens =
+        assistant::effective_max_tokens(state.cfg.assistant_max_output_tokens, request.max_tokens);
     let used = state.assistant.used(request.session_id.trim());
-    if !assistant::budget_allows(state.cfg.assistant_budget_tokens, used, estimated) {
+    if !assistant::budget_allows(
+        state.cfg.assistant_budget_tokens,
+        used,
+        estimated,
+        max_tokens.unwrap_or(0),
+    ) {
         record_result(
             &state,
             &context,
@@ -351,6 +388,7 @@ pub async fn chat(
         },
         &system,
         &request.messages,
+        max_tokens,
     );
     let completion = match assistant::complete(&call).await {
         Ok(completion) => completion,
@@ -385,7 +423,28 @@ pub async fn chat(
     };
     let total = prompt_tokens.saturating_add(completion_tokens);
     state.assistant.add(request.session_id.trim(), total);
-    let (message, proposal) = assistant::parse_reply(&completion.text);
+    let reply = match assistant::build_reply(&completion, max_tokens) {
+        Ok(reply) => reply,
+        Err(err) => {
+            record_result(
+                &state,
+                &context,
+                "assistant.chat",
+                &target,
+                Some(json!({
+                    "task": task,
+                    "model": model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total,
+                    "finish_reason": completion.finish_reason.as_str(),
+                    "truncated": completion.truncated(),
+                })),
+                "refused",
+            );
+            return Err(map_error(err));
+        }
+    };
 
     record(
         &state,
@@ -398,16 +457,24 @@ pub async fn chat(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total,
+            "finish_reason": reply.finish_reason.as_str(),
+            "truncated": reply.truncated,
         })),
     );
 
     Ok(Json(ChatResponse {
-        message,
-        proposal,
+        message: reply.message,
+        proposal: reply.proposal,
+        truncated: reply.truncated,
+        finish_reason: reply.finish_reason,
         usage: Usage {
             prompt: prompt_tokens,
             completion: completion_tokens,
             total,
+            reasoning: completion.reasoning_tokens,
+            max_tokens,
+            finish_reason: reply.finish_reason,
+            truncated: reply.truncated,
         },
         redaction,
     }))

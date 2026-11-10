@@ -19,6 +19,7 @@ the context summary and calls the routes below.
 | `FLEETT_ASSISTANT_PROVIDER` | — | id of an existing provider; the assistant borrows its secret and base URL |
 | `FLEETT_ASSISTANT_MODEL` | `deepseek-v4.1-flash` | model sent to the provider, unless the provider sets its own `model` |
 | `FLEETT_ASSISTANT_BUDGET_TOKENS` | `50000` | token budget of one session; `0` disables the limit |
+| `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` | `4096` | output ceiling of one reply (`max_tokens`); `0` omits the field and lets the provider decide |
 
 The provider is a **normal provider** created with `POST /api/providers`
 (see [PROVIDERS.md](PROVIDERS.md)): kind `openai-compatible`, a base URL such as
@@ -159,13 +160,16 @@ it the response reports the sum of the live sessions (a restart resets them).
   "messages": [
     {"role": "user", "content": "write me a SKILL.md that sorts invoices"}
   ],
-  "task": "skill"
+  "task": "skill",
+  "max_tokens": 4096
 }
 ```
 
 `context.page` is required; every other context field is optional. `messages`
 is the conversation the console keeps (at most 40 messages, 16 KiB each, roles
-`user` and `assistant` only). `task` defaults to `freeform`.
+`user` and `assistant` only). `task` defaults to `freeform`. `max_tokens` is
+optional: it lowers the output ceiling for this turn only and is always bounded
+by `FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS`.
 
 ```json
 {
@@ -175,7 +179,17 @@ is the conversation the console keeps (at most 40 messages, 16 KiB each, roles
     "path": "/SKILL.md",
     "content": "---\nname: invoice-sorter\ndescription: Sort invoices by supplier\n---\n…"
   },
-  "usage": {"prompt": 412, "completion": 188, "total": 600},
+  "truncated": false,
+  "finish_reason": "stop",
+  "usage": {
+    "prompt": 412,
+    "completion": 188,
+    "total": 600,
+    "reasoning": 96,
+    "max_tokens": 4096,
+    "finish_reason": "stop",
+    "truncated": false
+  },
   "redaction": {
     "sent": ["page: files", "instance: support-agent", "path: /SKILL.md", "file_content: 812 bytes"],
     "omitted": ["env secrets: 2 value(s) withheld (DISCORD_BOT_TOKEN, API_KEY)"],
@@ -200,6 +214,69 @@ A proposal is always complete (it replaces the whole target) and is validated:
 `healthcheck.py` (fleett renders both from the instance settings). An invalid
 proposal is dropped and the explanation is still returned.
 
+### Truncation and the output ceiling
+
+`FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS` is sent as `max_tokens` (default `4096`);
+`0` omits the field entirely so the provider applies its own default. A
+per-request `max_tokens` can only lower the ceiling, never raise it.
+
+The response always reports how generation ended:
+
+| Field | Meaning |
+|---|---|
+| `finish_reason` | `stop`, `length` or `other`, normalized from the upstream value |
+| `truncated` | `true` when `finish_reason` is `length`, or when the JSON output was structurally incomplete |
+
+Both fields are repeated in `usage`, next to the token counts.
+
+A truncated completion **never** yields a proposal. If the model had started
+one, the route refuses with `422 assistant_proposal_truncated` instead of
+handing the console a half file:
+
+```json
+{
+  "error": {
+    "code": "assistant_proposal_truncated",
+    "message": "the assistant reply was cut at the output token ceiling before its proposal was complete: raise FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS or ask for a shorter file",
+    "details": {
+      "finish_reason": "length",
+      "max_tokens": 4096,
+      "env": "FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS",
+      "hint": "increase FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS (0 lets the provider decide) or ask for a shorter file; nothing was applied"
+    }
+  }
+}
+```
+
+When the cut fell in the explanation, the route answers `200` with
+`truncated: true`, the recovered text and no proposal. The panel shows a
+“Reply truncated” banner and a **Continue** button; continuing sends the usual
+“continue exactly where you stopped” turn with the partial answer kept in the
+history, so the model does not repeat the beginning.
+
+A reasoning model such as `deepseek-v4.1-flash` returns `reasoning_content`,
+and that reasoning **consumes the same `max_tokens` budget** as the visible
+answer. The route keeps the reasoning out of `message` and reports its token
+count in `usage.reasoning` when the provider sends
+`completion_tokens_details.reasoning_tokens`. A long reasoning can therefore
+leave the visible answer empty at `finish_reason: "length"`; the response is
+then a readable notice asking to raise the ceiling rather than an empty bubble.
+
+### Structured output repair
+
+The system prompt asks for one JSON object `{message, proposal?}` (a single
+fenced JSON block is tolerated). The answer is parsed defensively (issue #69):
+
+1. strict JSON, then a fenced JSON block;
+2. a tolerant repair for a cut object (closing the missing quote and brace),
+   then a scan that extracts the `message` string and decodes its escapes;
+3. a readable `422 assistant_reply_unusable` when nothing can be extracted.
+
+Raw JSON is never returned in `message`, and literal `\n` or braces are never
+displayed. Every parse failure is logged at WARN with the output size and a
+redacted 200-character preview. A proposal is only offered when the JSON was
+strictly valid **and** generation did not hit the ceiling.
+
 ## Tasks
 
 The system prompt depends on `task`:
@@ -217,10 +294,13 @@ The system prompt depends on `task`:
 The console's quick-task aliases (`write_skill`, `draft_soul`, `env_allowlist`,
 `explain_error`, `config_yaml`) are accepted and mapped onto the table above.
 
-The model is asked for exactly one JSON object `{"message": …, "proposal": …}`.
-A plain-text answer is accepted too: it becomes the message and no proposal is
-offered (`{"choices":[{"message":{"content":"…"}}]}` still works with any
-OpenAI-compatible server that ignores the instruction).
+The model is asked for exactly one JSON object `{"message": …, "proposal": …}`,
+optionally inside a single JSON code fence. A plain-text answer is accepted
+too: it becomes the message and no proposal is offered
+(`{"choices":[{"message":{"content":"…"}}]}` still works with any
+OpenAI-compatible server that ignores the instruction). A JSON-looking answer
+that cannot be parsed is never shown raw: it is repaired or reported as
+`422 assistant_reply_unusable`.
 
 ## Privacy and redaction
 
@@ -262,9 +342,13 @@ x-opencode-session: <session id>        (opencode.ai gateways only)
   "model": "<provider model, else FLEETT_ASSISTANT_MODEL>",
   "messages": [{"role": "system", …}, …history…],
   "temperature": 0.2,
-  "max_tokens": 1200
+  "max_tokens": 4096
 }
 ```
+
+`max_tokens` is omitted entirely when
+`FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS=0`; it is clamped to that value when the
+request supplies its own `max_tokens`.
 
 The system message holds the instructions and the redacted console context.
 

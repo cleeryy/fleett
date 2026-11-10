@@ -525,6 +525,9 @@ pub struct Config {
     /// Per-session token budget (`FLEETT_ASSISTANT_BUDGET_TOKENS`, default
     /// 50 000; `0` disables the limit).
     pub assistant_budget_tokens: u64,
+    /// Output ceiling of one reply (`FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS`,
+    /// default 4096; `0` omits `max_tokens` and lets the provider decide).
+    pub assistant_max_output_tokens: u64,
     /// `FLEETT_MARKETPLACE_SKILLS_SH` (issue #61): `auto` scrapes skills.sh,
     /// `off` disables that provider without touching local/git/GitHub.
     pub marketplace_skills_sh: MarketplaceSkillsSh,
@@ -887,6 +890,14 @@ impl Config {
                 detail: format!("{err} (0 disables the budget)"),
             })?,
         };
+        let assistant_max_output_tokens = match get("ASSISTANT_MAX_OUTPUT_TOKENS") {
+            None => crate::assistant::DEFAULT_MAX_OUTPUT_TOKENS,
+            Some(value) => value.parse::<u64>().map_err(|err| ConfigError::Invalid {
+                var: "FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS",
+                value: value.clone(),
+                detail: format!("{err} (0 lets the provider decide)"),
+            })?,
+        };
 
         // Marketplace (issue #61). The scraper defaults to `auto`; `off` turns
         // it off without touching the other providers.
@@ -976,6 +987,7 @@ impl Config {
             assistant_provider,
             assistant_model,
             assistant_budget_tokens,
+            assistant_max_output_tokens,
             marketplace_skills_sh,
             marketplace_git_index,
             github_token,
@@ -1051,6 +1063,7 @@ impl Config {
             assistant_provider: None,
             assistant_model: crate::assistant::DEFAULT_MODEL.to_string(),
             assistant_budget_tokens: crate::assistant::DEFAULT_BUDGET_TOKENS,
+            assistant_max_output_tokens: crate::assistant::DEFAULT_MAX_OUTPUT_TOKENS,
             // The scraper is on by default; tests override both base URLs to
             // reach their local fixture instead of the real internet.
             marketplace_skills_sh: MarketplaceSkillsSh::Auto,
@@ -1782,6 +1795,10 @@ FLEETT_NETWORK='fleett-net'
             cfg.assistant_budget_tokens,
             crate::assistant::DEFAULT_BUDGET_TOKENS
         );
+        assert_eq!(
+            cfg.assistant_max_output_tokens,
+            crate::assistant::DEFAULT_MAX_OUTPUT_TOKENS
+        );
 
         // `off` removes the feature; `on` keeps it.
         assert!(
@@ -1796,17 +1813,21 @@ FLEETT_NETWORK='fleett-net'
         );
         assert!(load(vec![("FLEETT_ASSISTANT", "maybe")]).is_err());
 
-        // The provider, model and budget come from the environment.
+        // The provider, model, budget and output ceiling come from the
+        // environment.
         let cfg = load(vec![
             ("FLEETT_ASSISTANT_PROVIDER", "abc"),
             ("FLEETT_ASSISTANT_MODEL", "model-x"),
             ("FLEETT_ASSISTANT_BUDGET_TOKENS", "0"),
+            ("FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS", "8192"),
         ])
         .expect("explicit values");
         assert_eq!(cfg.assistant_provider.as_deref(), Some("abc"));
         assert_eq!(cfg.assistant_model, "model-x");
         assert_eq!(cfg.assistant_budget_tokens, 0);
+        assert_eq!(cfg.assistant_max_output_tokens, 8192);
         assert!(load(vec![("FLEETT_ASSISTANT_BUDGET_TOKENS", "many")]).is_err());
+        assert!(load(vec![("FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS", "many")]).is_err());
     }
 
     #[test]

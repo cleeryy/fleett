@@ -1949,6 +1949,8 @@ export interface AssistantConfig {
   model: string;
   budget_tokens: number;
   used_tokens: number;
+  /** Output ceiling of one reply; `0` lets the provider decide. */
+  max_output_tokens: number;
 }
 
 /** Resolution order: env > persisted setting > auto. */
@@ -2026,6 +2028,8 @@ export interface AssistantChatInput {
   context: AssistantContext;
   messages: AssistantTurnInput[];
   task?: AssistantTask;
+  /** Optional output ceiling for this turn, bounded by the server cap. */
+  max_tokens?: number;
 }
 
 /** `file` writes a file, `env` merges variables, `yaml` is copy-only. */
@@ -2049,10 +2053,19 @@ export interface AssistantProposal {
   env?: AssistantEnvVar[];
 }
 
+/** Normalized upstream stop reason. `length` means the reply was cut. */
+export type AssistantFinishReason = "stop" | "length" | "other";
+
 export interface AssistantUsage {
   prompt: number;
   completion: number;
   total: number;
+  /** Reasoning tokens reported by the provider, sharing the same ceiling. */
+  reasoning?: number;
+  /** Ceiling actually sent upstream; absent when the provider decided. */
+  max_tokens?: number;
+  finish_reason: AssistantFinishReason;
+  truncated: boolean;
 }
 
 /** What the controller put in the prompt, and what it left on the host. */
@@ -2067,6 +2080,9 @@ export interface AssistantRedaction {
 export interface AssistantReply {
   message: string;
   proposal?: AssistantProposal;
+  /** The reply stopped at the output ceiling; a proposal is never present. */
+  truncated: boolean;
+  finish_reason: AssistantFinishReason;
   usage: AssistantUsage;
   redaction: AssistantRedaction;
 }
