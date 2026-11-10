@@ -29,8 +29,21 @@ const ASSISTANT_HEADER: &str = "x-fleett-assistant";
 struct Captured {
     method: String,
     path: String,
-    authorization: Option<String>,
+    headers: Vec<(String, String)>,
     body: Value,
+}
+
+impl Captured {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(key, _)| key == name).count()
+    }
 }
 
 /// Local OpenAI-compatible provider: records every request and answers with
@@ -70,16 +83,22 @@ impl MockProvider {
                     .split_whitespace();
                 let method = request_line.next().unwrap_or_default().to_string();
                 let path = request_line.next().unwrap_or_default().to_string();
-                let authorization = headers.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.trim()
-                        .eq_ignore_ascii_case("authorization")
-                        .then(|| value.trim().to_string())
-                });
+                let captured_headers: Vec<(String, String)> = headers
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        let value = value.trim();
+                        if value.is_empty() {
+                            return None;
+                        }
+                        Some((name.trim().to_ascii_lowercase(), value.to_string()))
+                    })
+                    .collect();
                 recorded.lock().expect("requests").push(Captured {
                     method,
                     path,
-                    authorization,
+                    headers: captured_headers,
                     body: serde_json::from_str(&body).unwrap_or(Value::Null),
                 });
                 let (status, body) = answered.lock().expect("response").clone();
@@ -110,6 +129,11 @@ impl MockProvider {
             },
         });
         *self.response.lock().expect("response") = (200, body.to_string());
+    }
+
+    /// Answer every request with a non-2xx status and an upstream body.
+    fn fail_with(&self, status: u16, body: &str) {
+        *self.response.lock().expect("response") = (status, body.to_string());
     }
 
     fn requests(&self) -> Vec<Captured> {
@@ -339,6 +363,8 @@ fn attach_as(state: &AppState, id: &str, name: &str, base_url: &str) {
         kind: "openai-compatible".to_string(),
         base_url: base_url.to_string(),
         api_key_env: "PROVIDER_API_KEY".to_string(),
+        model: None,
+        header_names: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -358,6 +384,8 @@ fn attach(state: &AppState, base_url: &str) {
         kind: "openai-compatible".to_string(),
         base_url: base_url.to_string(),
         api_key_env: "PROVIDER_API_KEY".to_string(),
+        model: None,
+        header_names: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -661,7 +689,7 @@ async fn chat_calls_the_provider_with_the_contract_shape() {
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/v1/chat/completions");
     assert_eq!(
-        request.authorization.as_deref(),
+        request.header("authorization"),
         Some(format!("Bearer {PROVIDER_SECRET}").as_str())
     );
     assert_eq!(request.body["model"], MODEL);
@@ -678,6 +706,209 @@ async fn chat_calls_the_provider_with_the_contract_shape() {
     assert!(
         !request.body.to_string().contains(PROVIDER_SECRET),
         "the provider secret must stay in the header"
+    );
+}
+
+#[tokio::test]
+async fn the_provider_headers_and_default_model_are_used() {
+    let harness = Harness::new();
+
+    // Configure the provider the way the console does: headers (encrypted at
+    // rest, names only in the API) and a default model.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/providers/{PROVIDER_ID}"),
+            Some(json!({
+                "model": "provider-model",
+                "extra_headers": {
+                    "x-opencode-session": "conversation-42",
+                    "anthropic-version": "2023-06-01",
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let updated = parse(&body)["provider"].clone();
+    assert_eq!(updated["model"], "provider-model", "{updated}");
+    assert_eq!(
+        updated["extra_headers"],
+        json!(["anthropic-version", "x-opencode-session"]),
+        "the API exposes header names only"
+    );
+    assert!(
+        !body.contains("conversation-42"),
+        "a header value must never be returned: {body}"
+    );
+
+    // The default model of the provider wins over FLEETT_ASSISTANT_MODEL, and
+    // config reports it.
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["model"], "provider-model");
+
+    let (status, body) = harness
+        .chat(chat_body("headers", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = harness.provider.last();
+    assert_eq!(request.body["model"], "provider-model");
+    assert_eq!(
+        request.header("x-opencode-session"),
+        Some("conversation-42"),
+        "the configured header must be sent: {request:?}"
+    );
+    assert_eq!(request.header("anthropic-version"), Some("2023-06-01"));
+    assert_eq!(request.header_count("x-opencode-session"), 1);
+    // The credential still wins over a per-call default.
+    assert_eq!(
+        request.header("authorization"),
+        Some(format!("Bearer {PROVIDER_SECRET}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn the_opencode_session_header_is_stable_for_one_conversation() {
+    // A provider whose host is the gateway: the header is added automatically
+    // and derived from the assistant session id. The URL is never called here
+    // (prepare only), so no name resolution is involved.
+    let provider = ProviderSpec {
+        id: "opencode-provider".to_string(),
+        name: "opencode-go".to_string(),
+        kind: "openai-compatible".to_string(),
+        base_url: "https://opencode.ai/inference/go/openai/v1".to_string(),
+        api_key_env: "PROVIDER_API_KEY".to_string(),
+        model: None,
+        header_names: Vec::new(),
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let headers = std::collections::BTreeMap::new();
+    let call = fleett::assistant::prepare_chat(
+        &fleett::assistant::ChatTarget {
+            provider: &provider,
+            secret: "sk-secret",
+            headers: &headers,
+            model: "deepseek-v4.1-flash",
+            session_id: "panel 7f/3c",
+        },
+        "system",
+        &[],
+    );
+    let session = |call: &fleett::assistant::PreparedCall| {
+        call.headers
+            .iter()
+            .find(|(name, _)| name == "x-opencode-session")
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(session(&call).as_deref(), Some("panel-7f-3c"));
+
+    // The same conversation id always yields the same header; a different one
+    // changes it.
+    let same = fleett::assistant::prepare_chat(
+        &fleett::assistant::ChatTarget {
+            provider: &provider,
+            secret: "sk-secret",
+            headers: &headers,
+            model: "deepseek-v4.1-flash",
+            session_id: "panel 7f/3c",
+        },
+        "system",
+        &[],
+    );
+    assert_eq!(session(&same), session(&call));
+    let other = fleett::assistant::prepare_chat(
+        &fleett::assistant::ChatTarget {
+            provider: &provider,
+            secret: "sk-secret",
+            headers: &headers,
+            model: "deepseek-v4.1-flash",
+            session_id: "panel-other",
+        },
+        "system",
+        &[],
+    );
+    assert_ne!(session(&other), session(&call));
+
+    // An explicit header configured by the operator is never duplicated.
+    let explicit = std::collections::BTreeMap::from([(
+        "x-opencode-session".to_string(),
+        "fixed-by-operator".to_string(),
+    )]);
+    let call = fleett::assistant::prepare_chat(
+        &fleett::assistant::ChatTarget {
+            provider: &provider,
+            secret: "sk-secret",
+            headers: &explicit,
+            model: "deepseek-v4.1-flash",
+            session_id: "panel 7f/3c",
+        },
+        "system",
+        &[],
+    );
+    assert_eq!(session(&call).as_deref(), Some("fixed-by-operator"));
+    assert_eq!(
+        call.headers
+            .iter()
+            .filter(|(name, _)| name == "x-opencode-session")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_error_is_reported_in_the_502_and_redacted() {
+    let harness = Harness::new();
+    harness.provider.fail_with(
+        400,
+        r#"{"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session"},"key":"sk-leaked-upstream-value"}"#,
+    );
+
+    let (status, body) = harness
+        .chat(chat_body("upstream", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let error = body["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_error");
+    assert_eq!(error["details"]["provider_status"], 400);
+    assert_eq!(error["details"]["upstream"]["status"], 400);
+    let upstream = error["details"]["upstream"]["body"]
+        .as_str()
+        .expect("upstream body");
+    assert!(upstream.contains("MissingSessionID"), "{upstream}");
+    // The gateway body is quoted, the credential never is.
+    assert!(!body.to_string().contains(PROVIDER_SECRET), "{body}");
+    assert!(!upstream.contains("sk-leaked-upstream-value"), "{upstream}");
+    assert!(upstream.contains("[REDACTED]"), "{upstream}");
+}
+
+#[tokio::test]
+async fn a_large_upstream_error_is_truncated() {
+    let harness = Harness::new();
+    let body = format!(
+        "{{\"error\":\"boom\",\"padding\":\"{}\"}}",
+        "x".repeat(8 * 1024)
+    );
+    harness.provider.fail_with(500, &body);
+
+    let (status, body) = harness
+        .chat(chat_body("truncate", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let upstream = body["error"]["details"]["upstream"]["body"]
+        .as_str()
+        .expect("upstream body");
+    assert!(upstream.contains("boom"));
+    assert!(
+        upstream.len() <= 1024 + 4,
+        "the upstream body is not capped: {} bytes",
+        upstream.len()
+    );
+    assert!(
+        body.to_string().len() < 4 * 1024,
+        "the error response is not capped"
     );
 }
 

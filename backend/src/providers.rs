@@ -16,8 +16,13 @@
 //! * the secret lives in `providers.nonce`/`providers.ciphertext`, encrypted
 //!   with the same AES-256-GCM key as the instance environment (fresh nonce
 //!   per write, the value is bound to the `secret` field name);
-//! * no endpoint ever returns it — [`ProviderSummary`] has no secret field and
-//!   the probe/test response only reports status, latency and an error string;
+//! * the optional upstream headers (issue #64) live in
+//!   `providers.headers_nonce`/`headers_ciphertext`, encrypted the same way and
+//!   bound to the `header:` field prefix; only their names are returned by the
+//!   API;
+//! * no endpoint ever returns the secret or a header value — [`ProviderSummary`]
+//!   has no secret field and the probe/test response only reports statuses,
+//!   latency and a redacted error string;
 //! * rotating it is a `PATCH /api/providers/{id}` that restarts every attached
 //!   instance with the new value.
 
@@ -35,10 +40,36 @@ use std::time::{Duration, Instant};
 /// Field name the secret is encrypted under. A blob moved from another row (or
 /// another field) fails to decrypt instead of silently changing a credential.
 pub const SECRET_FIELD: &str = "secret";
-/// Path probed by `POST /api/providers/{id}/test`.
+/// Prefix every upstream header is encrypted under, so a secret blob moved to
+/// the headers column never decrypts into a usable header.
+pub const HEADER_FIELD_PREFIX: &str = "header:";
+/// Path probed by the `GET` half of `POST /api/providers/{id}/test`.
 pub const TEST_PATH: &str = "/models";
-/// Hard timeout of one connectivity test.
+/// Path called by the completion half of the test, and by the assistant.
+pub const COMPLETION_PATH: &str = "/chat/completions";
+/// Most upstream headers one provider may carry.
+pub const MAX_HEADERS: usize = 32;
+/// Longest accepted header name (RFC 7230 token).
+pub const MAX_HEADER_NAME_BYTES: usize = 128;
+/// Longest accepted header value.
+pub const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+/// Longest accepted provider default model.
+pub const MAX_MODEL_NAME_CHARS: usize = 200;
+/// Header the opencode.ai gateway needs to route a completion (issue #64).
+pub const SESSION_HEADER: &str = "x-opencode-session";
+/// Hosts whose gateway requires [`SESSION_HEADER`].
+pub const OPENCODE_HOST: &str = "opencode.ai";
+/// Longest session id echoed in [`SESSION_HEADER`].
+pub const MAX_SESSION_HEADER_CHARS: usize = 128;
+/// Part of an upstream error body kept in an error detail (issue #64).
+pub const MAX_UPSTREAM_BODY_BYTES: usize = 1024;
+/// Part of an upstream error body kept in a provider test `error` string.
+pub const MAX_UPSTREAM_ERROR_BYTES: usize = 512;
+/// Hard timeout of one connectivity test (each of its two calls).
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// `max_tokens` of the completion half of the test: one token is enough to
+/// prove the route answers.
+pub const TEST_MAX_TOKENS: u64 = 1;
 /// Instance came back healthy after a rotation.
 pub const RESTART_HEALTHY: &str = "healthy";
 /// Instance did not come back after a rotation.
@@ -74,12 +105,122 @@ pub fn validate_secret(secret: &str) -> Result<(), ProviderError> {
     crate::models::validate_secret_value(secret).map_err(ProviderError::Invalid)
 }
 
+/// Validate one HTTP header name (RFC 7230 token), so a header map can never
+/// inject a second header or a body separator.
+pub fn validate_header_name(name: &str) -> Result<(), ProviderError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_HEADER_NAME_BYTES
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        });
+    if !valid {
+        return Err(ProviderError::Invalid(format!(
+            "invalid HTTP header name \"{name}\""
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a complete upstream header map before it is encrypted.
+pub fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), ProviderError> {
+    if headers.len() > MAX_HEADERS {
+        return Err(ProviderError::Invalid(format!(
+            "at most {MAX_HEADERS} headers are accepted"
+        )));
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(headers.len());
+    let mut total = 0usize;
+    for (name, value) in headers {
+        validate_header_name(name)?;
+        let lowered = name.to_ascii_lowercase();
+        if seen.contains(&lowered) {
+            return Err(ProviderError::Invalid(format!(
+                "the header \"{name}\" is declared twice (names are case-insensitive)"
+            )));
+        }
+        seen.push(lowered);
+        if value.chars().any(|c| c.is_control()) {
+            return Err(ProviderError::Invalid(format!(
+                "the value of header \"{name}\" contains a control character"
+            )));
+        }
+        if value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(ProviderError::Invalid(format!(
+                "the value of header \"{name}\" must be at most {} KiB",
+                MAX_HEADER_VALUE_BYTES / 1024
+            )));
+        }
+        total += name.len() + value.len();
+    }
+    if total > MAX_HEADERS * (MAX_HEADER_NAME_BYTES + MAX_HEADER_VALUE_BYTES) {
+        return Err(ProviderError::Invalid(
+            "the header map is too large".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate and normalise one provider default model.
+pub fn validate_model(model: &str) -> Result<String, ProviderError> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(ProviderError::Invalid(
+            "model must not be empty (omit it to clear the default)".to_string(),
+        ));
+    }
+    if model.chars().count() > MAX_MODEL_NAME_CHARS {
+        return Err(ProviderError::Invalid(format!(
+            "model must be at most {MAX_MODEL_NAME_CHARS} characters"
+        )));
+    }
+    if model.chars().any(|c| c.is_control()) {
+        return Err(ProviderError::Invalid(
+            "model must not contain control characters".to_string(),
+        ));
+    }
+    Ok(model.to_string())
+}
+
 /// Encrypt one secret with the fleet key.
 pub fn seal(cfg: &Config, secret: &str) -> Result<secrets::Sealed, ProviderError> {
     let key = SecretsKey::from_config(cfg)?.ok_or(SecretsError::MissingKey)?;
     let mut map = BTreeMap::new();
     map.insert(SECRET_FIELD.to_string(), secret.to_string());
     Ok(secrets::encrypt_map(&key, &map)?)
+}
+
+/// Encrypt one validated upstream header map. An empty map stores nothing.
+pub fn seal_headers(
+    cfg: &Config,
+    headers: &BTreeMap<String, String>,
+) -> Result<Option<secrets::Sealed>, ProviderError> {
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    validate_headers(headers)?;
+    let key = SecretsKey::from_config(cfg)?.ok_or(SecretsError::MissingKey)?;
+    let bound: BTreeMap<String, String> = headers
+        .iter()
+        .map(|(name, value)| (format!("{HEADER_FIELD_PREFIX}{name}"), value.to_string()))
+        .collect();
+    Ok(Some(secrets::encrypt_map(&key, &bound)?))
 }
 
 /// Decrypt the secret of one provider. Only the driver and the test endpoint
@@ -95,6 +236,92 @@ pub fn secret_of(cfg: &Config, record: &ProviderRecord) -> Result<String, Provid
     })
 }
 
+/// Decrypt the upstream headers of one provider. Never returned by the API.
+pub fn headers_of(
+    cfg: &Config,
+    db: &Db,
+    id: &str,
+) -> Result<BTreeMap<String, String>, ProviderError> {
+    let Some(sealed) = db.provider_headers(id)? else {
+        return Ok(BTreeMap::new());
+    };
+    let key = SecretsKey::from_config(cfg)?.ok_or(SecretsError::MissingKey)?;
+    let stored = secrets::decrypt_map(&key, &sealed.nonce, &sealed.ciphertext)?;
+    let mut headers = BTreeMap::new();
+    for (name, value) in stored {
+        let Some(name) = name.strip_prefix(HEADER_FIELD_PREFIX) else {
+            return Err(SecretsError::Decrypt(
+                "the encrypted provider headers are not bound to the header field".to_string(),
+            )
+            .into());
+        };
+        headers.insert(name.to_string(), value);
+    }
+    Ok(headers)
+}
+
+/// Host of a base URL (`https://opencode.ai/x` → `opencode.ai`), lowercased.
+pub fn host_of(base_url: &str) -> Option<String> {
+    let rest = base_url.split_once("://").map(|(_, rest)| rest)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// `true` when the gateway behind this base URL requires [`SESSION_HEADER`].
+///
+/// The rule is the documented one: the host contains `opencode.ai` (the
+/// published gateway is `opencode.ai`, and a regional or proxied host such as
+/// `go.opencode.ai` keeps the same requirement).
+pub fn requires_session_header(base_url: &str) -> bool {
+    host_of(base_url).is_some_and(|host| host.contains(OPENCODE_HOST))
+}
+
+/// Sanitise a conversation id into a header-safe session value.
+///
+/// The value is stable for one conversation (the gateway routes by it) and
+/// contains only `[A-Za-z0-9._:-]`; anything else becomes `-`, the result is
+/// capped at [`MAX_SESSION_HEADER_CHARS`] and an empty or unusable id falls
+/// back to `fleett-assistant`.
+pub fn session_value(raw: &str) -> String {
+    let mut value: String = raw
+        .chars()
+        .take(MAX_SESSION_HEADER_CHARS * 2)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    value.truncate(MAX_SESSION_HEADER_CHARS);
+    if value.trim_matches('-').is_empty() {
+        return "fleett-assistant".to_string();
+    }
+    value
+}
+
+/// The session header to add to one call, when the provider needs it and the
+/// operator did not already configure it explicitly.
+pub fn session_header(
+    base_url: &str,
+    headers: &BTreeMap<String, String>,
+    session_id: &str,
+) -> Option<(String, String)> {
+    if !requires_session_header(base_url) {
+        return None;
+    }
+    let explicit = headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(SESSION_HEADER));
+    (!explicit).then(|| (SESSION_HEADER.to_string(), session_value(session_id)))
+}
+
 /// API view of one provider.
 pub fn summary(spec: &ProviderSpec, instances_count: usize) -> ProviderSummary {
     ProviderSummary {
@@ -103,6 +330,8 @@ pub fn summary(spec: &ProviderSpec, instances_count: usize) -> ProviderSummary {
         kind: spec.kind.clone(),
         base_url: spec.base_url.clone(),
         api_key_env: spec.api_key_env.clone(),
+        model: spec.model.clone(),
+        extra_headers: spec.header_names.clone(),
         instances_count,
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
@@ -165,58 +394,238 @@ pub fn resolved_env(
     }
 }
 
-/// `POST /api/providers/{id}/test`: call `${base_url}/models` with the
-/// decrypted key and report the outcome. The key never appears in the answer.
+/// One call of `POST /api/providers/{id}/test`.
+#[derive(Debug, Clone)]
+pub struct TestRequest<'a> {
+    pub base_url: &'a str,
+    pub secret: &'a str,
+    /// Decrypted upstream headers, already validated.
+    pub headers: &'a BTreeMap<String, String>,
+    /// Model of the completion half.
+    pub model: &'a str,
+}
+
+/// `POST /api/providers/{id}/test`: authenticate on `${base_url}/models` **and**
+/// prove the route the assistant actually uses with a real 1-token
+/// `POST /chat/completions` (issue #64).
 ///
-/// The request carries both `Authorization: Bearer` and `x-api-key` (plus the
-/// Anthropic version header) so one implementation covers the OpenAI-style and
-/// Anthropic-style deployments without knowing the kind.
-pub async fn probe(base_url: &str, secret: &str) -> ProviderTestResponse {
-    let url = format!("{}{TEST_PATH}", base_url.trim_end_matches('/'));
+/// A provider that answers `GET /models` but rejects the completion (a gateway
+/// that demands a routing header, a model that does not exist) used to be
+/// reported as healthy: the two results are now separate fields, so the console
+/// can turn red on `completion_ok` alone. Neither call ever carries the secret
+/// or a header value in the answer.
+pub async fn test_provider(request: TestRequest<'_>) -> ProviderTestResponse {
     let started = Instant::now();
-    let outcome = async {
-        let client = reqwest::Client::builder()
-            .timeout(TEST_TIMEOUT)
-            .build()
-            .map_err(|err| format!("cannot build the HTTP client: {err}"))?;
-        client
-            .get(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {secret}"))
-            .header("x-api-key", secret)
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|err| {
-                if err.is_timeout() {
-                    format!(
-                        "the provider did not answer within {}s",
-                        TEST_TIMEOUT.as_secs()
-                    )
-                } else {
-                    format!("cannot reach the provider: {err}")
-                }
-            })
+    let mut redaction: Vec<String> = vec![request.secret.to_string()];
+    redaction.extend(request.headers.values().cloned());
+    let redactor = crate::redact::Redactor::new(redaction);
+
+    let client = match reqwest::Client::builder().timeout(TEST_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(err) => {
+            return ProviderTestResponse {
+                ok: false,
+                models_ok: false,
+                completion_ok: false,
+                latency_ms: 0,
+                models_status: None,
+                completion_status: None,
+                error: Some(format!("cannot build the HTTP client: {err}")),
+            }
+        }
+    };
+
+    let base = request.base_url.trim_end_matches('/');
+    let mut headers = auth_headers(request.secret);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // The operator map wins over the defaults, exactly like the assistant.
+    headers.extend(request.headers.clone());
+    // The test is not a conversation: a fresh UUID is the right session id.
+    if let Some((name, value)) = session_header(
+        request.base_url,
+        request.headers,
+        &uuid::Uuid::new_v4().to_string(),
+    ) {
+        headers.insert(name, value);
     }
+
+    let models = get_models(&client, &format!("{base}{TEST_PATH}"), &headers).await;
+    let completion = post_completion(
+        &client,
+        &format!("{base}{COMPLETION_PATH}"),
+        &headers,
+        request.model,
+    )
     .await;
 
     let latency_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    match outcome {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            ProviderTestResponse {
-                ok: response.status().is_success(),
-                status,
-                latency_ms,
-                error: (!response.status().is_success())
-                    .then(|| format!("the provider answered with HTTP {status}")),
+    let mut error: Option<String> = None;
+    for (label, outcome) in [
+        ("GET /models", &models),
+        ("POST /chat/completions", &completion),
+    ] {
+        if let Some(detail) = &outcome.error {
+            if error.is_none() {
+                error = Some(format!(
+                    "{label} failed: {}",
+                    redactor.redact_capped(detail, MAX_UPSTREAM_ERROR_BYTES)
+                ));
             }
         }
-        Err(error) => ProviderTestResponse {
+    }
+    ProviderTestResponse {
+        ok: models.ok && completion.ok,
+        models_ok: models.ok,
+        completion_ok: completion.ok,
+        latency_ms,
+        models_status: models.status,
+        completion_status: completion.status,
+        error,
+    }
+}
+
+/// Outcome of one half of the test.
+struct Probe {
+    ok: bool,
+    status: Option<u16>,
+    /// Raw reason on failure (status line or transport error), pre-redaction.
+    error: Option<String>,
+}
+
+/// Headers every provider call carries, whatever the kind.
+///
+/// Both `Authorization: Bearer` and `x-api-key` (plus the Anthropic version
+/// header) are sent so one implementation covers the OpenAI-style and
+/// Anthropic-style deployments without knowing the kind.
+fn auth_headers(secret: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("authorization".to_string(), format!("Bearer {secret}")),
+        ("x-api-key".to_string(), secret.to_string()),
+        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+    ])
+}
+
+async fn get_models(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> Probe {
+    let mut request = client.get(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let detail = if status.is_success() {
+                None
+            } else {
+                let body = read_body_capped(response, MAX_UPSTREAM_ERROR_BYTES).await;
+                Some(format_body(status.as_u16(), &body))
+            };
+            Probe {
+                ok: status.is_success(),
+                status: Some(status.as_u16()),
+                error: detail,
+            }
+        }
+        Err(err) => Probe {
             ok: false,
-            status: 0,
-            latency_ms,
-            error: Some(error),
+            status: None,
+            error: Some(transport_error(&err)),
         },
+    }
+}
+
+async fn post_completion(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    model: &str,
+) -> Probe {
+    let mut request = client.post(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.0,
+        "max_tokens": TEST_MAX_TOKENS,
+        "stream": false,
+    });
+    // `.json()` would add its own content-type on top of an override in
+    // `extra_headers`; the header map already carries exactly one.
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return Probe {
+                ok: false,
+                status: None,
+                error: Some(format!("cannot serialise the test request: {err}")),
+            }
+        }
+    };
+    match request.body(payload).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let detail = if status.is_success() {
+                None
+            } else {
+                let body = read_body_capped(response, MAX_UPSTREAM_ERROR_BYTES).await;
+                Some(format_body(status.as_u16(), &body))
+            };
+            Probe {
+                ok: status.is_success(),
+                status: Some(status.as_u16()),
+                error: detail,
+            }
+        }
+        Err(err) => Probe {
+            ok: false,
+            status: None,
+            error: Some(transport_error(&err)),
+        },
+    }
+}
+
+/// Read at most `max` bytes of a response body, as UTF-8.
+///
+/// Shared by the provider test and the assistant: a gateway error is worth
+/// quoting (it names the missing header or the unknown model), a whole HTML
+/// error page is not.
+pub async fn read_body_capped(mut response: reqwest::Response, max: usize) -> String {
+    let mut body = Vec::new();
+    loop {
+        let room = max.saturating_sub(body.len());
+        if room == 0 {
+            break;
+        }
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk[..chunk.len().min(room)]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&body).trim().to_string()
+}
+
+/// `HTTP 400: <body>` — the shape both the test and the assistant report.
+pub fn format_body(status: u16, body: &str) -> String {
+    if body.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {body}")
+    }
+}
+
+fn transport_error(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        format!(
+            "the provider did not answer within {}s",
+            TEST_TIMEOUT.as_secs()
+        )
+    } else {
+        format!("cannot reach the provider: {err}")
     }
 }
 
@@ -246,6 +655,8 @@ mod tests {
             kind: "openai-compatible".to_string(),
             base_url: "https://provider.test/v1".to_string(),
             api_key_env: "PROVIDER_KEY".to_string(),
+            model: None,
+            header_names: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -382,5 +793,146 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alice", "bob"]
         );
+    }
+    #[test]
+    fn header_maps_are_validated() {
+        let headers = BTreeMap::from([
+            ("x-opencode-session".to_string(), "abc".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ]);
+        validate_headers(&headers).expect("valid");
+
+        // RFC token names, no control character in the value.
+        for bad in [
+            BTreeMap::from([("bad name".to_string(), "x".to_string())]),
+            BTreeMap::from([("x".to_string(), "a\r\nb".to_string())]),
+            BTreeMap::from([("".to_string(), "x".to_string())]),
+            BTreeMap::from([("x".to_string(), "x".repeat(MAX_HEADER_VALUE_BYTES + 1))]),
+        ] {
+            assert!(validate_headers(&bad).is_err(), "{bad:?}");
+        }
+
+        // Names are unique case-insensitively.
+        let duplicate = BTreeMap::from([
+            ("x-api-version".to_string(), "1".to_string()),
+            ("X-Api-Version".to_string(), "2".to_string()),
+        ]);
+        assert!(validate_headers(&duplicate).is_err());
+
+        // At most 32 headers.
+        let many: BTreeMap<String, String> = (0..=MAX_HEADERS)
+            .map(|index| (format!("x-h{index}"), "1".to_string()))
+            .collect();
+        assert!(validate_headers(&many).is_err());
+
+        // A model is trimmed and bounded.
+        assert_eq!(validate_model("  gpt-4  ").expect("model"), "gpt-4");
+        assert!(validate_model("   ").is_err());
+        assert!(validate_model(&"m".repeat(MAX_MODEL_NAME_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn headers_round_trip_encrypted_and_only_names_are_exposed() {
+        let (_dir, cfg, db) = setup();
+        let mut spec = provider("shared");
+        let headers = BTreeMap::from([
+            ("x-opencode-session".to_string(), "session-1".to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ]);
+        spec.header_names = headers.keys().cloned().collect();
+        spec.model = Some("model-a".to_string());
+        let sealed = seal(&cfg, "sk-test").expect("seal");
+        db.insert_provider(&spec, &sealed.nonce, &sealed.ciphertext)
+            .expect("insert");
+        let sealed_headers = seal_headers(&cfg, &headers)
+            .expect("seal")
+            .expect("non-empty");
+        db.set_provider_headers(&spec.id, Some(&sealed_headers))
+            .expect("store headers");
+
+        assert_eq!(headers_of(&cfg, &db, "shared").expect("read"), headers);
+        let stored = db
+            .provider_headers("shared")
+            .expect("blob")
+            .expect("present");
+        let ciphertext = String::from_utf8_lossy(&stored.ciphertext).to_string();
+        assert!(!ciphertext.contains("2023-06-01"), "{ciphertext}");
+
+        // The summary exposes names only, never a value.
+        let view = serde_json::to_value(summary(&spec, 0)).expect("json");
+        assert_eq!(
+            view["extra_headers"],
+            serde_json::json!(["anthropic-version", "x-opencode-session"])
+        );
+        assert_eq!(view["model"], "model-a");
+        assert!(!view.to_string().contains("2023-06-01"));
+
+        // A secret blob moved into the headers column fails the binding check.
+        db.set_provider_headers(&spec.id, Some(&sealed))
+            .expect("swap");
+        assert!(headers_of(&cfg, &db, "shared").is_err());
+
+        // An empty map clears the blob.
+        assert!(seal_headers(&cfg, &BTreeMap::new())
+            .expect("empty")
+            .is_none());
+        db.set_provider_headers(&spec.id, None).expect("clear");
+        assert!(headers_of(&cfg, &db, "shared").expect("read").is_empty());
+    }
+
+    #[test]
+    fn the_opencode_session_header_is_added_only_where_it_is_needed() {
+        assert_eq!(
+            host_of("https://opencode.ai/inference/go/openai/v1").as_deref(),
+            Some("opencode.ai")
+        );
+        assert_eq!(
+            host_of("http://user:pw@opencode.ai:8443/v1").as_deref(),
+            Some("opencode.ai")
+        );
+        assert_eq!(host_of("not a url"), None);
+        assert!(requires_session_header(
+            "https://opencode.ai/inference/go/openai/v1"
+        ));
+        assert!(requires_session_header("https://go.opencode.ai/v1"));
+        assert!(!requires_session_header("https://api.example.test/v1"));
+        // The rule is "the host contains opencode.ai".
+        assert!(requires_session_header(
+            "https://opencode.ai.example.test/v1"
+        ));
+        // The path never makes a host: only the authority is read.
+        assert!(!requires_session_header(
+            "https://gateway.example.test/opencode.ai/v1"
+        ));
+
+        // The session id is stable per conversation and header-safe.
+        assert_eq!(session_value("panel 7f/3c"), "panel-7f-3c");
+        assert_eq!(session_value(""), "fleett-assistant");
+        assert_eq!(session_value("///"), "fleett-assistant");
+        assert_eq!(
+            session_value(&"a".repeat(MAX_SESSION_HEADER_CHARS + 10)).len(),
+            MAX_SESSION_HEADER_CHARS
+        );
+
+        let headers = BTreeMap::new();
+        let (name, value) = session_header(
+            "https://opencode.ai/inference/go/openai/v1",
+            &headers,
+            "conv-1",
+        )
+        .expect("session header");
+        assert_eq!(name, SESSION_HEADER);
+        assert_eq!(value, "conv-1");
+
+        // An explicit header disables the automatic one.
+        let explicit = BTreeMap::from([(SESSION_HEADER.to_string(), "fixed".to_string())]);
+        assert!(session_header(
+            "https://opencode.ai/inference/go/openai/v1",
+            &explicit,
+            "conv-1"
+        )
+        .is_none());
+        // Another provider never gets one.
+        assert!(session_header("https://api.example.test/v1", &headers, "conv-1").is_none());
     }
 }

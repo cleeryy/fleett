@@ -770,6 +770,19 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL
 );
 "#,
+    // v32 — provider upstream headers and default model (issue #64). The
+    // opencode.ai gateway rejects a completion without `x-opencode-session`,
+    // and Azure/Anthropic proxies demand their own version header: those extra
+    // headers are per provider, and their values are encrypted like the secret.
+    // Only the names (metadata, never a secret) sit in `header_names`; the map
+    // itself lives in `headers_nonce`/`headers_ciphertext`. `model` is the
+    // credential's default model, used by the assistant and the test call.
+    r#"
+ALTER TABLE providers ADD COLUMN model TEXT;
+ALTER TABLE providers ADD COLUMN header_names TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE providers ADD COLUMN headers_nonce BLOB;
+ALTER TABLE providers ADD COLUMN headers_ciphertext BLOB;
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -2226,6 +2239,9 @@ impl Db {
     /// Insert one provider and its encrypted secret.
     ///
     /// A duplicate name is a [`DbError::Conflict`], exactly like a duplicate id.
+    /// The encrypted upstream headers are written by a separate
+    /// [`Db::set_provider_headers`] call: a provider without headers stores
+    /// `NULL` blobs.
     pub fn insert_provider(
         &self,
         spec: &ProviderSpec,
@@ -2246,7 +2262,8 @@ impl Db {
         }
         conn.execute(
             "INSERT INTO providers (id, name, kind, base_url, api_key_env, nonce, ciphertext, \
-             created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             model, header_names, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 spec.id,
                 spec.name,
@@ -2255,6 +2272,8 @@ impl Db {
                 spec.api_key_env,
                 nonce,
                 ciphertext,
+                spec.model,
+                header_names_json(&spec.header_names),
                 spec.created_at,
                 spec.updated_at,
             ],
@@ -2286,7 +2305,8 @@ impl Db {
         let updated = match secret {
             Some((nonce, ciphertext)) => conn.execute(
                 "UPDATE providers SET name = ?2, kind = ?3, base_url = ?4, api_key_env = ?5, \
-                 nonce = ?6, ciphertext = ?7, updated_at = ?8 WHERE id = ?1",
+                 nonce = ?6, ciphertext = ?7, model = ?8, header_names = ?9, updated_at = ?10 \
+                 WHERE id = ?1",
                 params![
                     spec.id,
                     spec.name,
@@ -2295,18 +2315,22 @@ impl Db {
                     spec.api_key_env,
                     nonce,
                     ciphertext,
+                    spec.model,
+                    header_names_json(&spec.header_names),
                     spec.updated_at,
                 ],
             )?,
             None => conn.execute(
                 "UPDATE providers SET name = ?2, kind = ?3, base_url = ?4, api_key_env = ?5, \
-                 updated_at = ?6 WHERE id = ?1",
+                 model = ?6, header_names = ?7, updated_at = ?8 WHERE id = ?1",
                 params![
                     spec.id,
                     spec.name,
                     spec.kind,
                     spec.base_url,
                     spec.api_key_env,
+                    spec.model,
+                    header_names_json(&spec.header_names),
                     spec.updated_at,
                 ],
             )?,
@@ -2323,7 +2347,7 @@ impl Db {
         let record = conn
             .query_row(
                 "SELECT id, name, kind, base_url, api_key_env, nonce, ciphertext, created_at, \
-                 updated_at FROM providers WHERE id = ?1",
+                 updated_at, model, header_names FROM providers WHERE id = ?1",
                 params![id],
                 provider_record,
             )
@@ -2335,8 +2359,8 @@ impl Db {
     pub fn list_providers(&self) -> Result<Vec<ProviderSpec>, DbError> {
         let conn = self.lock();
         let mut statement = conn.prepare(
-            "SELECT id, name, kind, base_url, api_key_env, created_at, updated_at \
-             FROM providers ORDER BY name",
+            "SELECT id, name, kind, base_url, api_key_env, created_at, updated_at, model, \
+             header_names FROM providers ORDER BY name",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -2348,10 +2372,58 @@ impl Db {
                     api_key_env: row.get(4)?,
                     created_at: row.get(5)?,
                     updated_at: row.get(6)?,
+                    model: row.get(7)?,
+                    header_names: header_names_from(row.get::<_, String>(8)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Encrypted `extra_headers` map of one provider, if any.
+    pub fn provider_headers(&self, id: &str) -> Result<Option<crate::secrets::Sealed>, DbError> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT headers_nonce, headers_ciphertext FROM providers WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(nonce), Some(ciphertext))) => {
+                Some(crate::secrets::Sealed { nonce, ciphertext })
+            }
+            _ => None,
+        })
+    }
+
+    /// Replace (or clear) the encrypted `extra_headers` map of one provider.
+    ///
+    /// The plaintext names live in `header_names` and are written by
+    /// [`Db::update_provider`]; this method only moves the encrypted blob.
+    pub fn set_provider_headers(
+        &self,
+        id: &str,
+        sealed: Option<&crate::secrets::Sealed>,
+    ) -> Result<(), DbError> {
+        let (nonce, ciphertext) = match sealed {
+            Some(sealed) => (
+                Some(sealed.nonce.as_slice()),
+                Some(sealed.ciphertext.as_slice()),
+            ),
+            None => (None, None),
+        };
+        self.lock().execute(
+            "UPDATE providers SET headers_nonce = ?2, headers_ciphertext = ?3 WHERE id = ?1",
+            params![id, nonce, ciphertext],
+        )?;
+        Ok(())
     }
 
     /// One persisted setting, if present.
@@ -3100,10 +3172,22 @@ fn provider_record(row: &Row<'_>) -> rusqlite::Result<ProviderRecord> {
             api_key_env: row.get(4)?,
             created_at: row.get(7)?,
             updated_at: row.get(8)?,
+            model: row.get(9)?,
+            header_names: header_names_from(row.get::<_, String>(10)?),
         },
         nonce: row.get(5)?,
         ciphertext: row.get(6)?,
     })
+}
+
+/// Header names are stored as a JSON array; a malformed value reads as "no
+/// header" instead of failing the whole row (the block is metadata only).
+fn header_names_from(raw: String) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+}
+
+fn header_names_json(names: &[String]) -> String {
+    serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn load_links(conn: &Connection, instance_id: &str) -> Result<Vec<ShareRef>, DbError> {
@@ -3382,7 +3466,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
-        assert_eq!(SCHEMA_VERSION, 31, "settings is schema v31");
+        assert_eq!(
+            SCHEMA_VERSION, 32,
+            "provider model and upstream headers are schema v32"
+        );
         let conn = db.lock();
         for table in [
             "instances",
@@ -3512,6 +3599,8 @@ mod tests {
             kind: "openai-compatible".to_string(),
             base_url: "https://provider.test/v1".to_string(),
             api_key_env: "PROVIDER_KEY".to_string(),
+            model: Some("model-a".to_string()),
+            header_names: vec!["x-opencode-session".to_string()],
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -3527,6 +3616,8 @@ mod tests {
 
         let record = db.provider("provider-1").expect("read").expect("present");
         assert_eq!(record.spec.name, "shared");
+        assert_eq!(record.spec.model.as_deref(), Some("model-a"));
+        assert_eq!(record.spec.header_names, ["x-opencode-session"]);
         assert_eq!(record.nonce, vec![1u8; 12]);
         assert_eq!(record.ciphertext, vec![2u8, 3u8]);
         assert!(db.provider("ghost").expect("read").is_none());
@@ -3570,6 +3661,47 @@ mod tests {
         assert!(db.delete_provider("provider-1").expect("delete"));
         assert!(!db.delete_provider("provider-1").expect("delete again"));
         assert!(db.list_providers().expect("list").is_empty());
+    }
+
+    #[test]
+    fn provider_headers_round_trip_encrypted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+        let now = now_iso();
+        let provider = ProviderSpec {
+            id: "provider-1".to_string(),
+            name: "shared".to_string(),
+            kind: "openai-compatible".to_string(),
+            base_url: "https://provider.test/v1".to_string(),
+            api_key_env: "PROVIDER_KEY".to_string(),
+            model: None,
+            header_names: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        db.insert_provider(&provider, &[1u8; 12], &[2u8, 3u8])
+            .expect("insert provider");
+        assert!(db.provider_headers("provider-1").expect("read").is_none());
+
+        db.set_provider_headers(
+            "provider-1",
+            Some(&crate::secrets::Sealed {
+                nonce: vec![9u8; 12],
+                ciphertext: vec![8u8, 7u8],
+            }),
+        )
+        .expect("store");
+        let sealed = db
+            .provider_headers("provider-1")
+            .expect("read")
+            .expect("present");
+        assert_eq!(sealed.nonce, vec![9u8; 12]);
+        assert_eq!(sealed.ciphertext, vec![8u8, 7u8]);
+
+        db.set_provider_headers("provider-1", None).expect("clear");
+        assert!(db.provider_headers("provider-1").expect("read").is_none());
+        // An unknown provider simply has no headers.
+        assert!(db.provider_headers("ghost").expect("read").is_none());
     }
 
     #[test]
@@ -3643,6 +3775,25 @@ mod tests {
         assert!(table_exists(&db.lock(), "instance_mcp_servers"));
         assert!(table_exists(&db.lock(), "mcp_incidents"));
         assert!(table_exists(&db.lock(), "settings"));
+        let columns: Vec<String> = db
+            .lock()
+            .prepare("PRAGMA table_info(providers)")
+            .expect("table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns");
+        for column in [
+            "model",
+            "header_names",
+            "headers_nonce",
+            "headers_ciphertext",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == column),
+                "providers.{column} missing: {columns:?}"
+            );
+        }
 
         // Re-opening an up-to-date database applies nothing.
         drop(db);

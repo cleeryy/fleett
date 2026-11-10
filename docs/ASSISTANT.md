@@ -17,13 +17,15 @@ the context summary and calls the routes below.
 |---|---|---|
 | `FLEETT_ASSISTANT` | `on` | `off` removes the routes entirely (`404 route not found`) |
 | `FLEETT_ASSISTANT_PROVIDER` | — | id of an existing provider; the assistant borrows its secret and base URL |
-| `FLEETT_ASSISTANT_MODEL` | `deepseek-v4.1-flash` | model sent to the provider |
+| `FLEETT_ASSISTANT_MODEL` | `deepseek-v4.1-flash` | model sent to the provider, unless the provider sets its own `model` |
 | `FLEETT_ASSISTANT_BUDGET_TOKENS` | `50000` | token budget of one session; `0` disables the limit |
 
 The provider is a **normal provider** created with `POST /api/providers`
 (see [PROVIDERS.md](PROVIDERS.md)): kind `openai-compatible`, a base URL such as
 `https://opencode.ai/inference/go/openai/v1` and its encrypted secret. The
-assistant decrypts that secret per request; it never stores one of its own.
+assistant decrypts that secret per request; it never stores one of its own. It
+also sends the provider's `extra_headers` and uses its `model` when one is set,
+so an `opencode.ai` gateway works without any extra configuration (issue #64).
 
 `FLEETT_ASSISTANT=off` is a hard switch: the router does not register the
 routes, so they answer the generic `404 not_found` and the console hides the
@@ -253,9 +255,11 @@ Counters live in memory and are reset by a restart; `0` disables the limit.
 POST ${base_url}/chat/completions
 Authorization: Bearer <provider secret>
 Content-Type: application/json
+<provider extra_headers, one line each>
+x-opencode-session: <session id>        (opencode.ai gateways only)
 
 {
-  "model": "<FLEETT_ASSISTANT_MODEL>",
+  "model": "<provider model, else FLEETT_ASSISTANT_MODEL>",
   "messages": [{"role": "system", …}, …history…],
   "temperature": 0.2,
   "max_tokens": 1200
@@ -263,9 +267,40 @@ Content-Type: application/json
 ```
 
 The system message holds the instructions and the redacted console context.
+
+Header precedence: the credential and `content-type` first, then every
+`extra_headers` of the provider (a configured `authorization` overrides the
+Bearer, which is how a proxy with its own scheme is wired), then
+`x-opencode-session` when the `base_url` host contains `opencode.ai` **and** the
+operator did not configure that header. The automatic value derives from the
+request `session_id` — stable for one conversation, sanitised to
+`[A-Za-z0-9._:-]`, at most 128 characters — so the gateway routes every turn of
+the same panel the same way.
+
 The client timeout is 60 s. A non-2xx answer becomes
-`502 assistant_provider_error` (`details.provider_status`); the upstream body is
-never echoed, because it can quote the prompt or a credential fragment.
+`502 assistant_provider_error`; the upstream status **and** its body (up to
+1 KiB, redacted with the provider secret, the header values, `sk-…`, `flt_…` and
+`Bearer …`) are returned and logged at WARN:
+
+```json
+{
+  "error": {
+    "code": "assistant_provider_error",
+    "message": "the assistant provider answered with HTTP 400",
+    "details": {
+      "provider_status": 400,
+      "upstream": {
+        "status": 400,
+        "body": "{\"type\":\"error\",\"error\":{\"type\":\"MissingSessionID\",\"message\":\"Request is missing x-opencode-session…\"}}"
+      }
+    }
+  }
+}
+```
+
+The body is quoted because it names the cause (`MissingSessionID`, an unknown
+model, a quota); the redactor runs over it first, so a credential echoed by the
+gateway never reaches the console or the log.
 
 ## Apply path and audit
 

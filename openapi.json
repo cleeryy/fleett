@@ -6124,7 +6124,7 @@
     },
     "/api/providers/{id}/test": {
       "post": {
-        "summary": "Probe one provider",
+        "summary": "Test one provider",
         "operationId": "postProvidersByIdTest",
         "tags": [
           "Providers"
@@ -6137,6 +6137,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Model of the completion half; overrides the provider default and FLEETT_ASSISTANT_MODEL for this test only."
           }
         ],
         "responses": {
@@ -6165,7 +6174,8 @@
           "502": {
             "$ref": "#/components/responses/BadGateway"
           }
-        }
+        },
+        "description": "Authenticates with GET /models, then proves the assistant route with a real 1-token POST /chat/completions. Sends the provider extra_headers and, on an opencode.ai host, a fresh x-opencode-session UUID. The key and the header values never appear in the answer."
       }
     },
     "/api/instances": {
@@ -11689,6 +11699,19 @@
           },
           "secret": {
             "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "nullable": true,
+            "description": "Default model of the credential, used by the assistant and the provider test."
+          },
+          "extra_headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Upstream headers sent with every provider call (for example x-opencode-session on opencode.ai). Values are encrypted at rest and never returned; only the names are. At most 32 entries, RFC 7230 token names, 8 KiB per value. On PATCH, an object replaces the whole map and {} removes every header; omitting the field leaves them untouched.",
+            "maxProperties": 32
           }
         }
       },
@@ -15164,7 +15187,8 @@
           {
             "$ref": "#/components/schemas/CreateProviderRequest"
           }
-        ]
+        ],
+        "description": "A missing field is left untouched. `secret` rotates the credential and restarts every attached instance; `extra_headers` replaces the whole map; `model: \"\"` clears the default model."
       },
       "PatchScheduleRequest": {
         "allOf": [
@@ -15876,6 +15900,18 @@
           "api_key_env": {
             "type": "string"
           },
+          "model": {
+            "type": "string",
+            "nullable": true,
+            "description": "Default model of the credential, used by the assistant and the provider test."
+          },
+          "extra_headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the configured upstream headers, sorted. Values are encrypted at rest and never returned."
+          },
           "instances_count": {
             "type": "integer"
           },
@@ -15974,6 +16010,18 @@
           "api_key_env": {
             "type": "string"
           },
+          "model": {
+            "type": "string",
+            "nullable": true,
+            "description": "Default model of the credential, used by the assistant and the provider test."
+          },
+          "extra_headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of the configured upstream headers, sorted. Values are encrypted at rest and never returned."
+          },
           "instances_count": {
             "type": "integer"
           },
@@ -15999,23 +16047,42 @@
         "type": "object",
         "properties": {
           "ok": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "True only when models_ok and completion_ok are both true."
           },
-          "status": {
-            "type": "integer"
+          "models_ok": {
+            "type": "boolean",
+            "description": "GET ${base_url}/models answered 2xx."
+          },
+          "completion_ok": {
+            "type": "boolean",
+            "description": "POST ${base_url}/chat/completions answered 2xx with max_tokens=1."
           },
           "latency_ms": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Wall time of both calls."
+          },
+          "models_status": {
+            "type": "integer",
+            "nullable": true,
+            "description": "HTTP status of GET /models; null when no response arrived."
+          },
+          "completion_status": {
+            "type": "integer",
+            "nullable": true,
+            "description": "HTTP status of POST /chat/completions; null when no response arrived."
           },
           "error": {
             "type": "string",
-            "nullable": true
+            "nullable": true,
+            "description": "Reason of the first failure, truncated and redacted."
           }
         },
         "required": [
           "ok",
-          "status",
+          "models_ok",
+          "completion_ok",
           "latency_ms"
         ]
       },
