@@ -30,6 +30,7 @@ const ASSISTANT_OPTIONS: { value: MockAssistantMode; labelKey: string }[] = [
   { value: "not-selected", labelKey: "mock.assistantNotSelected" },
   { value: "unconfigured", labelKey: "mock.assistantNoProvider" },
   { value: "unknown", labelKey: "mock.assistantUnknown" },
+  { value: "upstream", labelKey: "mock.assistantUpstream" },
 ];
 
 /**

@@ -615,6 +615,10 @@ pub struct PersonaBinding {
 /// The secret is never part of this struct: it lives encrypted in its own
 /// columns and is only decrypted by the compose driver (injection) and by the
 /// connectivity test.
+///
+/// `header_names` lists the upstream headers of the provider (issue #64). The
+/// names are metadata the API returns; their values live in one encrypted blob
+/// and never leave the process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSpec {
     pub id: String,
@@ -622,6 +626,11 @@ pub struct ProviderSpec {
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Model the assistant and the test call use when neither the request nor
+    /// `FLEETT_ASSISTANT_MODEL` names one.
+    pub model: Option<String>,
+    /// Names of the configured upstream headers, sorted.
+    pub header_names: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -634,6 +643,10 @@ pub struct ProviderSummary {
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Default model of the credential (`null` when unset).
+    pub model: Option<String>,
+    /// Names of the configured upstream headers; the values stay encrypted.
+    pub extra_headers: Vec<String>,
     /// Number of instances that reference this provider.
     pub instances_count: usize,
     pub created_at: String,
@@ -648,6 +661,8 @@ pub struct ProviderDetail {
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    pub model: Option<String>,
+    pub extra_headers: Vec<String>,
     pub instances_count: usize,
     pub created_at: String,
     pub updated_at: String,
@@ -678,13 +693,27 @@ pub struct ProviderRotateResponse {
     pub restarted: Vec<ProviderRestart>,
 }
 
-/// Response of `POST /api/providers/{id}/test`.
+/// Response of `POST /api/providers/{id}/test` (issue #64).
+///
+/// The probe does two calls: `GET /models` (authentication and routing of the
+/// metadata route) and a real 1-token `POST /chat/completions` (the route the
+/// assistant actually uses). A provider can pass the first and fail the second,
+/// which is exactly the case that used to make the test button lie.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProviderTestResponse {
+    /// `true` only when both calls succeeded.
     pub ok: bool,
-    /// HTTP status of `${base_url}/models`, `0` when no answer arrived.
-    pub status: u16,
+    /// `GET ${base_url}/models` answered 2xx.
+    pub models_ok: bool,
+    /// `POST ${base_url}/chat/completions` answered 2xx.
+    pub completion_ok: bool,
+    /// Wall time of the two calls, in milliseconds.
     pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_status: Option<u16>,
+    /// Human-readable reason of the first failure; secrets are redacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -702,10 +731,21 @@ pub struct CreateProviderRequest {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    /// Default model of the credential (used by the assistant and the test).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Upstream headers sent with every call of the provider. Values are
+    /// encrypted at rest and never returned; only the names are.
+    #[serde(default)]
+    pub extra_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// `PATCH /api/providers/{id}`. A missing field is left untouched; `secret`
 /// rotates the credential and restarts every attached instance.
+///
+/// `model: ""` clears the default model. An `extra_headers` object replaces the
+/// whole map (an empty object removes every header); omitting it leaves the
+/// stored headers untouched.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PatchProviderRequest {
     #[serde(default)]
@@ -718,6 +758,10 @@ pub struct PatchProviderRequest {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub extra_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Container runtime details returned by the driver.

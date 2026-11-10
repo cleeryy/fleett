@@ -81,7 +81,7 @@ Full semantics: [docs/ASSISTANT.md](docs/ASSISTANT.md).
 |---|---|---|---|
 | GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,provider_source:"env\|setting\|auto\|none",reason:"no_provider\|not_selected"\|null,model,budget_tokens,used_tokens}`; `422 assistant_provider_unknown` with `details.valid` when a reference is dangling |
 | PATCH | `/api/assistant/config` | `{"provider":"<id>"}` or `{"provider":null}` | resolved config (same shape as `GET`), admin only; `422 assistant_provider_unknown` with `details.valid` |
-| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured` (with `details.reason`), `422 invalid_messages`, `422 assistant_provider_unknown`, `429 assistant_budget_exceeded` |
+| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured` (with `details.reason`), `422 invalid_messages`, `422 assistant_provider_unknown`, `429 assistant_budget_exceeded`, `502 assistant_provider_error` (with `details.provider_status` and `details.upstream:{status,body}`) |
 
 `task` is `freeform` (default), `skill`, `soul`, `env`, `pipeline`, `fleet_yaml`,
 `explain` or `config`. A proposal is `{kind:"file"|"yaml",path,content}` or
@@ -361,18 +361,28 @@ The secret is never returned by any endpoint.
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/providers` | — | `[{"id":"…","name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","instances_count":2,"created_at":"…","updated_at":"…"}]` |
-| POST | `/api/providers` | `{"name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","secret":"…"}` | `201` summary, admin only |
+| GET | `/api/providers` | — | `[{"id":"…","name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","model":null,"extra_headers":["x-opencode-session"],"instances_count":2,"created_at":"…","updated_at":"…"}]` |
+| POST | `/api/providers` | `{"name":"shared","kind":"openai-compatible","base_url":"…","api_key_env":"…","secret":"…","model"?,"extra_headers"?}` | `201` summary, admin only |
 | GET | `/api/providers/{id}` | — | summary + `"instances":[{"id":"alice","name":"Alice"}]` |
-| PATCH | `/api/providers/{id}` | `{"name"?,"kind"?,"base_url"?,"api_key_env"?,"secret"?}` | `{"provider":{…},"restarted":[{"id":"alice","status":"healthy\|failed","error"?}]}`, admin only |
+| PATCH | `/api/providers/{id}` | `{"name"?,"kind"?,"base_url"?,"api_key_env"?,"secret"?,"model"?,"extra_headers"?}` | `{"provider":{…},"restarted":[{"id":"alice","status":"healthy\|failed","error"?}]}`, admin only |
 | DELETE | `/api/providers/{id}` | — | `204`, or `409 provider_in_use` with `details.instances`, admin only |
-| POST | `/api/providers/{id}/test` | — | `{"ok":true,"status":200,"latency_ms":42}`, admin only |
+| POST | `/api/providers/{id}/test?model=` | — | `{"ok":false,"models_ok":true,"completion_ok":false,"latency_ms":193,"models_status":200,"completion_status":400,"error":"POST /chat/completions failed: HTTP 400: …"}`, admin only |
 
 An instance attaches a provider with `"provider":"<id>"`. `base_url` and
 `api_key_env` default to the provider's values; an explicit value in the same
 request wins. `secret` on `PATCH` rotates the credential and restarts every
 attached instance sequentially (one `restarted` entry each). Instances without
 a provider keep their own `gate_token`/`api_key_env`.
+
+`extra_headers` (`{"name":"value"}`) are sent with every assistant and test call;
+the values are encrypted at rest and **never returned** — the API exposes the
+names as an array. `PATCH` replaces the whole map (`{}` removes every header,
+omitting the field keeps it). Names are RFC 7230 tokens, unique
+case-insensitively, at most 32, 8 KiB per value (`400 invalid_provider`
+otherwise). `model` is the credential's default model (`""` on `PATCH` clears
+it). The test endpoint makes a real 1-token completion in addition to
+`GET /models`, so `completion_ok` is what proves the assistant route. See
+[docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 ## Declarative state (GitOps)
 

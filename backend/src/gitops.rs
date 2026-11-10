@@ -1381,6 +1381,8 @@ fn create_provider(
         kind: provider.kind.clone(),
         base_url: provider.base_url.trim().to_string(),
         api_key_env: provider.api_key_env.clone(),
+        model: None,
+        header_names: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };

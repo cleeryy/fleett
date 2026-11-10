@@ -17,10 +17,12 @@ use crate::models::{
     Status, DEFAULT_API_KEY_ENV,
 };
 use crate::providers::{self, ProviderError, RESTART_FAILED, RESTART_HEALTHY};
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Per-instance health wait of a rotation, shared by every attached instance.
@@ -28,6 +30,14 @@ use std::time::Duration;
 /// The rolling-upgrade helper is reused as-is; a rotation is sequential so one
 /// slow instance never blocks the report of the others.
 pub const ROTATE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Query of `POST /api/providers/{id}/test`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TestQuery {
+    /// Model of the completion half; overrides the provider default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
 
 impl From<ProviderError> for ApiError {
     fn from(err: ProviderError) -> Self {
@@ -88,6 +98,14 @@ pub async fn create(
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("invalid_secret", "secret is required"))?;
     providers::validate_secret(secret).map_err(ApiError::from)?;
+    let model = request
+        .model
+        .as_deref()
+        .map(clean_model)
+        .transpose()?
+        .flatten();
+    let headers = request.extra_headers.unwrap_or_default();
+    let sealed_headers = providers::seal_headers(&state.cfg, &headers).map_err(ApiError::from)?;
 
     let sealed = providers::seal(&state.cfg, secret).map_err(ApiError::from)?;
     let now = now_iso();
@@ -97,6 +115,8 @@ pub async fn create(
         kind,
         base_url,
         api_key_env,
+        model,
+        header_names: header_names(&headers),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -104,6 +124,12 @@ pub async fn create(
         .db
         .insert_provider(&spec, &sealed.nonce, &sealed.ciphertext)
         .map_err(provider_db_error)?;
+    if let Some(sealed) = sealed_headers.as_ref() {
+        state
+            .db
+            .set_provider_headers(&spec.id, Some(sealed))
+            .map_err(ApiError::from)?;
+    }
 
     record(
         &state,
@@ -115,6 +141,8 @@ pub async fn create(
             "kind": spec.kind,
             "base_url": spec.base_url,
             "api_key_env": spec.api_key_env,
+            "model": spec.model,
+            "extra_headers": spec.header_names,
         })),
     );
     Ok((StatusCode::CREATED, Json(providers::summary(&spec, 0))))
@@ -158,6 +186,20 @@ pub async fn patch(
             .map_err(|message| ApiError::bad_request("invalid_api_key_env", message))?;
         spec.api_key_env = api_key_env.to_string();
     }
+    if let Some(model) = request.model.as_deref() {
+        spec.model = clean_model(model)?;
+    }
+
+    // `extra_headers` replaces the whole map: an empty object removes every
+    // header, an omitted field leaves them untouched (issue #64).
+    let headers_update = match request.extra_headers.as_ref() {
+        None => None,
+        Some(headers) => {
+            let sealed = providers::seal_headers(&state.cfg, headers).map_err(ApiError::from)?;
+            spec.header_names = header_names(headers);
+            Some(sealed)
+        }
+    };
 
     let rotated = match request.secret.as_deref() {
         Some(secret) => {
@@ -177,6 +219,12 @@ pub async fn patch(
             rotated.then_some((stored.nonce.as_slice(), stored.ciphertext.as_slice())),
         )
         .map_err(provider_db_error)?;
+    if let Some(sealed) = headers_update.as_ref() {
+        state
+            .db
+            .set_provider_headers(&spec.id, sealed.as_ref())
+            .map_err(ApiError::from)?;
+    }
     stored.spec = spec.clone();
 
     record(
@@ -189,6 +237,8 @@ pub async fn patch(
             "kind": spec.kind,
             "base_url": spec.base_url,
             "api_key_env": spec.api_key_env,
+            "model": spec.model,
+            "extra_headers": spec.header_names,
             "rotated": rotated,
         })),
     );
@@ -264,28 +314,56 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /api/providers/{id}/test`: decrypt the key and probe `/models`.
+/// `POST /api/providers/{id}/test`: decrypt the key and probe the provider.
 ///
-/// The answer never contains the key; see [`providers::probe`].
+/// Two calls (issue #64): `GET /models` proves the credential and the endpoint,
+/// a real 1-token `POST /chat/completions` proves the route the assistant uses.
+/// The answer never contains the key or a header value; an upstream error is
+/// truncated and redacted. `?model=` overrides the provider default for this
+/// test only.
 pub async fn test(
     Path(id): Path<String>,
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
+    Query(query): Query<TestQuery>,
 ) -> Result<Json<ProviderTestResponse>, ApiError> {
     require_admin(&context)?;
 
     let stored = load(&state, &id)?;
     let secret = providers::secret_of(&state.cfg, &stored).map_err(ApiError::from)?;
-    let outcome = providers::probe(&stored.spec.base_url, &secret).await;
+    let headers = providers::headers_of(&state.cfg, &state.db, &id).map_err(ApiError::from)?;
+    let model = match query
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        Some(model) => model.to_string(),
+        None => stored
+            .spec
+            .model
+            .clone()
+            .unwrap_or_else(|| state.cfg.assistant_model.clone()),
+    };
+    let outcome = providers::test_provider(providers::TestRequest {
+        base_url: &stored.spec.base_url,
+        secret: &secret,
+        headers: &headers,
+        model: &model,
+    })
+    .await;
     record(
         &state,
         &context,
         "provider.test",
         &stored.spec.id,
         Some(json!({
-            "ok": outcome.ok,
-            "status": outcome.status,
+            "models_ok": outcome.models_ok,
+            "completion_ok": outcome.completion_ok,
+            "models_status": outcome.models_status,
+            "completion_status": outcome.completion_status,
             "latency_ms": outcome.latency_ms,
+            "model": model,
         })),
     );
     Ok(Json(outcome))
@@ -325,11 +403,31 @@ fn detail(
         kind: spec.kind.clone(),
         base_url: spec.base_url.clone(),
         api_key_env: spec.api_key_env.clone(),
+        model: spec.model.clone(),
+        extra_headers: spec.header_names.clone(),
         instances_count: instances.len(),
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
         instances,
     }
+}
+
+/// Normalise the optional default model of a provider.
+///
+/// `None` or a blank value clears it; a value is trimmed and validated.
+fn clean_model(raw: &str) -> Result<Option<String>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    providers::validate_model(raw)
+        .map(Some)
+        .map_err(ApiError::from)
+}
+
+/// Sorted names of a validated header map, the only header data the API returns.
+fn header_names(headers: &BTreeMap<String, String>) -> Vec<String> {
+    headers.keys().cloned().collect()
 }
 
 fn required_name(raw: Option<&str>) -> Result<String, ApiError> {
