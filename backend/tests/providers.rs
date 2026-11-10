@@ -203,6 +203,86 @@ fn spawn_models_server(secret: &'static str) -> String {
     format!("http://{address}")
 }
 
+/// Gateway simulator of `POST /api/providers/{id}/test`: records every request
+/// and answers `GET /models` and `POST /chat/completions` independently.
+///
+/// Returns `(base_url, requests)`; each request is `(method, path, headers)`.
+#[allow(clippy::type_complexity)]
+fn spawn_gateway(
+    models: (u16, &'static str),
+    completion: (u16, &'static str),
+) -> (
+    String,
+    Arc<std::sync::Mutex<Vec<(String, String, Vec<(String, String)>)>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock gateway");
+    let address = listener.local_addr().expect("local address");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 8192];
+            // Read the headers (and a possible body) of one request.
+            let header_end = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                if read == 0 {
+                    break 0;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(position) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            if header_end == 0 {
+                continue;
+            }
+            let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+            let mut lines = headers.lines();
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let captured: Vec<(String, String)> = lines
+                .filter_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return None;
+                    }
+                    Some((name.trim().to_ascii_lowercase(), value.to_string()))
+                })
+                .collect();
+            recorded
+                .lock()
+                .expect("requests")
+                .push((method.clone(), path.clone(), captured));
+            let (status, body) = if method == "POST" { completion } else { models };
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                404 => "Not Found",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{address}"), requests)
+}
+
+fn request_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
 #[tokio::test]
 async fn two_instances_share_a_provider_and_one_rotation_restarts_both() {
     let harness = Harness::new();
@@ -436,7 +516,7 @@ async fn a_provider_base_url_wins_when_the_instance_omits_it_but_not_when_it_ove
 }
 
 #[tokio::test]
-async fn the_test_endpoint_probes_models_and_reports_ok_then_401() {
+async fn the_test_endpoint_probes_models_and_a_real_completion() {
     let harness = Harness::new();
     let base_url = spawn_models_server("sk-good");
 
@@ -462,11 +542,15 @@ async fn the_test_endpoint_probes_models_and_reports_ok_then_401() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let outcome = parse(&body);
     assert_eq!(outcome["ok"], true, "{outcome}");
-    assert_eq!(outcome["status"], 200);
+    assert_eq!(outcome["models_ok"], true);
+    assert_eq!(outcome["completion_ok"], true, "{outcome}");
+    assert_eq!(outcome["models_status"], 200);
+    assert_eq!(outcome["completion_status"], 200);
     assert!(outcome["latency_ms"].as_u64().is_some());
+    assert!(outcome.get("error").is_none(), "{outcome}");
     assert!(!body.contains("sk-good"), "the key must never be echoed");
 
-    // Same endpoint, wrong key: the provider answers 401, reported as such.
+    // Same endpoint, wrong key: both halves answer 401, reported as such.
     let (status, body) = harness
         .request(
             Method::POST,
@@ -489,11 +573,260 @@ async fn the_test_endpoint_probes_models_and_reports_ok_then_401() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let outcome = parse(&body);
     assert_eq!(outcome["ok"], false);
-    assert_eq!(outcome["status"], 401);
+    assert_eq!(outcome["models_ok"], false);
+    assert_eq!(outcome["completion_ok"], false);
+    assert_eq!(outcome["models_status"], 401);
+    assert_eq!(outcome["completion_status"], 401);
     assert!(outcome["error"]
         .as_str()
         .is_some_and(|text| text.contains("401")));
     assert!(!body.contains("sk-wrong"));
+}
+
+#[tokio::test]
+async fn the_test_endpoint_turns_red_when_only_the_completion_fails() {
+    // The case the issue describes: /models answers 200, the completion route
+    // rejects the request (a gateway that requires a session header).
+    let harness = Harness::new();
+    let (base_url, requests) = spawn_gateway(
+        (200, r#"{"data":[]}"#),
+        (
+            400,
+            r#"{"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session"}}"#,
+        ),
+    );
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/providers",
+            Some(json!({
+                "name": "gateway",
+                "kind": "openai-compatible",
+                "base_url": base_url,
+                "api_key_env": PROVIDER_KEY_ENV,
+                "secret": "sk-gateway",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = parse(&body)["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::POST, &format!("/api/providers/{id}/test"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let outcome = parse(&body);
+    assert_eq!(outcome["ok"], false, "{outcome}");
+    assert_eq!(outcome["models_ok"], true, "{outcome}");
+    assert_eq!(outcome["completion_ok"], false, "{outcome}");
+    assert_eq!(outcome["models_status"], 200);
+    assert_eq!(outcome["completion_status"], 400);
+    assert!(
+        outcome["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("MissingSessionID")),
+        "the upstream reason must reach the UI: {outcome}"
+    );
+    assert!(!body.contains("sk-gateway"));
+
+    // Two calls were made: the metadata one and the completion one.
+    let recorded = requests.lock().expect("requests").clone();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(recorded[0].0, "GET");
+    assert_eq!(recorded[0].1, "/models");
+    assert_eq!(recorded[1].0, "POST");
+    assert_eq!(recorded[1].1, "/chat/completions");
+    assert_eq!(
+        recorded[1]
+            .2
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.as_str()),
+        Some("Bearer sk-gateway")
+    );
+}
+
+#[tokio::test]
+async fn the_test_endpoint_sends_the_extra_headers_and_the_opencode_session() {
+    let harness = Harness::new();
+    let (base_url, requests) = spawn_gateway((200, r#"{"data":[]}"#), (200, r#"{"id":"x"}"#));
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/providers",
+            Some(json!({
+                "name": "gateway",
+                "kind": "openai-compatible",
+                "base_url": base_url,
+                "api_key_env": PROVIDER_KEY_ENV,
+                "secret": "sk-gateway",
+                "model": "provider-model",
+                "extra_headers": {"x-api-version": "2026-01-01"},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = parse(&body)["id"].as_str().expect("id").to_string();
+
+    let (status, body) = harness
+        .request(Method::POST, &format!("/api/providers/{id}/test"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["completion_ok"], true, "{body}");
+
+    let recorded = requests.lock().expect("requests").clone();
+    assert_eq!(recorded.len(), 2);
+    for (method, path, headers) in &recorded {
+        assert_eq!(
+            request_header(headers, "x-api-version"),
+            Some("2026-01-01"),
+            "{method} {path} did not carry the configured header: {headers:?}"
+        );
+        assert!(request_header(headers, "authorization").is_some());
+    }
+    // The completion half uses the provider default model and one token.
+    let (_, _, completion_headers) = &recorded[1];
+    assert!(request_header(completion_headers, "content-type").is_some());
+    // A local host is not the opencode gateway: no session header.
+    assert_eq!(
+        request_header(completion_headers, "x-opencode-session"),
+        None
+    );
+
+    // `?model=` overrides the provider default for the test only.
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            &format!("/api/providers/{id}/test?model=other-model"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["completion_ok"], true);
+}
+
+#[tokio::test]
+async fn provider_headers_are_validated_encrypted_and_never_returned() {
+    let harness = Harness::new();
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/providers",
+            Some(json!({
+                "name": "gateway",
+                "kind": "openai-compatible",
+                "base_url": PROVIDER_BASE_URL,
+                "api_key_env": PROVIDER_KEY_ENV,
+                "secret": "sk-gateway",
+                "model": "provider-model",
+                "extra_headers": {
+                    "x-opencode-session": "session-42",
+                    "anthropic-version": "2023-06-01",
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let summary = parse(&body);
+    let id = summary["id"].as_str().expect("id").to_string();
+    assert_eq!(summary["model"], "provider-model");
+    assert_eq!(
+        summary["extra_headers"],
+        json!(["anthropic-version", "x-opencode-session"]),
+        "the summary exposes names only"
+    );
+    assert!(!body.contains("session-42"), "{body}");
+    assert!(!body.contains("2023-06-01"), "{body}");
+
+    // Nothing returns a value: list, detail and the later patch.
+    for path in ["/api/providers".to_string(), format!("/api/providers/{id}")] {
+        let (status, body) = harness.request(Method::GET, &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("session-42"), "{path}: {body}");
+        assert!(!body.contains("2023-06-01"), "{path}: {body}");
+    }
+
+    // The values are encrypted at rest, with the fleet key.
+    let sealed = harness
+        .state
+        .db
+        .provider_headers(&id)
+        .expect("blob")
+        .expect("present");
+    let blob = String::from_utf8_lossy(&sealed.ciphertext).to_string();
+    assert!(!blob.contains("session-42"), "{blob}");
+    assert!(!blob.contains("2023-06-01"), "{blob}");
+
+    // PATCH replaces the whole map and never restarts an instance.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/providers/{id}"),
+            Some(json!({"extra_headers": {"x-api-version": "2026-01-01"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse(&body)["provider"]["extra_headers"],
+        json!(["x-api-version"])
+    );
+    assert!(parse(&body)["restarted"]
+        .as_array()
+        .expect("restarted")
+        .is_empty());
+
+    // An empty object removes every header; a blank model clears the default.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            &format!("/api/providers/{id}"),
+            Some(json!({"extra_headers": {}, "model": ""})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let provider = parse(&body)["provider"].clone();
+    assert_eq!(provider["extra_headers"], json!([]), "{provider}");
+    assert_eq!(provider["model"], Value::Null, "{provider}");
+
+    // Validation: RFC token names, at most 32 headers, no control character.
+    for extra_headers in [
+        json!({"bad name": "x"}),
+        json!({"x": "a\r\nb"}),
+        json!((0..=32)
+            .map(|index| (format!("x-h{index}"), "1".to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>()),
+    ] {
+        let (status, body) = harness
+            .request(
+                Method::POST,
+                "/api/providers",
+                Some(json!({
+                    "name": format!("invalid-{}", rand_suffix()),
+                    "kind": "openai-compatible",
+                    "base_url": PROVIDER_BASE_URL,
+                    "api_key_env": PROVIDER_KEY_ENV,
+                    "secret": "sk-invalid",
+                    "extra_headers": extra_headers,
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(parse(&body)["error"]["code"], "invalid_provider", "{body}");
+    }
+
+    // A duplicate name would fail the insert first: the errors above are about
+    // the headers, so the provider list still holds exactly one provider.
+    let (status, body) = harness.request(Method::GET, "/api/providers", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body).as_array().expect("list").len(), 1, "{body}");
+}
+
+/// A short unique suffix so a refusal test never trips on a duplicate name.
+fn rand_suffix() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 #[tokio::test]

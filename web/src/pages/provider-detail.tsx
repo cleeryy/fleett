@@ -42,6 +42,7 @@ import { ErrorAlert } from "@/components/error-alert";
 import { PageHeader } from "@/components/page-header";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
+import { providerHeaderNames } from "@/lib/providers";
 import { hrefFor, navigate } from "@/lib/router";
 import { useCanEdit } from "@/lib/session";
 import { useResource } from "@/lib/use-resource";
@@ -69,33 +70,83 @@ function CopyValue({ value, label }: { value: string; label: string }) {
 function TestResultPanel({ result, baseUrl }: { result: ProviderTestResult; baseUrl: string }) {
   const { t } = useI18n();
   const probeUrl = `${baseUrl.replace(/\/+$/, "")}/models`;
+  const bothOk = result.ok && result.models_ok && result.completion_ok;
+  const title = bothOk
+    ? t("providers.detail.testOk")
+    : result.models_ok
+      ? t("providers.detail.testPartial")
+      : t("providers.detail.testFailed");
+
+  function statusLabel(status: number | undefined): string {
+    if (status === undefined) return t("providers.detail.notRun");
+    if (status === 0) return t("providers.detail.noResponse");
+    return `HTTP ${status}`;
+  }
+
+  const probes = [
+    {
+      key: "models",
+      label: t("providers.detail.testModels"),
+      hint: t("providers.detail.testModelsHint"),
+      ok: result.models_ok,
+      status: result.models_status,
+    },
+    {
+      key: "completion",
+      label: t("providers.detail.testCompletion"),
+      hint: t("providers.detail.testCompletionHint"),
+      ok: result.completion_ok,
+      status: result.completion_status,
+    },
+  ];
+
   return (
     <div
       role="status"
       className={cn(
         "rounded-md border p-4",
-        result.ok ? "bg-muted/20" : "border-destructive/40 bg-destructive/5",
+        bothOk ? "bg-muted/20" : "border-destructive/40 bg-destructive/5",
       )}
     >
       <div className="flex flex-wrap items-center gap-2">
-        {result.ok ? (
+        {bothOk ? (
           <CheckCircle2 aria-hidden className="size-4 text-emerald-500" />
         ) : (
           <XCircle aria-hidden className="size-4 text-destructive" />
         )}
-        <p className="text-sm font-medium">
-          {result.ok ? t("providers.detail.testOk") : t("providers.detail.testFailed")}
-        </p>
+        <p className="text-sm font-medium">{title}</p>
         <span className="font-mono text-xs text-muted-foreground sm:ml-auto">
-          {result.status === 0
-            ? t("providers.detail.noResponse")
-            : `HTTP ${result.status}`}{" "}
-          · {result.latency_ms} ms
+          {result.latency_ms} ms
         </span>
       </div>
-      {result.error ? (
+
+      <ul className="mt-3 divide-y rounded-md border bg-background/60">
+        {probes.map((probe) => (
+          <li key={probe.key} className="flex items-start gap-2.5 px-3 py-2">
+            {probe.ok ? (
+              <CheckCircle2 aria-hidden className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+            ) : (
+              <XCircle aria-hidden className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-medium">{probe.label}</p>
+              <p className="text-[11px] break-words text-muted-foreground">{probe.hint}</p>
+            </div>
+            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+              {statusLabel(probe.status)}
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      {result.error && !bothOk ? (
         <p className="mt-2 font-mono text-xs break-words whitespace-pre-wrap text-destructive">
           {result.error}
+        </p>
+      ) : null}
+      {!result.completion_ok && result.models_ok ? (
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          {t("providers.detail.testPartialBody")}
         </p>
       ) : null}
       <p className="mt-1.5 font-mono text-xs break-all text-muted-foreground">GET {probeUrl}</p>
@@ -319,6 +370,7 @@ export function ProviderDetailPage({ id }: { id: string }) {
 
   const provider = detail.data;
   const linked = provider.instances_count;
+  const headerNames = providerHeaderNames(provider);
 
   return (
     <>
@@ -430,6 +482,37 @@ export function ProviderDetailPage({ id }: { id: string }) {
                 value: <Mono>{provider.api_key_env}</Mono>,
               },
               {
+                label: t("providers.form.model"),
+                value: provider.model ? (
+                  <Mono>{provider.model}</Mono>
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    {t("providers.detail.noModel")}
+                  </span>
+                ),
+              },
+              {
+                label: t("providers.form.headers"),
+                value:
+                  headerNames.length > 0 ? (
+                    <span className="flex flex-wrap gap-1">
+                      {headerNames.map((name) => (
+                        <Badge
+                          key={name}
+                          variant="outline"
+                          className="font-mono text-[11px] font-normal"
+                        >
+                          {name}
+                        </Badge>
+                      ))}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      {t("providers.detail.noHeaders")}
+                    </span>
+                  ),
+              },
+              {
                 label: t("nav.instances"),
                 value:
                   linked === 0
@@ -460,6 +543,7 @@ export function ProviderDetailPage({ id }: { id: string }) {
               },
             ]}
           />
+          <p className="text-xs text-muted-foreground">{t("providers.detail.headersHint")}</p>
         </Section>
 
         <Section

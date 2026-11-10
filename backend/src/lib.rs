@@ -42,6 +42,7 @@ pub mod personas;
 pub mod pipelines;
 pub mod providers;
 pub mod quota;
+pub mod redact;
 pub mod render;
 pub mod scheduler;
 pub mod secrets;

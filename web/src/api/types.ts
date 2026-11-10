@@ -673,6 +673,16 @@ export interface ProviderSummary {
   base_url: string;
   /** Container variable the secret is injected under. */
   api_key_env: string;
+  /**
+   * Default model every call names. `null` leaves the provider's own default
+   * in charge; the assistant falls back to `FLEETT_ASSISTANT_MODEL`.
+   */
+  model?: string | null;
+  /**
+   * Header names sent with every call. Values are encrypted at rest like the
+   * secret and never returned, so the console can only list the names.
+   */
+  extra_header_names?: string[];
   /** Instances whose `provider` is this id. */
   instances_count: number;
   created_at: string;
@@ -704,12 +714,24 @@ export interface ProviderRotateResult {
   restarted: ProviderRestart[];
 }
 
-/** `POST /api/providers/{id}/test`: never contains the key. */
+/**
+ * `POST /api/providers/{id}/test`: never contains the key.
+ *
+ * Two probes, because a credential can answer `GET /models` and still fail the
+ * call the assistant makes: `ok` is true only when both pass.
+ */
 export interface ProviderTestResult {
   ok: boolean;
-  /** HTTP status of `${base_url}/models`, `0` when no answer arrived. */
-  status: number;
+  /** `GET ${base_url}/models` answered 2xx. */
+  models_ok: boolean;
+  /** One-token completion with the provider model answered 2xx. */
+  completion_ok: boolean;
   latency_ms: number;
+  /** HTTP status of the models probe, `0` when no answer arrived. */
+  models_status?: number;
+  /** HTTP status of the completion probe, `0` when no answer arrived. */
+  completion_status?: number;
+  /** First failure, already redacted; absent when both probes pass. */
   error?: string;
 }
 
@@ -721,6 +743,10 @@ export interface CreateProviderInput {
   api_key_env: string;
   /** Write-only. Encrypted at rest. */
   secret: string;
+  /** Optional default model; `null` or absent keeps the provider default. */
+  model?: string | null;
+  /** Headers sent with every call. Values are encrypted at rest. */
+  extra_headers?: Record<string, string>;
 }
 
 /** `PATCH /api/providers/{id}`. A missing field is left untouched. */
@@ -731,6 +757,13 @@ export interface PatchProviderInput {
   api_key_env?: string;
   /** Write-only. Rotates the credential and restarts attached instances. */
   secret?: string;
+  /** `null` clears the default model. */
+  model?: string | null;
+  /**
+   * Merged into the stored headers: a value replaces or adds a name, `null`
+   * removes it. A name that is neither listed nor nulled keeps its value.
+   */
+  extra_headers?: Record<string, string | null>;
 }
 
 /** `409 provider_in_use`: the instances that still reference the provider. */
@@ -1943,6 +1976,17 @@ export interface AssistantProviderUnknownDetails {
   valid?: Array<string | { id: string; name?: string }>;
   /** The reference that no longer resolves. */
   provider?: string | null;
+}
+
+/** `502 assistant_provider_error`: what the provider answered, redacted. */
+export interface AssistantProviderErrorDetails {
+  /** HTTP status the upstream provider returned for the chat call. */
+  provider_status?: number;
+  upstream?: {
+    status?: number;
+    /** Truncated (~1 KiB) and redacted by the controller. */
+    body?: string;
+  };
 }
 
 /** The quick tasks offered above the composer. */

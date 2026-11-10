@@ -97,12 +97,15 @@ fn map_error(err: AssistantError) -> ApiError {
             "hint": "select an existing provider with PATCH /api/assistant/config, or clear \
                      FLEETT_ASSISTANT_PROVIDER",
         })),
-        AssistantError::ProviderStatus(status) => ApiError::new(
+        AssistantError::ProviderStatus { status, body } => ApiError::new(
             StatusCode::BAD_GATEWAY,
             "assistant_provider_error",
             format!("the assistant provider answered with HTTP {status}"),
         )
-        .with_details(json!({ "provider_status": status })),
+        .with_details(json!({
+            "provider_status": status,
+            "upstream": {"status": status, "body": body},
+        })),
         AssistantError::Provider(message) => ApiError::new(
             StatusCode::BAD_GATEWAY,
             "assistant_provider_error",
@@ -293,9 +296,11 @@ pub async fn chat(
         ProviderResolution::Resolved { provider, source } => (provider.clone(), *source),
         ProviderResolution::Unresolved { reason } => return Err(not_configured(*reason)),
     };
-    let model = state.cfg.assistant_model.clone();
+    let model = assistant::model_for(&state.cfg, &provider);
     let secret =
         assistant::provider_secret(&state.cfg, &state.db, &provider, source).map_err(map_error)?;
+    let extra_headers =
+        providers::headers_of(&state.cfg, &state.db, &provider.id).map_err(ApiError::from)?;
 
     let (context_text, redaction) = assistant::prepare_context(
         &state.cfg,
@@ -336,7 +341,17 @@ pub async fn chat(
         })));
     }
 
-    let call = assistant::prepare_chat(&provider, &secret, &model, &system, &request.messages);
+    let call = assistant::prepare_chat(
+        &assistant::ChatTarget {
+            provider: &provider,
+            secret: &secret,
+            headers: &extra_headers,
+            model: &model,
+            session_id: request.session_id.trim(),
+        },
+        &system,
+        &request.messages,
+    );
     let completion = match assistant::complete(&call).await {
         Ok(completion) => completion,
         Err(err) => {

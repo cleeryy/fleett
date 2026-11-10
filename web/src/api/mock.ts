@@ -255,6 +255,7 @@ export type MockAssistantMode =
   | "unconfigured"
   | "not-selected"
   | "unknown"
+  | "upstream"
   | "env"
   | "auto"
   | "exhausted";
@@ -298,7 +299,7 @@ function readMockLogTransport(raw: string | undefined): MockLogTransport {
 }
 
 function readAssistantMode(raw: string | undefined): MockAssistantMode {
-  // `?mock_assistant=live|off|unconfigured|not-selected|unknown|env|auto|exhausted`
+  // `?mock_assistant=live|off|unconfigured|not-selected|unknown|upstream|env|auto|exhausted`
   // switches the demo without a rebuild; the env var is the default.
   const query =
     typeof window === "undefined"
@@ -309,6 +310,7 @@ function readAssistantMode(raw: string | undefined): MockAssistantMode {
   if (value === "unconfigured" || value === "no-provider") return "unconfigured";
   if (value === "not-selected" || value === "unselected") return "not-selected";
   if (value === "unknown" || value === "broken") return "unknown";
+  if (value === "upstream" || value === "502") return "upstream";
   if (value === "env") return "env";
   if (value === "auto") return "auto";
   if (value === "exhausted" || value === "budget") return "exhausted";
@@ -382,6 +384,10 @@ interface StoredProvider {
   base_url: string;
   api_key_env: string;
   secret: string;
+  /** Default model named on every call; `null` keeps the provider default. */
+  model: string | null;
+  /** Extra headers, values included: the mock never leaves the browser. */
+  extra_headers: Record<string, string>;
   created_at: string;
   updated_at: string;
 }
@@ -700,6 +706,8 @@ function providerSummary(provider: StoredProvider): ProviderSummary {
     kind: provider.kind,
     base_url: provider.base_url,
     api_key_env: provider.api_key_env,
+    model: provider.model,
+    extra_header_names: Object.keys(provider.extra_headers).sort(),
     instances_count: providerInstances(provider).length,
     created_at: provider.created_at,
     updated_at: provider.updated_at,
@@ -736,6 +744,33 @@ function assertProviderBaseUrl(value: string): void {
 function assertProviderKeyEnv(value: string): void {
   if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(value)) {
     fail(400, "invalid_api_key_env", "api_key_env must match ^[A-Z_][A-Z0-9_]{0,63}$");
+  }
+}
+
+/** Header grammar from RFC 7230 (a `token`), same as the controller. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+const HEADER_VALUE_MAX = 8192;
+
+function assertProviderModel(value: string | null | undefined): void {
+  if (value === undefined || value === null) return;
+  const model = value.trim();
+  if (!model) {
+    fail(400, "invalid_model", "model must not be blank; omit it to use the provider default");
+  }
+  if (model.length > 200 || /\s/.test(model)) {
+    fail(400, "invalid_model", "model must be at most 200 characters without whitespace");
+  }
+}
+
+function assertHeaderPair(name: string, value: string): void {
+  if (!HEADER_NAME_RE.test(name)) {
+    fail(400, "invalid_header", `invalid header name "${name}"`);
+  }
+  if (!value) {
+    fail(400, "invalid_header", `header "${name}" requires a value`);
+  }
+  if (value.length > HEADER_VALUE_MAX || /[\n\r\0]/.test(value)) {
+    fail(400, "invalid_header", `header "${name}" value must be one line under 8 KiB`);
   }
 }
 
@@ -3990,6 +4025,10 @@ export function resetMock(): void {
       base_url: "https://opencode.ai/inference/go/openai/v1",
       api_key_env: GATE_ENV,
       secret: "sk-demo-shared",
+      model: "deepseek-v4.1-flash",
+      // The opencode gateway routes on this header; without it the completion
+      // fails while `GET /models` still answers 200 (issue #64).
+      extra_headers: { "x-opencode-session": "3a11b7b3-24a1-4a09-b5a6-fa27cf93c9aa" },
       created_at: iso(SEEDED_AT - 30 * DAY),
       updated_at: iso(SEEDED_AT - 2 * DAY),
     },
@@ -4000,6 +4039,8 @@ export function resetMock(): void {
       base_url: "https://api.anthropic.com/v1",
       api_key_env: "ANTHROPIC_API_KEY",
       secret: "sk-ant-demo",
+      model: "claude-sonnet-4-5",
+      extra_headers: { "anthropic-version": "2023-06-01" },
       created_at: iso(SEEDED_AT - 18 * DAY),
       updated_at: iso(SEEDED_AT - 6 * HOUR),
     },
@@ -4010,6 +4051,8 @@ export function resetMock(): void {
       base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
       api_key_env: "GEMINI_API_KEY",
       secret: "AIza-demo",
+      model: null,
+      extra_headers: {},
       created_at: iso(SEEDED_AT - 4 * DAY),
       updated_at: iso(SEEDED_AT - DAY),
     },
@@ -5729,10 +5772,8 @@ function resolveAssistantProvider(): AssistantResolution {
   return { provider: null, source: "none", reason: "not_selected" };
 }
 
-function assistantModelFor(): string {
-  // The provider model is a separate contract (#64); the demo names the model
-  // the assistant actually calls.
-  return ASSISTANT_FALLBACK_MODEL;
+function assistantModelFor(provider: StoredProvider): string {
+  return provider.model?.trim() || ASSISTANT_FALLBACK_MODEL;
 }
 
 function assistantSoul(instance: string): string {
@@ -5991,6 +6032,14 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     if (!input.secret.trim()) fail(400, "invalid_secret", "secret must not be empty");
     assertSecretsKey(input.secret);
 
+    assertProviderModel(input.model);
+    const extra_headers: Record<string, string> = {};
+    for (const [rawName, value] of Object.entries(input.extra_headers ?? {})) {
+      const header = rawName.trim();
+      assertHeaderPair(header, value);
+      extra_headers[header] = value;
+    }
+
     const created = Date.now();
     const provider: StoredProvider = {
       id: crypto.randomUUID(),
@@ -5999,6 +6048,8 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       base_url,
       api_key_env,
       secret: input.secret,
+      model: input.model?.trim() || null,
+      extra_headers,
       created_at: iso(created),
       updated_at: iso(created),
     };
@@ -6008,6 +6059,8 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       kind,
       base_url,
       api_key_env,
+      model: provider.model,
+      headers: Object.keys(extra_headers),
     });
     return providerSummary(provider);
   },
@@ -6045,6 +6098,28 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       const api_key_env = input.api_key_env.trim();
       assertProviderKeyEnv(api_key_env);
       provider.api_key_env = api_key_env;
+    }
+    if (input.model !== undefined) {
+      assertProviderModel(input.model);
+      provider.model = input.model?.trim() || null;
+    }
+    if (input.extra_headers !== undefined) {
+      // A value replaces or adds its name, `null` removes it, an absent name
+      // keeps its stored value: exactly the PATCH contract.
+      const next = { ...provider.extra_headers };
+      for (const [rawName, value] of Object.entries(input.extra_headers)) {
+        const header = rawName.trim();
+        if (!HEADER_NAME_RE.test(header)) {
+          fail(400, "invalid_header", `invalid header name "${header}"`);
+        }
+        if (value === null) {
+          delete next[header];
+          continue;
+        }
+        assertHeaderPair(header, value);
+        next[header] = value;
+      }
+      provider.extra_headers = next;
     }
 
     const rotated = input.secret !== undefined;
@@ -6086,6 +6161,8 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
         kind: provider.kind,
         base_url: provider.base_url,
         api_key_env: provider.api_key_env,
+        model: provider.model,
+        headers: Object.keys(provider.extra_headers).sort(),
       });
     }
 
@@ -6125,12 +6202,40 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     if (/(invalid|unreachable|localhost)/i.test(provider.base_url)) {
       return {
         ok: false,
-        status: 0,
+        models_ok: false,
+        completion_ok: false,
+        models_status: 0,
+        completion_status: 0,
         latency_ms,
         error: "cannot reach the provider: connection refused",
       };
     }
-    return { ok: true, status: 200, latency_ms };
+
+    // The models probe only proves the credential. The completion probe is the
+    // call the assistant actually makes, and a gateway can require headers or a
+    // model the models route ignores (issue #64).
+    const sessionHeader = Object.keys(provider.extra_headers).some(
+      (name) => name.toLowerCase() === "x-opencode-session",
+    );
+    const gateway = /opencode\.ai/i.test(provider.base_url);
+    const missingModel = gateway && !provider.model;
+    const missingSession = gateway && !sessionHeader;
+    const completion_ok = !missingModel && !missingSession;
+    const error = missingModel
+      ? '400 {"type":"error","error":{"type":"model_required","message":"No model was named and this gateway has no default."}}'
+      : missingSession
+        ? '400 {"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session and cannot be routed efficiently."}}'
+        : undefined;
+
+    return {
+      ok: completion_ok,
+      models_ok: true,
+      completion_ok,
+      models_status: 200,
+      completion_status: completion_ok ? 200 : 400,
+      latency_ms,
+      ...(error ? { error } : {}),
+    };
   },
 
   /* Personas */
@@ -9452,7 +9557,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
         : null,
       provider_source: resolved.source,
       reason: resolved.reason,
-      model: resolved.provider ? assistantModelFor() : "",
+      model: resolved.provider ? assistantModelFor(resolved.provider) : "",
       budget_tokens: ASSISTANT_BUDGET_TOKENS,
       used_tokens:
         mockConfig.assistant === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens,
@@ -9484,6 +9589,23 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     }
     if (input.messages.length === 0) {
       fail(400, "invalid_message", "at least one message is required");
+    }
+    if (mockConfig.assistant === "upstream") {
+      fail(502, "assistant_provider_error", "the provider refused the chat request", {
+        provider_status: 400,
+        upstream: {
+          status: 400,
+          body: [
+            "{",
+            '  "type": "error",',
+            '  "error": {',
+            '    "type": "MissingSessionID",',
+            '    "message": "Request is missing x-opencode-session and cannot be routed efficiently."',
+            "  }",
+            "}",
+          ].join("\n"),
+        },
+      });
     }
     if (mockConfig.assistant === "exhausted" || assistantSpentTokens >= ASSISTANT_BUDGET_TOKENS) {
       const spent =

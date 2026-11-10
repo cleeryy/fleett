@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Loader2, Plus, Save } from "lucide-react";
+import { Loader2, Plus, Save, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import { apiErrorMessage, toApiError, type ApiError } from "@/api/errors";
@@ -25,6 +25,15 @@ import {
 import { ErrorAlert } from "@/components/error-alert";
 import { RichText } from "@/components/rich-text";
 import { useI18n } from "@/lib/i18n";
+import {
+  createHeadersFor,
+  isValidHeaderName,
+  isValidModelName,
+  newHeaderRow,
+  patchHeadersFor,
+  providerHeaderNames,
+  type HeaderRow,
+} from "@/lib/providers";
 import { isValidProviderName } from "@/lib/validation";
 
 export const PROVIDER_KIND_OPTIONS = [
@@ -41,6 +50,9 @@ interface Draft {
   baseUrl: string;
   apiKeyEnv: string;
   secret: string;
+  /** Optional default model for every call. */
+  model: string;
+  headers: HeaderRow[];
 }
 
 const EMPTY_DRAFT: Draft = {
@@ -49,12 +61,16 @@ const EMPTY_DRAFT: Draft = {
   baseUrl: "",
   apiKeyEnv: DEFAULT_ENV,
   secret: "",
+  model: "",
+  headers: [],
 };
+
+type Translate = (key: string, params?: Record<string, string | number>) => string;
 
 function validate(
   draft: Draft,
   creating: boolean,
-  t: (key: string, params?: Record<string, string | number>) => string,
+  t: Translate,
 ): Record<string, string> {
   const errors: Record<string, string> = {};
   if (!isValidProviderName(draft.name.trim())) {
@@ -79,7 +95,49 @@ function validate(
   if (creating && !draft.secret.trim()) {
     errors.secret = t("providers.form.secretRequired");
   }
+  const model = draft.model.trim();
+  if (model && !isValidModelName(model)) {
+    errors.model = t("providers.form.modelInvalid");
+  }
   return errors;
+}
+
+interface HeaderIssue {
+  rowId: number;
+  field: "name" | "value";
+  message: string;
+}
+
+/** First broken row of the header editor, so the error lands on the field. */
+function validateHeaders(rows: HeaderRow[], t: Translate): HeaderIssue | null {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const name = row.name.trim();
+    if (!name && !row.value) continue;
+    if (!name) {
+      return { rowId: row.id, field: "name", message: t("providers.form.headerNameRequired") };
+    }
+    if (!isValidHeaderName(name)) {
+      return { rowId: row.id, field: "name", message: t("providers.form.headerNameInvalid") };
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      return {
+        rowId: row.id,
+        field: "name",
+        message: t("providers.form.headerDuplicate", { name }),
+      };
+    }
+    seen.add(key);
+    if (!row.value && !row.stored) {
+      return {
+        rowId: row.id,
+        field: "value",
+        message: t("providers.form.headerValueRequired", { name }),
+      };
+    }
+  }
+  return null;
 }
 
 const FIELD_IDS: Record<string, string> = {
@@ -87,12 +145,17 @@ const FIELD_IDS: Record<string, string> = {
   baseUrl: "provider-base-url",
   apiKeyEnv: "provider-api-key-env",
   secret: "provider-secret",
+  model: "provider-model",
 };
 
 /**
  * One dialog for both create (`provider` absent) and metadata edit. The secret
  * is only collected on create: rotating it is its own action on the detail
  * page, because it restarts every attached instance.
+ *
+ * Extra header values are write-only like the secret: the API returns the
+ * names, so a stored row starts empty and means "keep the encrypted value"
+ * unless it is removed or a new value is typed.
  */
 export function ProviderFormDialog({
   provider,
@@ -108,6 +171,7 @@ export function ProviderFormDialog({
   const { t } = useI18n();
   const editing = provider !== undefined && provider !== null;
   const editingProvider = provider ?? null;
+  const storedNames = editingProvider ? providerHeaderNames(editingProvider) : [];
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [attempted, setAttempted] = useState(false);
   const [pending, setPending] = useState(false);
@@ -124,6 +188,10 @@ export function ProviderFormDialog({
             baseUrl: provider.base_url,
             apiKeyEnv: provider.api_key_env,
             secret: "",
+            model: provider.model ?? "",
+            headers: providerHeaderNames(provider).map((name) =>
+              newHeaderRow({ name, stored: true }),
+            ),
           }
         : EMPTY_DRAFT,
     );
@@ -134,10 +202,35 @@ export function ProviderFormDialog({
   }, [open, provider]);
 
   const errors = validate(draft, !editing, t);
+  const headerIssue = validateHeaders(draft.headers, t);
+  const visibleHeaderIssue = attempted ? headerIssue : null;
 
   function update<K extends keyof Draft>(key: K, value: Draft[K]) {
     setDraft((current) => ({ ...current, [key]: value }));
     if (fieldError?.key === key) setFieldError(null);
+  }
+
+  function patchHeader(id: number, changes: Partial<HeaderRow>) {
+    update(
+      "headers",
+      draft.headers.map((row) => (row.id === id ? { ...row, ...changes } : row)),
+    );
+    if (fieldError?.key === "headers") setFieldError(null);
+  }
+
+  function addHeader() {
+    const row = newHeaderRow();
+    update("headers", [...draft.headers, row]);
+    window.requestAnimationFrame(() =>
+      document.getElementById(`provider-header-${row.id}-name`)?.focus(),
+    );
+  }
+
+  function removeHeader(id: number) {
+    update(
+      "headers",
+      draft.headers.filter((row) => row.id !== id),
+    );
   }
 
   function messageFor(key: string): string | undefined {
@@ -145,18 +238,28 @@ export function ProviderFormDialog({
     return attempted ? errors[key] : undefined;
   }
 
+  function focusInvalid() {
+    if (attempted && headerIssue) {
+      document.getElementById(`provider-header-${headerIssue.rowId}-${headerIssue.field}`)?.focus();
+      return;
+    }
+    const key = Object.keys(errors)[0];
+    if (key) document.getElementById(FIELD_IDS[key] ?? key)?.focus();
+  }
+
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setAttempted(true);
     setError(null);
-    const keys = Object.keys(errors);
-    if (keys.length > 0) {
-      document.getElementById(FIELD_IDS[keys[0]] ?? keys[0])?.focus();
+    if (Object.keys(errors).length > 0 || headerIssue) {
+      focusInvalid();
       return;
     }
 
     setPending(true);
     try {
+      const model = draft.model.trim();
+      const createHeaders = createHeadersFor(draft.headers);
       const body = {
         name: draft.name.trim(),
         kind: draft.kind,
@@ -164,8 +267,19 @@ export function ProviderFormDialog({
         api_key_env: draft.apiKeyEnv.trim(),
       };
       const saved = editingProvider
-        ? (await api.patchProvider(editingProvider.id, body)).provider
-        : await api.createProvider({ ...body, secret: draft.secret });
+        ? (
+            await api.patchProvider(editingProvider.id, {
+              ...body,
+              model: model || null,
+              extra_headers: patchHeadersFor(draft.headers, storedNames),
+            })
+          ).provider
+        : await api.createProvider({
+            ...body,
+            secret: draft.secret,
+            model: model || null,
+            ...(Object.keys(createHeaders).length > 0 ? { extra_headers: createHeaders } : {}),
+          });
       toast.success(
         editing
           ? t("providers.form.saved", { name: saved.name })
@@ -186,6 +300,14 @@ export function ProviderFormDialog({
         window.requestAnimationFrame(() => document.getElementById("provider-api-key-env")?.focus());
       } else if (failure.code === "invalid_secret") {
         setFieldError({ key: "secret", message: apiErrorMessage(failure, t) });
+      } else if (failure.code === "invalid_model") {
+        setFieldError({ key: "model", message: apiErrorMessage(failure, t) });
+        window.requestAnimationFrame(() => document.getElementById("provider-model")?.focus());
+      } else if (failure.code === "invalid_header") {
+        setFieldError({ key: "headers", message: apiErrorMessage(failure, t) });
+        window.requestAnimationFrame(() =>
+          document.querySelector<HTMLInputElement>('[id^="provider-header-"][id$="-name"]')?.focus(),
+        );
       } else {
         setError(failure);
       }
@@ -193,6 +315,10 @@ export function ProviderFormDialog({
       setPending(false);
     }
   }
+
+  const headerMessage =
+    visibleHeaderIssue?.message ??
+    (fieldError?.key === "headers" ? fieldError.message : undefined);
 
   return (
     <Dialog open={open} onOpenChange={pending ? undefined : onOpenChange}>
@@ -330,6 +456,110 @@ export function ProviderFormDialog({
               ) : null}
             </div>
           ) : null}
+
+          <div className="space-y-2">
+            <Label htmlFor="provider-model">{t("providers.form.model")}</Label>
+            <Input
+              id="provider-model"
+              value={draft.model}
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              placeholder="deepseek-v4.1-flash"
+              aria-invalid={!!messageFor("model")}
+              aria-describedby={messageFor("model") ? "provider-model-error" : "provider-model-help"}
+              onChange={(event) => update("model", event.target.value)}
+            />
+            <p id="provider-model-help" className="text-xs text-muted-foreground">
+              <RichText text={t("providers.form.modelHint")} />
+            </p>
+            {messageFor("model") ? (
+              <p id="provider-model-error" className="text-xs text-destructive">
+                {messageFor("model")}
+              </p>
+            ) : null}
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <Label>{t("providers.form.headers")}</Label>
+              <Button type="button" variant="outline" size="sm" onClick={addHeader}>
+                <Plus aria-hidden />
+                {t("providers.form.addHeader")}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              <RichText text={t("providers.form.headersHint")} />
+            </p>
+
+            {draft.headers.length === 0 ? (
+              <p className="rounded-md border border-dashed px-3 py-3 text-xs text-muted-foreground">
+                {t("providers.form.noHeaders")}
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {draft.headers.map((row, index) => {
+                  const rowError =
+                    visibleHeaderIssue?.rowId === row.id ? visibleHeaderIssue.message : undefined;
+                  const name = row.name.trim() || t("providers.form.headerN", { index: index + 1 });
+                  return (
+                    <div key={row.id} className="space-y-1">
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_auto] sm:items-center">
+                        <Input
+                          id={`provider-header-${row.id}-name`}
+                          value={row.name}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className="col-span-2 font-mono text-xs sm:col-span-1"
+                          placeholder="x-opencode-session"
+                          aria-label={t("providers.form.headerNameAria", { name })}
+                          aria-invalid={!!rowError && visibleHeaderIssue?.field === "name"}
+                          onChange={(event) => patchHeader(row.id, { name: event.target.value })}
+                        />
+                        <Input
+                          id={`provider-header-${row.id}-value`}
+                          value={row.value}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className="font-mono text-xs"
+                          placeholder={
+                            row.stored
+                              ? t("providers.form.headerStored")
+                              : t("providers.form.headerValue")
+                          }
+                          aria-label={t("providers.form.headerValueAria", { name })}
+                          aria-invalid={!!rowError && visibleHeaderIssue?.field === "value"}
+                          onChange={(event) => patchHeader(row.id, { value: event.target.value })}
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          className="justify-self-start sm:justify-self-auto"
+                          aria-label={t("providers.form.removeHeader", { name })}
+                          title={t("providers.form.removeHeader", { name })}
+                          onClick={() => removeHeader(row.id)}
+                        >
+                          <Trash2 aria-hidden />
+                        </Button>
+                      </div>
+                      {rowError ? <p className="text-xs text-destructive">{rowError}</p> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {draft.headers.some((row) => row.stored) ? (
+              <p className="text-xs text-muted-foreground">
+                {t("providers.form.headerWriteOnly")}
+              </p>
+            ) : null}
+
+            {headerMessage && !visibleHeaderIssue ? (
+              <p className="text-xs text-destructive">{headerMessage}</p>
+            ) : null}
+          </div>
 
           {error ? <ErrorAlert error={error} /> : null}
 

@@ -9,6 +9,67 @@ import { cn } from "@/lib/utils";
 const EGRESS_COMMAND = "sudo fleett egress install";
 const SECRETS_COMMAND = "sudo fleett secrets init";
 
+interface UpstreamFailure {
+  /** Status returned by the chat call (`details.provider_status`). */
+  providerStatus?: number;
+  /** Status and redacted body of the provider response. */
+  status?: number;
+  body?: string;
+}
+
+/**
+ * `502 assistant_provider_error` carries what the provider answered. Without
+ * it an opaque 502 costs an hour of guessing, so it is surfaced verbatim.
+ */
+function upstreamFailure(details: unknown): UpstreamFailure | null {
+  if (!details || typeof details !== "object") return null;
+  const record = details as Record<string, unknown>;
+  const providerStatus =
+    typeof record.provider_status === "number" ? record.provider_status : undefined;
+  const raw = record.upstream;
+  const upstream = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+  const status = typeof upstream?.status === "number" ? upstream.status : undefined;
+  const body =
+    typeof upstream?.body === "string" && upstream.body.trim() ? upstream.body : undefined;
+  if (providerStatus === undefined && status === undefined && !body) return null;
+  return { providerStatus, status, body };
+}
+
+function UpstreamBlock({ failure }: { failure: UpstreamFailure }) {
+  const { t } = useI18n();
+  const status = failure.status ?? failure.providerStatus;
+  return (
+    <details className="mt-2 rounded-md border border-destructive/30 bg-background/50">
+      <summary className="cursor-pointer px-2.5 py-1.5 text-xs font-medium select-none">
+        {t("errors.upstream.title")}
+        {status !== undefined ? (
+          <span className="ml-1.5 font-mono text-[11px] font-normal text-muted-foreground">
+            HTTP {status}
+          </span>
+        ) : null}
+      </summary>
+      <div className="space-y-1.5 border-t px-2.5 py-2">
+        {failure.status !== undefined ? (
+          <p className="font-mono text-[11px] text-muted-foreground">
+            {t("errors.upstream.status", { status: failure.status })}
+          </p>
+        ) : null}
+        {failure.body ? (
+          <>
+            <p className="text-[11px] text-muted-foreground">{t("errors.upstream.bodyLabel")}</p>
+            <pre className="max-h-56 overflow-auto rounded-sm bg-muted/40 p-2 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap">
+              {failure.body}
+            </pre>
+          </>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">{t("errors.upstream.empty")}</p>
+        )}
+        <p className="text-[11px] text-muted-foreground">{t("errors.upstream.redacted")}</p>
+      </div>
+    </details>
+  );
+}
+
 function FixCommand({ command }: { command: string }) {
   const { t } = useI18n();
   return (
@@ -54,6 +115,8 @@ export function ErrorAlert({
   // The compose stderr is the useful part of a driver failure; keep it verbatim.
   const detail = error.code === "driver_error" ? error.message : null;
   const mono = !egress && !secrets && (docker || message.length > 120);
+  const upstreamDetail =
+    error.code === "assistant_provider_error" ? upstreamFailure(error.details) : null;
 
   const title = upstream
     ? t("errors.title.upstream")
@@ -82,6 +145,8 @@ export function ErrorAlert({
             {detail}
           </p>
         ) : null}
+
+        {upstreamDetail ? <UpstreamBlock failure={upstreamDetail} /> : null}
 
         {egress ? <FixCommand command={EGRESS_COMMAND} /> : null}
         {secrets ? <FixCommand command={SECRETS_COMMAND} /> : null}
