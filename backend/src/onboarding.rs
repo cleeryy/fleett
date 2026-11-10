@@ -8,6 +8,7 @@
 //! The list is derived from the live state, never stored: creating the first
 //! instance marks the tour complete, and deleting the last one brings it back.
 
+use crate::assistant::{self, ProviderReason, ProviderResolution, ProviderSource};
 use crate::config::Config;
 use crate::db::Db;
 use crate::doctor;
@@ -46,7 +47,7 @@ pub enum Action {
     Command { command: String },
 }
 
-/// Evaluate the four steps against the live state.
+/// Evaluate the five steps against the live state.
 ///
 /// Driver and database failures mark the step undone instead of failing the
 /// request: the tour is a hint, and an unreachable engine must not blank the
@@ -70,6 +71,7 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
         tracing::warn!(%err, "onboarding cannot count the instances");
         0
     });
+    let assistant_step = assistant_step(cfg, db);
 
     let steps = vec![
         Step {
@@ -105,6 +107,7 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
                 to: "/providers?new=1".to_string(),
             }),
         },
+        assistant_step,
         Step {
             id: "instance",
             title: "Create your first instance",
@@ -121,6 +124,91 @@ pub async fn report(cfg: &Config, db: &Db, driver: &dyn Driver) -> Onboarding {
     Onboarding {
         complete: instances > 0,
         steps,
+    }
+}
+
+/// The `assistant` step (issues #56, #63).
+///
+/// The panel is useless until a provider answers it, so the tour names the
+/// selection explicitly instead of letting the operator finish with a broken
+/// assistant. `complete` does not depend on it: an instance is the finish line.
+fn assistant_step(cfg: &Config, db: &Db) -> Step {
+    if !cfg.assistant_enabled {
+        return Step {
+            id: "assistant",
+            title: "Select the assistant provider",
+            description: "The assistant is disabled (FLEETT_ASSISTANT=off); no provider is \
+                          needed."
+                .to_string(),
+            done: true,
+            action: None,
+        };
+    }
+    let link = || Action::Link {
+        to: "/providers?assistant=1".to_string(),
+    };
+    match assistant::resolve_provider(cfg, db) {
+        Ok(ProviderResolution::Resolved { provider, source }) => Step {
+            id: "assistant",
+            title: "Select the assistant provider",
+            description: format!(
+                "The console assistant drafts with provider \"{}\" ({}).",
+                provider.name,
+                match source {
+                    ProviderSource::Env => "FLEETT_ASSISTANT_PROVIDER",
+                    ProviderSource::Setting => "selected in the console",
+                    ProviderSource::Auto => "the only provider of the fleet",
+                    ProviderSource::None => "no source",
+                }
+            ),
+            done: true,
+            action: None,
+        },
+        Ok(ProviderResolution::Unresolved { reason }) => Step {
+            id: "assistant",
+            title: "Select the assistant provider",
+            description: match reason {
+                ProviderReason::NoProvider => {
+                    "The assistant needs a provider to answer; create one, then select it for the \
+                     assistant."
+                        .to_string()
+                }
+                ProviderReason::NotSelected => {
+                    "Several providers exist and none is selected for the assistant: choose the \
+                     one it should use."
+                        .to_string()
+                }
+            },
+            done: false,
+            action: Some(match reason {
+                ProviderReason::NoProvider => Action::Link {
+                    to: "/providers?new=1".to_string(),
+                },
+                ProviderReason::NotSelected => link(),
+            }),
+        },
+        Err(assistant::AssistantError::ProviderUnknown { id, .. }) => Step {
+            id: "assistant",
+            title: "Select the assistant provider",
+            description: format!(
+                "The assistant points at provider \"{id}\", which no longer exists: select an \
+                 existing one."
+            ),
+            done: false,
+            action: Some(link()),
+        },
+        Err(err) => {
+            tracing::warn!(%err, "onboarding cannot resolve the assistant provider");
+            Step {
+                id: "assistant",
+                title: "Select the assistant provider",
+                description: "fleett cannot read the assistant configuration; open the providers \
+                              page to check the selection."
+                    .to_string(),
+                done: false,
+                action: Some(link()),
+            }
+        }
     }
 }
 

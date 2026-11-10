@@ -9,13 +9,13 @@ regular routes (`PUT /files/content`, `PUT /instances/{id}/env`, …), so the
 write keeps its ETag check, backup, git commit and audit row.
 
 The whole assistant is server-side; the console only renders the panel, shows
-the context summary and calls the two routes below.
+the context summary and calls the routes below.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLEETT_ASSISTANT` | `on` | `off` removes both routes entirely (`404 route not found`) |
+| `FLEETT_ASSISTANT` | `on` | `off` removes the routes entirely (`404 route not found`) |
 | `FLEETT_ASSISTANT_PROVIDER` | — | id of an existing provider; the assistant borrows its secret and base URL |
 | `FLEETT_ASSISTANT_MODEL` | `deepseek-v4.1-flash` | model sent to the provider |
 | `FLEETT_ASSISTANT_BUDGET_TOKENS` | `50000` | token budget of one session; `0` disables the limit |
@@ -25,33 +25,99 @@ The provider is a **normal provider** created with `POST /api/providers`
 `https://opencode.ai/inference/go/openai/v1` and its encrypted secret. The
 assistant decrypts that secret per request; it never stores one of its own.
 
-`FLEETT_ASSISTANT=off` is a hard switch: the router does not register the two
+`FLEETT_ASSISTANT=off` is a hard switch: the router does not register the
 routes, so they answer the generic `404 not_found` and the console hides the
 panel. Nothing else changes; the provider, if one is configured, keeps serving
 the instances that reference it.
 
-### Without a provider
+## Provider resolution
 
-`GET /api/assistant/config` still answers `200` with `"provider": null`, which
-is what lets the panel render the setup hint instead of an error. The chat
-route answers `409 assistant_not_configured`:
+The assistant needs one provider. It resolves it from three sources, in this
+order, and reports which one won in `provider_source`:
+
+| `provider_source` | When |
+|---|---|
+| `env` | `FLEETT_ASSISTANT_PROVIDER` names an existing provider |
+| `setting` | the console selected one with `PATCH /api/assistant/config` |
+| `auto` | nothing is selected and the fleet holds **exactly one** provider |
+| `none` | nothing applies (see `reason`) |
+
+`auto` never guesses between several credentials: with two or more providers and
+no selection the assistant stays unconfigured until an operator chooses.
+
+When `provider` is `null`, `reason` says which situation the panel is in:
+
+| `reason` | Meaning | What the console shows |
+|---|---|---|
+| `no_provider` | the fleet holds no provider at all | "create a provider" |
+| `not_selected` | providers exist, none is selected | a selector pre-filled with the existing providers |
+
+`reason` is `null` whenever a provider is resolved.
+
+A persisted selection takes effect immediately, without a restart; the env
+variable keeps priority, so a host pinned with `FLEETT_ASSISTANT_PROVIDER`
+ignores the stored value (and says so with `provider_source: "env"`).
+
+### Selecting a provider
+
+```
+PATCH /api/assistant/config        (admin)
+{"provider": "<provider id>"}      selects and persists
+{"provider": null}                 clears the selection
+```
+
+The response is the resolved configuration, identical to `GET
+/api/assistant/config`, so the panel updates in one round trip. An unknown id
+(or a missing `provider` field) is refused with `422`:
 
 ```json
 {
   "error": {
-    "code": "assistant_not_configured",
-    "message": "the assistant has no provider: create one and point FLEETT_ASSISTANT_PROVIDER at its id",
+    "code": "assistant_provider_unknown",
+    "message": "the assistant references provider \"d2b3…\", which no longer exists",
     "details": {
-      "env": "FLEETT_ASSISTANT_PROVIDER",
-      "hint": "create a provider with POST /api/providers, then restart the control plane with FLEETT_ASSISTANT_PROVIDER=<provider id>",
-      "providers": "/api/providers"
+      "provider": "d2b3…",
+      "source": "setting",
+      "valid": ["8f21…", "a4c9…"],
+      "providers": "/api/providers",
+      "hint": "select an existing provider with PATCH /api/assistant/config, or clear FLEETT_ASSISTANT_PROVIDER"
     }
   }
 }
 ```
 
-An id that no longer exists yields the same code and a hint naming it, so a
-deleted provider is never a dead end either.
+### Broken reference
+
+`FLEETT_ASSISTANT_PROVIDER` or the stored setting may name a provider that was
+deleted. `GET /api/assistant/config` and `POST /api/assistant/chat` then answer
+`422 assistant_provider_unknown` with
+`details.valid` (the ids that do exist), never a `500` and never a silent
+`provider: null` — the console must be able to tell "no provider at all" from
+"the configured one is gone". `GET /api/doctor` reports the same state as an
+`error` on its `assistant` check.
+
+### Without a provider
+
+`GET /api/assistant/config` still answers `200` with `"provider": null` and
+`provider_source: "none"`, which is what lets the panel render the right hint
+instead of an error. The chat route answers `409 assistant_not_configured`
+carrying the same `reason`:
+
+```json
+{
+  "error": {
+    "code": "assistant_not_configured",
+    "message": "the assistant has no provider selected and the fleet holds several",
+    "details": {
+      "reason": "not_selected",
+      "env": "FLEETT_ASSISTANT_PROVIDER",
+      "hint": "choose one with PATCH /api/assistant/config {\"provider\":\"<id>\"}; the assistant never guesses between several credentials",
+      "providers": "/api/providers",
+      "configure": "/api/assistant/config"
+    }
+  }
+}
+```
 
 ## API
 
@@ -64,11 +130,16 @@ it the response reports the sum of the live sessions (a restart resets them).
 {
   "enabled": true,
   "provider": {"id": "…", "name": "opencode-go"},
+  "provider_source": "auto",
+  "reason": null,
   "model": "deepseek-v4.1-flash",
   "budget_tokens": 50000,
   "used_tokens": 1200
 }
 ```
+
+`provider_source` and `reason` are documented under
+[Provider resolution](#provider-resolution).
 
 ### `POST /api/assistant/chat`
 

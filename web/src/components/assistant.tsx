@@ -39,6 +39,10 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { AssistantProposalCard, type LoadedProposalFile } from "@/components/assistant-proposal";
+import {
+  AssistantProviderSettings,
+  AssistantSourceLabel,
+} from "@/components/assistant-provider";
 import { ErrorAlert } from "@/components/error-alert";
 import {
   QUICK_TASKS,
@@ -52,6 +56,7 @@ import {
   type QuickTask,
 } from "@/lib/assistant";
 import { apiErrorMessage } from "@/api/errors";
+import { ASSISTANT_CONFIG_EVENT } from "@/lib/events";
 import { formatBytes, formatTokens } from "@/lib/format";
 import { hasTranslation, useI18n } from "@/lib/i18n";
 import { useRoute } from "@/lib/router";
@@ -167,28 +172,49 @@ export function AssistantPanel() {
     }
   }, []);
 
+  /** Persisted selection accepted: adopt the resolved config without a refetch. */
+  const applyConfig = useCallback((value: AssistantConfig) => {
+    setConfig(value);
+    setConfigError(null);
+    setUsedTokens(value.used_tokens);
+    setError(null);
+  }, []);
+
   useEffect(() => {
     void loadConfig();
   }, [loadConfig]);
 
-  // Usage is authoritative on the controller; re-read it when the panel opens.
+  // The Providers page (or another panel) can save the selection first.
   useEffect(() => {
-    if (!open || !config?.enabled) return;
+    function onConfig(event: Event) {
+      const detail = (event as CustomEvent<AssistantConfig>).detail;
+      if (detail) applyConfig(detail);
+    }
+    window.addEventListener(ASSISTANT_CONFIG_EVENT, onConfig);
+    return () => window.removeEventListener(ASSISTANT_CONFIG_EVENT, onConfig);
+  }, [applyConfig]);
+
+  // Usage and the provider resolution are authoritative on the controller:
+  // re-read them when the panel opens, so a selection saved elsewhere shows up.
+  useEffect(() => {
+    if (!open) return;
     let alive = true;
     api
       .assistantConfig()
       .then((value) => {
         if (!alive) return;
         setConfig(value);
+        setConfigError(null);
         setUsedTokens(value.used_tokens);
       })
-      .catch(() => {
-        /* a stale count is harmless */
+      .catch((cause) => {
+        if (!alive) return;
+        setConfigError(toApiError(cause));
       });
     return () => {
       alive = false;
     };
-  }, [open, config?.enabled]);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -226,8 +252,12 @@ export function AssistantPanel() {
   // `FLEETT_ASSISTANT=off` answers 404: nothing is rendered at all.
   const hidden = config ? !config.enabled : configError ? configError.status === 404 : true;
 
-  const noProvider = config !== null && config.provider === null;
-  const notConfigured = noProvider || error?.code === "assistant_not_configured";
+  const providerMissing = config !== null && config.provider === null;
+  const notSelected = providerMissing && config?.reason === "not_selected";
+  const noProvider = providerMissing && !notSelected;
+  /** The saved reference points at a deleted provider: repair before writing. */
+  const repair = configError?.code === "assistant_provider_unknown";
+  const notConfigured = notSelected || noProvider || repair || error?.code === "assistant_not_configured";
   const budgetExceeded = error?.code === "assistant_budget_exceeded";
   const composerDisabled = busy || config === null || notConfigured || budgetExceeded;
 
@@ -300,7 +330,16 @@ export function AssistantPanel() {
       setLastRedaction(reply.redaction);
       setUsedTokens((previous) => previous + reply.usage.total);
     } catch (cause) {
-      setError(toApiError(cause));
+      const failure = toApiError(cause);
+      setError(failure);
+      // The provider can vanish while the panel is open: re-resolve so the
+      // chooser or the repair state replaces the stale header.
+      if (
+        failure.code === "assistant_not_configured" ||
+        failure.code === "assistant_provider_unknown"
+      ) {
+        void loadConfig();
+      }
     } finally {
       setBusy(false);
     }
@@ -324,6 +363,7 @@ export function AssistantPanel() {
   if (hidden) return null;
 
   const providerName = config?.provider?.name ?? t("assistant.noProvider");
+  const providerSource = config?.provider ? config.provider_source : null;
   const model = config?.model?.trim();
   const budget = config?.budget_tokens ?? 0;
   const percent = budget > 0 ? Math.min(100, Math.round((usedTokens / budget) * 100)) : 0;
@@ -348,36 +388,39 @@ export function AssistantPanel() {
             <Badge variant="secondary" className="max-w-40 font-normal">
               <span className="truncate">{providerName}</span>
             </Badge>
+            {providerSource ? <AssistantSourceLabel source={providerSource} /> : null}
           </div>
-          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
-            {model ? (
-              <span className="truncate font-mono">{model}</span>
-            ) : (
-              <span>{t("assistant.noModel")}</span>
-            )}
-            <span aria-hidden>·</span>
-            <span className="flex items-center gap-1.5">
-              <span>
-                {t("assistant.tokenUsage", {
-                  used: formatTokens(usedTokens),
-                  budget: formatTokens(budget),
-                })}
-              </span>
-              <span
-                className="h-1 w-14 overflow-hidden rounded-full bg-muted"
-                role="progressbar"
-                aria-label={t("assistant.budgetAria")}
-                aria-valuemin={0}
-                aria-valuemax={Math.max(budget, 1)}
-                aria-valuenow={Math.min(usedTokens, budget)}
-              >
+          {config ? (
+            <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] text-muted-foreground">
+              {model ? (
+                <span className="truncate font-mono">{model}</span>
+              ) : (
+                <span>{t("assistant.noModel")}</span>
+              )}
+              <span aria-hidden>·</span>
+              <span className="flex items-center gap-1.5">
+                <span>
+                  {t("assistant.tokenUsage", {
+                    used: formatTokens(usedTokens),
+                    budget: formatTokens(budget),
+                  })}
+                </span>
                 <span
-                  className="block h-full rounded-full bg-foreground/30"
-                  style={{ width: `${percent}%` }}
-                />
+                  className="h-1 w-14 overflow-hidden rounded-full bg-muted"
+                  role="progressbar"
+                  aria-label={t("assistant.budgetAria")}
+                  aria-valuemin={0}
+                  aria-valuemax={Math.max(budget, 1)}
+                  aria-valuenow={Math.min(usedTokens, budget)}
+                >
+                  <span
+                    className="block h-full rounded-full bg-foreground/30"
+                    style={{ width: `${percent}%` }}
+                  />
+                </span>
               </span>
-            </span>
-          </p>
+            </p>
+          ) : null}
           <div className="mt-2">
             <Popover>
               <PopoverTrigger asChild>
@@ -460,10 +503,30 @@ export function AssistantPanel() {
     <>
       {configError && configError.status !== 404 ? (
         <div className="shrink-0 px-4 pt-3">
-          <ErrorAlert error={configError} onRetry={() => void loadConfig()} />
+          {repair ? (
+            <AssistantProviderSettings
+              config={config}
+              error={configError}
+              canEdit={canEdit}
+              onResolved={applyConfig}
+              surface="panel"
+            />
+          ) : (
+            <ErrorAlert error={configError} onRetry={() => void loadConfig()} />
+          )}
         </div>
       ) : null}
-      {notConfigured ? (
+      {notSelected ? (
+        <div className="shrink-0 px-4 pt-3">
+          <AssistantProviderSettings
+            config={config}
+            canEdit={canEdit}
+            onResolved={applyConfig}
+            surface="panel"
+          />
+        </div>
+      ) : null}
+      {noProvider ? (
         <div className="shrink-0 px-4 pt-3">
           <Alert className="items-start">
             <Plug aria-hidden className="mt-0.5" />
@@ -471,7 +534,7 @@ export function AssistantPanel() {
             <AlertDescription>
               <p>{t("assistant.noProviderBody")}</p>
               <Button asChild variant="outline" size="sm" className="mt-2">
-                <a href="#/providers" onClick={() => setOpen(false)}>
+                <a href="#/providers?new=1" onClick={() => setOpen(false)}>
                   {t("assistant.openProviders")}
                 </a>
               </Button>
@@ -512,7 +575,7 @@ export function AssistantPanel() {
       className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4"
       aria-live="polite"
     >
-      {turns.length === 0 ? (
+      {turns.length === 0 && !notConfigured ? (
         <div className="space-y-1 py-6 text-center">
           <p className="text-sm font-medium">{t("assistant.emptyTitle")}</p>
           <p className="text-xs text-muted-foreground">{t("assistant.emptyBody")}</p>

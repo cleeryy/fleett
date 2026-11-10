@@ -89,6 +89,26 @@ function Fix({ fix }: { fix: string }) {
   );
 }
 
+/**
+ * A check can carry both a `fix` (copied) and a `link` (opened): the assistant
+ * check has a command for the env var and a page to pick the provider.
+ */
+function CheckLink({ link }: { link: string }) {
+  const { t } = useI18n();
+  const external = isUrl(link);
+  return (
+    <Button asChild variant="outline" size="sm" className="h-8">
+      <a
+        href={external ? link : hrefFor(link)}
+        {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
+      >
+        {external ? <ExternalLink aria-hidden /> : null}
+        {t("health.openLink")}
+      </a>
+    </Button>
+  );
+}
+
 /** Check labels are server copy; map the stable id to translator keys. */
 function checkTitle(
   check: DoctorCheck,
@@ -126,6 +146,11 @@ function CheckRow({ check }: { check: DoctorCheck }) {
         </div>
         <p className="text-sm break-words text-muted-foreground">{check.detail}</p>
         {check.fix ? <Fix fix={check.fix} /> : null}
+        {check.link ? (
+          <div className="mt-1">
+            <CheckLink link={check.link} />
+          </div>
+        ) : null}
       </div>
     </li>
   );

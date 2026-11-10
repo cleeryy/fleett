@@ -131,6 +131,7 @@ import type {
   SnapshotDiff,
   Template,
   TokenInfo,
+  UpdateAssistantConfigInput,
   UpdateMemoryInput,
   UploadResult,
   WriteFileInput,
@@ -1133,6 +1134,12 @@ export const httpApi: FleetApi = {
 
   assistantConfig: () =>
     request<AssistantConfig>("/api/assistant/config", {}, { signalUnauthorized: false }),
+
+  updateAssistantConfig: (input: UpdateAssistantConfigInput) =>
+    request<AssistantConfig>("/api/assistant/config", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
 
   assistantChat: (input: AssistantChatInput) =>
     request<AssistantReply>("/api/assistant/chat", {

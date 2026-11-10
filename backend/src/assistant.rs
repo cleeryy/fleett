@@ -257,12 +257,98 @@ pub struct AssistantProvider {
     pub name: String,
 }
 
-/// `GET /api/assistant/config`.
+/// Where the resolved provider comes from (issue #63).
+///
+/// The priority is `env > setting > auto`: an explicit selection always wins,
+/// and `auto` only fires when the fleet holds exactly one provider (never a
+/// guess between several credentials).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderSource {
+    Env,
+    Setting,
+    Auto,
+    None,
+}
+
+impl ProviderSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Setting => "setting",
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Why no provider is resolved. The console needs the difference: "create a
+/// provider" and "choose one of these" are two different screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReason {
+    /// The fleet holds no provider at all.
+    NoProvider,
+    /// Several providers exist and none is selected: no implicit choice.
+    NotSelected,
+}
+
+impl ProviderReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProvider => "no_provider",
+            Self::NotSelected => "not_selected",
+        }
+    }
+}
+
+/// The provider that answers the assistant, or why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResolution {
+    Resolved {
+        provider: ProviderSpec,
+        source: ProviderSource,
+    },
+    Unresolved {
+        reason: ProviderReason,
+    },
+}
+
+impl ProviderResolution {
+    /// The resolved provider, when there is one.
+    pub fn provider(&self) -> Option<&ProviderSpec> {
+        match self {
+            Self::Resolved { provider, .. } => Some(provider),
+            Self::Unresolved { .. } => None,
+        }
+    }
+
+    pub fn source(&self) -> ProviderSource {
+        match self {
+            Self::Resolved { source, .. } => *source,
+            Self::Unresolved { .. } => ProviderSource::None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<ProviderReason> {
+        match self {
+            Self::Resolved { .. } => None,
+            Self::Unresolved { reason } => Some(*reason),
+        }
+    }
+}
+
+/// `GET` and `PATCH /api/assistant/config`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AssistantConfig {
     pub enabled: bool,
-    /// `null` when `FLEETT_ASSISTANT_PROVIDER` names nothing.
+    /// `null` when no provider is resolved; `reason` then says why.
     pub provider: Option<AssistantProvider>,
+    /// `env`, `setting`, `auto` or `none` (issue #63).
+    pub provider_source: ProviderSource,
+    /// `null` when a provider is resolved, `no_provider` or `not_selected`
+    /// otherwise.
+    pub reason: Option<ProviderReason>,
     pub model: String,
     pub budget_tokens: u64,
     pub used_tokens: u64,
@@ -270,10 +356,15 @@ pub struct AssistantConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssistantError {
-    #[error("assistant is not configured: set FLEETT_ASSISTANT_PROVIDER to a provider id")]
-    NotConfigured,
-    #[error("provider \"{0}\" not found")]
-    ProviderNotFound(String),
+    /// The env variable or the persisted setting names an id that is gone.
+    #[error("the assistant references provider \"{id}\", which no longer exists")]
+    ProviderUnknown {
+        /// Where the stale id comes from (env variable or stored setting).
+        origin: ProviderSource,
+        id: String,
+        /// Ids that do exist, so the console can offer the valid choice.
+        valid: Vec<String>,
+    },
     #[error("the assistant provider answered with HTTP {0}")]
     ProviderStatus(u16),
     #[error("the assistant provider request failed: {0}")]
@@ -844,53 +935,140 @@ pub fn parse_reply(text: &str) -> (String, Option<Proposal>) {
 // Provider resolution
 // ---------------------------------------------------------------------------
 
-/// The provider configured by `FLEETT_ASSISTANT_PROVIDER`, if any.
+/// Setting key that persists the console selection (issue #63).
+pub const PROVIDER_SETTING_KEY: &str = "assistant_provider";
+
+/// Every existing provider id, sorted: the `details.valid` of a broken
+/// reference.
+fn valid_provider_ids(db: &Db) -> Result<Vec<String>, AssistantError> {
+    let mut ids: Vec<String> = db
+        .list_providers()?
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// Resolve the provider that answers the assistant.
 ///
-/// A configured id that no longer exists is reported as `ProviderNotFound`:
-/// the route turns it into the same `409 assistant_not_configured` as an unset
-/// variable, so the console always offers the provider setup hint.
-pub fn configured_provider(cfg: &Config, db: &Db) -> Result<Option<ProviderSpec>, AssistantError> {
-    let Some(id) = cfg.assistant_provider.as_deref().map(str::trim) else {
-        return Ok(None);
-    };
-    if id.is_empty() {
-        return Ok(None);
+/// Priority (issue #63): `FLEETT_ASSISTANT_PROVIDER` > persisted
+/// `assistant_provider` setting > auto when exactly one provider exists. A
+/// reference to a deleted provider is an error carrying the valid ids: it is
+/// never a silent `null`, which the console cannot tell apart from an empty
+/// fleet.
+pub fn resolve_provider(cfg: &Config, db: &Db) -> Result<ProviderResolution, AssistantError> {
+    let env = cfg
+        .assistant_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if let Some(id) = env {
+        return match db.provider(id)? {
+            Some(record) => Ok(ProviderResolution::Resolved {
+                provider: record.spec,
+                source: ProviderSource::Env,
+            }),
+            None => Err(AssistantError::ProviderUnknown {
+                origin: ProviderSource::Env,
+                id: id.to_string(),
+                valid: valid_provider_ids(db)?,
+            }),
+        };
     }
-    match db.provider(id)? {
-        Some(record) => Ok(Some(record.spec)),
-        None => Err(AssistantError::ProviderNotFound(id.to_string())),
+
+    let setting = db
+        .setting(PROVIDER_SETTING_KEY)?
+        .map(|value| value.trim().to_string())
+        .filter(|id| !id.is_empty());
+    if let Some(id) = setting {
+        return match db.provider(&id)? {
+            Some(record) => Ok(ProviderResolution::Resolved {
+                provider: record.spec,
+                source: ProviderSource::Setting,
+            }),
+            None => Err(AssistantError::ProviderUnknown {
+                origin: ProviderSource::Setting,
+                id,
+                valid: valid_provider_ids(db)?,
+            }),
+        };
+    }
+
+    let mut providers = db.list_providers()?;
+    match providers.len() {
+        0 => Ok(ProviderResolution::Unresolved {
+            reason: ProviderReason::NoProvider,
+        }),
+        1 => Ok(ProviderResolution::Resolved {
+            provider: providers.remove(0),
+            source: ProviderSource::Auto,
+        }),
+        _ => Ok(ProviderResolution::Unresolved {
+            reason: ProviderReason::NotSelected,
+        }),
     }
 }
 
-/// Decrypt the secret of the configured provider.
+/// Persist (or clear) the assistant provider setting after validating the id.
+///
+/// The env variable keeps priority at read time; this only records the
+/// operator's choice.
+pub fn set_provider_setting(db: &Db, id: Option<&str>) -> Result<(), AssistantError> {
+    match id {
+        None => {
+            db.clear_setting(PROVIDER_SETTING_KEY)?;
+            Ok(())
+        }
+        Some(id) => {
+            if db.provider(id)?.is_none() {
+                return Err(AssistantError::ProviderUnknown {
+                    origin: ProviderSource::Setting,
+                    id: id.to_string(),
+                    valid: valid_provider_ids(db)?,
+                });
+            }
+            db.set_setting(PROVIDER_SETTING_KEY, id)?;
+            Ok(())
+        }
+    }
+}
+
+/// Decrypt the secret of the resolved provider.
 pub fn provider_secret(
     cfg: &Config,
     db: &Db,
     provider: &ProviderSpec,
+    source: ProviderSource,
 ) -> Result<String, AssistantError> {
-    let record = db
-        .provider(&provider.id)?
-        .ok_or_else(|| AssistantError::ProviderNotFound(provider.id.clone()))?;
+    let record = db.provider(&provider.id)?.ok_or_else(|| {
+        AssistantError::ProviderUnknown {
+            origin: source,
+            id: provider.id.clone(),
+            // The provider disappeared between the resolution and this read.
+            valid: valid_provider_ids(db).unwrap_or_default(),
+        }
+    })?;
     Ok(providers::secret_of(cfg, &record)?)
 }
 
 /// `GET /api/assistant/config` payload.
+///
+/// A broken reference is returned as an error (the route turns it into
+/// `422 assistant_provider_unknown` with `details.valid`): reporting
+/// `provider: null` there would make the panel offer to create a provider the
+/// operator already has.
 pub fn config_payload(
     cfg: &Config,
     db: &Db,
     sessions: &Sessions,
     session_id: Option<&str>,
 ) -> Result<AssistantConfig, AssistantError> {
-    let provider = match configured_provider(cfg, db) {
-        Ok(provider) => provider.map(|spec| AssistantProvider {
-            id: spec.id,
-            name: spec.name,
-        }),
-        // A dangling id is reported as "not configured" in the panel, never as
-        // an error: the panel exists to fix exactly that.
-        Err(AssistantError::ProviderNotFound(_)) => None,
-        Err(err) => return Err(err),
-    };
+    let resolution = resolve_provider(cfg, db)?;
+    let provider = resolution.provider().map(|spec| AssistantProvider {
+        id: spec.id.clone(),
+        name: spec.name.clone(),
+    });
     let used_tokens = match session_id {
         Some(id) => sessions.used(id),
         None => sessions.total(),
@@ -898,6 +1076,8 @@ pub fn config_payload(
     Ok(AssistantConfig {
         enabled: cfg.assistant_enabled,
         provider,
+        provider_source: resolution.source(),
+        reason: resolution.reason(),
         model: cfg.assistant_model.clone(),
         budget_tokens: cfg.assistant_budget_tokens,
         used_tokens,
@@ -907,6 +1087,10 @@ pub fn config_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+    use crate::store;
+
+    const KEY_BYTES: [u8; 32] = [9u8; 32];
 
     fn provider() -> ProviderSpec {
         ProviderSpec {
@@ -918,6 +1102,150 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    fn setup() -> (tempfile::TempDir, Config, Db) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut cfg = Config::for_tests(dir.path().join("root"));
+        store::ensure_layout(&cfg).expect("layout");
+        cfg.secrets_key = Some(crate::secrets::encode_key(&KEY_BYTES));
+        let db = Db::open(&cfg.db_path()).expect("db");
+        (dir, cfg, db)
+    }
+
+    /// Insert one provider without a secret round trip: the resolution only
+    /// reads metadata.
+    fn insert_provider(db: &Db, id: &str) {
+        let mut spec = provider();
+        spec.id = id.to_string();
+        spec.name = id.to_string();
+        db.insert_provider(&spec, &[1u8; 12], &[2u8, 3u8])
+            .expect("insert provider");
+    }
+
+    fn config_of(cfg: &Config, db: &Db) -> AssistantConfig {
+        config_payload(cfg, db, &Sessions::default(), None).expect("config")
+    }
+
+    #[test]
+    fn a_single_provider_is_used_automatically() {
+        let (_dir, cfg, db) = setup();
+        insert_provider(&db, "only");
+        let resolution = resolve_provider(&cfg, &db).expect("resolve");
+        assert_eq!(resolution.source(), ProviderSource::Auto);
+        assert_eq!(resolution.provider().map(|p| p.id.as_str()), Some("only"));
+        let payload = config_of(&cfg, &db);
+        assert_eq!(payload.provider_source, ProviderSource::Auto);
+        assert!(payload.reason.is_none());
+        assert_eq!(
+            payload.provider.as_ref().map(|p| p.id.as_str()),
+            Some("only")
+        );
+    }
+
+    #[test]
+    fn an_empty_fleet_reports_no_provider() {
+        let (_dir, cfg, db) = setup();
+        let payload = config_of(&cfg, &db);
+        assert!(payload.provider.is_none());
+        assert_eq!(payload.provider_source, ProviderSource::None);
+        assert_eq!(payload.reason, Some(ProviderReason::NoProvider));
+        let reason = serde_json::to_value(payload).expect("json")["reason"].clone();
+        assert_eq!(reason, json!("no_provider"));
+    }
+
+    #[test]
+    fn several_providers_without_a_selection_are_not_guessed() {
+        let (_dir, cfg, db) = setup();
+        insert_provider(&db, "a");
+        insert_provider(&db, "b");
+        let payload = config_of(&cfg, &db);
+        assert!(payload.provider.is_none());
+        assert_eq!(payload.provider_source, ProviderSource::None);
+        assert_eq!(payload.reason, Some(ProviderReason::NotSelected));
+    }
+
+    #[test]
+    fn the_env_variable_wins_over_the_setting_and_auto() {
+        let (_dir, mut cfg, db) = setup();
+        insert_provider(&db, "a");
+        insert_provider(&db, "b");
+        cfg.assistant_provider = Some("b".to_string());
+
+        let payload = config_of(&cfg, &db);
+        assert_eq!(payload.provider_source, ProviderSource::Env);
+        assert_eq!(payload.provider.as_ref().map(|p| p.id.as_str()), Some("b"));
+
+        // A broken env reference is never a silent null: it names the source,
+        // the id and the ids that do exist.
+        cfg.assistant_provider = Some("ghost".to_string());
+        match resolve_provider(&cfg, &db) {
+            Err(AssistantError::ProviderUnknown { origin, id, valid }) => {
+                assert_eq!(origin, ProviderSource::Env);
+                assert_eq!(id, "ghost");
+                assert_eq!(valid, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected a broken reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_persisted_setting_resolves_and_can_be_cleared() {
+        let (_dir, cfg, db) = setup();
+        insert_provider(&db, "a");
+        insert_provider(&db, "b");
+
+        set_provider_setting(&db, Some("b")).expect("select");
+        let payload = config_of(&cfg, &db);
+        assert_eq!(payload.provider_source, ProviderSource::Setting);
+        assert_eq!(payload.provider.as_ref().map(|p| p.id.as_str()), Some("b"));
+
+        // The setting survives a new read and is overridden by the env.
+        let mut env = cfg.clone();
+        env.assistant_provider = Some("a".to_string());
+        assert_eq!(config_of(&env, &db).provider_source, ProviderSource::Env);
+
+        set_provider_setting(&db, None).expect("clear");
+        let payload = config_of(&cfg, &db);
+        assert_eq!(payload.reason, Some(ProviderReason::NotSelected));
+
+        // Selecting an unknown id is refused with the valid list.
+        match set_provider_setting(&db, Some("ghost")) {
+            Err(AssistantError::ProviderUnknown { origin, valid, .. }) => {
+                assert_eq!(origin, ProviderSource::Setting);
+                assert_eq!(valid, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(db.setting(PROVIDER_SETTING_KEY).expect("read").is_none());
+    }
+
+    #[test]
+    fn a_deleted_provider_breaks_the_stored_selection() {
+        let (_dir, cfg, db) = setup();
+        insert_provider(&db, "a");
+        insert_provider(&db, "b");
+        set_provider_setting(&db, Some("b")).expect("select");
+        db.delete_provider("b").expect("delete");
+
+        match resolve_provider(&cfg, &db) {
+            Err(AssistantError::ProviderUnknown { origin, id, valid }) => {
+                assert_eq!(origin, ProviderSource::Setting);
+                assert_eq!(id, "b");
+                assert_eq!(valid, vec!["a".to_string()]);
+            }
+            other => panic!("expected a broken reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_config_serialises_the_source_and_the_reason() {
+        let (_dir, cfg, db) = setup();
+        insert_provider(&db, "a");
+        let payload = config_of(&cfg, &db);
+        let json = serde_json::to_string(&payload).expect("json");
+        assert!(json.contains("\"provider_source\":\"auto\""), "{json}");
+        assert!(json.contains("\"reason\":null"), "{json}");
     }
 
     #[test]

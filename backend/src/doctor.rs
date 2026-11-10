@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Ids of every check, in the order the report lists them.
-pub const CHECK_IDS: [&str; 11] = [
+pub const CHECK_IDS: [&str; 12] = [
     "api",
     "docker",
     "image",
@@ -35,11 +35,17 @@ pub const CHECK_IDS: [&str; 11] = [
     "egress",
     "egress-policy",
     "providers",
+    "assistant",
     "instances",
     "permissions",
     "disk",
     "dns",
 ];
+
+/// Link the console opens to fix the assistant provider selection.
+pub const ASSISTANT_LINK: &str = "/providers?assistant=1";
+/// Link the console opens to create the first provider.
+pub const PROVIDERS_NEW_LINK: &str = "/providers?new=1";
 
 /// Free-space percentage below which the disk check warns.
 pub const DISK_WARN_PERCENT: f64 = 10.0;
@@ -90,6 +96,10 @@ pub struct Check {
     /// Exact command (or setting) that fixes an `error`/`warn`, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// Console page that fixes the check in one click, when one exists
+    /// (issue #63: the assistant provider selection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 impl Check {
@@ -105,6 +115,7 @@ impl Check {
             status,
             detail: detail.into(),
             fix: None,
+            link: None,
         }
     }
 
@@ -122,6 +133,11 @@ impl Check {
 
     fn with_fix(mut self, fix: impl Into<String>) -> Self {
         self.fix = Some(fix.into());
+        self
+    }
+
+    fn with_link(mut self, link: impl Into<String>) -> Self {
+        self.link = Some(link.into());
         self
     }
 }
@@ -160,6 +176,7 @@ pub async fn report(
         )
         .await,
         guarded_now("providers", "Providers", check_providers(db)),
+        guarded_now("assistant", "Assistant", check_assistant(cfg, db)),
         guarded_now("instances", "Instances", check_instances(db)),
         check_permissions(cfg, docker_host.as_deref()),
         check_disk(&cfg.root),
@@ -446,6 +463,69 @@ fn check_providers(db: &Db) -> Result<Check, String> {
         "Providers",
         format!("{} configured", count(providers.len(), "provider")),
     ))
+}
+
+/// Assistant provider resolution (issue #63).
+///
+/// `ok` as soon as a provider is resolved from the env, the persisted setting
+/// or the single existing provider; `warn` when one is simply not selected (the
+/// panel then shows the selector); `error` only for a reference to a provider
+/// that no longer exists, which breaks the chat route outright.
+fn check_assistant(cfg: &Config, db: &Db) -> Result<Check, String> {
+    if !cfg.assistant_enabled {
+        return Ok(Check::ok(
+            "assistant",
+            "Assistant",
+            "disabled (FLEETT_ASSISTANT=off); the routes are not registered",
+        ));
+    }
+    match crate::assistant::resolve_provider(cfg, db) {
+        Ok(resolution) => match resolution.provider() {
+            Some(provider) => Ok(Check::ok(
+                "assistant",
+                "Assistant",
+                format!(
+                    "provider \"{}\" resolved from {}",
+                    provider.name,
+                    resolution.source().as_str()
+                ),
+            )),
+            None => match resolution.reason() {
+                Some(crate::assistant::ProviderReason::NoProvider) => Ok(Check::warn(
+                    "assistant",
+                    "Assistant",
+                    "no provider: the fleet holds none, so the assistant cannot answer",
+                )
+                .with_fix("create a provider, then select it for the assistant")
+                .with_link(PROVIDERS_NEW_LINK)),
+                _ => Ok(Check::warn(
+                    "assistant",
+                    "Assistant",
+                    "several providers exist and none is selected for the assistant; it never \
+                     guesses between credentials",
+                )
+                .with_fix("select one: PATCH /api/assistant/config {\"provider\":\"<id>\"}")
+                .with_link(ASSISTANT_LINK)),
+            },
+        },
+        Err(crate::assistant::AssistantError::ProviderUnknown { origin, id, valid }) => {
+            Ok(Check::error(
+                "assistant",
+                "Assistant",
+                format!(
+                    "{} names provider \"{id}\", which no longer exists ({} available)",
+                    match origin {
+                        crate::assistant::ProviderSource::Env => "FLEETT_ASSISTANT_PROVIDER",
+                        _ => "the stored assistant selection",
+                    },
+                    valid.len()
+                ),
+            )
+            .with_fix("select an existing provider, or clear the reference")
+            .with_link(ASSISTANT_LINK))
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn check_instances(db: &Db) -> Result<Check, String> {

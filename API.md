@@ -56,17 +56,20 @@ Read-only diagnostics and first-run state, available to every authenticated role
 
 | Method | Route | Response |
 |---|---|---|
-| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?}]}` — api, docker, image, secrets, egress, egress-policy, providers, instances, permissions, disk, dns |
-| GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, instance; `complete` when at least one instance exists |
+| GET | `/api/doctor` | `{ok, checks:[{id,label,status:"ok\|warn\|error",detail,fix?,link?}]}` — api, docker, image, secrets, egress, egress-policy, providers, assistant, instances, permissions, disk, dns |
+| GET | `/api/onboarding` | `{complete, steps:[{id,title,description,done,action?}]}` — docker, image, provider, assistant, instance; `complete` when at least one instance exists |
 
-`fix` is either a copyable command or a UI link; a failing check is reported inline and never
-turns the response into a 500. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
+`fix` is either a copyable command or a UI link; `link` is the console page that repairs the
+check in one click (today: the assistant provider selection). A failing check is reported
+inline and never turns the response into a 500. See [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
 ## Assistant
 
 A contextual drafting copilot available on every page. It borrows the secret and
-base URL of the provider named by `FLEETT_ASSISTANT_PROVIDER` and never stores a
-credential of its own. The context is redacted server-side before it leaves the
+base URL of the resolved provider and never stores a credential of its own. The
+provider comes from `FLEETT_ASSISTANT_PROVIDER` (highest priority), else the
+selection persisted by `PATCH /api/assistant/config`, else the only provider of
+the fleet when there is exactly one; `provider_source` reports which. The context is redacted server-side before it leaves the
 process: secret environment values, the provider key and known token shapes
 (`sk-…`, `ghp_…`, `xoxb-…`, `Bearer …`, PEM blocks) are withheld or replaced.
 Proposals are applied by the console through the regular file/env routes, so
@@ -76,8 +79,9 @@ Full semantics: [docs/ASSISTANT.md](docs/ASSISTANT.md).
 
 | Method | Route | Body | Response |
 |---|---|---|---|
-| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,model,budget_tokens,used_tokens}`; `provider` is `null` when unset |
-| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured`, `422 invalid_messages`, `429 assistant_budget_exceeded` |
+| GET | `/api/assistant/config?session_id=` | — | `{enabled,provider,provider_source:"env\|setting\|auto\|none",reason:"no_provider\|not_selected"\|null,model,budget_tokens,used_tokens}`; `422 assistant_provider_unknown` with `details.valid` when a reference is dangling |
+| PATCH | `/api/assistant/config` | `{"provider":"<id>"}` or `{"provider":null}` | resolved config (same shape as `GET`), admin only; `422 assistant_provider_unknown` with `details.valid` |
+| POST | `/api/assistant/chat` | `{session_id,context:{page,instance?,path?,selection?,file_content?,schema?},messages:[{role,content}],task?}` | `{message,proposal?,usage,redaction}`; `409 assistant_not_configured` (with `details.reason`), `422 invalid_messages`, `422 assistant_provider_unknown`, `429 assistant_budget_exceeded` |
 
 `task` is `freeform` (default), `skill`, `soul`, `env`, `pipeline`, `fleet_yaml`,
 `explain` or `config`. A proposal is `{kind:"file"|"yaml",path,content}` or

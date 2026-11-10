@@ -9,13 +9,13 @@
 //! console through the regular routes, so the mutation keeps its ETag check,
 //! backup, git commit and audit row.
 
-use crate::api::audit::{record, record_result};
+use crate::api::audit::{record, record_result, require_admin};
 use crate::api::error::ApiError;
 use crate::api::json::ApiJson;
 use crate::api::AppState;
 use crate::assistant::{
-    self, AssistantConfig, AssistantError, ChatRequest, ChatResponse, Usage, MAX_MESSAGES,
-    MAX_MESSAGE_BYTES, MAX_SESSION_ID_CHARS,
+    self, AssistantConfig, AssistantError, ChatRequest, ChatResponse, ProviderReason,
+    ProviderResolution, Usage, MAX_MESSAGES, MAX_MESSAGE_BYTES, MAX_SESSION_ID_CHARS,
 };
 use crate::auth::AuthContext;
 use crate::providers;
@@ -33,31 +33,51 @@ pub struct ConfigQuery {
     pub session_id: Option<String>,
 }
 
-/// `409 assistant_not_configured`, with the provider setup hint.
-fn not_configured() -> ApiError {
-    ApiError::conflict(
-        "assistant_not_configured",
-        "the assistant has no provider: create one and point FLEETT_ASSISTANT_PROVIDER at its id",
-    )
-    .with_details(json!({
-        "env": "FLEETT_ASSISTANT_PROVIDER",
-        "hint": "create a provider with POST /api/providers, then restart the control plane with \
-                 FLEETT_ASSISTANT_PROVIDER=<provider id>",
-        "providers": "/api/providers",
-    }))
+/// Body of `PATCH /api/assistant/config`.
+///
+/// `{"provider": "<id>"}` selects a provider, `{"provider": null}` clears the
+/// selection (the env variable still wins when it is set). A field that is
+/// absent is refused instead of silently doing nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConfigPatch {
+    #[serde(default, deserialize_with = "present_option")]
+    pub provider: Option<Option<String>>,
 }
 
-fn missing_provider(id: &str) -> ApiError {
-    ApiError::conflict(
-        "assistant_not_configured",
-        format!("FLEETT_ASSISTANT_PROVIDER names provider \"{id}\", which does not exist"),
-    )
-    .with_details(json!({
+/// Distinguish an absent field from an explicit `null`.
+///
+/// `Option<Option<String>>` alone cannot: serde maps both to `None`, and the
+/// route could not tell "clear the selection" from "no field". The wrapper
+/// keeps the first layer (present or not) and lets the inner `Option` carry the
+/// `null`.
+fn present_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// `409 assistant_not_configured`, with the reason and the provider setup hint.
+fn not_configured(reason: ProviderReason) -> ApiError {
+    let (message, hint) = match reason {
+        ProviderReason::NoProvider => (
+            "the assistant has no provider: the fleet holds none",
+            "create a provider with POST /api/providers, then restart the control plane with \
+             FLEETT_ASSISTANT_PROVIDER=<provider id> or select it with \
+             PATCH /api/assistant/config",
+        ),
+        ProviderReason::NotSelected => (
+            "the assistant has no provider selected and the fleet holds several",
+            "choose one with PATCH /api/assistant/config {\"provider\":\"<id>\"}; the assistant \
+             never guesses between several credentials",
+        ),
+    };
+    ApiError::conflict("assistant_not_configured", message).with_details(json!({
+        "reason": reason.as_str(),
         "env": "FLEETT_ASSISTANT_PROVIDER",
-        "provider": id,
-        "hint": "create the provider with POST /api/providers or point the variable at an \
-                 existing id, then restart the control plane",
+        "hint": hint,
         "providers": "/api/providers",
+        "configure": "/api/assistant/config",
     }))
 }
 
@@ -65,7 +85,18 @@ fn missing_provider(id: &str) -> ApiError {
 /// `502`: the control plane is fine, the upstream is not.
 fn map_error(err: AssistantError) -> ApiError {
     match err {
-        AssistantError::NotConfigured | AssistantError::ProviderNotFound(_) => not_configured(),
+        AssistantError::ProviderUnknown { origin, id, valid } => ApiError::unprocessable(
+            "assistant_provider_unknown",
+            format!("the assistant references provider \"{id}\", which no longer exists"),
+        )
+        .with_details(json!({
+            "provider": id,
+            "source": origin.as_str(),
+            "valid": valid,
+            "providers": "/api/providers",
+            "hint": "select an existing provider with PATCH /api/assistant/config, or clear \
+                     FLEETT_ASSISTANT_PROVIDER",
+        })),
         AssistantError::ProviderStatus(status) => ApiError::new(
             StatusCode::BAD_GATEWAY,
             "assistant_provider_error",
@@ -190,6 +221,56 @@ pub async fn config(
     Ok(Json(payload))
 }
 
+/// `PATCH /api/assistant/config` — admin only.
+///
+/// Persists the console selection (`settings.assistant_provider`) and returns
+/// the resolved configuration immediately, so the panel flips to the new
+/// provider without a reload. The env variable keeps priority: when it is set,
+/// the response says `provider_source: "env"` even after a successful write.
+pub async fn patch_config(
+    State(state): State<AppState>,
+    Extension(context): Extension<AuthContext>,
+    ApiJson(request): ApiJson<ConfigPatch>,
+) -> Result<Json<AssistantConfig>, ApiError> {
+    require_admin(&context)?;
+
+    let Some(provider) = request.provider else {
+        return Err(ApiError::unprocessable(
+            "invalid_provider",
+            "provider is required: a provider id to select, or null to clear the selection",
+        ));
+    };
+    let provider = match provider {
+        Some(id) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(ApiError::unprocessable(
+                    "invalid_provider",
+                    "provider must be a provider id or null",
+                ));
+            }
+            Some(id.to_string())
+        }
+        None => None,
+    };
+
+    assistant::set_provider_setting(&state.db, provider.as_deref()).map_err(map_error)?;
+
+    let payload = assistant::config_payload(&state.cfg, &state.db, &state.assistant, None)
+        .map_err(map_error)?;
+    record(
+        &state,
+        &context,
+        "assistant.provider",
+        "assistant",
+        Some(json!({
+            "provider": provider,
+            "source": payload.provider_source.as_str(),
+        })),
+    );
+    Ok(Json(payload))
+}
+
 /// `POST /api/assistant/chat`.
 pub async fn chat(
     State(state): State<AppState>,
@@ -206,15 +287,15 @@ pub async fn chat(
         .clone()
         .unwrap_or_else(|| "assistant".to_string());
     let task = request.task.as_str();
-    let model = state.cfg.assistant_model.clone();
 
-    let provider = match assistant::configured_provider(&state.cfg, &state.db) {
-        Ok(Some(provider)) => provider,
-        Ok(None) => return Err(not_configured()),
-        Err(AssistantError::ProviderNotFound(id)) => return Err(missing_provider(&id)),
-        Err(err) => return Err(map_error(err)),
+    let resolution = assistant::resolve_provider(&state.cfg, &state.db).map_err(map_error)?;
+    let (provider, source) = match &resolution {
+        ProviderResolution::Resolved { provider, source } => (provider.clone(), *source),
+        ProviderResolution::Unresolved { reason } => return Err(not_configured(*reason)),
     };
-    let secret = assistant::provider_secret(&state.cfg, &state.db, &provider).map_err(map_error)?;
+    let model = state.cfg.assistant_model.clone();
+    let secret =
+        assistant::provider_secret(&state.cfg, &state.db, &provider, source).map_err(map_error)?;
 
     let (context_text, redaction) = assistant::prepare_context(
         &state.cfg,

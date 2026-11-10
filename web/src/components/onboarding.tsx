@@ -113,9 +113,11 @@ function StepAction({ step, canEdit }: { step: OnboardingStep; canEdit: boolean 
   const label =
     step.id === "provider"
       ? t("providers.form.newTitle")
-      : step.id === "instance"
-        ? t("nav.newInstance")
-        : t("common.open");
+      : step.id === "assistant"
+        ? t("setup.chooseProvider")
+        : step.id === "instance"
+          ? t("nav.newInstance")
+          : t("common.open");
   return (
     <div className="pt-1.5">
       <Button asChild variant="outline" size="sm">
@@ -153,9 +155,12 @@ function stepDescription(
 export function OnboardingSteps({
   report,
   className,
+  showProgress = true,
 }: {
   report: OnboardingReport;
   className?: string;
+  /** False when the caller already rendered its own progress bar. */
+  showProgress?: boolean;
 }) {
   const { t } = useI18n();
   const canEdit = useCanEdit();
@@ -163,7 +168,7 @@ export function OnboardingSteps({
 
   return (
     <div className={cn("space-y-3", className)}>
-      <OnboardingProgress steps={report.steps} />
+      {showProgress ? <OnboardingProgress steps={report.steps} /> : null}
       <ol className="divide-y overflow-hidden rounded-md border">
         {report.steps.map((step, index) => (
           <li
@@ -188,6 +193,9 @@ export function OnboardingSteps({
                 </span>
               </div>
               <p className="text-xs text-muted-foreground">{stepDescription(step, t)}</p>
+              {step.hint ? (
+                <p className="text-xs text-muted-foreground italic">{step.hint}</p>
+              ) : null}
               {!step.done ? <StepAction step={step} canEdit={canEdit} /> : null}
             </div>
           </li>
@@ -433,6 +441,12 @@ export function OnboardingSection({
             instances={instances.data ?? []}
             onOpenDiagnostics={onRunDiagnostics}
           />
+          {report.steps.some((step) => !step.done) ? (
+            <div className="space-y-2 rounded-lg border p-4 sm:p-5">
+              <h3 className="text-sm font-medium">{t("setup.remainingTitle")}</h3>
+              <OnboardingSteps report={report} showProgress={false} />
+            </div>
+          ) : null}
         </div>
       ) : report ? (
         <div className="rounded-lg border p-4 sm:p-5">
