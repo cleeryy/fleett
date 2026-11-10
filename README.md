@@ -33,7 +33,7 @@ The instance you already run is never touched. `fleett` manages the new ones, si
 | **Templates & env** | `guest`, `guest-discord`, `solo`; per-key `secret` flag; encrypted at rest, values never returned; allowlist suggestions. |
 | **Providers** | Share one API credential across agents, test it, rotate once and restart every linked agent with a report. |
 | **Personas** | Reusable `SOUL.md` templates with variables; assign to any agent, track divergence, reapply in one click. |
-| **Skills** | Versioned, read-only skill registry; pin a version per agent or follow `latest`, promote with a rolling restart. |
+| **Skills** | Versioned, read-only registry; pin a version per agent or follow `latest`, promote with a rolling restart. Marketplace search across local and remote indexes with preview, script warnings, provenance and upstream updates. |
 | **MCP marketplace** | Deploy MCP servers from a catalogue as hardened containers, discover their tools, attach them to agents, supervise health and incidents. |
 | **Assistant** | A context-aware panel on every page drafts `SKILL.md`, `SOUL.md`, env allowlists or YAML — with redaction, a token budget and a diff to apply, never a blind write. |
 | **Files** | Browse, edit, upload, download and zip; Markdown preview, coloured YAML/JSON, full-text search, ETag conflicts, backups. |
@@ -60,8 +60,8 @@ release: a `.deb` (systemd unit, UID 10000, secrets key) and the image
 <summary><strong>Debian / Ubuntu</strong></summary>
 
 ```bash
-curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.7.0_amd64.deb
-sudo dpkg -i fleett_0.7.0_amd64.deb
+curl -fsSLO https://github.com/cleeryy/fleett/releases/latest/download/fleett_0.8.0_amd64.deb
+sudo dpkg -i fleett_0.8.0_amd64.deb
 sudoedit /etc/fleett/fleett.env   # set FLEETT_TOKEN
 sudo systemctl enable --now fleett
 ```
@@ -78,7 +78,7 @@ docker run -d --name fleett \
   -e FLEETT_TOKEN=change-me \
   -e FLEETT_DRIVER=compose \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-  ghcr.io/cleeryy/fleett:0.7.0
+  ghcr.io/cleeryy/fleett:0.8.0
 ```
 </details>
 

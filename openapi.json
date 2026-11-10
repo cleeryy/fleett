@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "fleett API",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "description": "Control plane for fleet-managed Hermes agents. Every /api route except GET /api/health, GET /api/auth/config and GET /api/openapi.json requires a bearer token (Authorization: Bearer <token>) or a fleett_session cookie. Mutations require the admin role. Browser-facing /auth/login, /auth/callback and /auth/logout are outside /api and are intentionally omitted from this document. GET /api/openapi.json is authoritative: its info.version is the binary version and a unit test fails the build when a router route is missing from this document (or documented but absent from the router).",
     "license": {
       "name": "Private"

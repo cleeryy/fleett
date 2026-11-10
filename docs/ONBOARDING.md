@@ -23,7 +23,7 @@ network call: the DNS check only reads `/etc/resolv.conf`, so an isolated host s
 {
   "ok": false,
   "checks": [
-    {"id": "api", "label": "API", "status": "ok", "detail": "fleett 0.7.0, up 3m 4s"},
+    {"id": "api", "label": "API", "status": "ok", "detail": "fleett 0.8.0, up 3m 4s"},
     {"id": "image", "label": "Agent image", "status": "error",
      "detail": "image \"hermes-agent:0.22.2-local\" (FLEETT_IMAGE) is not in the local Docker image store",
      "fix": "docker build -t hermes-agent:0.22.2-local /path/to/hermes-official"},
