@@ -1856,6 +1856,11 @@ export interface DoctorCheck {
   detail: string;
   /** Exact command or setting that repairs the check; absent on `ok` lines. */
   fix?: string;
+  /**
+   * Console page that repairs the check (a provider to pick, for instance).
+   * Rendered next to `fix`: one is copied, the other is opened.
+   */
+  link?: string;
 }
 
 /** `GET /api/doctor`: `ok` is false only when a check is an `error`. */
@@ -1875,6 +1880,8 @@ export interface OnboardingStep {
   title: string;
   description: string;
   done: boolean;
+  /** Server copy, shown under the description when the step needs a nuance. */
+  hint?: string;
   /** Absent once the step is done. */
   action?: OnboardingAction;
 }
@@ -1892,16 +1899,50 @@ export interface OnboardingReport {
 /** `GET /api/assistant/config`. `enabled: false` hides the panel entirely. */
 export interface AssistantConfig {
   enabled: boolean;
-  /** Provider the assistant borrows; `null` until an operator selects one. */
+  /**
+   * Provider the assistant borrows; `null` until one is resolved. A `null`
+   * provider is always paired with `reason`, so the console can tell an empty
+   * fleet from a provider that simply was not picked.
+   */
   provider: AssistantProvider | null;
+  /**
+   * Where the resolution came from, highest priority first:
+   * `env` (`FLEETT_ASSISTANT_PROVIDER`), `setting` (saved in the console),
+   * `auto` (the only provider in the fleet) or `none`.
+   */
+  provider_source: AssistantProviderSource;
+  /** Why `provider` is null; `null` when a provider is resolved. */
+  reason: AssistantProviderReason | null;
   model: string;
   budget_tokens: number;
   used_tokens: number;
 }
 
+/** Resolution order: env > persisted setting > auto. */
+export type AssistantProviderSource = "env" | "setting" | "auto" | "none";
+
+/** `not_selected`: providers exist but none is chosen. `no_provider`: there is none. */
+export type AssistantProviderReason = "no_provider" | "not_selected";
+
 export interface AssistantProvider {
   id: string;
   name: string;
+}
+
+/** `PATCH /api/assistant/config` (admin): persisted selection, `null` clears it. */
+export interface UpdateAssistantConfigInput {
+  provider: string | null;
+}
+
+/**
+ * `422 assistant_provider_unknown`: the env var or the saved setting points at
+ * a provider that was deleted. `valid` lists what can be picked instead.
+ */
+export interface AssistantProviderUnknownDetails {
+  /** Ids only, or `{id,name}` pairs; both are accepted when repairing. */
+  valid?: Array<string | { id: string; name?: string }>;
+  /** The reference that no longer resolves. */
+  provider?: string | null;
 }
 
 /** The quick tasks offered above the composer. */
@@ -2250,5 +2291,10 @@ export interface FleetApi {
   /* Assistant */
   /** 404 hides the panel (`FLEETT_ASSISTANT=off`). */
   assistantConfig(): Promise<AssistantConfig>;
+  /**
+   * Admin: persist the provider the assistant borrows, then answer with the
+   * resolved config. `422 assistant_provider_unknown` lists the valid ids.
+   */
+  updateAssistantConfig(input: UpdateAssistantConfigInput): Promise<AssistantConfig>;
   assistantChat(input: AssistantChatInput): Promise<AssistantReply>;
 }

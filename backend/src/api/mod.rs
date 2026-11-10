@@ -517,7 +517,10 @@ fn api_routes(state: AppState) -> Router<AppState> {
     // generic 404 and the console hides the panel.
     let protected = if state.cfg.assistant_enabled {
         protected
-            .route("/assistant/config", get(assistant::config))
+            .route(
+                "/assistant/config",
+                get(assistant::config).patch(assistant::patch_config),
+            )
             .route("/assistant/chat", post(assistant::chat))
     } else {
         protected

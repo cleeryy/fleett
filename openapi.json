@@ -10398,6 +10398,48 @@
             "$ref": "#/components/responses/Unauthorized"
           }
         }
+      },
+      "patch": {
+        "summary": "Select the assistant provider",
+        "description": "Admin only. Persists the console selection and returns the resolved configuration immediately. FLEETT_ASSISTANT_PROVIDER keeps priority: when it is set, provider_source stays \"env\".",
+        "operationId": "patchAssistantConfig",
+        "tags": [
+          "Assistant"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssistantConfigPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantConfig"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          }
+        }
       }
     },
     "/api/assistant/chat": {
@@ -10717,6 +10759,25 @@
           "used_tokens": {
             "type": "integer",
             "format": "int64"
+          },
+          "provider_source": {
+            "type": "string",
+            "enum": [
+              "env",
+              "setting",
+              "auto",
+              "none"
+            ],
+            "description": "Where the provider comes from: env variable, persisted setting, automatic single provider, or none."
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "no_provider",
+              "not_selected"
+            ],
+            "description": "Why no provider is resolved; null when one is."
           }
         },
         "required": [
@@ -11959,7 +12020,7 @@
             "enum": [
               "ok",
               "warn",
-              "fail"
+              "error"
             ]
           },
           "detail": {
@@ -11968,6 +12029,11 @@
           "fix": {
             "type": "string",
             "nullable": true
+          },
+          "link": {
+            "type": "string",
+            "nullable": true,
+            "description": "Console page that fixes the check when the fix is a UI action."
           }
         },
         "required": [
@@ -17937,6 +18003,16 @@
           "rendered",
           "restarted"
         ]
+      },
+      "AssistantConfigPatch": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "nullable": true,
+            "description": "Provider id to select, or null to clear the selection."
+          }
+        }
       }
     }
   }

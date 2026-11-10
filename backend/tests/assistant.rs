@@ -256,6 +256,39 @@ impl Harness {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
+    /// Same as [`Harness::request`] with another credential (a viewer token).
+    async fn request_as(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        let body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = api::router(self.state.clone())
+            .oneshot(builder.body(body).expect("valid request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     async fn chat(&self, body: Value) -> (StatusCode, Value) {
         let (status, body) = self
             .request(Method::POST, "/api/assistant/chat", Some(body))
@@ -294,6 +327,25 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "audit: {body}");
         parse(&body).as_array().expect("audit array").to_vec()
     }
+}
+
+/// Insert one more provider the assistant can resolve.
+fn attach_as(state: &AppState, id: &str, name: &str, base_url: &str) {
+    let sealed = fleett::providers::seal(&state.cfg, PROVIDER_SECRET).expect("seal");
+    let now = now_iso();
+    let spec = ProviderSpec {
+        id: id.to_string(),
+        name: name.to_string(),
+        kind: "openai-compatible".to_string(),
+        base_url: base_url.to_string(),
+        api_key_env: "PROVIDER_API_KEY".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    state
+        .db
+        .insert_provider(&spec, &sealed.nonce, &sealed.ciphertext)
+        .expect("insert provider");
 }
 
 /// Insert the provider row the assistant reads at request time.
@@ -338,6 +390,8 @@ async fn config_reports_the_defaults_and_off_removes_every_route() {
     let config = parse(&body);
     assert_eq!(config["enabled"], true);
     assert!(config["provider"].is_null(), "{config}");
+    assert_eq!(config["provider_source"], "none", "{config}");
+    assert_eq!(config["reason"], "no_provider", "{config}");
     assert_eq!(config["model"], MODEL);
     assert_eq!(config["budget_tokens"], 50_000);
     assert_eq!(config["used_tokens"], 0);
@@ -365,6 +419,202 @@ async fn chat_without_a_provider_answers_the_setup_hint() {
     assert_eq!(error["details"]["env"], "FLEETT_ASSISTANT_PROVIDER");
     assert_eq!(error["details"]["providers"], "/api/providers");
     assert!(harness.provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_console_selects_the_assistant_provider_and_the_env_still_wins() {
+    let harness = Harness::unconfigured();
+
+    // One provider, no selection: auto.
+    attach(&harness.state, &harness.provider.base_url);
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert_eq!(config["provider_source"], "auto", "{config}");
+    assert_eq!(config["provider"]["id"], PROVIDER_ID);
+    assert!(config["reason"].is_null(), "{config}");
+
+    // A second provider makes the choice explicit instead of guessing.
+    attach_as(
+        &harness.state,
+        "second-provider",
+        "second",
+        "https://second.test/v1",
+    );
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert!(config["provider"].is_null(), "{config}");
+    assert_eq!(config["provider_source"], "none");
+    assert_eq!(config["reason"], "not_selected");
+    // The chat route says the same thing, with the actionable hint.
+    let (status, body) = harness
+        .chat(chat_body("select", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "assistant_not_configured");
+    assert_eq!(body["error"]["details"]["reason"], "not_selected");
+    assert_eq!(
+        body["error"]["details"]["configure"],
+        "/api/assistant/config"
+    );
+
+    // A selection persists and applies immediately.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": PROVIDER_ID})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert_eq!(config["provider_source"], "setting", "{config}");
+    assert_eq!(config["provider"]["id"], PROVIDER_ID, "{config}");
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["provider_source"], "setting");
+
+    // The selection really answers: the assistant calls that provider.
+    let (status, body) = harness
+        .chat(chat_body("selected", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.provider.requests().len(), 1);
+
+    // An unknown id is refused with the valid ids, never silently stored.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "ghost"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let refusal = parse(&body);
+    assert_eq!(
+        refusal["error"]["code"], "assistant_provider_unknown",
+        "{body}"
+    );
+    let valid = refusal["error"]["details"]["valid"]
+        .as_array()
+        .expect("valid");
+    assert!(valid.iter().any(|id| id == PROVIDER_ID), "{valid:?}");
+    assert!(
+        !valid.iter().any(|id| id == "ghost"),
+        "the refused id must not be reported as valid: {valid:?}"
+    );
+    // An absent field is refused too.
+    let (status, body) = harness
+        .request(Method::PATCH, "/api/assistant/config", Some(json!({})))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "invalid_provider");
+
+    // `null` clears the selection and the fleet falls back to not_selected.
+    let (status, body) = harness
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert!(config["provider"].is_null(), "{config}");
+    assert_eq!(config["reason"], "not_selected", "{config}");
+
+    // The env variable keeps priority over the persisted setting.
+    let env = Harness::new();
+    attach_as(
+        &env.state,
+        "second-provider",
+        "second",
+        "https://second.test/v1",
+    );
+    let (status, body) = env
+        .request(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": "second-provider"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let config = parse(&body);
+    assert_eq!(config["provider_source"], "env", "{config}");
+    assert_eq!(config["provider"]["id"], PROVIDER_ID, "{config}");
+}
+
+#[tokio::test]
+async fn only_an_admin_selects_the_provider() {
+    let harness = Harness::unconfigured();
+    attach(&harness.state, &harness.provider.base_url);
+    let (status, body) = harness
+        .request(
+            Method::POST,
+            "/api/tokens",
+            Some(json!({"name": "ci", "role": "viewer"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let token = parse(&body)["token"]
+        .as_str()
+        .expect("token once")
+        .to_string();
+
+    let (status, body) = harness
+        .request_as(
+            Method::PATCH,
+            "/api/assistant/config",
+            Some(json!({"provider": PROVIDER_ID})),
+            &token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(parse(&body)["error"]["code"], "forbidden");
+    // A viewer still reads the configuration.
+    let (status, body) = harness
+        .request_as(Method::GET, "/api/assistant/config", None, &token)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["provider_source"], "auto");
+}
+
+#[tokio::test]
+async fn a_dangling_env_reference_is_a_422_with_the_valid_ids() {
+    let harness = Harness::new();
+    harness
+        .state
+        .db
+        .delete_provider(PROVIDER_ID)
+        .expect("delete provider");
+
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let refusal = parse(&body);
+    let error = refusal["error"].clone();
+    assert_eq!(error["code"], "assistant_provider_unknown");
+    assert_eq!(error["details"]["source"], "env");
+    assert_eq!(error["details"]["provider"], PROVIDER_ID);
+    assert_eq!(error["details"]["valid"], json!([]));
+
+    // The chat route refuses instead of pretending the fleet is empty.
+    let (status, body) = harness
+        .chat(chat_body("dangling", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "assistant_provider_unknown");
+    assert!(harness.provider.requests().is_empty());
+    // Never a 500 and never a silent null.
+    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]

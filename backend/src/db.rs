@@ -760,6 +760,16 @@ CREATE INDEX IF NOT EXISTS idx_mcp_incidents_server
 CREATE INDEX IF NOT EXISTS idx_mcp_incidents_status
     ON mcp_incidents (status);
 "#,
+    // v31 — assistant provider selection (issue #63). A small key/value store:
+    // the console persists `assistant_provider` there, and the env variable
+    // stays the priority at read time.
+    r#"
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#,
 ];
 
 /// Schema version this build expects, i.e. the number of applied migrations.
@@ -2344,6 +2354,38 @@ impl Db {
         Ok(rows)
     }
 
+    /// One persisted setting, if present.
+    pub fn setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self.lock();
+        let value = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Create or replace one setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        self.lock().execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value, \
+             updated_at = excluded.updated_at",
+            params![key, value, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one setting. Returns `false` when the key was absent.
+    pub fn clear_setting(&self, key: &str) -> Result<bool, DbError> {
+        let removed = self
+            .lock()
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(removed > 0)
+    }
+
     /// Delete one provider row. Returns `false` when the id is unknown.
     pub fn delete_provider(&self, id: &str) -> Result<bool, DbError> {
         let deleted = self
@@ -3340,7 +3382,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = Db::open(&dir.path().join("fleet.db")).expect("open");
         assert_eq!(db.schema_version().expect("version"), SCHEMA_VERSION as i64);
-        assert_eq!(SCHEMA_VERSION, 30, "MCP marketplace is schema v30");
+        assert_eq!(SCHEMA_VERSION, 31, "settings is schema v31");
         let conn = db.lock();
         for table in [
             "instances",
@@ -3358,6 +3400,7 @@ mod tests {
             "mcp_server_env",
             "instance_mcp_servers",
             "mcp_incidents",
+            "settings",
         ] {
             assert!(table_exists(&conn, table), "missing table {table}");
         }
@@ -3530,6 +3573,31 @@ mod tests {
     }
 
     #[test]
+    fn settings_round_trip_and_are_replaceable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Db::open(&dir.path().join("fleet.db")).expect("open");
+
+        assert!(db.setting("assistant_provider").expect("read").is_none());
+        // An unknown key is simply absent, never an error.
+        assert!(db.setting("never_written").expect("read").is_none());
+        db.set_setting("assistant_provider", "provider-1")
+            .expect("set");
+        assert_eq!(
+            db.setting("assistant_provider").expect("read").as_deref(),
+            Some("provider-1")
+        );
+        db.set_setting("assistant_provider", "provider-2")
+            .expect("replace");
+        assert_eq!(
+            db.setting("assistant_provider").expect("read").as_deref(),
+            Some("provider-2")
+        );
+        assert!(db.clear_setting("assistant_provider").expect("clear"));
+        assert!(!db.clear_setting("assistant_provider").expect("clear again"));
+        assert!(db.setting("assistant_provider").expect("read").is_none());
+    }
+
+    #[test]
     fn a_v0_database_is_migrated_in_place() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("fleet.db");
@@ -3574,6 +3642,7 @@ mod tests {
         assert!(table_exists(&db.lock(), "mcp_server_env"));
         assert!(table_exists(&db.lock(), "instance_mcp_servers"));
         assert!(table_exists(&db.lock(), "mcp_incidents"));
+        assert!(table_exists(&db.lock(), "settings"));
 
         // Re-opening an up-to-date database applies nothing.
         drop(db);

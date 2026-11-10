@@ -13,6 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { AssistantProviderSettings } from "@/components/assistant-provider";
 import { DeleteProviderDialog } from "@/components/provider-delete-dialog";
 import { ProviderFormDialog } from "@/components/provider-form-dialog";
 import { EmptyState } from "@/components/empty-state";
@@ -75,6 +76,52 @@ function ProviderActions({
   );
 }
 
+/**
+ * The assistant borrows one provider. Shown on top of the list because that is
+ * where the "no provider"/"not selected" states send the operator, and because
+ * choosing one is a provider-level decision.
+ */
+function AssistantProviderSection({
+  nonce,
+  canEdit,
+}: {
+  nonce: number;
+  canEdit: boolean;
+}) {
+  const assistant = useResource(() => api.assistantConfig(), [nonce]);
+
+  // `FLEETT_ASSISTANT=off` answers 404: nothing to configure.
+  if (assistant.error?.status === 404) return null;
+  if (assistant.data && !assistant.data.enabled) return null;
+  // A fleet with no provider at all is the empty state below this card: there
+  // is nothing to pick until one exists.
+  if (assistant.data && assistant.data.provider === null && assistant.data.reason === "no_provider") {
+    return null;
+  }
+
+  return (
+    <div className="rounded-lg border p-4 sm:p-5">
+      {assistant.loading && !assistant.data ? (
+        <div className="space-y-2">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-3 w-3/4" />
+          <Skeleton className="h-9 w-full sm:w-72" />
+        </div>
+      ) : assistant.error && assistant.error.code !== "assistant_provider_unknown" ? (
+        <ErrorAlert error={assistant.error} onRetry={assistant.reload} />
+      ) : (
+        <AssistantProviderSettings
+          config={assistant.data}
+          error={assistant.error}
+          canEdit={canEdit}
+          onResolved={(next) => assistant.setData(() => next)}
+          surface="card"
+        />
+      )}
+    </div>
+  );
+}
+
 export function ProvidersPage() {
   const { t, lang } = useI18n();
   const canEdit = useCanEdit();
@@ -98,6 +145,26 @@ export function ProvidersPage() {
 
   const rows = providers.data ?? [];
   const linked = rows.reduce((total, provider) => total + provider.instances_count, 0);
+  const assistantRequested = route.query.get("assistant") === "1";
+
+  // The diagnostics check and the onboarding step link here as `?assistant=1`.
+  // The card renders after its own fetch, so retry briefly until it exists.
+  useEffect(() => {
+    if (!assistantRequested) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      const target = document.getElementById("assistant-provider");
+      if (target) {
+        window.clearInterval(timer);
+        target.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+        return;
+      }
+      if (attempts >= 8) window.clearInterval(timer);
+    }, 200);
+    return () => window.clearInterval(timer);
+  }, [assistantRequested]);
 
   return (
     <>
@@ -125,6 +192,8 @@ export function ProvidersPage() {
       />
 
       {providers.error ? <ErrorAlert error={providers.error} onRetry={providers.reload} /> : null}
+
+      <AssistantProviderSection nonce={nonce} canEdit={canEdit} />
 
       <div className="rounded-md border" aria-busy={providers.loading || providers.refreshing}>
         {providers.loading && !providers.data ? (
