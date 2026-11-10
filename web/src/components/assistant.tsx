@@ -22,6 +22,7 @@ import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
 import type {
   AssistantConfig,
+  AssistantFinishReason,
   AssistantProposal,
   AssistantRedaction,
   AssistantUsage,
@@ -67,6 +68,9 @@ interface StoredTurn {
   content: string;
   proposal?: AssistantProposal;
   usage?: AssistantUsage;
+  /** The reply stopped at the output ceiling (issue #68). */
+  truncated?: boolean;
+  finishReason?: AssistantFinishReason;
 }
 
 interface Conversation {
@@ -151,6 +155,8 @@ export function AssistantPanel() {
   const [pageSel, setPageSel] = useState("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  /** Last user turn, so a readable parse failure can be retried (issue #69). */
+  const lastRequest = useRef<{ text: string; task?: QuickTask } | null>(null);
 
   const page = scope.page ?? pageForPath(route.path);
   const schema = scope.schema ?? schemaForPath(route.path);
@@ -288,6 +294,7 @@ export function AssistantPanel() {
   async function send(text: string, task?: QuickTask): Promise<void> {
     const content = text.trim();
     if (!content || busy) return;
+    lastRequest.current = task ? { text: content, task } : { text: content };
 
     const current = threads[threadKey] ?? newConversation();
     const nextTurns: StoredTurn[] = [...current.turns, { role: "user", content }];
@@ -322,6 +329,8 @@ export function AssistantPanel() {
                 content: reply.message,
                 proposal: reply.proposal,
                 usage: reply.usage,
+                truncated: reply.truncated,
+                finishReason: reply.finish_reason,
               },
             ],
           },
@@ -349,6 +358,12 @@ export function AssistantPanel() {
     void send(taskInstruction(task, scope.errorText), task);
   }
 
+  /** Retry the last user turn after a readable parse failure (issue #69). */
+  function retryLast(): void {
+    const last = lastRequest.current;
+    if (last) void send(last.text, last.task);
+  }
+
   function submit(): void {
     void send(draft);
   }
@@ -362,8 +377,26 @@ export function AssistantPanel() {
 
   if (hidden) return null;
 
-  const providerName = config?.provider?.name ?? t("assistant.noProvider");
   const providerSource = config?.provider ? config.provider_source : null;
+  // The chip must not say "No provider" when one exists but nothing is
+  // selected (#63), nor while the config is still loading.
+  const providerChip = config?.provider ? (
+    <Badge variant="secondary" className="max-w-40 font-normal">
+      <span className="truncate">{config.provider.name}</span>
+    </Badge>
+  ) : notSelected ? (
+    <Badge variant="outline" className="font-normal">
+      {t("assistant.notSelectedChip")}
+    </Badge>
+  ) : repair ? (
+    <Badge variant="outline" className="border-destructive/40 font-normal text-destructive">
+      {t("assistant.repairChip")}
+    </Badge>
+  ) : noProvider ? (
+    <Badge variant="outline" className="font-normal">
+      {t("assistant.noProvider")}
+    </Badge>
+  ) : null;
   const model = config?.model?.trim();
   const budget = config?.budget_tokens ?? 0;
   const percent = budget > 0 ? Math.min(100, Math.round((usedTokens / budget) * 100)) : 0;
@@ -385,9 +418,7 @@ export function AssistantPanel() {
               <Sparkles aria-hidden className="size-4 text-muted-foreground" />
               {t("assistant.title")}
             </h2>
-            <Badge variant="secondary" className="max-w-40 font-normal">
-              <span className="truncate">{providerName}</span>
-            </Badge>
+            {providerChip}
             {providerSource ? <AssistantSourceLabel source={providerSource} /> : null}
           </div>
           {config ? (
@@ -533,11 +564,15 @@ export function AssistantPanel() {
             <AlertTitle>{t("assistant.noProviderTitle")}</AlertTitle>
             <AlertDescription>
               <p>{t("assistant.noProviderBody")}</p>
-              <Button asChild variant="outline" size="sm" className="mt-2">
-                <a href="#/providers?new=1" onClick={() => setOpen(false)}>
-                  {t("assistant.openProviders")}
-                </a>
-              </Button>
+              {canEdit ? (
+                <Button asChild variant="outline" size="sm" className="mt-2">
+                  <a href="#/providers?new=1" onClick={() => setOpen(false)}>
+                    {t("assistant.openProviders")}
+                  </a>
+                </Button>
+              ) : (
+                <p className="mt-2 text-xs">{t("assistant.chooseReadOnly")}</p>
+              )}
             </AlertDescription>
           </Alert>
         </div>
@@ -563,7 +598,10 @@ export function AssistantPanel() {
       ) : null}
       {error && !notConfigured && !budgetExceeded ? (
         <div className="shrink-0 px-4 pt-3">
-          <ErrorAlert error={error} />
+          <ErrorAlert
+            error={error}
+            onRetry={error.code === "assistant_reply_unusable" ? retryLast : undefined}
+          />
         </div>
       ) : null}
     </>
@@ -592,13 +630,32 @@ export function AssistantPanel() {
         ) : (
           <div key={index} className="space-y-2">
             <p className="text-sm break-words whitespace-pre-wrap">{turn.content}</p>
-            {turn.proposal ? (
+            {turn.proposal && !turn.truncated ? (
               <AssistantProposalCard
                 proposal={turn.proposal}
                 instance={scope.instance}
                 canEdit={canEdit}
                 loaded={loadedFile}
               />
+            ) : null}
+            {turn.truncated ? (
+              <Alert className="items-start">
+                <TriangleAlert aria-hidden className="mt-0.5" />
+                <AlertTitle>{t("assistant.truncatedTitle")}</AlertTitle>
+                <AlertDescription>
+                  <p>{t("assistant.truncatedBody")}</p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="mt-2"
+                    disabled={composerDisabled}
+                    onClick={() => void send(t("assistant.continuePrompt"))}
+                  >
+                    {t("assistant.continue")}
+                  </Button>
+                </AlertDescription>
+              </Alert>
             ) : null}
             {turn.usage ? (
               <p className="text-[11px] text-muted-foreground">
@@ -665,11 +722,15 @@ export function AssistantPanel() {
           rows={2}
           aria-label={t("assistant.inputAria")}
           placeholder={
-            notConfigured
-              ? t("assistant.placeholderNoProvider")
-              : budgetExceeded
-                ? t("assistant.placeholderBudget")
-                : t("assistant.placeholder")
+            repair
+              ? t("assistant.placeholderRepair")
+              : notSelected
+                ? t("assistant.placeholderChoose")
+                : notConfigured
+                  ? t("assistant.placeholderNoProvider")
+                  : budgetExceeded
+                    ? t("assistant.placeholderBudget")
+                    : t("assistant.placeholder")
           }
           className="max-h-40 min-h-16 resize-none"
           disabled={composerDisabled}

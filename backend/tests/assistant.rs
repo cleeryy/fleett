@@ -120,12 +120,54 @@ impl MockProvider {
     }
 
     fn answer_with(&self, content: &str, prompt_tokens: u64, completion_tokens: u64) {
+        self.answer_with_finish(content, prompt_tokens, completion_tokens, "stop");
+    }
+
+    /// Answer with an explicit upstream `finish_reason` (`length` simulates a
+    /// reply cut at `max_tokens`, issue #68).
+    fn answer_with_finish(
+        &self,
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        finish_reason: &str,
+    ) {
         let body = json!({
-            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "choices": [{
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+            },
+        });
+        *self.response.lock().expect("response") = (200, body.to_string());
+    }
+
+    /// Answer with reasoning content and its token accounting (deepseek).
+    fn answer_with_reasoning(
+        &self,
+        content: &str,
+        reasoning: &str,
+        reasoning_tokens: u64,
+        finish_reason: &str,
+    ) {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 30,
+                "total_tokens": 40,
+                "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
             },
         });
         *self.response.lock().expect("response") = (200, body.to_string());
@@ -206,6 +248,10 @@ impl Harness {
         Self::build(true, Some(MODEL.to_string()), budget)
     }
 
+    fn with_max_output(cap: u64) -> Self {
+        Self::build_full(true, Some(MODEL.to_string()), 50_000, true, cap)
+    }
+
     fn build(attach_provider: bool, model: Option<String>, budget: u64) -> Self {
         Self::build_with(attach_provider, model, budget, true)
     }
@@ -216,6 +262,22 @@ impl Harness {
         budget: u64,
         enabled: bool,
     ) -> Self {
+        Self::build_full(
+            attach_provider,
+            model,
+            budget,
+            enabled,
+            fleett::assistant::DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+    }
+
+    fn build_full(
+        attach_provider: bool,
+        model: Option<String>,
+        budget: u64,
+        enabled: bool,
+        max_output: u64,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut cfg = Config::for_tests(dir.path().to_path_buf());
         cfg.secrets_key = Some(fleett::secrets::encode_key(&SECRETS_KEY_BYTES));
@@ -223,6 +285,7 @@ impl Harness {
         cfg.assistant_provider = attach_provider.then(|| PROVIDER_ID.to_string());
         cfg.assistant_model = model.unwrap_or_else(|| MODEL.to_string());
         cfg.assistant_budget_tokens = budget;
+        cfg.assistant_max_output_tokens = max_output;
         let mock = Arc::new(MockDriver::new());
         let state = AppState::bootstrap(cfg, mock.clone()).expect("bootstrap state");
         let provider = MockProvider::spawn();
@@ -678,10 +741,14 @@ async fn chat_calls_the_provider_with_the_contract_shape() {
         .as_str()
         .expect("content")
         .contains("name: invoices"));
-    assert_eq!(
-        body["usage"],
-        json!({"prompt": 120, "completion": 80, "total": 200})
-    );
+    assert_eq!(body["truncated"], false);
+    assert_eq!(body["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt"], 120);
+    assert_eq!(body["usage"]["completion"], 80);
+    assert_eq!(body["usage"]["total"], 200);
+    assert_eq!(body["usage"]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["truncated"], false);
+    assert_eq!(body["usage"]["max_tokens"], 4096);
     let sent = body["redaction"]["sent"].as_array().expect("sent");
     assert!(sent.iter().any(|entry| entry == "page: files"), "{sent:?}");
 
@@ -694,7 +761,7 @@ async fn chat_calls_the_provider_with_the_contract_shape() {
     );
     assert_eq!(request.body["model"], MODEL);
     assert_eq!(request.body["temperature"], 0.2);
-    assert_eq!(request.body["max_tokens"], 1200);
+    assert_eq!(request.body["max_tokens"], 4096);
     let messages = request.body["messages"].as_array().expect("messages");
     assert_eq!(messages[0]["role"], "system");
     let system = messages[0]["content"].as_str().expect("system text");
@@ -796,6 +863,7 @@ async fn the_opencode_session_header_is_stable_for_one_conversation() {
         },
         "system",
         &[],
+        Some(4096),
     );
     let session = |call: &fleett::assistant::PreparedCall| {
         call.headers
@@ -817,6 +885,7 @@ async fn the_opencode_session_header_is_stable_for_one_conversation() {
         },
         "system",
         &[],
+        Some(4096),
     );
     assert_eq!(session(&same), session(&call));
     let other = fleett::assistant::prepare_chat(
@@ -829,6 +898,7 @@ async fn the_opencode_session_header_is_stable_for_one_conversation() {
         },
         "system",
         &[],
+        Some(4096),
     );
     assert_ne!(session(&other), session(&call));
 
@@ -847,6 +917,7 @@ async fn the_opencode_session_header_is_stable_for_one_conversation() {
         },
         "system",
         &[],
+        Some(4096),
     );
     assert_eq!(session(&call).as_deref(), Some("fixed-by-operator"));
     assert_eq!(
@@ -1123,6 +1194,149 @@ async fn the_audit_row_carries_the_task_model_and_token_counts_only() {
     assert!(
         !raw.contains("write me a SKILL.md"),
         "the prompt must never be audited: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn the_output_ceiling_comes_from_the_configuration_and_is_bounded_per_request() {
+    let harness = Harness::with_max_output(8192);
+    harness.provider.answer_with("{\"message\":\"ok\"}", 10, 5);
+
+    let (status, body) = harness
+        .chat(chat_body("ceiling", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.provider.last().body["max_tokens"], 8192);
+    assert_eq!(body["usage"]["max_tokens"], 8192);
+
+    // A per-request value is honoured…
+    let mut request = chat_body("ceiling", "freeform", json!({"page": "files"}));
+    request["max_tokens"] = json!(1200);
+    let (status, body) = harness.chat(request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.provider.last().body["max_tokens"], 1200);
+
+    // … but never exceeds the configured ceiling.
+    let mut request = chat_body("ceiling", "freeform", json!({"page": "files"}));
+    request["max_tokens"] = json!(100_000);
+    let (status, body) = harness.chat(request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(harness.provider.last().body["max_tokens"], 8192);
+
+    // A budget smaller than the ceiling is refused before paying for a call.
+    let (status, body) = harness
+        .request(Method::GET, "/api/assistant/config", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(parse(&body)["max_output_tokens"], 8192);
+
+    // `0` omits `max_tokens` and lets the provider decide.
+    let unlimited = Harness::with_max_output(0);
+    unlimited
+        .provider
+        .answer_with("{\"message\":\"ok\"}", 10, 5);
+    let (status, body) = unlimited
+        .chat(chat_body(
+            "provider-decides",
+            "freeform",
+            json!({"page": "files"}),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        unlimited.provider.last().body.get("max_tokens").is_none(),
+        "0 must omit max_tokens"
+    );
+    assert!(body["usage"].get("max_tokens").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn a_length_completion_is_reported_as_truncated_without_a_proposal() {
+    let harness = Harness::new();
+    harness.provider.answer_with_finish(
+        r#"{"message":"The answer was cut in the mid"#,
+        100,
+        4096,
+        "length",
+    );
+    let (status, body) = harness
+        .chat(chat_body("truncated", "soul", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["finish_reason"], "length");
+    assert_eq!(body["usage"]["truncated"], true);
+    assert_eq!(body["usage"]["finish_reason"], "length");
+    assert_eq!(body["message"], "The answer was cut in the mid");
+    assert!(body["proposal"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn a_truncated_proposal_is_refused_with_422_and_never_returned() {
+    let harness = Harness::new();
+    harness.provider.answer_with_finish(
+        r##"{"message":"Here is the file","proposal":{"kind":"file","path":"/SOUL.md","content":"# Soul\nJe n"##,
+        100,
+        4096,
+        "length",
+    );
+    let (status, body) = harness
+        .chat(chat_body("proposal-cut", "soul", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = &body["error"];
+    assert_eq!(error["code"], "assistant_proposal_truncated");
+    assert_eq!(error["details"]["finish_reason"], "length");
+    assert_eq!(
+        error["details"]["env"],
+        "FLEETT_ASSISTANT_MAX_OUTPUT_TOKENS"
+    );
+    assert!(body["proposal"].is_null(), "{body}");
+    assert!(
+        !body.to_string().contains("# Soul"),
+        "the half file must never be echoed: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_reasoning_only_length_completion_gets_a_readable_notice() {
+    let harness = Harness::new();
+    harness
+        .provider
+        .answer_with_reasoning("", "a very long chain of thought", 4095, "length");
+    let (status, body) = harness
+        .chat(chat_body("reasoning", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["usage"]["reasoning"], 4095);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("output token ceiling"),
+        "{body}"
+    );
+    assert!(body["proposal"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn an_unparseable_structured_reply_is_422_never_raw_json() {
+    let harness = Harness::new();
+    harness.provider.answer_with_finish(
+        r#"{"not_the_contract":"value","padding":"xx"}"#,
+        10,
+        5,
+        "stop",
+    );
+    let (status, body) = harness
+        .chat(chat_body("unusable", "freeform", json!({"page": "files"})))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "assistant_reply_unusable");
+    assert!(
+        !body.to_string().contains("not_the_contract"),
+        "the payload must never be echoed: {body}"
     );
 }
 

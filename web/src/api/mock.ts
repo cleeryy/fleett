@@ -4987,12 +4987,11 @@ function assistantDoctorCheck(providerCount: number): DoctorCheck {
       resolution?.reason === "not_selected"
         ? "providers exist but none is selected for the assistant; drafts are refused"
         : "no provider configured; the assistant cannot answer",
-    fix: providerCount > 0 ? "fleett assistant use <provider-id>" : undefined,
     link: providerCount > 0 ? "/providers?assistant=1" : "/providers?new=1",
   };
 }
 
-/** `GET /api/doctor`: the eleven checks, shaped by the selected demo scenario. */
+/** `GET /api/doctor`: the twelve checks, shaped by the selected demo scenario. */
 function mockDoctorReport(): DoctorReport {
   const mode = mockConfig.doctor;
   const bare = mockConfig.onboarding === "empty";
@@ -9547,6 +9546,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
         model: "",
         budget_tokens: 0,
         used_tokens: 0,
+        max_output_tokens: 0,
       };
     }
     const resolved = resolveAssistantProvider();
@@ -9561,6 +9561,7 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
       budget_tokens: ASSISTANT_BUDGET_TOKENS,
       used_tokens:
         mockConfig.assistant === "exhausted" ? ASSISTANT_BUDGET_TOKENS : assistantSpentTokens,
+      max_output_tokens: 4096,
     };
   },
 
@@ -9620,7 +9621,14 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     const prompt =
       620 + Math.ceil(byteLength(JSON.stringify(input.context)) / 4) + input.messages.length * 60;
     const completion = 380 + (input.task === "write_skill" ? 320 : 0);
-    const usage = { prompt, completion, total: prompt + completion };
+    const usage = {
+      prompt,
+      completion,
+      total: prompt + completion,
+      finish_reason: "stop" as const,
+      truncated: false,
+      max_tokens: 4096,
+    };
     assistantSpentTokens += usage.total;
 
     const answer = assistantAnswer(input);
@@ -9633,6 +9641,8 @@ export const mockApi: FleetApi = {  async health(): Promise<Health> {
     return {
       message: answer.message,
       ...(answer.proposal ? { proposal: answer.proposal } : {}),
+      truncated: false,
+      finish_reason: "stop" as const,
       usage,
       redaction: assistantRedaction(input),
     };

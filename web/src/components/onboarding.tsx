@@ -114,7 +114,9 @@ function StepAction({ step, canEdit }: { step: OnboardingStep; canEdit: boolean 
     step.id === "provider"
       ? t("providers.form.newTitle")
       : step.id === "assistant"
-        ? t("setup.chooseProvider")
+        ? action.to.includes("new=1")
+          ? t("providers.form.newTitle")
+          : t("setup.chooseProvider")
         : step.id === "instance"
           ? t("nav.newInstance")
           : t("common.open");
