@@ -2,7 +2,7 @@
   <img src="web/public/favicon.svg" width="64" height="64" alt="">
   <h1>fleett</h1>
   <p><strong>A small control plane for fleets of Hermes agents.</strong><br>
-  Create, configure, inspect and upgrade each agent in its own Docker container —
+  Create, configure, inspect and upgrade each agent in its own Docker container,
   without ever touching the one you already run.</p>
 
   <p>
