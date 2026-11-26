@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./app";
 import { I18nProvider } from "@/lib/i18n";
+import { UiModeProvider } from "@/lib/mode";
 
 const container = document.getElementById("root");
 if (!container) throw new Error("Missing #root element");
@@ -10,7 +11,9 @@ if (!container) throw new Error("Missing #root element");
 createRoot(container).render(
   <StrictMode>
     <I18nProvider>
-      <App />
+      <UiModeProvider>
+        <App />
+      </UiModeProvider>
     </I18nProvider>
   </StrictMode>,
 );
