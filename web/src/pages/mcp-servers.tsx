@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  ArrowLeft,
   KeyRound,
   Plus,
   RefreshCw,
@@ -281,6 +282,12 @@ export function McpServersPage() {
         }
         actions={
           <>
+            <Button asChild variant="ghost" size="sm">
+              <a href={hrefFor("/library")}>
+                <ArrowLeft aria-hidden />
+                {t("library.backToLibrary")}
+              </a>
+            </Button>
             <Button
               variant="outline"
               size="sm"
