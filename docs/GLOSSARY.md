@@ -10,7 +10,7 @@ vocabulary: renaming them would make the product harder to operate, not easier.
 |---|---|---|
 | Agent | Agent | instance, conteneur, projet compose |
 | Fournisseur de modèles | Model provider | provider, base URL, clé d'API |
-| Personnalité | Persona | persona, `SOUL.md`, variables `{{clé}}` |
+| Personnalité | Personality | persona, `SOUL.md`, variables `{{clé}}` |
 | Compétence | Skill | skill, `SKILL.md`, script de compétence |
 | Connecteur | Connector | canal, `channel`, jeton de bot |
 | Dossier partagé | Shared folder | share, volume, montage |

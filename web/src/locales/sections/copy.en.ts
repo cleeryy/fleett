@@ -41,8 +41,8 @@ export const copyEn: Record<string, string> = {
   "checklist.step.test.description": "Send a message and check the reply.",
   "checklist.step.test.action": "Test the agent",
   "checklist.step.personalize.title": "Personalize",
-  "checklist.step.personalize.description": "Attach a persona or a skill.",
-  "checklist.step.personalize.action": "Browse personas",
+  "checklist.step.personalize.description": "Attach a personality or a skill.",
+  "checklist.step.personalize.action": "Browse personalities",
 
   // ── Empty states ──────────────────────────────────────────────────────
   "fleet.emptyCreateAction": "Create an agent",
@@ -50,7 +50,7 @@ export const copyEn: Record<string, string> = {
   // ── Glossary (docs/GLOSSARY.md keeps the FR/EN table) ─────────────────
   "glossary.agent": "Agent",
   "glossary.provider": "Model provider",
-  "glossary.persona": "Persona",
+  "glossary.persona": "Personality",
   "glossary.skill": "Skill",
   "glossary.connector": "Connector",
   "glossary.share": "Shared folder",
