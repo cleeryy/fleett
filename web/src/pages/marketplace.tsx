@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
+  ArrowLeft,
   ArrowUpCircle,
   CloudDownload,
   Eye,
@@ -217,6 +218,12 @@ export function MarketplacePage() {
         }
         actions={
           <>
+            <Button asChild variant="ghost" size="sm">
+              <a href={hrefFor("/library")}>
+                <ArrowLeft aria-hidden />
+                {t("library.backToLibrary")}
+              </a>
+            </Button>
             <Button variant="outline" size="sm" onClick={refresh} disabled={search.refreshing}>
               <RefreshCw
                 aria-hidden
