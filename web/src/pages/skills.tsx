@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ArrowUpCircle, FileArchive, Plus, RefreshCw, Sparkles, Users } from "lucide-react";
+import { ArrowLeft, ArrowUpCircle, FileArchive, Plus, RefreshCw, Sparkles, Users } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import type { MarketplaceUpdateInfo, SkillSummary } from "@/api/types";
@@ -135,6 +135,12 @@ export function SkillsPage() {
         description={skillSummaryText(rows, skills.data !== null, t)}
         actions={
           <>
+            <Button asChild variant="ghost" size="sm">
+              <a href={hrefFor("/library")}>
+                <ArrowLeft aria-hidden />
+                {t("library.backToLibrary")}
+              </a>
+            </Button>
             <Button
               variant="outline"
               size="sm"
