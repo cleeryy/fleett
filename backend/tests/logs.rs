@@ -309,10 +309,17 @@ async fn filters_and_validation_are_enforced() {
 async fn tick_tails_the_mock_driver_and_deduplicates() {
     let harness = Harness::new();
     harness.create_instance("alice").await;
+    // Fresh timestamps: the first tick also runs the retention pass, and a
+    // fixture older than `FLEETT_LOG_RETENTION` would be purged right after
+    // ingestion, making the second tick insert the same lines again.
+    let now = chrono::Utc::now();
+    let first_at =
+        (now - chrono::Duration::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let second_at =
+        (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     harness.mock.set_logs(
         "alice",
-        "2026-11-09T10:00:00Z ERROR tick-one\n\
-         2026-11-09T10:00:01Z WARN tick-two\n",
+        format!("{first_at} ERROR tick-one\n{second_at} WARN tick-two\n"),
     );
 
     let first = logstore::tick(&harness.state).await;
