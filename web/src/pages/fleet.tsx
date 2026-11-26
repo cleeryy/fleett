@@ -21,7 +21,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
-import type { InstanceDetail, InstanceSummary } from "@/api/types";
+import type { InstanceDetail, InstanceSummary, Message } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -54,10 +54,9 @@ import { DoctorDialog } from "@/components/doctor";
 import { EgressBadge } from "@/components/egress-badge";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
-import {
-  FleetOnboardingCard,
-  OnboardingCompleteCard,
-} from "@/components/onboarding";
+import { FirstAgentChecklist, type FirstAgentStep } from "@/components/first-agent-checklist";
+import { OnboardingCompleteCard } from "@/components/onboarding";
+import { OnboardingQuestionnaire } from "@/components/onboarding-questionnaire";
 import { PageHeader } from "@/components/page-header";
 import { StatusBadge } from "@/components/status-badge";
 import { INSTANCES_CHANGED_EVENT } from "@/lib/events";
@@ -220,8 +219,6 @@ export function FleetPage() {
 
   const setupPending = onboarding.data !== null && !onboarding.data.complete;
   const setupComplete = onboarding.data?.complete === true;
-  const setupDone = onboarding.data?.steps.filter((step) => step.done).length ?? 0;
-  const setupTotal = onboarding.data?.steps.length ?? 0;
 
   // Remember this browser saw an unfinished host, so the one-time success
   // banner is only shown to the operator who actually went through the tour.
@@ -235,13 +232,57 @@ export function FleetPage() {
     return sorted.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null;
   }, [list.data]);
 
-  const showOnboardingCard = setupPending && !onboardingMemory.dismissed;
+  // One message involving the first agent is enough to know it answered (#75).
+  const messages = useResource<Message[]>(
+    async () => (firstInstance ? api.listMessages({ instance: firstInstance.id, limit: 1 }) : []),
+    [nonce, firstInstance?.id],
+  );
+
+  /**
+   * Four first-agent steps, each derived from live controller data (issue #75)
+   * — never from a manual checkbox. A step whose data source is unavailable
+   * stays "to do", with the action that would repair or confirm it.
+   */
+  const checklistSteps = useMemo<FirstAgentStep[]>(() => {
+    const rows = list.data ?? [];
+    const createHref = hrefFor("/instances/new");
+    const tabHref = (tab: string) =>
+      firstInstance
+        ? hrefFor(`/instances/${encodeURIComponent(firstInstance.id)}?tab=${tab}`)
+        : createHref;
+    return [
+      { id: "create", done: rows.length > 0, href: createHref },
+      {
+        id: "connect",
+        // `none` is the template default: the agent exists but no chat connector.
+        done: rows.some((row) => row.channel !== "" && row.channel !== "none"),
+        href: tabHref("configuration"),
+      },
+      {
+        id: "test",
+        // A stored message is the durable proof that a provider and a
+        // connector both worked; a one-off test result is not persisted.
+        done: (messages.data?.length ?? 0) > 0,
+        href: tabHref("messages"),
+      },
+      {
+        id: "personalize",
+        done: rows.some((row) => Boolean(row.persona) || (row.skills?.length ?? 0) > 0),
+        href: rows.length > 0 ? hrefFor("/personas") : createHref,
+      },
+    ];
+  }, [list.data, messages.data, firstInstance]);
+  const checklistComplete = checklistSteps.every((step) => step.done);
+  // Viewers cannot create or configure an agent: the checklist would be a dead
+  // end, so the read-only empty state carries the message for them.
+  const showChecklist =
+    canEdit && list.data !== null && !checklistComplete && !onboardingMemory.dismissed;
+
   const showSetupSuccess =
     setupComplete &&
     onboardingMemory.seen &&
     firstInstance !== null &&
     onboardingMemory.celebrated !== firstInstance.id;
-  const setupDismissed = setupPending && onboardingMemory.dismissed;
 
   function dismissOnboarding() {
     setOnboardingMemory(writeOnboardingMemory({ dismissed: true }));
@@ -368,25 +409,19 @@ export function FleetPage() {
     <EmptyState
       icon={Boxes}
       title={t("fleet.emptyTitle")}
-      description={
-        setupPending
-          ? t("fleet.emptySetup", { done: setupDone, total: setupTotal })
-          : canEdit
-            ? t("fleet.emptyCreate")
-            : t("fleet.emptyReadOnly")
-      }
+      description={canEdit ? t("fleet.emptyCreate") : t("fleet.emptyReadOnly")}
       action={
-        canEdit || setupDismissed ? (
+        canEdit || onboardingMemory.dismissed ? (
           <div className="flex flex-wrap items-center justify-center gap-2">
             {canEdit ? (
               <Button asChild>
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  {t("nav.newInstance")}
+                  {t("fleet.emptyCreateAction")}
                 </a>
               </Button>
             ) : null}
-            {setupDismissed ? (
+            {onboardingMemory.dismissed ? (
               <Button variant="outline" onClick={showOnboardingAgain}>
                 {t("fleet.showGettingStarted")}
               </Button>
@@ -417,7 +452,7 @@ export function FleetPage() {
   return (
     <>
       <PageHeader
-        title={t("nav.instances")}
+        title={t("nav.agents")}
         description={
           list.data
             ? `${t(
@@ -436,7 +471,7 @@ export function FleetPage() {
               <Button asChild size="sm">
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  {t("nav.newInstance")}
+                  {t("nav.newAgent")}
                 </a>
               </Button>
             ) : null}
@@ -444,12 +479,8 @@ export function FleetPage() {
         }
       />
 
-      {showOnboardingCard && onboarding.data ? (
-        <FleetOnboardingCard
-          report={onboarding.data}
-          onDismiss={dismissOnboarding}
-          onOpenDoctor={() => setDoctorOpen(true)}
-        />
+      {showChecklist ? (
+        <FirstAgentChecklist steps={checklistSteps} onDismiss={dismissOnboarding} />
       ) : null}
 
       {showSetupSuccess ? (
@@ -813,6 +844,11 @@ export function FleetPage() {
       />
 
       <DoctorDialog open={doctorOpen} onOpenChange={setDoctorOpen} />
+
+      <OnboardingQuestionnaire
+        open={onboardingMemory.answers === null}
+        onAnswered={(answers) => setOnboardingMemory(writeOnboardingMemory({ answers }))}
+      />
     </>
   );
 }

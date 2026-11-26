@@ -57,6 +57,12 @@ export function TemplatesPage() {
             icon={LayoutTemplate}
             title={t("templates.emptyTitle")}
             description={t("templates.emptyDescription")}
+            action={
+              <Button variant="outline" size="sm" onClick={templates.reload}>
+                <RefreshCw aria-hidden className={templates.refreshing ? "animate-spin" : undefined} />
+                {t("common.refresh")}
+              </Button>
+            }
           />
         ) : (
           <>

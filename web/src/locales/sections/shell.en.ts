@@ -1,0 +1,96 @@
+/** Shell copy: navigation, mode switch, hubs, page titles. */
+export const shellEn: Record<string, string> = {
+  // ── Navigation: the four spaces and the advanced groups ──────────────
+  "nav.agents": "Agents",
+  "nav.library": "Library",
+  "nav.activity": "Activity",
+  "nav.settings": "Settings",
+  "nav.newAgent": "New agent",
+  "nav.advancedTools": "Advanced tools",
+  "nav.groupAutomate": "Automate",
+  "nav.groupAutomateHint": "Multi-step automations, on a schedule or on demand.",
+  "nav.groupData": "Data",
+  "nav.groupDataHint": "Messages, memory, shared folders and cost.",
+  "nav.groupSystem": "System",
+  "nav.groupSystemHint": "Deployments, model providers, security and access.",
+
+  // ── Simple / Advanced switch ─────────────────────────────────────────
+  "shell.mode": "Console mode",
+  "shell.modeSimple": "Simple",
+  "shell.modeAdvanced": "Advanced",
+  "shell.modeSimpleHint": "Four spaces and plain-language labels.",
+  "shell.modeAdvancedHint": "Adds automation, data and system tools.",
+  "shell.modeSimpleOn": "Simple mode on. The console shows the four spaces again.",
+  "shell.modeAdvancedOn":
+    "Advanced mode on. Automation, data and system tools are now in the sidebar.",
+
+  // ── Réglages hub ─────────────────────────────────────────────────────
+  "shell.settings.description":
+    "One place for the accounts, credentials and checks that keep the agents running.",
+  "shell.settings.preferences": "Preferences",
+  "shell.settings.preferencesHint": "These choices stay in this browser.",
+  "shell.settings.mode": "Console mode",
+  "shell.settings.modeHint":
+    "Simple keeps four spaces. Advanced adds the technical tools without removing anything.",
+  "shell.settings.language": "Language",
+  "shell.settings.languageHint":
+    "Changes the interface copy only. Logs and technical values stay unchanged.",
+  "shell.settings.sections": "Sections",
+  "shell.settings.sectionsHint": "Each section opens its own page; nothing is configured twice here.",
+  "shell.settings.providers": "Model providers",
+  "shell.settings.providersDescription": "The services behind your agents, and the keys they use.",
+  "shell.settings.security": "Security",
+  "shell.settings.securityDescription": "Sign-in limits, lockout and response headers.",
+  "shell.settings.tokens": "Access tokens",
+  "shell.settings.tokensDescription": "Credentials for scripts, the CLI and integrations.",
+  "shell.settings.audit": "Audit log",
+  "shell.settings.auditDescription": "Who changed what, with the time and the target.",
+  "shell.settings.setup": "Installation",
+  "shell.settings.setupDescription": "Host checks and the first-run checklist.",
+  "shell.settings.viewerNote": "Security, access tokens and audit are reserved for administrators.",
+
+  // ── Activité hub ─────────────────────────────────────────────────────
+  "shell.activity.description":
+    "What just happened: open incidents, the latest log lines and recent deployments.",
+  "shell.activity.incidentsTitle": "Open incidents",
+  "shell.activity.incidentsHint": "Agents that need attention right now.",
+  "shell.activity.incidentsEmptyTitle": "No open incident",
+  "shell.activity.incidentsEmptyDescription": "Every agent is running normally.",
+  "shell.activity.incidentsEmptyAction": "Open the agents",
+  "shell.activity.incidentsViewAll": "All incidents",
+  "shell.activity.openOne": "{count} open incident",
+  "shell.activity.openMany": "{count} open incidents",
+  "shell.activity.logsTitle": "Recent logs",
+  "shell.activity.logsHint": "The last lines received, across all agents.",
+  "shell.activity.logsEmptyTitle": "No line in the last 24 hours",
+  "shell.activity.logsEmptyDescription": "Lines appear here as soon as an agent writes one.",
+  "shell.activity.logsEmptyAction": "Open the logs",
+  "shell.activity.logsViewAll": "All logs",
+  "shell.activity.level.info": "info",
+  "shell.activity.level.warn": "warning",
+  "shell.activity.level.error": "error",
+  "shell.activity.deploymentsTitle": "Recent deployments",
+  "shell.activity.deploymentsHint": "Image rollouts across the fleet.",
+  "shell.activity.deploymentsEmptyTitle": "No deployment yet",
+  "shell.activity.deploymentsEmptyDescription": "A rollout shows up here as soon as one starts.",
+  "shell.activity.deploymentsEmptyAction": "Open deployments",
+  "shell.activity.deploymentsViewAll": "All deployments",
+  "shell.activity.agentOne": "{count} agent",
+  "shell.activity.agentMany": "{count} agents",
+  "shell.activity.notStarted": "not started",
+
+  // ── Bibliothèque hub ─────────────────────────────────────────────────
+  "shell.library.description":
+    "Everything you can add to an agent: a starting point, a personality, a skill or a connector.",
+  "shell.library.templates": "Agent templates",
+  "shell.library.templatesDescription": "A starting point for a new agent.",
+  "shell.library.personas": "Personalities",
+  "shell.library.personasDescription": "Who the agent is, how it speaks and what it refuses.",
+  "shell.library.skills": "Skills",
+  "shell.library.skillsDescription": "What the agent knows how to do.",
+  "shell.library.connectors": "Connectors",
+  "shell.library.connectorsDescription": "The tools and services the agent can reach.",
+  "shell.library.marketplace": "Marketplace",
+  "shell.library.marketplaceDescription": "Ready-made content, with its source and version.",
+  "shell.library.note": "Pick what to add; each page keeps every available setting.",
+};

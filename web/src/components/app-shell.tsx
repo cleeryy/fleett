@@ -1,32 +1,5 @@
-import { useState, type ReactNode } from "react";
-import {
-  Boxes,
-  Brain,
-  CalendarClock,
-  CircleDollarSign,
-  FileClock,
-  Fingerprint,
-  FolderTree,
-  KeyRound,
-  LayoutTemplate,
-  ListChecks,
-  LogOut,
-  Menu,
-  MessagesSquare,
-  Moon,
-  Plug,
-  Rocket,
-  ScrollText,
-  Search,
-  Server,
-  ShieldCheck,
-  Sparkles,
-  Store,
-  Sun,
-  TriangleAlert,
-  Workflow,
-  type LucideIcon,
-} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Boxes, LogOut, Menu, Moon, Search, Sun } from "lucide-react";
 import type { Health, Identity } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,71 +13,53 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import { LanguageToggle } from "@/components/language-toggle";
+import { ModeToggle } from "@/components/mode-toggle";
+import { NavGroup, NavLink } from "@/components/nav-group";
 import { useI18n } from "@/lib/i18n";
+import { useUiMode } from "@/lib/mode";
+import {
+  activeLeaf,
+  groupOf,
+  NAV_GROUPS,
+  NAV_SPACES,
+  navSelection,
+  type Crumb,
+  type GroupKey,
+} from "@/lib/navigation";
 import { identityLabel } from "@/lib/session";
 import { COMMAND_KEY_ARIA, COMMAND_KEY_LABEL } from "@/lib/shortcut";
 import { cn } from "@/lib/utils";
 
-export interface Crumb {
-  label: string;
-  href?: string;
-  mono?: boolean;
+export type { Crumb };
+
+const GROUPS_KEY = "fleett.nav.groups";
+
+type GroupOpen = Record<GroupKey, boolean>;
+
+const GROUPS_CLOSED: GroupOpen = { automate: false, data: false, system: false };
+
+/** Opens are a quiet preference: a blocked storage keeps the default. */
+function readGroupOpen(): GroupOpen {
+  try {
+    const raw = localStorage.getItem(GROUPS_KEY);
+    if (!raw) return GROUPS_CLOSED;
+    const parsed = JSON.parse(raw) as Partial<Record<GroupKey, unknown>>;
+    return {
+      automate: parsed.automate === true,
+      data: parsed.data === true,
+      system: parsed.system === true,
+    };
+  } catch {
+    return GROUPS_CLOSED;
+  }
 }
 
-interface NavItem {
-  key: string;
-  /** Dictionary key under `nav.*`; the label is translated at render time. */
-  labelKey: string;
-  href: string;
-  icon: LucideIcon;
-  /** Hidden from `viewer` accounts, and the route refuses them. */
-  adminOnly?: boolean;
-}
-
-const NAV: NavItem[] = [
-  { key: "instances", labelKey: "nav.instances", href: "#/instances", icon: Boxes },
-  { key: "schedules", labelKey: "nav.schedules", href: "#/schedules", icon: CalendarClock, adminOnly: true },
-  { key: "pipelines", labelKey: "nav.pipelines", href: "#/pipelines", icon: Workflow },
-  { key: "incidents", labelKey: "nav.incidents", href: "#/incidents", icon: TriangleAlert },
-  { key: "cost", labelKey: "nav.cost", href: "#/cost", icon: CircleDollarSign },
-  { key: "logs", labelKey: "nav.logs", href: "#/logs", icon: ScrollText },
-  { key: "deployments", labelKey: "nav.deployments", href: "#/deployments", icon: Rocket },
-  { key: "security", labelKey: "nav.security", href: "#/security", icon: ShieldCheck, adminOnly: true },
-  { key: "messages", labelKey: "nav.messages", href: "#/messages", icon: MessagesSquare, adminOnly: true },
-  { key: "memory", labelKey: "nav.memory", href: "#/memory", icon: Brain },
-  { key: "providers", labelKey: "nav.providers", href: "#/providers", icon: Plug },
-  { key: "shares", labelKey: "nav.shares", href: "#/shares", icon: FolderTree },
-  { key: "templates", labelKey: "nav.templates", href: "#/templates", icon: LayoutTemplate },
-  { key: "personas", labelKey: "nav.personas", href: "#/personas", icon: Fingerprint },
-  { key: "skills", labelKey: "nav.skills", href: "#/skills", icon: Sparkles },
-  { key: "marketplace", labelKey: "nav.marketplace", href: "#/marketplace", icon: Store },
-  { key: "mcp", labelKey: "nav.mcpServers", href: "#/mcp-servers", icon: Server },
-  { key: "setup", labelKey: "nav.setup", href: "#/setup", icon: ListChecks },
-  { key: "tokens", labelKey: "nav.tokens", href: "#/tokens", icon: KeyRound, adminOnly: true },
-  { key: "audit", labelKey: "nav.audit", href: "#/audit", icon: FileClock, adminOnly: true },
-];
-
-function activeKey(path: string): string {
-  if (path.startsWith("/schedules")) return "schedules";
-  if (path.startsWith("/pipelines")) return "pipelines";
-  if (path.startsWith("/incidents")) return "incidents";
-  if (path.startsWith("/cost")) return "cost";
-  if (path.startsWith("/logs")) return "logs";
-  if (path.startsWith("/deployments")) return "deployments";
-  if (path.startsWith("/security")) return "security";
-  if (path.startsWith("/providers")) return "providers";
-  if (path.startsWith("/shares")) return "shares";
-  if (path.startsWith("/templates")) return "templates";
-  if (path.startsWith("/personas")) return "personas";
-  if (path.startsWith("/skills")) return "skills";
-  if (path.startsWith("/marketplace")) return "marketplace";
-  if (path.startsWith("/mcp-servers")) return "mcp";
-  if (path.startsWith("/setup")) return "setup";
-  if (path.startsWith("/tokens")) return "tokens";
-  if (path.startsWith("/audit")) return "audit";
-  if (path.startsWith("/messages")) return "messages";
-  if (path.startsWith("/memory")) return "memory";
-  return "instances";
+function writeGroupOpen(value: GroupOpen): void {
+  try {
+    localStorage.setItem(GROUPS_KEY, JSON.stringify(value));
+  } catch {
+    /* ignore storage failures */
+  }
 }
 
 function SideNav({
@@ -113,25 +68,30 @@ function SideNav({
   health,
   healthFailed,
   theme,
+  groupOpen,
+  onToggleGroup,
   onToggleTheme,
   onSignOut,
   onNavigate,
+  showModeToggle = false,
 }: {
   path: string;
   identity: Identity;
   health: Health | null;
   healthFailed: boolean;
   theme: "dark" | "light";
+  groupOpen: GroupOpen;
+  onToggleGroup: (key: GroupKey) => void;
   onToggleTheme: () => void;
   onSignOut: () => void;
   onNavigate?: () => void;
+  showModeToggle?: boolean;
 }) {
   const { t } = useI18n();
-  const active = activeKey(path);
+  const { mode } = useUiMode();
+  const active = navSelection(path, mode);
   const dockerOk = health?.docker.ok ?? true;
   const admin = identity.role === "admin";
-  const viewer = !admin;
-  const items = NAV.filter((item) => !item.adminOnly || admin);
 
   return (
     <div className="flex h-full flex-col bg-background">
@@ -142,31 +102,45 @@ function SideNav({
         <span className="text-sm font-semibold tracking-tight">fleett</span>
       </div>
 
-      <nav aria-label={t("nav.consoleSections")} className="flex-1 space-y-1 overflow-y-auto p-2">
-        {items.map((item) => {
-          const Icon = item.icon;
-          const isActive = item.key === active;
-          return (
-            <a
-              key={item.key}
-              href={item.href}
-              onClick={onNavigate}
-              aria-current={isActive ? "page" : undefined}
-              className={cn(
-                "flex min-h-11 items-center gap-2.5 rounded-md px-3 text-sm outline-none transition-colors focus-visible:ring-[3px] focus-visible:ring-ring/50 md:min-h-9",
-                isActive
-                  ? "bg-accent font-medium text-accent-foreground"
-                  : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-              )}
-            >
-              <Icon aria-hidden className="size-4 shrink-0" />
-              {t(item.labelKey)}
-            </a>
-          );
-        })}
+      {showModeToggle ? (
+        <div className="border-b px-3 py-2.5">
+          <ModeToggle size="md" fullWidth />
+        </div>
+      ) : null}
+
+      <nav aria-label={t("nav.consoleSections")} className="flex-1 overflow-y-auto px-2 py-2">
+        <div className="space-y-0.5">
+          {NAV_SPACES.map((space) => (
+            <NavLink
+              key={space.key}
+              entry={space}
+              active={space.key === active}
+              onNavigate={onNavigate}
+            />
+          ))}
+        </div>
+
+        {mode === "advanced" ? (
+          <div className="mt-4 space-y-1 border-t pt-3">
+            <p className="px-2.5 pb-0.5 text-[11px] font-medium tracking-wider text-muted-foreground/70 uppercase">
+              {t("nav.advancedTools")}
+            </p>
+            {NAV_GROUPS.map((group) => (
+              <NavGroup
+                key={group.key}
+                group={group}
+                activeKey={active}
+                open={groupOpen[group.key]}
+                admin={admin}
+                onToggle={() => onToggleGroup(group.key)}
+                onNavigate={onNavigate}
+              />
+            ))}
+          </div>
+        ) : null}
       </nav>
 
-      <div className="space-y-3 border-t p-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
+      <div className="space-y-3 border-t bg-background p-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
         <div className="space-y-1.5 rounded-md border bg-muted/30 p-2.5">
           <p
             className="truncate text-sm font-medium"
@@ -181,13 +155,13 @@ function SideNav({
             >
               {t(`role.${identity.role}`)}
             </Badge>
-            {viewer ? (
+            {!admin ? (
               <Badge variant="outline" className="font-mono text-[11px] font-normal">
                 {t("shell.readOnly")}
               </Badge>
             ) : null}
           </div>
-          {viewer ? (
+          {!admin ? (
             <p className="text-xs text-muted-foreground">{t("shell.readOnlyHint")}</p>
           ) : null}
           <Button
@@ -234,19 +208,18 @@ function SideNav({
           ) : null}
         </div>
 
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="w-full justify-start"
-          onClick={onToggleTheme}
-          aria-label={theme === "dark" ? t("shell.switchToLight") : t("shell.switchToDark")}
-        >
-          {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
-          {theme === "dark" ? t("shell.lightTheme") : t("shell.darkTheme")}
-        </Button>
-        <div className="flex items-center justify-between gap-2 px-0.5">
-          <span className="text-xs text-muted-foreground">{t("shell.language")}</span>
+        <div className="flex items-center justify-between gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="justify-start px-2"
+            onClick={onToggleTheme}
+            aria-label={theme === "dark" ? t("shell.switchToLight") : t("shell.switchToDark")}
+          >
+            {theme === "dark" ? <Sun aria-hidden /> : <Moon aria-hidden />}
+            {theme === "dark" ? t("shell.lightTheme") : t("shell.darkTheme")}
+          </Button>
           <LanguageToggle />
         </div>
       </div>
@@ -278,7 +251,42 @@ export function AppShell({
   children: ReactNode;
 }) {
   const [navOpen, setNavOpen] = useState(false);
+  const [groupOpen, setGroupOpen] = useState<GroupOpen>(readGroupOpen);
   const { t } = useI18n();
+  const { mode } = useUiMode();
+
+  // Crossing into the desktop layout must not leave the mobile sheet on top
+  // of the permanent sidebar.
+  useEffect(() => {
+    const query = window.matchMedia("(min-width: 768px)");
+    function closeAtDesktop(event: MediaQueryListEvent) {
+      if (event.matches) setNavOpen(false);
+    }
+    query.addEventListener("change", closeAtDesktop);
+    return () => query.removeEventListener("change", closeAtDesktop);
+  }, []);
+
+  // A direct link can land inside a collapsed group. Open that one group
+  // once, without overriding a collapse the operator does afterwards.
+  useEffect(() => {
+    if (mode !== "advanced") return;
+    const group = groupOf(activeLeaf(path));
+    if (!group) return;
+    setGroupOpen((current) => {
+      if (current[group.key]) return current;
+      const next = { ...current, [group.key]: true };
+      writeGroupOpen(next);
+      return next;
+    });
+  }, [mode, path]);
+
+  function toggleGroup(key: GroupKey) {
+    setGroupOpen((current) => {
+      const next = { ...current, [key]: !current[key] };
+      writeGroupOpen(next);
+      return next;
+    });
+  }
 
   return (
     <div className="flex min-h-dvh bg-background">
@@ -293,7 +301,7 @@ export function AppShell({
         {t("nav.skipToContent")}
       </a>
 
-      <aside className="hidden w-56 shrink-0 border-r md:block">
+      <aside className="hidden w-60 shrink-0 border-r md:block">
         <div className="sticky top-0 h-dvh">
           <SideNav
             path={path}
@@ -301,6 +309,8 @@ export function AppShell({
             health={health}
             healthFailed={healthFailed}
             theme={theme}
+            groupOpen={groupOpen}
+            onToggleGroup={toggleGroup}
             onToggleTheme={onToggleTheme}
             onSignOut={onSignOut}
           />
@@ -308,14 +318,14 @@ export function AppShell({
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex min-h-14 items-center gap-3 border-b bg-background px-4 pt-[env(safe-area-inset-top)] md:px-6">
+        <header className="sticky top-0 z-20 flex min-h-14 items-center gap-3 border-b bg-background/95 px-4 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-background/80 md:px-6">
           <Sheet open={navOpen} onOpenChange={setNavOpen}>
             <SheetTrigger asChild>
               <Button variant="ghost" size="icon-sm" className="md:hidden" aria-label={t("nav.openNavigation")}>
                 <Menu aria-hidden />
               </Button>
             </SheetTrigger>
-            <SheetContent side="left" className="w-64 p-0 pt-[env(safe-area-inset-top)]">
+            <SheetContent side="left" className="w-72 p-0 pt-[env(safe-area-inset-top)]">
               <SheetHeader className="sr-only">
                 <SheetTitle>{t("nav.navigation")}</SheetTitle>
                 <SheetDescription>{t("nav.consoleSections")}</SheetDescription>
@@ -326,38 +336,58 @@ export function AppShell({
                 health={health}
                 healthFailed={healthFailed}
                 theme={theme}
+                groupOpen={groupOpen}
+                onToggleGroup={toggleGroup}
                 onToggleTheme={onToggleTheme}
                 onSignOut={onSignOut}
                 onNavigate={() => setNavOpen(false)}
+                showModeToggle
               />
             </SheetContent>
           </Sheet>
 
           <nav aria-label={t("nav.breadcrumb")} className="min-w-0 flex-1">
-            <ol className="flex min-w-0 items-center gap-2 text-sm">
-              {crumbs.map((crumb, index) => (
-                <li key={`${crumb.label}-${index}`} className="flex min-w-0 items-center gap-2">
-                  {index > 0 ? (
-                    <span aria-hidden className="text-muted-foreground/60">
-                      /
-                    </span>
-                  ) : null}
-                  {crumb.href ? (
-                    <a href={crumb.href} className="truncate text-muted-foreground hover:text-foreground">
-                      {crumb.label}
-                    </a>
-                  ) : (
-                    <span
-                      aria-current="page"
-                      className={cn("truncate font-medium", crumb.mono && "font-mono text-xs")}
-                    >
-                      {crumb.label}
-                    </span>
-                  )}
-                </li>
-              ))}
+            <ol className="flex min-w-0 items-center gap-1.5 text-sm sm:gap-2">
+              {crumbs.map((crumb, index) => {
+                const last = index === crumbs.length - 1;
+                return (
+                  <li
+                    key={`${crumb.label}-${index}`}
+                    className={cn(
+                      "flex min-w-0 items-center gap-1.5 sm:gap-2",
+                      index < crumbs.length - 2 && "hidden sm:flex",
+                    )}
+                  >
+                    {index > 0 ? (
+                      <span aria-hidden className="text-muted-foreground/50">
+                        /
+                      </span>
+                    ) : null}
+                    {crumb.href && !last ? (
+                      <a
+                        href={crumb.href}
+                        className="truncate text-muted-foreground transition-colors outline-none hover:text-foreground focus-visible:rounded-sm"
+                      >
+                        {crumb.label}
+                      </a>
+                    ) : (
+                      <span
+                        className={cn(
+                          "truncate",
+                          last ? "font-medium text-foreground" : "text-muted-foreground",
+                          crumb.mono && "font-mono text-xs",
+                        )}
+                      >
+                        {crumb.label}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ol>
           </nav>
+
+          <ModeToggle className="hidden shrink-0 md:flex" />
 
           {/* One palette, two entry points: a labelled button on desktop and
               the same dialog behind an icon on a phone. */}

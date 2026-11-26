@@ -3,7 +3,6 @@ import {
   ArrowRight,
   Check,
   CircleCheck,
-  ListChecks,
   RefreshCw,
   Stethoscope,
   X,
@@ -204,67 +203,6 @@ export function OnboardingSteps({
         ))}
       </ol>
     </div>
-  );
-}
-
-/** Prominent first-run card on the Fleet page, used while the fleet is empty. */
-export function FleetOnboardingCard({
-  report,
-  onDismiss,
-  onOpenDoctor,
-}: {
-  report: OnboardingReport;
-  onDismiss: () => void;
-  onOpenDoctor: () => void;
-}) {
-  const { t } = useI18n();
-  const remaining = report.steps.filter((step) => !step.done).length;
-  return (
-    <section aria-labelledby="getting-started-title" className="rounded-lg border bg-card p-4 sm:p-5">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 space-y-1">
-          <div className="flex items-center gap-2">
-            <ListChecks aria-hidden className="size-4 shrink-0 text-muted-foreground" />
-            <h2 id="getting-started-title" className="text-base font-semibold tracking-tight">
-              {t("setup.gettingStarted")}
-            </h2>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            {remaining > 0
-              ? t(remaining === 1 ? "setup.stepsLeftOne" : "setup.stepsLeftMany", {
-                  count: remaining,
-                })
-              : t("setup.allReady")}
-          </p>
-        </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          className="-mt-1 -mr-1 shrink-0"
-          aria-label={t("setup.dismiss")}
-          title={t("setup.dismiss")}
-          onClick={onDismiss}
-        >
-          <X aria-hidden />
-        </Button>
-      </div>
-
-      <OnboardingSteps report={report} className="mt-4" />
-
-      <div className="mt-4 flex flex-wrap items-center gap-2">
-        <Button type="button" variant="outline" size="sm" onClick={onOpenDoctor}>
-          <Stethoscope aria-hidden />
-          {t("setup.runDiagnostics")}
-        </Button>
-        <Button asChild variant="ghost" size="sm">
-          <a href={hrefFor("/setup")}>{t("setup.openSetup")}</a>
-        </Button>
-        <span className="text-xs text-muted-foreground sm:ml-auto">
-          {t("setup.diagnosticsReadOnly")}
-        </span>
-      </div>
-    </section>
   );
 }
 
