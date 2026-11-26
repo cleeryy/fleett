@@ -1,4 +1,4 @@
-import { LayoutTemplate, RefreshCw } from "lucide-react";
+import { ArrowLeft, LayoutTemplate, RefreshCw } from "lucide-react";
 import { api } from "@/api";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -36,10 +36,18 @@ export function TemplatesPage() {
             : t("templates.loading")
         }
         actions={
-          <Button variant="outline" size="sm" onClick={templates.reload}>
-            <RefreshCw aria-hidden className={templates.refreshing ? "animate-spin" : undefined} />
-            {t("common.refresh")}
-          </Button>
+          <>
+            <Button asChild variant="ghost" size="sm">
+              <a href={hrefFor("/library")}>
+                <ArrowLeft aria-hidden />
+                {t("library.backToLibrary")}
+              </a>
+            </Button>
+            <Button variant="outline" size="sm" onClick={templates.reload}>
+              <RefreshCw aria-hidden className={templates.refreshing ? "animate-spin" : undefined} />
+              {t("common.refresh")}
+            </Button>
+          </>
         }
       />
 

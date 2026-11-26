@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Fingerprint, Plus, RefreshCw, Users } from "lucide-react";
+import { ArrowLeft, Fingerprint, Plus, RefreshCw, Users } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/api";
 import type { PersonaSummary } from "@/api/types";
@@ -98,6 +98,12 @@ export function PersonasPage() {
         }
         actions={
           <>
+            <Button asChild variant="ghost" size="sm">
+              <a href={hrefFor("/library")}>
+                <ArrowLeft aria-hidden />
+                {t("library.backToLibrary")}
+              </a>
+            </Button>
             <Button
               variant="outline"
               size="sm"
