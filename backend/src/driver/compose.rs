@@ -1218,6 +1218,21 @@ fn field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Stri
     None
 }
 
+/// Write an executable stand-in for the Docker CLI.
+///
+/// The script is written to a sibling path and renamed into place: `cargo
+/// test` runs tests in parallel, and a forked child that inherited the write
+/// descriptor keeps the inode busy, so executing the freshly written file can
+/// fail with `ETXTBSY` (os error 26).
+#[cfg(test)]
+fn write_fake_binary(path: &std::path::Path, script: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, script).expect("fake binary");
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::rename(&tmp, path).expect("install fake binary");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,8 +1735,6 @@ mod tests {
 
     #[tokio::test]
     async fn usage_maps_docker_stats_to_instances_without_docker() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let cfg = Config::for_tests(dir.path().join("root"));
         crate::store::ensure_layout(&cfg).expect("layout");
@@ -1740,12 +1753,10 @@ mod tests {
 
         // A stand-in for the Docker CLI: only `docker stats` is answered.
         let docker = dir.path().join("docker");
-        std::fs::write(
+        super::write_fake_binary(
             &docker,
             "#!/bin/sh\nprintf '%s\\n' '{\"Name\":\"fleett-alice\",\"CPUPerc\":\"2.50%\",\"MemUsage\":\"100MiB / 512MiB\"}'\n",
-        )
-        .expect("fake docker");
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            );
 
         let driver = ComposeDriver::new(&cfg).with_docker_binary(&docker);
         let specs = vec![usage_spec("alice"), usage_spec("bob")];
@@ -1800,10 +1811,8 @@ mod tests {
     }
 
     fn fake_docker(dir: &std::path::Path, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("docker");
-        std::fs::write(&path, script).expect("fake docker");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        super::write_fake_binary(&path, script);
         path
     }
 
@@ -1893,22 +1902,18 @@ mod project_tests {
 
     #[tokio::test]
     async fn project_commands_use_the_explicit_file_project_and_service() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let calls = dir.path().join("calls");
         let compose = dir.path().join("compose.yaml");
         std::fs::write(&compose, "name: fleett-mcp-fetch\nservices: {}\n").expect("compose");
         let docker = dir.path().join("docker");
-        std::fs::write(
+        super::write_fake_binary(
             &docker,
             format!(
                 "#!/bin/sh\nprintf 'args:%s\\n' \"$*\" >> {calls}\nprintf 'env:%s\\n' \"${{MCP_TOKEN:-}}\" >> {calls}\ncase \" $* \" in *\" ps \"*) printf '%s\\n' '{{\"State\":\"running\",\"Health\":\"healthy\"}}';; esac\nexit 0\n",
                 calls = calls.display()
             ),
-        )
-        .expect("fake docker");
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            );
 
         let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
             .with_docker_binary(&docker);
@@ -1964,18 +1969,14 @@ mod project_tests {
 
     #[tokio::test]
     async fn a_project_logs_call_targets_the_service_project() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let compose = dir.path().join("compose.yaml");
         std::fs::write(&compose, "name: fleett-mcp-memory\nservices: {}\n").expect("compose");
         let docker = dir.path().join("docker");
-        std::fs::write(
+        super::write_fake_binary(
             &docker,
             "#!/bin/sh\ncase \" $* \" in *\" inspect \"*) echo '{\"State\":{\"Status\":\"running\"}}';; *) echo 'mock-line';; esac\nexit 0\n",
-        )
-        .expect("fake docker");
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            );
 
         let driver = ComposeDriver::new(&Config::for_tests(dir.path().to_path_buf()))
             .with_docker_binary(&docker);
