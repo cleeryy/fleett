@@ -382,7 +382,7 @@ export function FleetPage() {
               <Button asChild>
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  {t("nav.newInstance")}
+                  {t("nav.newAgent")}
                 </a>
               </Button>
             ) : null}
@@ -417,7 +417,7 @@ export function FleetPage() {
   return (
     <>
       <PageHeader
-        title={t("nav.instances")}
+        title={t("nav.agents")}
         description={
           list.data
             ? `${t(
@@ -436,7 +436,7 @@ export function FleetPage() {
               <Button asChild size="sm">
                 <a href={hrefFor("/instances/new")}>
                   <Plus aria-hidden />
-                  {t("nav.newInstance")}
+                  {t("nav.newAgent")}
                 </a>
               </Button>
             ) : null}
