@@ -8,6 +8,13 @@
  * Technical strings (commands, paths, env var names, model ids, image tags,
  * API field names, log lines) are never translated — see `web/I18N.md`.
  */
+import { shellEn } from "./sections/shell.en";
+import { copyEn } from "./sections/copy.en";
+import { libraryEn } from "./sections/library.en";
+import { wizardEn } from "./sections/wizard.en";
+import { detailEn } from "./sections/detail.en";
+import { paletteEn } from "./sections/palette.en";
+
 export const en: Record<string, string> = {
   // ── Navigation / shell ────────────────────────────────────────────────
   "nav.instances": "Instances",
@@ -2681,5 +2688,10 @@ export const en: Record<string, string> = {
   "errors.mcp_unreachable": "The MCP server is unreachable.",
   "errors.mcp_upstream": "The MCP upstream failed.",
   "errors.invalid_mcp_server": "The MCP server definition is invalid.",
-
+  ...shellEn,
+  ...copyEn,
+  ...libraryEn,
+  ...wizardEn,
+  ...detailEn,
+  ...paletteEn,
 };

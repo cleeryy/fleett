@@ -351,6 +351,27 @@ function dictionaryKeys(path) {
   return keys;
 }
 
+/** `locales/en.ts` plus every `locales/sections/*.en.ts` feature lane file. */
+function dictionaryFiles(lang) {
+  const dir = join(SRC, "locales");
+  const files = [join(dir, `${lang}.ts`)];
+  const sections = join(dir, "sections");
+  try {
+    for (const entry of readdirSync(sections)) {
+      if (entry.endsWith(`.${lang}.ts`)) files.push(join(sections, entry));
+    }
+  } catch {
+    /* no section files: the base dictionary is the whole surface */
+  }
+  return files;
+}
+
+function dictionary(lang) {
+  const keys = [];
+  for (const file of dictionaryFiles(lang)) keys.push(...dictionaryKeys(file));
+  return keys;
+}
+
 function main() {
   const files = walk(join(SRC, "pages")).concat(walk(join(SRC, "components")));
   for (const file of files) scanFile(file);
@@ -367,8 +388,8 @@ function main() {
     );
   }
 
-  const en = dictionaryKeys(join(SRC, "locales", "en.ts"));
-  const fr = dictionaryKeys(join(SRC, "locales", "fr.ts"));
+  const en = dictionary("en");
+  const fr = dictionary("fr");
   const enSet = new Set(en);
   const frSet = new Set(fr);
   const missingFr = en.filter((key) => !frSet.has(key));

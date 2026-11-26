@@ -4,6 +4,13 @@
  * Voice: vouvoiement, impersonal for labels ("Créer", "Supprimer"), full
  * sentences for errors. Technical strings stay in English.
  */
+import { shellFr } from "./sections/shell.fr";
+import { copyFr } from "./sections/copy.fr";
+import { libraryFr } from "./sections/library.fr";
+import { wizardFr } from "./sections/wizard.fr";
+import { detailFr } from "./sections/detail.fr";
+import { paletteFr } from "./sections/palette.fr";
+
 export const fr: Record<string, string> = {
   // ── Navigation / shell ────────────────────────────────────────────────
   "nav.instances": "Instances",
@@ -2677,5 +2684,10 @@ export const fr: Record<string, string> = {
   "errors.mcp_unreachable": "Le serveur MCP est injoignable.",
   "errors.mcp_upstream": "L'amont MCP a échoué.",
   "errors.invalid_mcp_server": "La définition du serveur MCP est invalide.",
-
+  ...shellFr,
+  ...copyFr,
+  ...libraryFr,
+  ...wizardFr,
+  ...detailFr,
+  ...paletteFr,
 };
