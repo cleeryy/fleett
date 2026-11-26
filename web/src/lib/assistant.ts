@@ -120,6 +120,9 @@ export function useAssistantScope(scope: AssistantScope | null): void {
 const PAGES: Record<string, string> = {
   "/instances": "Instances",
   "/instances/new": "New instance",
+  "/activity": "Activity",
+  "/library": "Library",
+  "/settings": "Settings",
   "/providers": "Providers",
   "/shares": "Shares",
   "/templates": "Templates",
@@ -149,6 +152,12 @@ export function pageForPath(path: string): string {
 const SCHEMAS: Record<string, string> = {
   "/instances/new":
     "New instance form: id (slug), name, template, provider, model, base_url, api_key_env, channel (telegram|discord|none), shares, memory limit, LAN access, notes, env[].",
+  "/activity":
+    "Read-only activity feed: open incidents, the latest log lines and recent deployments, each with a link to its full page.",
+  "/library":
+    "Library hub: agent templates, personalities, skills, MCP connectors and marketplace. Each card links to its existing page.",
+  "/settings":
+    "Settings hub: console mode and language preferences, plus links to model providers, security, access tokens, audit log and setup.",
   "/providers":
     "Provider: name (lowercase slug), kind (openai-compatible|anthropic|google), base_url, api_key_env, write-only secret.",
   "/shares": "Shared folder: name, host path, instances attached read-write or read-only.",

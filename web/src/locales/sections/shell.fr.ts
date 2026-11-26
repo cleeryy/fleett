@@ -1,2 +1,96 @@
-/** Coquille : navigation, mode simple/avancé, titres de page. */
-export const shellFr: Record<string, string> = {};
+/** Coquille : navigation, mode simple/avancé, hubs, titres de page. */
+export const shellFr: Record<string, string> = {
+  // ── Navigation : les quatre espaces et les groupes avancés ───────────
+  "nav.agents": "Agents",
+  "nav.library": "Bibliothèque",
+  "nav.activity": "Activité",
+  "nav.settings": "Réglages",
+  "nav.newAgent": "Nouvel agent",
+  "nav.advancedTools": "Outils avancés",
+  "nav.groupAutomate": "Automatiser",
+  "nav.groupAutomateHint": "Des automatisations multi-étapes, planifiées ou à la demande.",
+  "nav.groupData": "Données",
+  "nav.groupDataHint": "Messages, mémoire, dossiers partagés et coûts.",
+  "nav.groupSystem": "Système",
+  "nav.groupSystemHint": "Déploiements, fournisseurs de modèles, sécurité et accès.",
+
+  // ── Sélecteur Simple / Avancé ────────────────────────────────────────
+  "shell.mode": "Mode de la console",
+  "shell.modeSimple": "Simple",
+  "shell.modeAdvanced": "Avancé",
+  "shell.modeSimpleHint": "Quatre espaces et des libellés en langage courant.",
+  "shell.modeAdvancedHint": "Ajoute les outils d'automatisation, de données et de système.",
+  "shell.modeSimpleOn": "Mode simple activé. La console affiche de nouveau les quatre espaces.",
+  "shell.modeAdvancedOn":
+    "Mode avancé activé. Les outils d'automatisation, de données et de système sont maintenant dans la barre latérale.",
+
+  // ── Hub Réglages ─────────────────────────────────────────────────────
+  "shell.settings.description":
+    "Un seul endroit pour les comptes, les identifiants et les vérifications qui font tourner les agents.",
+  "shell.settings.preferences": "Préférences",
+  "shell.settings.preferencesHint": "Ces choix restent dans ce navigateur.",
+  "shell.settings.mode": "Mode de la console",
+  "shell.settings.modeHint":
+    "Le mode simple garde quatre espaces. Le mode avancé ajoute les outils techniques sans rien retirer.",
+  "shell.settings.language": "Langue",
+  "shell.settings.languageHint":
+    "Modifie uniquement la copie de l'interface. Les journaux et les valeurs techniques ne changent pas.",
+  "shell.settings.sections": "Rubriques",
+  "shell.settings.sectionsHint": "Chaque rubrique ouvre sa propre page ; rien n'est configuré deux fois ici.",
+  "shell.settings.providers": "Fournisseurs de modèles",
+  "shell.settings.providersDescription": "Les services derrière vos agents et les clés qu'ils utilisent.",
+  "shell.settings.security": "Sécurité",
+  "shell.settings.securityDescription": "Limites de connexion, verrouillage et en-têtes de réponse.",
+  "shell.settings.tokens": "Jetons d'accès",
+  "shell.settings.tokensDescription": "Identifiants pour les scripts, la CLI et les intégrations.",
+  "shell.settings.audit": "Journal d'audit",
+  "shell.settings.auditDescription": "Qui a changé quoi, avec l'heure et la cible.",
+  "shell.settings.setup": "Installation",
+  "shell.settings.setupDescription": "Vérifications de l'hôte et liste des premiers pas.",
+  "shell.settings.viewerNote": "La sécurité, les jetons d'accès et l'audit sont réservés aux administrateurs.",
+
+  // ── Hub Activité ─────────────────────────────────────────────────────
+  "shell.activity.description":
+    "Ce qui vient de se passer : incidents ouverts, dernières lignes de journal et déploiements récents.",
+  "shell.activity.incidentsTitle": "Incidents ouverts",
+  "shell.activity.incidentsHint": "Les agents qui demandent votre attention maintenant.",
+  "shell.activity.incidentsEmptyTitle": "Aucun incident ouvert",
+  "shell.activity.incidentsEmptyDescription": "Tous les agents fonctionnent normalement.",
+  "shell.activity.incidentsEmptyAction": "Ouvrir les agents",
+  "shell.activity.incidentsViewAll": "Tous les incidents",
+  "shell.activity.openOne": "{count} incident ouvert",
+  "shell.activity.openMany": "{count} incidents ouverts",
+  "shell.activity.logsTitle": "Journaux récents",
+  "shell.activity.logsHint": "Les dernières lignes reçues, tous agents confondus.",
+  "shell.activity.logsEmptyTitle": "Aucune ligne ces dernières 24 heures",
+  "shell.activity.logsEmptyDescription": "Les lignes apparaissent dès qu'un agent en écrit une.",
+  "shell.activity.logsEmptyAction": "Ouvrir les journaux",
+  "shell.activity.logsViewAll": "Tous les journaux",
+  "shell.activity.level.info": "info",
+  "shell.activity.level.warn": "avertissement",
+  "shell.activity.level.error": "erreur",
+  "shell.activity.deploymentsTitle": "Déploiements récents",
+  "shell.activity.deploymentsHint": "Les déploiements d'images sur la flotte.",
+  "shell.activity.deploymentsEmptyTitle": "Aucun déploiement pour l'instant",
+  "shell.activity.deploymentsEmptyDescription": "Un déploiement apparaît ici dès qu'il commence.",
+  "shell.activity.deploymentsEmptyAction": "Ouvrir les déploiements",
+  "shell.activity.deploymentsViewAll": "Tous les déploiements",
+  "shell.activity.agentOne": "{count} agent",
+  "shell.activity.agentMany": "{count} agents",
+  "shell.activity.notStarted": "pas encore démarré",
+
+  // ── Hub Bibliothèque ─────────────────────────────────────────────────
+  "shell.library.description":
+    "Tout ce que vous pouvez ajouter à un agent : un point de départ, une personnalité, une compétence ou un connecteur.",
+  "shell.library.templates": "Modèles d'agents",
+  "shell.library.templatesDescription": "Un point de départ pour un nouvel agent.",
+  "shell.library.personas": "Personnalités",
+  "shell.library.personasDescription": "Qui est l'agent, comment il parle et ce qu'il refuse.",
+  "shell.library.skills": "Compétences",
+  "shell.library.skillsDescription": "Ce que l'agent sait faire.",
+  "shell.library.connectors": "Connecteurs",
+  "shell.library.connectorsDescription": "Les outils et services que l'agent peut joindre.",
+  "shell.library.marketplace": "Marketplace",
+  "shell.library.marketplaceDescription": "Des contenus prêts à installer, avec leur source et leur version.",
+  "shell.library.note": "Choisissez quoi ajouter ; chaque page garde tous les réglages disponibles.",
+};
