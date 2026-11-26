@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { api, FALLBACK_AUTH_CONFIG } from "@/api";
 import { toApiError, type ApiError } from "@/api/errors";
 import type { AuthConfig, Health, Identity } from "@/api/types";
-import { AppShell, type Crumb } from "@/components/app-shell";
+import { AppShell } from "@/components/app-shell";
 import { AssistantPanel } from "@/components/assistant";
 import { CommandPalette } from "@/components/command-palette";
 import { Button } from "@/components/ui/button";
@@ -12,9 +12,12 @@ import { Toaster } from "@/components/ui/sonner";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
 import { useI18n } from "@/lib/i18n";
+import { useUiMode } from "@/lib/mode";
+import { crumbsFor, titleFor } from "@/lib/navigation";
 import { navigate, useRoute } from "@/lib/router";
 import { SessionContext } from "@/lib/session";
 import { tokenStore } from "@/lib/token";
+import { ActivityPage } from "@/pages/activity";
 import { AuditPage } from "@/pages/audit";
 import { CostPage } from "@/pages/cost";
 import { DeploymentsPage } from "@/pages/deployments";
@@ -22,6 +25,7 @@ import { FleetPage } from "@/pages/fleet";
 import { IncidentsPage } from "@/pages/incidents";
 import { InstanceDetailPage } from "@/pages/instance-detail";
 import { NewInstancePage } from "@/pages/instance-new";
+import { LibraryPage } from "@/pages/library";
 import { LoginPage } from "@/pages/login";
 import { LogsPage } from "@/pages/logs";
 import { MarketplacePage } from "@/pages/marketplace";
@@ -36,6 +40,7 @@ import { ProviderDetailPage } from "@/pages/provider-detail";
 import { ProvidersPage } from "@/pages/providers";
 import { SchedulesPage } from "@/pages/schedules";
 import { SecurityPage } from "@/pages/security";
+import { SettingsPage } from "@/pages/settings";
 import { SetupPage } from "@/pages/setup";
 import { SharesPage } from "@/pages/shares";
 import { SkillDetailPage } from "@/pages/skill-detail";
@@ -48,40 +53,6 @@ type Theme = "dark" | "light";
 const THEME_KEY = "fleett.theme";
 // Key written before the rename; still read so an open tab keeps its theme.
 const LEGACY_THEME_KEY = "fleet.theme";
-
-type Translate = ReturnType<typeof useI18n>["t"];
-
-function titleFor(path: string, t: Translate): string {
-  if (path === "/") return t("nav.instances");
-  if (path === "/instances") return t("nav.instances");
-  if (path === "/instances/new") return t("nav.newInstance");
-  if (path.startsWith("/instances/")) return decodeURIComponent(path.slice("/instances/".length));
-  if (path === "/providers") return t("nav.providers");
-  if (path.startsWith("/providers/")) return t("nav.providerDetail");
-  if (path === "/shares") return t("nav.shares");
-  if (path === "/templates") return t("nav.templates");
-  if (path === "/personas") return t("nav.personas");
-  if (path.startsWith("/personas/")) return t("nav.personaDetail");
-  if (path === "/skills") return t("nav.skills");
-  if (path.startsWith("/skills/")) return t("nav.skillDetail");
-  if (path === "/marketplace") return t("nav.marketplace");
-  if (path === "/mcp-servers") return t("nav.mcpServers");
-  if (path.startsWith("/mcp-servers/")) return t("nav.mcpServerDetail");
-  if (path === "/tokens") return t("nav.tokens");
-  if (path === "/audit") return t("nav.audit");
-  if (path === "/schedules") return t("nav.schedules");
-  if (path === "/pipelines") return t("nav.pipelines");
-  if (path === "/incidents") return t("nav.incidents");
-  if (path === "/cost") return t("nav.cost");
-  if (path === "/logs") return t("nav.logs");
-  if (path === "/security") return t("nav.security");
-  if (path === "/deployments") return t("nav.deployments");
-  if (path === "/messages") return t("nav.messages");
-  if (path === "/memory") return t("nav.memory");
-  if (path === "/setup") return t("nav.setup");
-  if (path === "/login") return t("nav.login");
-  return t("nav.notFound");
-}
 
 function readTheme(): Theme {
   try {
@@ -127,6 +98,7 @@ function RestrictedScreen({ title, message }: { title: string; message: string }
 
 export default function App() {
   const { t, lang } = useI18n();
+  const { mode } = useUiMode();
   const route = useRoute();
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [authConfig, setAuthConfig] = useState<AuthConfig>(FALLBACK_AUTH_CONFIG);
@@ -235,8 +207,8 @@ export default function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-    document.title = `${identity ? titleFor(route.path, t) : t("nav.login")} · fleett`;
-  }, [identity, route.path, t, lang]);
+    document.title = `${identity ? titleFor(route.path, mode, t) : t("nav.login")} · fleett`;
+  }, [identity, route.path, mode, t, lang]);
 
   function handleSignedIn(next: Identity) {
     identityRef.current = next;
@@ -288,7 +260,9 @@ export default function App() {
   const admin = identity.role === "admin";
   const canEdit = identity.role !== "viewer";
 
-  let crumbs: Crumb[] = [];
+  // One source for the breadcrumb, the document title and the sidebar's
+  // active space. Every legacy route below keeps its screen and its guard.
+  const crumbs = crumbsFor(path, mode, t);
   let screen: ReactNode = null;
 
   const detailMatch = /^\/instances\/([^/]+)$/.exec(path);
@@ -298,64 +272,52 @@ export default function App() {
   const mcpMatch = /^\/mcp-servers\/([^/]+)$/.exec(path);
 
   if (path === "/instances") {
-    crumbs = [{ label: t("nav.instances") }];
     screen = <FleetPage />;
   } else if (path === "/instances/new") {
-    crumbs = [{ label: t("nav.instances"), href: "#/instances" }, { label: t("nav.newInstance") }];
     screen = canEdit ? (
       <NewInstancePage />
     ) : (
       <RestrictedScreen
-        title={t("nav.newInstance")}
+        title={t("nav.newAgent")}
         message={t("shell.restricted.newInstance")}
       />
     );
   } else if (detailMatch) {
     const id = decodeURIComponent(detailMatch[1]);
-    crumbs = [{ label: t("nav.instances"), href: "#/instances" }, { label: id, mono: true }];
     screen = <InstanceDetailPage key={id} id={id} />;
+  } else if (path === "/activity") {
+    screen = <ActivityPage />;
+  } else if (path === "/library") {
+    screen = <LibraryPage />;
+  } else if (path === "/settings") {
+    screen = <SettingsPage />;
   } else if (path === "/providers") {
-    crumbs = [{ label: t("nav.providers") }];
     screen = <ProvidersPage />;
   } else if (providerMatch) {
     const id = decodeURIComponent(providerMatch[1]);
-    crumbs = [{ label: t("nav.providers"), href: "#/providers" }, { label: t("nav.providerDetail") }];
     screen = <ProviderDetailPage key={id} id={id} />;
   } else if (path === "/shares") {
-    crumbs = [{ label: t("nav.shares") }];
     screen = <SharesPage />;
   } else if (path === "/templates") {
-    crumbs = [{ label: t("nav.templates") }];
     screen = <TemplatesPage />;
   } else if (path === "/personas") {
-    crumbs = [{ label: t("nav.personas") }];
     screen = <PersonasPage />;
   } else if (personaMatch) {
     const id = decodeURIComponent(personaMatch[1]);
-    crumbs = [{ label: t("nav.personas"), href: "#/personas" }, { label: id, mono: true }];
     screen = <PersonaDetailPage key={id} id={id} />;
   } else if (path === "/skills") {
-    crumbs = [{ label: t("nav.skills") }];
     screen = <SkillsPage />;
   } else if (skillMatch) {
     const name = decodeURIComponent(skillMatch[1]);
-    crumbs = [{ label: t("nav.skills"), href: "#/skills" }, { label: name, mono: true }];
     screen = <SkillDetailPage key={name} name={name} />;
   } else if (path === "/marketplace") {
-    crumbs = [{ label: t("nav.marketplace") }];
     screen = <MarketplacePage />;
   } else if (path === "/mcp-servers") {
-    crumbs = [{ label: t("nav.mcpServers") }];
     screen = <McpServersPage />;
   } else if (mcpMatch) {
     const id = decodeURIComponent(mcpMatch[1]);
-    crumbs = [
-      { label: t("nav.mcpServers"), href: "#/mcp-servers" },
-      { label: id, mono: true },
-    ];
     screen = <McpServerDetailPage key={id} id={id} />;
   } else if (path === "/schedules") {
-    crumbs = [{ label: t("nav.schedules") }];
     screen = admin ? (
       <SchedulesPage />
     ) : (
@@ -365,25 +327,18 @@ export default function App() {
       />
     );
   } else if (path === "/pipelines") {
-    crumbs = [{ label: t("nav.pipelines") }];
     screen = <PipelinesPage />;
   } else if (path === "/setup") {
-    crumbs = [{ label: t("nav.setup") }];
     screen = <SetupPage />;
   } else if (path === "/incidents") {
-    crumbs = [{ label: t("nav.incidents") }];
     screen = <IncidentsPage />;
   } else if (path === "/cost") {
-    crumbs = [{ label: t("nav.cost") }];
     screen = <CostPage />;
   } else if (path === "/logs") {
-    crumbs = [{ label: t("nav.logs") }];
     screen = <LogsPage />;
   } else if (path === "/deployments") {
-    crumbs = [{ label: t("nav.deployments") }];
     screen = <DeploymentsPage />;
   } else if (path === "/security") {
-    crumbs = [{ label: t("nav.security") }];
     screen = admin ? (
       <SecurityPage />
     ) : (
@@ -393,7 +348,6 @@ export default function App() {
       />
     );
   } else if (path === "/tokens") {
-    crumbs = [{ label: t("nav.tokens") }];
     screen = admin ? (
       <TokensPage />
     ) : (
@@ -403,7 +357,6 @@ export default function App() {
       />
     );
   } else if (path === "/audit") {
-    crumbs = [{ label: t("nav.audit") }];
     screen = admin ? (
       <AuditPage />
     ) : (
@@ -413,7 +366,6 @@ export default function App() {
       />
     );
   } else if (path === "/messages") {
-    crumbs = [{ label: t("nav.messages") }];
     screen = admin ? (
       <MessagesPage />
     ) : (
@@ -423,10 +375,8 @@ export default function App() {
       />
     );
   } else if (path === "/memory") {
-    crumbs = [{ label: t("nav.memory") }];
     screen = <MemoryPage />;
   } else {
-    crumbs = [{ label: t("nav.notFound") }];
     screen = (
       <div className="space-y-4">
         <PageHeader

@@ -11,18 +11,27 @@ export function Segmented<T extends string>({
   onChange,
   label,
   className,
+  size = "sm",
+  fullWidth = false,
 }: {
   value: T;
   options: Array<{ value: T; label: string; title?: string }>;
   onChange: (next: T) => void;
   label: string;
   className?: string;
+  /** `md` meets the 44px touch target used in the mobile drawer. */
+  size?: "sm" | "md";
+  fullWidth?: boolean;
 }) {
   return (
     <div
       role="group"
       aria-label={label}
-      className={cn("flex items-center gap-0.5 rounded-md bg-muted p-0.5", className)}
+      className={cn(
+        "flex items-center gap-0.5 rounded-md bg-muted p-0.5",
+        fullWidth && "w-full",
+        className,
+      )}
     >
       {options.map((option) => {
         const selected = option.value === value;
@@ -34,7 +43,9 @@ export function Segmented<T extends string>({
             title={option.title}
             onClick={() => onChange(option.value)}
             className={cn(
-              "rounded px-2 py-0.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+              "rounded outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+              size === "sm" ? "px-2 py-0.5 text-xs" : "min-h-11 px-3 py-1.5 text-sm",
+              fullWidth && "flex-1",
               selected
                 ? "bg-background font-medium text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground",
