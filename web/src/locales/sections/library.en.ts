@@ -2,13 +2,13 @@
 export const libraryEn: Record<string, string> = {
   "library.title": "Library",
   "library.description":
-    "One entry point for templates, personas, skills and connectors. Open a card to preview it, then use it or attach it to an agent.",
+    "One entry point for agent templates, personalities, skills and connectors. Open a card to preview it, then use it or attach it to an agent.",
   "library.readOnly":
     "Read-only: installing, applying, attaching and updating need a write-capable account.",
   "library.pills.label": "Library sections",
   "library.pill.all": "All",
-  "library.pill.templates": "Templates",
-  "library.pill.personas": "Personas",
+  "library.pill.templates": "Agent templates",
+  "library.pill.personas": "Personalities",
   "library.pill.skills": "Skills",
   "library.pill.connectors": "Connectors",
   "library.searchLabel": "Search the library",
@@ -55,7 +55,7 @@ export const libraryEn: Record<string, string> = {
 
   "library.empty.allTitle": "The library is empty",
   "library.empty.allDescription":
-    "Create an agent to get started; templates, personas, skills and connectors will follow.",
+    "Create an agent to get started; templates, personalities, skills and connectors will follow.",
   "library.empty.templatesTitle": "No templates",
   "library.empty.templatesDescription":
     "A template seeds a new agent. Add templates/<id>/config.yaml on the host, then refresh.",
@@ -79,7 +79,7 @@ export const libraryEn: Record<string, string> = {
     "Try a shorter term or switch the source back to local.",
 
   "library.preview.templateTitle": "Template {name}",
-  "library.preview.personaTitle": "Persona {name}",
+  "library.preview.personaTitle": "Personality {name}",
   "library.preview.skillTitle": "Skill {name}",
   "library.preview.connectorTitle": "Connector {name}",
   "library.preview.image": "Image",
